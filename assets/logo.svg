@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="200" viewBox="0 0 880 200" role="img" aria-label="Aria Quantum Language">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.55" stop-color="#131a36"/>
+      <stop offset="1" stop-color="#1b1140"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="0.5" stop-color="#36c2ff"/>
+      <stop offset="1" stop-color="#22e0c8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#36c2ff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#36c2ff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="0" y="0" width="880" height="200" rx="18" fill="url(#bg)"/>
+  <rect x="1.5" y="1.5" width="877" height="197" rx="17" fill="none" stroke="url(#accent)" stroke-opacity="0.35" stroke-width="1.5"/>
+
+  <!-- Bloch-sphere emblem -->
+  <g transform="translate(110,100)">
+    <circle cx="0" cy="0" r="78" fill="url(#glow)"/>
+    <circle cx="0" cy="0" r="62" fill="none" stroke="url(#accent)" stroke-width="2.5"/>
+    <ellipse cx="0" cy="0" rx="62" ry="22" fill="none" stroke="#36c2ff" stroke-opacity="0.55" stroke-width="1.5"/>
+    <ellipse cx="0" cy="0" rx="22" ry="62" fill="none" stroke="#7c5cff" stroke-opacity="0.5" stroke-width="1.5"/>
+    <line x1="0" y1="0" x2="40" y2="-44" stroke="url(#accent)" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="40" cy="-44" r="6" fill="#22e0c8"/>
+    <circle cx="0" cy="0" r="4" fill="#ffffff"/>
+  </g>
+
+  <!-- Wordmark -->
+  <g transform="translate(220,0)" font-family="'Segoe UI',Helvetica,Arial,sans-serif">
+    <text x="0" y="84" font-size="44" font-weight="700" fill="#ffffff" letter-spacing="0.5">Aria Quantum Language</text>
+    <text x="2" y="118" font-size="19" font-weight="500" fill="#8ea2c6">read · parameterize · run · train · export · prove</text>
+    <g transform="translate(2,150)">
+      <rect x="0" y="-16" width="104" height="24" rx="12" fill="#7c5cff" fill-opacity="0.18" stroke="#7c5cff" stroke-opacity="0.6"/>
+      <text x="14" y="1" font-size="13" font-weight="700" fill="#b9a7ff" letter-spacing="1.2">PURE RUST</text>
+      <rect x="116" y="-16" width="120" height="24" rx="12" fill="#36c2ff" fill-opacity="0.15" stroke="#36c2ff" stroke-opacity="0.6"/>
+      <text x="130" y="1" font-size="13" font-weight="700" fill="#7fd8ff" letter-spacing="1.2">NO LIBTORCH</text>
+      <rect x="248" y="-16" width="128" height="24" rx="12" fill="#22e0c8" fill-opacity="0.13" stroke="#22e0c8" stroke-opacity="0.6"/>
+      <text x="262" y="1" font-size="13" font-weight="700" fill="#79ecda" letter-spacing="1.2">LEAN 4 PROVEN</text>
+    </g>
+  </g>
+</svg>

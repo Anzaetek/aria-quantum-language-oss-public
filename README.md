@@ -1,4 +1,32 @@
+<div align="center">
+
+<img src="./assets/logo.svg" alt="Aria Quantum Language" width="680">
+
 # Aria Quantum Language
+
+**A small, readable language for quantum circuits — a model you can _read,
+parameterize, run, train, export, and prove_ from one source — on a pluggable,
+pure-Rust runtime that needs no libtorch and is backed by Lean 4 correctness proofs.**
+
+![license](https://img.shields.io/badge/license-Apache--2.0-2ea043)
+![language](https://img.shields.io/badge/language-pure%20Rust-de5833)
+![runtime](https://img.shields.io/badge/runtime-no%20libtorch%20required-7c5cff)
+![examples](https://img.shields.io/badge/examples-31%2F32%20numerically%20verified-36c2ff)
+![proofs](https://img.shields.io/badge/proofs-Lean%204%20%C2%B7%20sorry--free-22e0c8)
+![backends](https://img.shields.io/badge/backends-CPU%20%C2%B7%20MPS%20%C2%B7%20CUDA%2FMetal%2FOpenCL%20%C2%B7%20tch-f59e0b)
+
+`APACHE-2.0` · `PURE RUST` · `NO LIBTORCH` · `LEAN 4 PROVEN` · `31/32 VERIFIED` · see [LICENSE](./LICENSE)
+
+🔗 **https://github.com/Anzaetek/aria-quantum-language-oss-public**
+
+</div>
+
+> 💡 **One source, many targets.** A circuit parses to a backend-agnostic IR and
+> then *runs* (CPU / MPS / GPU / libtorch / remote), *trains* its `symbolic[k]`
+> angles with parameter-shift gradients in pure Rust, and *exports* to OPENQASM
+> 2.0, JSON, or machine-checked Lean 4 — all from the same readable source.
+
+---
 
 **Aria** is a small, readable domain-specific language for quantum circuits — a
 quantum model you can *read, parameterize, run, train, and export* from a single
@@ -24,6 +52,24 @@ $ aria run examples/aria/bell.aria --circuit Bell --statevector
 
 $ aria run examples/aria/bell.aria --circuit Bell --expectation "Z0 Z1"
 <Z0 Z1> = 1.000000000000
+```
+
+## What's here
+
+```
+aria-quantum-language-oss/
+├── crates/
+│   ├── aria-core/        lexer · parser · AST · IR · QASM/JSON/Lean/Rocq export
+│   ├── aria-runtime/     lowering + the pluggable Backend trait (run / train)
+│   ├── aria-cli/         the `aria` binary: list · parse · run · train · export
+│   ├── aria-verify/      application harnesses: quantum vs classical oracle
+│   ├── apps/<name>/      one small crate per example (~60 readable lines)
+│   └── omega-*/          vendored pure-Rust runtime: IR + backends + server
+├── examples/aria/        32 example circuits (each header cites its harness + check)
+├── proofs/lean4/         Lean 4 correctness theorems (sorry-free)
+├── editors/              Aria syntax: tree-sitter · Neovim · VS Code
+├── TUTORIAL.md · GRAMMAR.md · VERIFICATION.md · LIMITATIONS.md · TESTING.md
+└── ci.sh                 the whole pipeline (local by design — no hosted runner)
 ```
 
 ## Why Aria
