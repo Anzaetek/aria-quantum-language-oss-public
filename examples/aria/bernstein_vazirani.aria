@@ -1,0 +1,41 @@
+-- ▶ Application harness + classical cross-check: crates/apps/bernstein-vazirani/src/lib.rs
+--   run: cargo run -p aria-app-bernstein-vazirani   (or: cargo run -p aria-verify -- bernstein_vazirani)
+-- VERIFIED: register recovered in one query == the hidden string a of f(x)=a·x mod 2, exact equality over n=4 bits.
+--
+-- Bernstein-Vazirani: learn an unknown n-bit string `a` encoded in an
+-- oracle f(x) = a . x (mod 2) with a single query.
+--
+-- Layout mirrors Deutsch-Jozsa: n query qubits + 1 answer qubit.
+-- After one query to the phase oracle + Hadamards, measuring the query
+-- register yields `a` directly.
+
+@assert unitary
+@prove "bv_recovers_a_in_one_query" equiv { measurement = a }
+
+circuit BernsteinVazirani(n: int, a: int) {
+    qreg q[n + 1]
+    creg c[n]
+
+    -- Answer qubit into |->, Hadamards on the queries.
+    apply X on q[n]
+    repeat i from 0 to n {
+        apply H on q[i]
+    }
+
+    -- Phase oracle for f(x) = a . x (mod 2): CX from every set bit of a.
+    -- We pre-expand the bits of `a` via the compile-time scope, so the
+    -- circuit has exactly popcount(a) CX gates.
+    repeat k from 0 to n - 1 {
+        when (a / 2 ^ k) % 2 == 1 {
+            apply CX on q[k], q[n]
+        }
+    }
+
+    -- Invert Hadamards and measure.
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+    }
+    repeat i from 0 to n - 1 {
+        measure q[i] -> c[i]
+    }
+}

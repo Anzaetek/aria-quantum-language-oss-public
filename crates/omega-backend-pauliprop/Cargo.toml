@@ -1,0 +1,19 @@
+[package]
+name = "omega-backend-pauliprop"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pauli-propagation (Heisenberg-picture) backend for the omega runtime."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+num-complex = { workspace = true }
+
+[dev-dependencies]
+num-complex = { workspace = true }
+smallvec = { workspace = true }

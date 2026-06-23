@@ -1,0 +1,51 @@
+-- Quantum Circuit Born Machine (QCBM) with StronglyEntanglingLayers.
+-- A generative model whose Born-rule output distribution is trained to match a
+-- target joint histogram.
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- qcbm_strongly_entangling)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- Structure:
+--   1. Hadamard prelude on every wire (uniform superposition start).
+--   2. L strongly-entangling layers, each = per-qubit Euler rotation
+--      Rot(phi,theta,omega) = RZ(phi) RY(theta) RZ(omega), then a RING of
+--      CNOTs CX(q, (q+1) mod N). PennyLane applies the template one layer at
+--      a time, so the ring range is always 1 (never the increasing stride).
+--   3. Readout is qml.probs over all wires — the Born distribution sampled to
+--      reproduce a target joint histogram. (Aria carries a Z(0) observable
+--      as a placeholder; the model reads the full probability vector.)
+--
+-- Symbols: theta[0 .. 3*N*L-1] — 3 trainable angles per qubit per layer,
+-- bound as (layer, qubit, k) row-major to match theta.reshape(-1).
+
+@assert unitary
+@bound parameters = 3 * N * L
+
+circuit QcbmStronglyEntangling(N: int, L: int) {
+    qreg q[N]
+
+    let theta = symbolic[3 * N * L]
+
+    -- 1. Hadamard prelude.
+    repeat i from 0 to N - 1 {
+        apply H on q[i]
+    }
+
+    -- 2. L strongly-entangling layers.
+    repeat layer from 0 to L - 1 {
+        repeat i from 0 to N - 1 {
+            apply RZ(theta[3 * (layer * N + i) + 0]) on q[i]
+            apply RY(theta[3 * (layer * N + i) + 1]) on q[i]
+            apply RZ(theta[3 * (layer * N + i) + 2]) on q[i]
+        }
+        -- Ring entanglement (range 1, wrapping q[N-1] -> q[0]).
+        repeat i from 0 to N - 1 {
+            apply CX on q[i], q[(i + 1) % N]
+        }
+    }
+}
+
+-- Born-machine readout: the model samples qml.probs(all wires); this Z(0)
+-- observable is a spec-extraction placeholder for the probability readout.
+observable BornReadout {
+    1.0 * Z(0)
+}

@@ -1,0 +1,113 @@
+# Aria Quantum Language — OSS workspace.
+#
+# One cargo workspace bundling the full `omega-functions` runtime (the
+# pluggable execution engine) and the Aria language frontend (`aria-*`).
+# Apache-2.0. The pure-Rust statevector backend is the default; libtorch
+# (`tch`), GPU (metal/cuda/opencl), and remote (omega-server) backends are
+# optional, feature-gated plugins that implement `omega_core::executor::Backend`.
+[workspace]
+resolver = "2"
+exclude = [
+    "examples/wasm-guests/vqe",
+    "examples/wasm-guests/qaoa",
+    "examples/wasm-guests/qaoa_qubo",
+    "examples/wasm-guests/qaoa_qubo_self",
+    "examples/wasm-guests/omega_app",
+    # Optional libtorch backend — excluded so the default build stays
+    # libtorch-free; built only via `aria-runtime --features tch`.
+    "crates/aria-backend-tch",
+]
+members = [
+    # --- omega-functions runtime (vendored) ---
+    "crates/omega-core",
+    "crates/omega-parser",
+    "crates/omega-backend-statevector",
+    "crates/omega-backend-statevector-metal",
+    "crates/omega-backend-statevector-cuda",
+    "crates/omega-backend-statevector-opencl",
+    "crates/omega-backend-photonics",
+    "crates/omega-backend-mps",
+    "crates/omega-backend-mps-metal",
+    "crates/omega-backend-mps-cuda",
+    "crates/omega-backend-pauli",
+    "crates/omega-backend-pauliprop",
+    "crates/omega-tensor",
+    "crates/omega-ffi",
+    "crates/omega-wasm-runtime",
+    "crates/omega-server",
+    "crates/omega-cli",
+    "crates/omega-wasm-cli",
+    "crates/omega-client",
+    "crates/omega-bridges",
+
+    # --- Aria language frontend ---
+    "crates/aria-core",
+    "crates/aria-runtime",
+    "crates/aria-cli",
+    "crates/aria-verify-core",
+    "crates/apps/qsvd",
+    "crates/apps/qft",
+    "crates/apps/vqe-ansatz",
+    "crates/apps/grover3",
+    "crates/apps/bernstein-vazirani",
+    "crates/apps/deutsch-jozsa",
+    "crates/apps/swap-test",
+    "crates/apps/teleport",
+    "crates/apps/qaoa-maxcut",
+    "crates/apps/qml-classifier",
+    "crates/apps/qos",
+    "crates/apps/circulant",
+    "crates/apps/cqs",
+    "crates/apps/noise",
+    "crates/apps/bell",
+    "crates/apps/ghz",
+    "crates/apps/superdense",
+    "crates/apps/simon",
+    "crates/apps/qpe",
+    "crates/apps/qsp",
+    "crates/apps/forward",
+    "crates/aria-verify",
+    # "crates/aria-backend-tch",# added in Phase 4 (optional)
+]
+
+# Shared package metadata for crates.io publish readiness. Member crates opt in
+# with `license.workspace = true` etc.; each keeps its own `name`/`description`.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/aria-lang/aria-quantum-language"
+authors = ["Anzaetek <aria@anzaetek.com>"]
+
+[workspace.dependencies]
+num-complex = "0.4"
+smallvec = { version = "1", features = ["const_generics"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+rayon = "1"
+pest = "2"
+pest_derive = "2"
+rand = "0.10"
+libloading = "0.8"
+ndarray = "0.16"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "timeout", "cors", "trace"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "36", default-features = false, features = ["preview1"] }
+pqcrypto-mldsa = "0.1"
+pqcrypto-traits = "0.3"
+ml-dsa = "0.1.0-rc.7"
+signature = "=3.0.0-rc.10"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+ml-kem = { version = "0.3.0-rc.0", features = ["getrandom"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+ciborium = "0.2"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

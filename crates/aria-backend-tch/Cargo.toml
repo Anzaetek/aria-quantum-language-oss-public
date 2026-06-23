@@ -1,0 +1,18 @@
+# aria-backend-tch — libtorch (tch) execution backend for Aria.
+#
+# Implements `omega_core::executor::Backend` on top of a tch::Tensor statevector,
+# so it slots into aria-runtime's BackendSel like any other backend. Optional and
+# heavy (links libtorch) — it is EXCLUDED from the default workspace so the
+# pure-Rust build stays libtorch-free; aria-runtime pulls it only under
+# `--features tch`. Needs LIBTORCH set (see INSTALL_LIBTORCH.md).
+[package]
+name = "aria-backend-tch"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "libtorch (tch) statevector backend for the Aria Quantum Language."
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+num-complex = "0.4"
+tch = "0.20"

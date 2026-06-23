@@ -1,0 +1,45 @@
+-- Simon's algorithm: find the hidden period `s` of a 2-to-1 function
+-- f(x) = f(x XOR s) in O(n) quantum queries.
+-- Rust harness: crates/apps/simon/src/lib.rs  (cargo run -p aria-app-simon, or: cargo run -p aria-verify -- simon)
+-- VERIFIED: every measured y satisfies y·s=0 (mod 2) for the baked period s=1ⁿ (n=3); satisfied fraction == 1.0, |Δ| ≤ 1e-9.
+--
+-- Layout: two n-qubit registers. The oracle baked in here corresponds
+-- to the period s = 11..1 (all ones), encoded as a cascade of CX gates
+-- from query register into answer register.
+--
+-- After each run, measuring the query register yields a y with y.s = 0.
+-- Classical Gaussian elimination over the collected ys recovers s.
+
+@assert unitary
+@prove "simon_produces_y_perp_s" equiv { y perp s }
+
+circuit Simon(n: int) {
+    qreg q[2 * n]
+    creg c[n]
+
+    -- Hadamards on the query register.
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+    }
+
+    -- Oracle with hidden period s = 1^n. A 2-to-1 linear map
+    --   f(x) = (x0 XOR x1, x1 XOR x2, ..., x_{n-2} XOR x_{n-1})
+    -- whose kernel is exactly {0, 1^n}, so f(x) = f(x XOR 1^n). Answer qubit
+    -- q[n+i] receives x_i XOR x_{i+1}. (A plain CX(q[i], q[n+i]) cascade would
+    -- copy x — an injective f with trivial period s = 0; this folds adjacent
+    -- bits so the period is the intended 1^n.)
+    repeat i from 0 to n - 2 {
+        apply CX on q[i], q[n + i]
+        apply CX on q[i + 1], q[n + i]
+    }
+
+    -- Final Hadamards on the query register.
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+    }
+
+    -- Measure the query register - each sample is some y perp s.
+    repeat i from 0 to n - 1 {
+        measure q[i] -> c[i]
+    }
+}

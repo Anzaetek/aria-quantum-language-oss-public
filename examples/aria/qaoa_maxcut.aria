@@ -1,0 +1,58 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qaoa-maxcut/src/lib.rs
+--   run: cargo run -p aria-app-qaoa-maxcut   (or: cargo run -p aria-verify -- qaoa_maxcut)
+-- VERIFIED: QAOA(p=2) estimated cut (|E|−2·min⟨½ΣZZ⟩)/2 vs brute-force MaxCut over all 2³ partitions, |Δ| ≤ 0.5.
+--
+-- QAOA for MaxCut on a small ring graph (n qubits, edges (i, i+1 mod n)).
+--
+-- Layout:
+--   q[0..n-1]     vertex qubits
+--
+-- Symbols: gamma[0..p-1] (cost layer), beta[0..p-1] (mixer layer).
+-- Each cost step: for every edge (i, j) apply RZZ(2*gamma) via
+--   CX(i,j) RZ(2*gamma)(j) CX(i,j).
+-- Each mixer step: RX(2*beta) on every qubit.
+
+@assert unitary
+@prove "qaoa_preserves_norm" equiv { inner product preserved }
+@bound parameters = 2 * p
+
+circuit QAOAMaxCut(n: int, p: int) {
+    qreg q[n]
+
+    let gamma = symbolic[p]
+    let beta  = symbolic[p]
+
+    -- Initial uniform superposition.
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+    }
+
+    repeat layer from 0 to p - 1 {
+        -- Cost layer: ring edges (i, i+1 mod n).
+        repeat i from 0 to n - 1 {
+            apply CX on q[i], q[(i + 1) % n]
+            apply RZ(2 * gamma[layer]) on q[(i + 1) % n]
+            apply CX on q[i], q[(i + 1) % n]
+        }
+
+        -- Mixer layer.
+        repeat i from 0 to n - 1 {
+            apply RX(2 * beta[layer]) on q[i]
+        }
+    }
+}
+
+-- Cost Hamiltonian: H_C = sum_{(i,j) in E} 0.5 * (I - Z_i Z_j).
+-- For n=4 ring: (0,1), (1,2), (2,3), (3,0).
+observable MaxCutRing4 {
+    let half = 0.5
+
+    half * I
+  - half * Z(0) * Z(1)
+  + half * I
+  - half * Z(1) * Z(2)
+  + half * I
+  - half * Z(2) * Z(3)
+  + half * I
+  - half * Z(3) * Z(0)
+}

@@ -1,0 +1,21 @@
+-- QASM → GPU → result roundtrip (GPU_PLAN Phase 7), Aria mirror.
+-- Same Bell circuit the Rust example defaults to; the example parses a QASM
+-- file (or this circuit) and runs it through the device-aware in-tree tch
+-- statevector on Cpu / Mps / Cuda, cross-checking the distributions.
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- qasm_gpu)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+
+@assert unitary
+@prove "qasm_gpu_correct" equiv { creates (|00> + |11>)/sqrt(2) }
+@bound gate_count = 2
+
+circuit QasmGpu {
+    qreg q[2]
+    creg c[2]
+
+    -- Bell pair: superposition then entangle (P(00)=P(11)=0.5 on every device).
+    apply H on q[0]
+    apply CX on q[0], q[1]
+
+    measure q -> c
+}

@@ -1,0 +1,36 @@
+-- Quantum Signal Processing (QSP): a single qubit interleaves a fixed "signal"
+-- operator W(x) = RX(θ) (encoding x = cos θ) with tunable "signal-processing"
+-- phase rotations RZ(φ_k). The (0,0) matrix element of the length-(d+1) product
+--
+--   e^{i φ_0 Z} · ∏_{k=1}^{d} [ W(x) · e^{i φ_k Z} ]
+--
+-- is a degree-d polynomial P(x) in x = cos θ whose coefficients are set by the
+-- phases φ_0..φ_d. QSP is the engine under QSVT, Hamiltonian simulation, and
+-- the linear-system / matrix-inversion primitives.
+--
+-- The faithful phase ⇒ polynomial correspondence (forward AND converse, up to a
+-- global phase) is proven sorry-free in
+-- proofs/lean4/QuantumProofs/QSP.lean (qsp_implements_poly / qsp_converse).
+-- This template is the runnable circuit; the `aria-verify qsp` harness checks
+-- the zero-phase identity ⟨Z₀⟩ = cos(d·θ) = T_d(cos θ) — the Chebyshev baseline.
+-- VERIFIED: zero-phase ⟨Z₀⟩ (d=4) vs the Chebyshev baseline cos(d·θ)=T_d(cos θ), |Δ| ≤ 1e-9.
+
+@assert unitary
+@prove "qsp_implements_polynomial" equiv { (0,0) element is a degree-d polynomial of x = cos theta }
+@bound qsp_phases = d + 1
+
+circuit QSP(d: int) {
+    qreg q[1]
+    creg c[1]
+
+    let phi = symbolic[d + 1]   -- d+1 signal-processing phase angles φ_0..φ_d
+    let signal = symbolic[1]     -- signal angle θ (encodes x = cos θ)
+
+    apply RZ(phi[0]) on q[0]            -- e^{i φ_0 Z}
+    repeat k from 1 to d {
+        apply RX(signal[0]) on q[0]    -- W(x): the signal operator
+        apply RZ(phi[k]) on q[0]       -- e^{i φ_k Z}
+    }
+
+    measure q -> c
+}

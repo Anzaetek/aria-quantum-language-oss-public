@@ -1,0 +1,20 @@
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.bk
+
+# Python bridge virtualenvs / caches (opt-in bridges build these locally)
+**/.venv*
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/node_modules
+
+# Local runtime/state
+*.db
+*.token
+.DS_Store
+
+# Lean 4 / lake build artifacts + mathlib cache (multi-GB; never commit)
+proofs/lean4/.lake/
+**/*.olean

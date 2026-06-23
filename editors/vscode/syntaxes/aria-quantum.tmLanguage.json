@@ -1,0 +1,140 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Aria (quantum)",
+  "scopeName": "source.aria.quantum",
+  "fileTypes": ["aria"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#annotation" },
+    { "include": "#keyword" },
+    { "include": "#bra-ket" },
+    { "include": "#string" },
+    { "include": "#gate" },
+    { "include": "#builtin-function" },
+    { "include": "#constant" },
+    { "include": "#number" },
+    { "include": "#type-name" },
+    { "include": "#operator" },
+    { "include": "#punctuation" },
+    { "include": "#identifier" }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        { "name": "comment.line.double-dash.aria", "match": "--.*$" }
+      ]
+    },
+    "annotation": {
+      "patterns": [
+        {
+          "name": "meta.annotation.aria",
+          "match": "(@)(assert|prove|bound|resource_bound|ensure|requires|invariant|note)\\b",
+          "captures": {
+            "1": { "name": "punctuation.definition.annotation.aria" },
+            "2": { "name": "storage.type.annotation.aria" }
+          }
+        },
+        {
+          "name": "meta.annotation.unknown.aria",
+          "match": "(@)([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.definition.annotation.aria" },
+            "2": { "name": "storage.type.annotation.aria" }
+          }
+        }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        { "name": "keyword.declaration.circuit.aria", "match": "\\b(circuit|observable)\\b" },
+        { "name": "storage.type.register.aria",      "match": "\\b(qreg|creg|symbolic)\\b" },
+        { "name": "storage.type.binding.aria",       "match": "\\b(let|var)\\b" },
+        { "name": "keyword.control.flow.aria",       "match": "\\b(repeat|from|to|step|when)\\b" },
+        { "name": "keyword.other.measurement.aria",  "match": "\\b(measure|apply|on|oracle)\\b" }
+      ]
+    },
+    "bra-ket": {
+      "patterns": [
+        { "name": "string.other.ket.aria", "match": "\\|[+\\-0-9a-zA-Z_]*\\>" },
+        { "name": "string.other.bra.aria", "match": "\\<[+\\-0-9a-zA-Z_]*\\|" }
+      ]
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.aria",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.aria", "match": "\\\\." }
+          ]
+        }
+      ]
+    },
+    "gate": {
+      "patterns": [
+        { "name": "support.function.gate.multi.aria",    "match": "\\b(CCX|TOFFOLI|CSWAP|FREDKIN|CNOT|SWAP|CX|CY|CZ|CP|RXX|RYY|RZZ)\\b" },
+        { "name": "support.function.gate.rotation.aria", "match": "\\b(RX|RY|RZ|U1|U3|U|P)\\b" },
+        { "name": "support.function.gate.single.aria",   "match": "\\b(SDG|TDG|SX|H|X|Y|Z|S|T|I|ID)\\b" }
+      ]
+    },
+    "builtin-function": {
+      "patterns": [
+        { "name": "support.function.builtin.aria", "match": "\\b(sin|cos|tan|sqrt|exp|log|abs|floor|ceil|bit|min|max)\\b(?=\\s*\\()" }
+      ]
+    },
+    "constant": {
+      "patterns": [
+        { "name": "constant.language.pi.aria",      "match": "\\bpi\\b" },
+        { "name": "constant.language.boolean.aria", "match": "\\b(true|false)\\b" }
+      ]
+    },
+    "number": {
+      "patterns": [
+        { "name": "constant.numeric.float.aria",   "match": "\\b[0-9]+\\.[0-9]+([eE][+\\-]?[0-9]+)?\\b" },
+        { "name": "constant.numeric.integer.aria", "match": "\\b[0-9]+\\b" }
+      ]
+    },
+    "type-name": {
+      "patterns": [
+        {
+          "match": "(:)\\s*([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.separator.type.aria" },
+            "2": { "name": "entity.name.type.aria" }
+          }
+        }
+      ]
+    },
+    "operator": {
+      "patterns": [
+        { "name": "keyword.operator.arrow.aria",      "match": "->" },
+        { "name": "keyword.operator.comparison.aria", "match": "==|!=|<=|>=|<|>" },
+        { "name": "keyword.operator.assignment.aria", "match": "=" },
+        { "name": "keyword.operator.arithmetic.aria", "match": "\\+|\\-|\\*|/|\\^|%" }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.section.brace.aria",       "match": "[{}]" },
+        { "name": "punctuation.section.bracket.aria",     "match": "[\\[\\]]" },
+        { "name": "punctuation.section.paren.aria",       "match": "[()]" },
+        { "name": "punctuation.separator.comma.aria",     "match": "," },
+        { "name": "punctuation.terminator.semicolon.aria","match": ";" }
+      ]
+    },
+    "identifier": {
+      "patterns": [
+        {
+          "match": "\\b(circuit|observable)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.declaration.circuit.aria" },
+            "2": { "name": "entity.name.type.circuit.aria" }
+          }
+        },
+        { "name": "entity.name.function.call.aria", "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*(?=\\s*\\()" },
+        { "name": "variable.other.aria",            "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b" }
+      ]
+    }
+  }
+}

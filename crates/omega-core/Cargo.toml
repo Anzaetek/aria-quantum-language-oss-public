@@ -1,0 +1,28 @@
+[package]
+name = "omega-core"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Quantum circuit IR, executor traits, and numeric kernels for the omega runtime."
+
+# Compute-device feature gates referenced by `omega_core::device::DeviceKind`.
+# Default build is CPU-only; the GPU features are turned on by downstream
+# crates (omega-backend-statevector-metal etc.) once those backends ship.
+[features]
+default = []
+metal = []
+cuda = []
+opencl = []
+
+[dependencies]
+num-complex = { workspace = true }
+ndarray = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libloading = { workspace = true }
+rand = { workspace = true }
+

@@ -1,0 +1,46 @@
+# aria-verify — unified runner over the per-example application crates.
+#
+# Each example lives in its own crate under `crates/apps/<name>` (open that to
+# read the harness). This thin bin just maps names → their `run()` and provides
+# `all`, `<name>`, and the `socket` transport. Run a single example standalone
+# with e.g. `cargo run -p aria-app-qsvd`.
+[package]
+publish = false
+name = "aria-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Unified runner for the Aria example application harnesses (quantum vs classical, numeric)."
+
+[[bin]]
+name = "aria-verify"
+path = "src/main.rs"
+
+[features]
+default = []
+# Socket transport: drive a running omega-server over HTTP (the `socket` cmd).
+remote = ["aria-verify-core/remote"]
+
+[dependencies]
+aria-verify-core = { path = "../aria-verify-core" }
+aria-app-qsvd = { path = "../apps/qsvd" }
+aria-app-qft = { path = "../apps/qft" }
+aria-app-vqe-ansatz = { path = "../apps/vqe-ansatz" }
+aria-app-grover3 = { path = "../apps/grover3" }
+aria-app-bernstein-vazirani = { path = "../apps/bernstein-vazirani" }
+aria-app-deutsch-jozsa = { path = "../apps/deutsch-jozsa" }
+aria-app-swap-test = { path = "../apps/swap-test" }
+aria-app-teleport = { path = "../apps/teleport" }
+aria-app-qaoa-maxcut = { path = "../apps/qaoa-maxcut" }
+aria-app-qml-classifier = { path = "../apps/qml-classifier" }
+aria-app-qos = { path = "../apps/qos" }
+aria-app-circulant = { path = "../apps/circulant" }
+aria-app-cqs = { path = "../apps/cqs" }
+aria-app-noise = { path = "../apps/noise" }
+aria-app-bell = { path = "../apps/bell" }
+aria-app-ghz = { path = "../apps/ghz" }
+aria-app-superdense = { path = "../apps/superdense" }
+aria-app-simon = { path = "../apps/simon" }
+aria-app-qpe = { path = "../apps/qpe" }
+aria-app-qsp = { path = "../apps/qsp" }
+aria-app-forward = { path = "../apps/forward" }

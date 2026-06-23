@@ -1,0 +1,58 @@
+-- Shor's algorithm for the elliptic-curve discrete-log problem.
+-- Parse-only showcase: no executable harness ships (verified by parsing only).
+--
+-- Aria describes the QPE envelope around a controlled EC point-addition
+-- oracle - the oracle itself lives in Rust (circuits::ec_arithmetic)
+-- because the Draper/Beauregard modular-arithmetic gate sequence is
+-- too deep to inline cleanly in the DSL. This file is the structural
+-- outer layer: counting register + Hadamards + `oracle ec_step` calls
+-- + inverse-QFT + measurement.
+--
+-- Register layout (for n-bit p, t-bit counting precision):
+--   q[0..t-1]              counting
+--   q[t..t+n-1]             x-coord of quantum point
+--   q[t+n..t+2n-1]          y-coord of quantum point
+--   q[t+2n..t+3n-1]         lambda scratch
+--   q[t+3n..t+4n-1]         tmp scratch
+--   q[t+4n]                 mod-add ancilla
+--   q[t+4n+1]               controlled-AND ancilla
+
+@assert unitary
+@bound counting_qubits = t
+@bound work_qubits = 4 * n + 2
+
+circuit ShorECDLP(n: int, t: int) {
+    qreg q[t + 4 * n + 2]
+    creg c[t]
+
+    -- Counting register into superposition.
+    repeat i from 0 to t - 1 {
+        apply H on q[i]
+    }
+
+    -- Each controlled EC step is structurally represented as an
+    -- opaque oracle call. The Rust side binds this to
+    -- `ec_point_add_constant_controlled`, which expands into the
+    -- full Draper/Beauregard modular-arithmetic sequence at lower time.
+    repeat k from 0 to t - 1 {
+        oracle ec_step(k) on q[k], q[t], q[t + n], q[t + 2 * n], q[t + 3 * n], q[t + 4 * n], q[t + 4 * n + 1]
+    }
+
+    -- Inverse-QFT-like hand-rolled layer on the counting register.
+    repeat i from 0 to t - 1 {
+        apply H on q[i]
+    }
+
+    repeat i from 0 to t - 1 {
+        measure q[i] -> c[i]
+    }
+}
+
+-- Stub for the oracle. The Rust side replaces this with
+-- `ec_point_add_constant_controlled` per QPE step; the Aria declaration
+-- here exists to make the template parse and to document the qubit
+-- signature the oracle expects.
+circuit ec_step(k: int) {
+    qreg r[7]
+    apply I on r[0]
+}

@@ -1,0 +1,12 @@
+[package]
+name = "omega-tensor"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dense and matrix-product-state tensor primitives for the omega runtime."
+
+[dependencies]
+ndarray = { workspace = true }
+thiserror = { workspace = true }

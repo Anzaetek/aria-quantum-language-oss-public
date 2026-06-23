@@ -1,0 +1,50 @@
+-- ▶ Application harness + classical cross-check: crates/apps/vqe-ansatz/src/lib.rs
+--   run: cargo run -p aria-app-vqe-ansatz   (or: cargo run -p aria-verify -- vqe_ansatz)
+-- VERIFIED: VQE min energy of the H₂ Hamiltonian vs the exact smallest eigenvalue of the 4×4 matrix (Jacobi), |Δ| ≤ 1e-3.
+--
+-- Hardware-efficient VQE ansatz for H₂ ground-state search.
+--
+-- Two qubits, n_layers × (RY RY RZ RZ CX) blocks, fully parametric.
+-- The Rust sibling binds symbols via `circuit.bind_params(...)` per
+-- optimization step — the Aria side declares the symbols once and
+-- optimizers substitute numerically at run time.
+
+@assert unitary
+@prove "vqe_ansatz_expressive" equiv { covers H2 ground space at R=0.735 }
+@bound parameters = 4 * n_layers
+
+circuit VQEAnsatz(n_layers: int) {
+    qreg q[2]
+
+    -- Symbol table: 4 angles per layer
+    let theta = symbolic[4 * n_layers]
+
+    repeat layer from 0 to n_layers - 1 {
+        -- Rotation layer
+        apply RY(theta[4 * layer + 0]) on q[0]
+        apply RY(theta[4 * layer + 1]) on q[1]
+        apply RZ(theta[4 * layer + 2]) on q[0]
+        apply RZ(theta[4 * layer + 3]) on q[1]
+
+        -- Entangling layer
+        apply CX on q[0], q[1]
+    }
+}
+
+-- H₂ Hamiltonian observable at R=0.735 Å, Bravyi–Kitaev mapped.
+-- The Rust sibling calls this from `backends::omega::h2_observable`.
+observable H2 {
+    let g0 = -0.4804
+    let g1 =  0.3435
+    let g2 = -0.4347
+    let g3 =  0.5716
+    let g4 =  0.0910
+    let g5 =  0.0910
+
+    g0 * I
+  + g1 * Z(0)
+  + g2 * Z(1)
+  + g3 * Z(0) * Z(1)
+  + g4 * X(0) * X(1)
+  + g5 * Y(0) * Y(1)
+}

@@ -1,0 +1,13 @@
+# aria-app-qml-classifier — application harness for the `qml_classifier` Aria example.
+# data-reuploading classifier confusion matrix vs labels.
+# Run standalone: cargo run -p aria-app-qml-classifier     (or: aria-verify qml_classifier)
+[package]
+publish = false
+name = "aria-app-qml-classifier"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "data-reuploading classifier confusion matrix vs labels."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

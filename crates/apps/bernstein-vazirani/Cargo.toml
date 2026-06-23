@@ -1,0 +1,13 @@
+# aria-app-bernstein-vazirani — application harness for the `bernstein_vazirani` Aria example.
+# recover a hidden bit-string vs the input.
+# Run standalone: cargo run -p aria-app-bernstein-vazirani     (or: aria-verify bernstein_vazirani)
+[package]
+publish = false
+name = "aria-app-bernstein-vazirani"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "recover a hidden bit-string vs the input."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

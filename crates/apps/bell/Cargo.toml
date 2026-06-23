@@ -1,0 +1,13 @@
+# aria-app-bell — application harness for the `bell` Aria example.
+# Bell-state amplitudes vs the analytic (1/2,0,0,1/2) distribution.
+# Run standalone: cargo run -p aria-app-bell     (or: aria-verify bell)
+[package]
+publish = false
+name = "aria-app-bell"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Bell-state amplitudes vs the analytic (1/2,0,0,1/2) distribution."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

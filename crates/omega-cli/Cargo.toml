@@ -1,0 +1,65 @@
+[package]
+name = "omega-cli"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command-line interface for the omega quantum runtime."
+
+[[bin]]
+name = "omega-run"
+path = "src/main.rs"
+
+[features]
+default = []
+# Pulls in the Metal statevector backend so `--device metal` is real
+# rather than a graceful CPU fallback. Off by default so a stock
+# `cargo build` on every platform stays GPU-crate-free (TODO.md →
+# GPU cross-cutting invariant). Propagates the `metal` flag to
+# omega-core so `DeviceKind::is_available()` reports correctly.
+metal = [
+    "dep:omega-backend-statevector-metal",
+    "omega-backend-statevector-metal/metal",
+    "omega-core/metal",
+]
+# Pulls in the CUDA statevector backend so `--device cuda` is real
+# rather than a graceful CPU fallback. Off by default; gated behind
+# `--features cuda` on the Linux+NVIDIA host (sibling `ci-linux-cuda.sh`
+# is the CI gate, not this host's `ci.sh`).
+cuda = [
+    "dep:omega-backend-statevector-cuda",
+    "omega-backend-statevector-cuda/cuda",
+    "omega-core/cuda",
+]
+# Pulls in the OpenCL statevector backend so `--device opencl` is real
+# rather than a graceful CPU fallback. Off by default; gated behind
+# `--features opencl` for hosts with an ICD installed (Apple ICD on
+# macOS, vendor ICD on Linux/Windows). Cross-vendor counterpart to
+# the Metal / CUDA features.
+opencl = [
+    "dep:omega-backend-statevector-opencl",
+    "omega-backend-statevector-opencl/opencl",
+    "omega-core/opencl",
+]
+# `--bridge qiskit` / `--bridge perceval` route the circuit through an
+# external simulator subprocess (see crates/omega-bridges/python/).
+# Without these features the dispatcher returns NotCompiled at runtime,
+# matching the soft-fail design from `../QuetzalcoatlProto/backend/backend.py`.
+bridge-qiskit = ["omega-bridges/bridge-qiskit"]
+bridge-perceval = ["omega-bridges/bridge-perceval"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-parser = { path = "../omega-parser" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-statevector-metal = { path = "../omega-backend-statevector-metal", optional = true }
+omega-backend-statevector-cuda = { path = "../omega-backend-statevector-cuda", optional = true }
+omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl", optional = true }
+omega-backend-photonics = { path = "../omega-backend-photonics" }
+omega-backend-mps = { path = "../omega-backend-mps" }
+omega-backend-pauli = { path = "../omega-backend-pauli" }
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
+omega-bridges = { path = "../omega-bridges" }
+serde_json = { workspace = true }
+num-complex = { workspace = true }

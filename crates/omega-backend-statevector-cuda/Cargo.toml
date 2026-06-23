@@ -1,0 +1,51 @@
+[package]
+name = "omega-backend-statevector-cuda"
+version = "0.1.0"
+edition = "2021"
+description = "CUDA (NVIDIA, Linux/Windows) statevector backend — opt-in via the `cuda` feature."
+license = "MIT"
+publish = false
+
+# The `cuda` feature gates the cudarc dep on. Mirrors Metal's pattern:
+# the dep is target-gated to Linux+Windows so a `cargo build --workspace
+# --features cuda` on macOS still compiles, with the constructor
+# returning CudaError::Unavailable.
+[features]
+default = []
+cuda = ["dep:cudarc", "omega-core/cuda"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+# Shared CPU gate-derivative builders (drx/dry/drz/du2_*/du3_*/dcrz/dcu3_*).
+# Mirrors the Metal crate so the CUDA adjoint reuses the well-tested CPU
+# matrices instead of rederiving them. CPU sim code dead-strips out of the
+# CUDA binary at link time.
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+
+# cudarc only on Linux/Windows targets, even when --features cuda is set
+# elsewhere. Keeps `cargo build --workspace --features cuda` green on
+# macOS — the constructor returns CudaError::Unavailable on those builds.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+# `cuda-version-from-build-system` lets cudarc auto-detect the host's
+# nvcc version (12.9 on the Linux+NVIDIA box). `fallback-dynamic-loading`
+# means missing CUDA libs at link time fail at runtime instead, so the
+# crate still compiles on machines without CUDA installed (the
+# constructor returns Driver / Unavailable instead of panicking).
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "curand", "std", "fallback-dynamic-loading", "cuda-version-from-build-system"], optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "cuda_bench"
+harness = false
+required-features = ["cuda"]
+
+[[bench]]
+name = "qml_train_bench"
+harness = false
+required-features = ["cuda"]

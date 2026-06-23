@@ -1,0 +1,27 @@
+# aria-verify-core — shared toolkit for the per-example application harnesses.
+#
+# The reusable pieces live here ONCE: the COMPUTES/PASS-FAIL banner, the
+# pure-Rust classical oracles, the `.aria → lower → omega WASM runtime` harness
+# glue, and the socket transport. Each example is its own small crate under
+# `crates/apps/<name>` that depends only on this one.
+[package]
+name = "aria-verify-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Shared harness toolkit (banner, classical oracles, omega WASM glue) for the Aria example applications."
+
+[features]
+default = []
+# Socket transport (the `socket` module): drive a running omega-server.
+remote = ["aria-runtime/remote"]
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+aria-runtime = { path = "../aria-runtime" }
+omega-core = { path = "../omega-core" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-wasm-runtime = { path = "../omega-wasm-runtime" }
+num-complex = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { workspace = true }

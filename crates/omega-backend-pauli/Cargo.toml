@@ -1,0 +1,24 @@
+[package]
+name = "omega-backend-pauli"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Clifford/stabilizer tableau backend for the omega runtime."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "pauli_bench"
+harness = false

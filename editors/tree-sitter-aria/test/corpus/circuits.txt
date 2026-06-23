@@ -1,0 +1,78 @@
+==================
+bell
+==================
+
+@assert unitary
+@prove "bell_correct" equiv { creates }
+@bound gate_count = 2
+
+circuit Bell {
+    qreg q[2]
+    creg c[2]
+
+    apply H on q[0]
+    apply CX on q[0], q[1]
+
+    measure q -> c
+}
+
+---
+
+(source_file
+  (annotation kind: (identifier))
+  (annotation kind: (identifier) (annotation_block))
+  (annotation kind: (identifier))
+  (circuit_decl
+    name: (type_identifier)
+    body: (block
+      (qreg_decl name: (identifier) size: (integer))
+      (creg_decl name: (identifier) size: (integer))
+      (apply_stmt
+        gate: (gate_name)
+        qubits: (qubit_list (indexed_register name: (identifier) index: (integer))))
+      (apply_stmt
+        gate: (gate_name)
+        qubits: (qubit_list
+          (indexed_register name: (identifier) index: (integer))
+          (indexed_register name: (identifier) index: (integer))))
+      (measure_stmt
+        from: (identifier)
+        to: (identifier)))))
+
+==================
+parametric circuit with repeat and when
+==================
+
+circuit Grover3(marked: int) {
+    qreg q[3]
+    let k = 2
+    repeat k {
+        apply H on q[0]
+    }
+    when bit(marked, 0) == 0 { apply X on q[0] }
+}
+
+---
+
+(source_file
+  (circuit_decl
+    name: (type_identifier)
+    params: (param_list
+      (param name: (identifier) type: (type_identifier)))
+    body: (block
+      (qreg_decl name: (identifier) size: (integer))
+      (let_decl name: (identifier) value: (integer))
+      (repeat_stmt
+        count: (identifier)
+        body: (block
+          (apply_stmt
+            gate: (gate_name)
+            qubits: (qubit_list (indexed_register name: (identifier) index: (integer))))))
+      (when_stmt
+        condition: (binary_expr
+          (call_expr callee: (identifier) (identifier) (integer))
+          (integer))
+        body: (block
+          (apply_stmt
+            gate: (gate_name)
+            qubits: (qubit_list (indexed_register name: (identifier) index: (integer)))))))))

@@ -1,0 +1,16 @@
+# aria-app-noise — modeled-noise robustness of the QLSS reproductions.
+# Drives omega's trajectory noise model; anchored by the analytic depolarizing law.
+# Run standalone: cargo run -p aria-app-noise     (or: aria-verify noise)
+[package]
+publish = false
+name = "aria-app-noise"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Depolarizing-noise robustness curve (omega trajectory model) vs the analytic (1-4p/3) law."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+omega-core = { path = "../../omega-core" }
+omega-backend-statevector = { path = "../../omega-backend-statevector" }
+smallvec = { workspace = true }

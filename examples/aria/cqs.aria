@@ -1,0 +1,28 @@
+-- ▶ Application harness + classical cross-check: crates/apps/cqs/src/lib.rs
+--   run: cargo run -p aria-app-cqs   (or: cargo run -p aria-verify -- cqs)
+-- VERIFIED: Hadamard-test overlap Re⟨ψ|Z|ψ⟩ (8192 shots) vs the classical cos(π/3)=0.5 via omega_core::cqs::apply_pauli, |Δ| ≤ 0.05.
+--
+-- Hadamard test — the quantum primitive CQS (qa-cqs, arXiv:1909.07344) uses to
+-- estimate the Gram-matrix overlaps Re⟨ψ|P|ψ⟩ that drive its linear solve.
+--
+-- Here |ψ⟩ = RY(π/3)|0⟩ and P = Z, so Re⟨ψ|Z|ψ⟩ = cos(π/3) = 0.5, and the
+-- ancilla reads |0⟩ with probability (1 + Re⟨Z⟩)/2 = 0.75. The harness runs this
+-- through omega and checks 2·P(anc=0) − 1 against the classical overlap
+-- (computed with omega-core::cqs::apply_pauli). The full CQS solve (assembling
+-- many such overlaps into Q,r and combining classically) is the Rust module.
+--
+-- q[0] = ancilla, q[1] = system.
+
+@assert unitary
+
+circuit HadamardTestZ() {
+    qreg q[2]
+    creg c[1]
+
+    apply RY(1.0471975511965976) on q[1]   -- |ψ⟩ = RY(π/3)|0⟩
+    apply H on q[0]
+    apply CZ on q[0], q[1]                  -- controlled-Z (ancilla controls Z)
+    apply H on q[0]
+
+    measure q[0] -> c[0]
+}

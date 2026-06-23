@@ -1,0 +1,15 @@
+# Bloqade is the QuEra Aquila Python stack (gate-mode + analog AHS).
+# Two distributions ship today:
+#   - `bloqade-circuit`: gate-mode QASM2 simulator (state vector).
+#   - `bloqade`:         analog Rydberg-Hamiltonian compiler/simulator.
+# Both are pre-1.0 — version pin loosely so the venv builds against
+# whatever's current at make-bloqade-venv time.
+bloqade
+bloqade-circuit
+numpy>=1.26
+# Pin pyqrack-cpu < 2 because bloqade-circuit 0.14.x still passes
+# `qubitCount=...` (camelCase) to QrackSimulator, which pyqrack 2.0
+# renamed to `qubit_count` (snake_case). Drop the pin once
+# bloqade-circuit catches up — track via the qubitCount keyword in
+# bloqade/pyqrack/device.py.
+pyqrack-cpu<2

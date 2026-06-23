@@ -1,0 +1,17 @@
+# aria-core — the Aria Quantum Language front end: lexer, recursive-descent
+# parser, circuit/observable AST, compile-time parameter expressions, and the
+# gate-model `Circuit` IR. Pure Rust, no quantum runtime dependency: it lowers
+# Aria source to a backend-agnostic `Circuit` (and to the omega JSON wire IR).
+# Execution is provided by the `omega-*` backend crates via aria-cli.
+[package]
+name = "aria-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Aria Quantum Language: lexer, parser, AST, and gate-model circuit IR."
+repository = "https://github.com/aria-lang/aria-quantum-language"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = "1"

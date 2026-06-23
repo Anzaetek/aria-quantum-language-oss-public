@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Wrapper for perceval_runner.py — see omega-bridge-qiskit-runner for
+# the contract. Discovery order:
+# 1. $OMEGA_BRIDGE_PERCEVAL_PYTHON
+# 2. $(dirname $0)/.venv-perceval/bin/python
+# 3. python3 on PATH.
+
+set -euo pipefail
+
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+runner="${self_dir}/perceval_runner.py"
+
+if [ ! -f "${runner}" ]; then
+  echo "perceval_runner.py not found alongside the wrapper at ${runner}" >&2
+  exit 2
+fi
+
+py="${OMEGA_BRIDGE_PERCEVAL_PYTHON:-${self_dir}/.venv-perceval/bin/python}"
+if [ ! -x "${py}" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    py=python3
+  else
+    echo "no usable python (set OMEGA_BRIDGE_PERCEVAL_PYTHON or run 'make perceval-venv')" >&2
+    exit 2
+  fi
+fi
+
+exec "${py}" "${runner}"

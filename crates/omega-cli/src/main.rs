@@ -1,0 +1,1354 @@
+use std::env;
+use std::fs;
+
+use omega_backend_mps::MpsBackend;
+use omega_backend_pauli::PauliBackend;
+use omega_backend_pauliprop::PauliPropBackend;
+use omega_backend_photonics::PhotonicsBackend;
+use omega_backend_statevector::StatevectorBackend;
+use omega_core::circuit::CircuitType;
+use omega_core::executor::{Backend, ExecConfig, MidCircuitMode, Observable, PauliOp};
+use omega_core::gradient::{
+    compute_functional_gradient, compute_gradient, parse_functional_spec, FunctionalGradMethod,
+    GradMethod,
+};
+use omega_core::params::ParameterBinding;
+use omega_parser::lower_to_ir;
+
+mod qubo_mode;
+mod serialize;
+use serialize::Format;
+
+fn print_usage() {
+    eprintln!("Usage: omega-run <circuit-file> [options]");
+    eprintln!();
+    eprintln!("Execution modes:");
+    eprintln!("  (default)              Sample with 1024 shots");
+    eprintln!("  --statevector          Exact statevector output");
+    eprintln!("  --shots N              Sample N shots");
+    eprintln!("  --expectation OBS      Compute <psi|O|psi> for observable OBS");
+    eprintln!("  --gradient OBS         Compute d<O>/d(params) for observable OBS");
+    eprintln!("  --gradient-of-fn JSON  Compute d E[f(x)]/d(params) for a Functional");
+    eprintln!("                         JSON shapes:");
+    eprintln!("                           {{\"qubo\":{{\"n\":N,\"Q\":[[i,j,c],...]}}}}");
+    eprintln!("                           {{\"table\":[[\"bits\",value],...],\"num_qubits\":N}}");
+    eprintln!("                         Pair with --method diagonal | score-fn.");
+    eprintln!("  --score-fn-shots N     Shot count for --method score-fn (default 1024)");
+    eprintln!();
+    eprintln!("Observable format (for --expectation and --gradient):");
+    eprintln!("  Z0                     Single Pauli Z on qubit 0");
+    eprintln!("  Z0Z1                   Pauli ZZ on qubits 0,1");
+    eprintln!("  0.5*Z0+0.3*X1         Weighted sum of Pauli terms");
+    eprintln!("  X0X1+Z0Z1             Sum with implicit coefficient 1.0");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --backend NAME         statevector (default), mps, pauli, photonics,");
+    eprintln!("                         pauliprop (Pauli propagation; --expectation only)");
+    eprintln!("  --bridge NAME          Route execution through an external simulator");
+    eprintln!("                         (qiskit, perceval). Only the default sample mode");
+    eprintln!("                         is supported; statevector / expectation / gradient");
+    eprintln!("                         modes require an in-process backend. Counts are");
+    eprintln!("                         displayed MSB-first to match the in-process path.");
+    eprintln!("  --device NAME          cpu (default), metal, cuda, opencl — honoured for the");
+    eprintln!("                         statevector backend's execute and --gradient");
+    eprintln!("                         paths; falls back to cpu when the requested");
+    eprintln!("                         device isn't compiled in or available");
+    eprintln!("  --seed N               Random seed for sampling");
+    eprintln!("  --params V0,V1,...     Bind free parameters (sorted by symbol ID)");
+    eprintln!(
+        "  --method NAME          Gradient method: adjoint (default), param-shift, finite-diff,\n\
+         \x20                       diagonal (for --gradient-of-fn, default), score-fn"
+    );
+    eprintln!("  --input N0,N1,...      Input Fock state (photonics only)");
+    eprintln!("  --format FMT           Output format: text (default), json, jsonl");
+    eprintln!("  --noise JSON           Noise model for the statevector backend, e.g.");
+    eprintln!("                         '{{\"depolarizing\":0.001,\"amplitude_damping\":0.0005,\"readout_flip\":0.02}}'");
+    eprintln!();
+    eprintln!("QUBO solve mode (--qubo):");
+    eprintln!("  --qubo FILE            QUBO problem JSON ({{\"n\":N,\"Q\":[[i,j,c],...]}})");
+    eprintln!("  --qaoa-depth P         QAOA rounds (default: 2)");
+    eprintln!("  --optimizer NAME       cma-es (default) or gradient");
+    eprintln!("  --max-iters N          Optimizer budget (default: 50)");
+    eprintln!("  --top-k K              Ranked samples emitted (default: 20)");
+    eprintln!();
+    eprintln!("Shor factoring demo (--shor):");
+    eprintln!("  --shor                 Run Shor's algorithm");
+    eprintln!("  --N N                  Composite to factor (≤ 63)");
+    eprintln!("  --max-attempts M       Cap random-a trials (default: 16)");
+    eprintln!("  --seed S               Deterministic RNG seed");
+    eprintln!();
+    eprintln!("Supported formats: QASM 2.0 (.qasm), OPTICQASM (.opticqasm),");
+    eprintln!("                   Qiskit QPY (.qpy or `QISKIT` magic-byte header — requires");
+    eprintln!("                   --features bridge-qiskit and a Qiskit venv on the host;");
+    eprintln!("                   decoded to QASM 2.0 in-memory before the in-process pipeline)");
+}
+
+/// Fall back to the Qiskit bridge subprocess when the pure-Rust QPY
+/// reader can't handle a feature in the blob. Errors here bubble up
+/// as a fatal — without subprocess _and_ without the pure-Rust
+/// reader we have no way to read the file.
+fn qpy_via_subprocess(raw_bytes: &[u8]) -> String {
+    match omega_bridges::qpy_to_qasm2(raw_bytes) {
+        Ok(s) => {
+            eprintln!(
+                "QPY: decoded {} bytes via qiskit bridge → {} chars of QASM2",
+                raw_bytes.len(),
+                s.len()
+            );
+            s
+        }
+        Err(e) => {
+            eprintln!("QPY decode failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_format(args: &[String]) -> Format {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--format" && i + 1 < args.len() {
+            match Format::parse(&args[i + 1]) {
+                Some(f) => return f,
+                None => {
+                    eprintln!(
+                        "Unknown format: {}. Options: text, json, jsonl",
+                        args[i + 1]
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        i += 1;
+    }
+    Format::Text
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
+        print_usage();
+        if args.len() >= 2 {
+            return;
+        }
+        std::process::exit(1);
+    }
+
+    let format = parse_format(&args);
+
+    // Check for --qubo mode (doesn't take a circuit file as positional arg).
+    if args.iter().any(|a| a == "--qubo") {
+        let opts = parse_qubo_args(&args);
+        qubo_mode::run_qubo(opts, format);
+        return;
+    }
+
+    // Check for --shor mode (doesn't need a circuit file).
+    if args.iter().any(|a| a == "--shor") {
+        run_shor(&args, format);
+        return;
+    }
+
+    let file_path = &args[1];
+    let mut shots: Option<u32> = Some(1024);
+    let mut seed: Option<u64> = None;
+    let mut input_state: Option<Vec<u32>> = None;
+    let mut backend_name: Option<String> = None;
+    let mut device_name: Option<String> = None;
+    let mut observable_str: Option<String> = None;
+    let mut gradient_str: Option<String> = None;
+    let mut gradient_fn_str: Option<String> = None;
+    let mut gradient_fn_shots: Option<u32> = None;
+    let mut param_values: Option<Vec<f64>> = None;
+    let mut grad_method_name: Option<String> = None;
+    let mut noise_json: Option<String> = None;
+    let mut bridge_name: Option<String> = None;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shots" => {
+                i += 1;
+                shots = Some(args[i].parse().expect("invalid shots number"));
+            }
+            "--statevector" | "--exact" => {
+                shots = None;
+            }
+            "--seed" => {
+                i += 1;
+                seed = Some(args[i].parse().expect("invalid seed"));
+            }
+            "--backend" => {
+                i += 1;
+                backend_name = Some(args[i].clone());
+            }
+            "--bridge" => {
+                i += 1;
+                bridge_name = Some(args[i].clone());
+            }
+            "--device" => {
+                i += 1;
+                device_name = Some(args[i].clone());
+            }
+            "--input" => {
+                i += 1;
+                input_state = Some(
+                    args[i]
+                        .split(',')
+                        .map(|s| s.trim().parse().expect("invalid photon number"))
+                        .collect(),
+                );
+            }
+            "--expectation" => {
+                i += 1;
+                observable_str = Some(args[i].clone());
+            }
+            "--gradient" => {
+                i += 1;
+                gradient_str = Some(args[i].clone());
+            }
+            "--gradient-of-fn" => {
+                i += 1;
+                gradient_fn_str = Some(args[i].clone());
+            }
+            "--score-fn-shots" => {
+                i += 1;
+                gradient_fn_shots = Some(args[i].parse().expect("invalid --score-fn-shots"));
+            }
+            "--params" => {
+                i += 1;
+                param_values = Some(
+                    args[i]
+                        .split(',')
+                        .map(|s| s.trim().parse().expect("invalid parameter value"))
+                        .collect(),
+                );
+            }
+            "--method" => {
+                i += 1;
+                grad_method_name = Some(args[i].clone());
+            }
+            "--format" => {
+                i += 1; // already consumed by parse_format above
+            }
+            "--noise" => {
+                i += 1;
+                noise_json = Some(args[i].clone());
+            }
+            other => {
+                eprintln!("Unknown argument: {}", other);
+                eprintln!("Use --help for usage information.");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    // info() routes to stdout in text mode, stderr in machine modes.
+    let info = |msg: String| {
+        if format.is_machine() {
+            eprintln!("{}", msg);
+        } else {
+            println!("{}", msg);
+        }
+    };
+
+    // Read and parse circuit. `.qpy` (Qiskit's binary serialisation)
+    // is auto-detected by extension *or* by the magic bytes. We
+    // prefer the pure-Rust reader (`omega_bridges::qpy::read_qpy_circuit_ir`)
+    // since it doesn't spawn a Python subprocess; on any
+    // `QpyError::Unsupported{Gate,_}` we fall back to the qiskit
+    // bridge subprocess that round-trips through `qpy.load + qasm2.dumps`.
+    // The fallback path additionally requires `--features bridge-qiskit`
+    // and a Qiskit venv on the host.
+    let raw_bytes = fs::read(file_path).unwrap_or_else(|e| {
+        eprintln!("Error reading {}: {}", file_path, e);
+        std::process::exit(1);
+    });
+    let is_qpy_input =
+        omega_bridges::is_qpy(&raw_bytes) || file_path.to_lowercase().ends_with(".qpy");
+
+    let mut prebuilt_circuit: Option<omega_core::circuit::CircuitIR> = None;
+    let source = if is_qpy_input {
+        // First attempt: pure-Rust reader. Skips the Python hop
+        // entirely when it succeeds. When --bridge is set the bridge
+        // wants the QASM2 string itself, so we still fall through to
+        // the subprocess path in that case.
+        if bridge_name.is_none() {
+            match omega_bridges::qpy::read_qpy_circuit_ir(&raw_bytes) {
+                Ok(ir) => {
+                    eprintln!(
+                        "QPY: decoded {} bytes via pure-Rust reader (no Qiskit subprocess)",
+                        raw_bytes.len()
+                    );
+                    prebuilt_circuit = Some(ir);
+                    String::new()
+                }
+                Err(e) => {
+                    eprintln!(
+                        "QPY: pure-Rust reader hit {} — falling back to qiskit bridge",
+                        e
+                    );
+                    qpy_via_subprocess(&raw_bytes)
+                }
+            }
+        } else {
+            qpy_via_subprocess(&raw_bytes)
+        }
+    } else {
+        String::from_utf8(raw_bytes).unwrap_or_else(|e| {
+            eprintln!("Error: file {} is not valid UTF-8: {e}", file_path);
+            std::process::exit(1);
+        })
+    };
+
+    // When --bridge is set, the QASM goes through an external simulator
+    // verbatim. Local parse failures (e.g. a construct omega-parser
+    // doesn't yet handle but Qiskit does) shouldn't block the run; we
+    // emit a notice and proceed with placeholder metadata. The bridge
+    // counts come back as bit-strings whose length tells us num_qubits.
+    let circuit = if let Some(ir) = prebuilt_circuit {
+        ir
+    } else {
+        match lower_to_ir(&source) {
+            Ok(c) => c,
+            Err(e) => {
+                if bridge_name.is_some() {
+                    eprintln!(
+                        "Note: omega-parser failed ({e}); forwarding QASM to the bridge anyway."
+                    );
+                    omega_core::circuit::CircuitIR::new(0, CircuitType::GateBased)
+                } else {
+                    eprintln!("Parse error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    let num_modes = circuit.num_qubits;
+    info(format!(
+        "Circuit: {} {}, {} ops, type: {:?}",
+        num_modes,
+        if circuit.circuit_type == CircuitType::Photonic {
+            "modes"
+        } else {
+            "qubits"
+        },
+        circuit.ops.len(),
+        circuit.circuit_type
+    ));
+
+    // Bind parameters
+    let mut params = ParameterBinding::new();
+    let mut symbol_ids: Vec<u32> = circuit.symbols.keys().copied().collect();
+    symbol_ids.sort();
+
+    if let Some(ref vals) = param_values {
+        for (idx, &sym_id) in symbol_ids.iter().enumerate() {
+            let val = if idx < vals.len() { vals[idx] } else { 0.0 };
+            params.bind(sym_id, val);
+        }
+        if !symbol_ids.is_empty() {
+            info(format!(
+                "Parameters bound: {:?}",
+                symbol_ids
+                    .iter()
+                    .zip(param_values.as_ref().unwrap().iter())
+                    .map(|(id, v)| format!(
+                        "{}={:.4}",
+                        circuit.symbols.get(id).unwrap_or(&format!("sym_{}", id)),
+                        v
+                    ))
+                    .collect::<Vec<_>>()
+            ));
+        }
+    } else {
+        for &id in &symbol_ids {
+            params.bind(id, 0.0);
+        }
+        if !circuit.symbols.is_empty() {
+            eprintln!(
+                "Warning: {} unbound parameters, using 0.0 for all (use --params to set)",
+                circuit.symbols.len()
+            );
+        }
+    }
+
+    // Select backend
+    let chosen = backend_name
+        .as_deref()
+        .unwrap_or(match circuit.circuit_type {
+            CircuitType::GateBased => "statevector",
+            CircuitType::Photonic => "photonics",
+        });
+
+    // --- Mode: --bridge dispatch through an external simulator ---
+    if let Some(ref bridge_str) = bridge_name {
+        if observable_str.is_some()
+            || gradient_str.is_some()
+            || gradient_fn_str.is_some()
+            || shots.is_none()
+        {
+            eprintln!(
+                "--bridge supports only the default sampling mode \
+                 (--shots N or default 1024). Statevector, expectation, \
+                 and gradient modes require an in-process backend."
+            );
+            std::process::exit(1);
+        }
+        let n_shots = shots.unwrap();
+        let backend = omega_bridges::Backend::parse(bridge_str).unwrap_or_else(|e| {
+            eprintln!("Invalid --bridge value: {}", e);
+            std::process::exit(1);
+        });
+        let noise_value: Option<serde_json::Value> = noise_json.as_deref().map(|s| {
+            serde_json::from_str(s).unwrap_or_else(|e| {
+                eprintln!("Invalid --noise JSON: {}", e);
+                std::process::exit(1);
+            })
+        });
+        info(format!("Bridge: {:?}", backend));
+        let counts_str = omega_bridges::run_qasm2(backend, &source, n_shots, noise_value.as_ref())
+            .unwrap_or_else(|e| {
+                eprintln!("Bridge error: {}", e);
+                std::process::exit(1);
+            });
+
+        // Bridges return LSB-first bit-strings. Convert to the u64-keyed
+        // counts the rest of omega-run uses, where bit 0 of the integer
+        // is qubit 0; from there `serialize::format_bits` re-emits MSB-
+        // first so the CLI output matches the in-process path.
+        let inferred_qubits = counts_str.keys().map(|k| k.len() as u32).max().unwrap_or(0);
+        let display_qubits = if num_modes > 0 {
+            num_modes
+        } else {
+            inferred_qubits
+        };
+        let mut counts_u64: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for (key, n) in &counts_str {
+            let mut bits: u64 = 0;
+            for (i, ch) in key.chars().enumerate() {
+                if ch == '1' {
+                    bits |= 1u64 << i;
+                }
+            }
+            *counts_u64.entry(bits).or_insert(0) += *n;
+        }
+        let result = omega_core::executor::ExecResult::Counts(counts_u64);
+        match format {
+            Format::Json => {
+                let v = serialize::exec_result_to_json(
+                    &result,
+                    display_qubits,
+                    Some(n_shots),
+                    &CircuitType::GateBased,
+                );
+                println!("{}", v);
+            }
+            Format::Jsonl => {
+                if let omega_core::executor::ExecResult::Counts(counts) = &result {
+                    serialize::emit_jsonl_counts(counts, display_qubits, &CircuitType::GateBased);
+                }
+            }
+            Format::Text => {
+                println!("\nResults:");
+                println!("{}", result.format_counts(display_qubits));
+            }
+        }
+        return;
+    }
+
+    // --- Mode: gradient-of-functional ---
+    if let Some(ref spec_str) = gradient_fn_str {
+        let (functional, spec_kind) = parse_functional_spec(spec_str).unwrap_or_else(|e| {
+            eprintln!("Error parsing --gradient-of-fn: {}", e);
+            std::process::exit(1);
+        });
+        let method = match grad_method_name.as_deref() {
+            Some("score-fn") | Some("score-function") | Some("reinforce") => {
+                FunctionalGradMethod::ScoreFunction {
+                    shots: gradient_fn_shots.unwrap_or(1024),
+                }
+            }
+            Some("diagonal") | None => FunctionalGradMethod::DiagonalObservable,
+            Some(other) => {
+                eprintln!(
+                    "Unknown method for --gradient-of-fn: {}. Options: diagonal, score-fn",
+                    other
+                );
+                std::process::exit(1);
+            }
+        };
+        info(format!("Functional: {}", spec_kind));
+        info(format!("Method: {:?}", method));
+
+        let grads = match chosen {
+            "statevector" | "sv" => compute_functional_gradient(
+                &StatevectorBackend::new(),
+                &circuit,
+                &params,
+                &functional,
+                &method,
+            ),
+            "mps" => compute_functional_gradient(
+                &MpsBackend::new(64),
+                &circuit,
+                &params,
+                &functional,
+                &method,
+            ),
+            other => {
+                eprintln!("--gradient-of-fn not supported for backend: {}", other);
+                std::process::exit(1);
+            }
+        };
+        let grads = grads.unwrap_or_else(|e| {
+            eprintln!("Functional-gradient error: {}", e);
+            std::process::exit(1);
+        });
+        let method_name = match &method {
+            FunctionalGradMethod::DiagonalObservable => "diagonal",
+            FunctionalGradMethod::ScoreFunction { .. } => "score-fn",
+        };
+        if format.is_machine() {
+            let named: Vec<(String, f64)> = grads
+                .iter()
+                .map(|(sym, g)| {
+                    let name = circuit
+                        .symbols
+                        .get(sym)
+                        .cloned()
+                        .unwrap_or_else(|| format!("sym_{}", sym));
+                    (name, *g)
+                })
+                .collect();
+            let v = serialize::functional_gradient_to_json(spec_kind, method_name, &named);
+            println!("{}", v);
+        } else {
+            println!("\nGradients:");
+            for (sym_id, grad) in &grads {
+                let name = circuit
+                    .symbols
+                    .get(sym_id)
+                    .unwrap_or(&format!("sym_{}", sym_id))
+                    .clone();
+                println!("  d E[f]/d({}) = {:.10}", name, grad);
+            }
+        }
+        return;
+    }
+
+    // --- Mode: gradient ---
+    if let Some(ref obs_str) = gradient_str {
+        let observable = parse_observable(obs_str);
+        let method = match grad_method_name.as_deref() {
+            Some("param-shift") | Some("parameter-shift") => GradMethod::ParameterShift,
+            Some("finite-diff") | Some("fd") => GradMethod::FiniteDifference { epsilon: 1e-7 },
+            Some("adjoint") | None => GradMethod::Adjoint,
+            Some(other) => {
+                eprintln!(
+                    "Unknown gradient method: {}. Options: adjoint, param-shift, finite-diff",
+                    other
+                );
+                std::process::exit(1);
+            }
+        };
+
+        info(format!("Observable: {}", obs_str));
+        info(format!("Method: {:?}", method));
+
+        // Honour --device metal for the statevector gradient path.
+        // Same gating as the execute mode: omega-cli `metal` feature
+        // must be on; gracefully falls back to CPU on Metal failure.
+        let requested_device = device_name.as_deref().map(|s| {
+            omega_core::device::DeviceKind::parse(s).unwrap_or_else(|e| {
+                eprintln!("Invalid --device: {e}");
+                std::process::exit(1);
+            })
+        });
+        let resolved_device = omega_core::device::DeviceKind::resolve(requested_device);
+        #[cfg(feature = "metal")]
+        let use_metal_grad = matches!(resolved_device, omega_core::device::DeviceKind::Metal)
+            && (chosen == "statevector" || chosen == "sv");
+        #[cfg(not(feature = "metal"))]
+        let use_metal_grad = false;
+        #[cfg(feature = "cuda")]
+        let use_cuda_grad = matches!(resolved_device, omega_core::device::DeviceKind::Cuda)
+            && (chosen == "statevector" || chosen == "sv");
+        #[cfg(not(feature = "cuda"))]
+        let use_cuda_grad = false;
+        #[cfg(not(any(feature = "metal", feature = "cuda")))]
+        let _ = resolved_device;
+
+        let grads = match chosen {
+            "statevector" | "sv" => {
+                if use_cuda_grad {
+                    #[cfg(feature = "cuda")]
+                    {
+                        info("Device: cuda".to_string());
+                        match omega_backend_statevector_cuda::CudaStatevectorBackend::new() {
+                            Ok(b) => {
+                                match compute_gradient(&b, &circuit, &params, &observable, &method)
+                                {
+                                    Ok(g) => Ok(g),
+                                    Err(omega_core::error::OmegaError::Unsupported(msg))
+                                    | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                        info(format!("cuda fallback to cpu: {msg}"));
+                                        compute_gradient(
+                                            &StatevectorBackend::new(),
+                                            &circuit,
+                                            &params,
+                                            &observable,
+                                            &method,
+                                        )
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => {
+                                info(format!("cuda unavailable: {e}; falling back to cpu"));
+                                compute_gradient(
+                                    &StatevectorBackend::new(),
+                                    &circuit,
+                                    &params,
+                                    &observable,
+                                    &method,
+                                )
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        unreachable!("use_cuda_grad is false without --features cuda")
+                    }
+                } else if use_metal_grad {
+                    #[cfg(feature = "metal")]
+                    {
+                        info("Device: metal".to_string());
+                        match omega_backend_statevector_metal::MetalStatevectorBackend::new() {
+                            Ok(b) => {
+                                match compute_gradient(&b, &circuit, &params, &observable, &method)
+                                {
+                                    Ok(g) => Ok(g),
+                                    Err(omega_core::error::OmegaError::Unsupported(msg))
+                                    | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                        info(format!("metal fallback to cpu: {msg}"));
+                                        compute_gradient(
+                                            &StatevectorBackend::new(),
+                                            &circuit,
+                                            &params,
+                                            &observable,
+                                            &method,
+                                        )
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            Err(e) => {
+                                info(format!("metal unavailable: {e}; falling back to cpu"));
+                                compute_gradient(
+                                    &StatevectorBackend::new(),
+                                    &circuit,
+                                    &params,
+                                    &observable,
+                                    &method,
+                                )
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        unreachable!("use_metal_grad is false without --features metal")
+                    }
+                } else {
+                    compute_gradient(
+                        &StatevectorBackend::new(),
+                        &circuit,
+                        &params,
+                        &observable,
+                        &method,
+                    )
+                }
+            }
+            "mps" => compute_gradient(
+                &MpsBackend::new(64),
+                &circuit,
+                &params,
+                &observable,
+                &method,
+            ),
+            "photonics" => {
+                let b = input_state
+                    .map(PhotonicsBackend::with_input)
+                    .unwrap_or_default();
+                compute_gradient(&b, &circuit, &params, &observable, &method)
+            }
+            _ => {
+                eprintln!("Gradient not supported for backend: {}", chosen);
+                std::process::exit(1);
+            }
+        };
+
+        let grads = grads.unwrap_or_else(|e| {
+            eprintln!("Gradient error: {}", e);
+            std::process::exit(1);
+        });
+
+        if format.is_machine() {
+            let method_name = grad_method_name.as_deref().unwrap_or("adjoint");
+            let named: Vec<(String, f64)> = grads
+                .iter()
+                .map(|(sym, g)| {
+                    let name = circuit
+                        .symbols
+                        .get(sym)
+                        .cloned()
+                        .unwrap_or_else(|| format!("sym_{}", sym));
+                    (name, *g)
+                })
+                .collect();
+            let v = serialize::gradient_to_json(obs_str, method_name, &named);
+            println!("{}", v);
+        } else {
+            println!("\nGradients:");
+            for (sym_id, grad) in &grads {
+                let name = circuit
+                    .symbols
+                    .get(sym_id)
+                    .unwrap_or(&format!("sym_{}", sym_id))
+                    .clone();
+                println!("  d<O>/d({}) = {:.10}", name, grad);
+            }
+        }
+        return;
+    }
+
+    // --- Mode: expectation ---
+    if let Some(ref obs_str) = observable_str {
+        let observable = parse_observable(obs_str);
+
+        info(format!("Observable: {}", obs_str));
+
+        let val = match chosen {
+            "statevector" | "sv" => {
+                StatevectorBackend::new().expectation(&circuit, &params, &observable)
+            }
+            "mps" => MpsBackend::new(64).expectation(&circuit, &params, &observable),
+            "pauliprop" | "pp" => {
+                PauliPropBackend::new().expectation(&circuit, &params, &observable)
+            }
+            "photonics" => {
+                let b = input_state
+                    .map(PhotonicsBackend::with_input)
+                    .unwrap_or_default();
+                b.expectation(&circuit, &params, &observable)
+            }
+            _ => {
+                eprintln!("Expectation not supported for backend: {}", chosen);
+                std::process::exit(1);
+            }
+        };
+
+        let val = val.unwrap_or_else(|e| {
+            eprintln!("Expectation error: {}", e);
+            std::process::exit(1);
+        });
+
+        if format.is_machine() {
+            println!("{}", serialize::expectation_to_json(obs_str, val));
+        } else {
+            println!("\n<O> = {:.10}", val);
+        }
+        return;
+    }
+
+    // --- Mode: execute (default) ---
+    // Auto-detect mid-circuit behaviour: if the circuit has any classically
+    // conditioned gate, or any measurement followed by another op, or any
+    // cbit written by more than one `measure` (Qiskit semantics:
+    // last-write-wins on the creg state, omega's basis-state sampling would
+    // double-count), the simulator must collapse. Pure end-of-circuit
+    // sampling with a 1:1 qubit→cbit mapping stays in Skip mode (cheaper,
+    // preserves the analytic statevector path).
+    let needs_collapse = {
+        let last_meas = circuit
+            .ops
+            .iter()
+            .rposition(|op| matches!(op.gate, omega_core::circuit::GateKind::Measure));
+        let has_cond = circuit.ops.iter().any(|op| op.condition.is_some());
+        let cbit_overwritten = {
+            let mut seen = std::collections::HashSet::new();
+            let mut dup = false;
+            for op in &circuit.ops {
+                if matches!(op.gate, omega_core::circuit::GateKind::Measure) {
+                    if let Some(c) = op.classical_bit {
+                        if !seen.insert(c) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            dup
+        };
+        has_cond
+            || cbit_overwritten
+            || last_meas
+                .map(|i| {
+                    circuit.ops[i + 1..]
+                        .iter()
+                        .any(|op| !matches!(op.gate, omega_core::circuit::GateKind::Measure))
+                })
+                .unwrap_or(false)
+            || circuit.ops.iter().enumerate().any(|(i, op)| {
+                matches!(op.gate, omega_core::circuit::GateKind::Measure)
+                    && circuit.ops[i + 1..]
+                        .iter()
+                        .any(|next| !matches!(next.gate, omega_core::circuit::GateKind::Measure))
+            })
+    };
+    let mid_circuit_mode = if needs_collapse {
+        MidCircuitMode::Collapse
+    } else {
+        MidCircuitMode::Skip
+    };
+    let config = ExecConfig {
+        shots,
+        seed,
+        mid_circuit_mode,
+    };
+
+    let noise_model = noise_json.as_deref().map(parse_noise_model);
+
+    // Resolve the compute device requested via `--device`.
+    // Honours OMEGA_DEVICE if --device wasn't passed; falls back to CPU
+    // with a single stderr notice when the requested device isn't
+    // compiled in. Metal is honoured for the statevector backend only —
+    // MPS / Pauli / Photonics stay CPU on this commit (steps 5+ /
+    // future phases pick those up).
+    let requested_device = device_name.as_deref().map(|s| {
+        omega_core::device::DeviceKind::parse(s).unwrap_or_else(|e| {
+            eprintln!("Invalid --device: {e}");
+            std::process::exit(1);
+        })
+    });
+    let resolved_device = omega_core::device::DeviceKind::resolve(requested_device);
+    // `use_metal_sv` only goes true when the omega-cli `metal` feature
+    // is compiled in. Without it, omega-core's `is_available()` returns
+    // false and `resolve()` already falls back to CPU; we keep this
+    // explicitly cfg-gated so the metal crate dep itself is optional.
+    #[cfg(feature = "metal")]
+    let use_metal_sv = matches!(resolved_device, omega_core::device::DeviceKind::Metal)
+        && (chosen == "statevector" || chosen == "sv")
+        && noise_model.is_none();
+    #[cfg(not(feature = "metal"))]
+    let use_metal_sv = false;
+    #[cfg(feature = "cuda")]
+    let use_cuda_sv = matches!(resolved_device, omega_core::device::DeviceKind::Cuda)
+        && (chosen == "statevector" || chosen == "sv")
+        && noise_model.is_none();
+    #[cfg(not(feature = "cuda"))]
+    let use_cuda_sv = false;
+    #[cfg(feature = "opencl")]
+    let use_opencl_sv = matches!(resolved_device, omega_core::device::DeviceKind::OpenCl)
+        && (chosen == "statevector" || chosen == "sv")
+        && noise_model.is_none();
+    #[cfg(not(feature = "opencl"))]
+    let use_opencl_sv = false;
+    #[cfg(not(any(feature = "metal", feature = "cuda", feature = "opencl")))]
+    let _ = resolved_device;
+
+    // For circuits with mid-circuit measurement under Collapse mode, the
+    // executor returns one trajectory per call. To get a faithful shot
+    // distribution we run the circuit N times here with independent RNG
+    // seeds and aggregate the counts. Done in the CLI rather than the
+    // backend so the analytic Skip path stays a single execute(); only
+    // conditional / mid-measure circuits pay the N× cost.
+    let result = if let (true, "statevector" | "sv", None, Some(n_shots)) =
+        (needs_collapse, chosen, &noise_model, shots)
+    {
+        use std::collections::HashMap;
+        let mut agg: HashMap<u64, u32> = HashMap::new();
+        let base_seed = seed.unwrap_or(0xC0FFEE_u64);
+        for s in 0..n_shots as u64 {
+            let traj_seed = base_seed.wrapping_add(s).wrapping_mul(2654435761);
+            let traj_cfg = ExecConfig {
+                shots: Some(1),
+                seed: Some(traj_seed),
+                mid_circuit_mode: MidCircuitMode::Collapse,
+            };
+            match StatevectorBackend::new().execute(&circuit, &params, &traj_cfg) {
+                Ok(omega_core::executor::ExecResult::Counts(c)) => {
+                    for (k, v) in c {
+                        *agg.entry(k).or_insert(0) += v;
+                    }
+                }
+                Ok(_) => unreachable!("shots:Some(1) always yields Counts"),
+                Err(e) => {
+                    eprintln!("Execution error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Ok(omega_core::executor::ExecResult::Counts(agg))
+    } else {
+        match chosen {
+            "statevector" | "sv" => {
+                if let Some(model) = &noise_model {
+                    info(format!("Noise model: {:?}", model));
+                    omega_backend_statevector::NoisyStatevectorBackend::with_model(
+                        model.clone(),
+                        seed,
+                    )
+                    .execute(&circuit, &params, &config)
+                } else if use_cuda_sv {
+                    #[cfg(feature = "cuda")]
+                    {
+                        info("Device: cuda".to_string());
+                        let cuda_result =
+                            match omega_backend_statevector_cuda::CudaStatevectorBackend::new() {
+                                Ok(b) => b.execute(&circuit, &params, &config),
+                                Err(e) => Err(omega_core::error::OmegaError::Backend(format!(
+                                    "cuda unavailable: {e}"
+                                ))),
+                            };
+                        match cuda_result {
+                            Ok(r) => Ok(r),
+                            // Same graceful fallback semantics as Metal.
+                            Err(omega_core::error::OmegaError::Unsupported(msg))
+                            | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                info(format!("cuda fallback to cpu: {msg}"));
+                                StatevectorBackend::new().execute(&circuit, &params, &config)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        unreachable!("use_cuda_sv is false without --features cuda")
+                    }
+                } else if use_opencl_sv {
+                    #[cfg(feature = "opencl")]
+                    {
+                        info("Device: opencl".to_string());
+                        let opencl_result =
+                            match omega_backend_statevector_opencl::OpenClStatevectorBackend::new()
+                            {
+                                Ok(b) => b.execute(&circuit, &params, &config),
+                                Err(e) => Err(omega_core::error::OmegaError::Backend(format!(
+                                    "opencl unavailable: {e}"
+                                ))),
+                            };
+                        match opencl_result {
+                            Ok(r) => Ok(r),
+                            // Same graceful fallback as Metal / CUDA.
+                            Err(omega_core::error::OmegaError::Unsupported(msg))
+                            | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                info(format!("opencl fallback to cpu: {msg}"));
+                                StatevectorBackend::new().execute(&circuit, &params, &config)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    #[cfg(not(feature = "opencl"))]
+                    {
+                        unreachable!("use_opencl_sv is false without --features opencl")
+                    }
+                } else if use_metal_sv {
+                    #[cfg(feature = "metal")]
+                    {
+                        info("Device: metal".to_string());
+                        let metal_result =
+                            match omega_backend_statevector_metal::MetalStatevectorBackend::new() {
+                                Ok(b) => b.execute(&circuit, &params, &config),
+                                Err(e) => Err(omega_core::error::OmegaError::Backend(format!(
+                                    "metal unavailable: {e}"
+                                ))),
+                            };
+                        match metal_result {
+                            Ok(r) => Ok(r),
+                            // Graceful fallback: when metal rejects a feature it
+                            // doesn't implement yet (CCX/CSwap, Reset, mid-circuit
+                            // measurement) or the device isn't usable, drop down
+                            // to the CPU backend rather than fail the run. The
+                            // notice is verbose-only so verify-qiskit doesn't
+                            // drown in fallback noise.
+                            Err(omega_core::error::OmegaError::Unsupported(msg))
+                            | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                info(format!("metal fallback to cpu: {msg}"));
+                                StatevectorBackend::new().execute(&circuit, &params, &config)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        unreachable!("use_metal_sv is false without --features metal")
+                    }
+                } else {
+                    StatevectorBackend::new().execute(&circuit, &params, &config)
+                }
+            }
+            "mps" => MpsBackend::new(64).execute(&circuit, &params, &config),
+            "pauli" | "stabilizer" => PauliBackend::new().execute(&circuit, &params, &config),
+            "pauliprop" | "pp" => {
+                eprintln!(
+                    "pauliprop is an expectation-value backend; it has no sampling/\
+                     statevector output. Use it with --expectation \"<Pauli string>\"."
+                );
+                std::process::exit(1);
+            }
+            "photonics" => {
+                let backend = if let Some(input) = input_state {
+                    PhotonicsBackend::with_input(input)
+                } else {
+                    let n = (num_modes as usize).div_ceil(2);
+                    let mut input = vec![0u32; num_modes as usize];
+                    for slot in input.iter_mut().take(n.min(num_modes as usize)) {
+                        *slot = 1;
+                    }
+                    info(format!(
+                        "Input Fock state: |{}>",
+                        input
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                    PhotonicsBackend::with_input(input)
+                };
+                backend.execute(&circuit, &params, &config)
+            }
+            other => {
+                eprintln!(
+                    "Unknown backend: {}. Options: statevector, mps, pauli, pauliprop, photonics",
+                    other
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let result = result.unwrap_or_else(|e| {
+        eprintln!("Execution error: {}", e);
+        std::process::exit(1);
+    });
+
+    match format {
+        Format::Json => {
+            let v =
+                serialize::exec_result_to_json(&result, num_modes, shots, &circuit.circuit_type);
+            println!("{}", v);
+        }
+        Format::Jsonl => match &result {
+            omega_core::executor::ExecResult::Counts(counts) => {
+                serialize::emit_jsonl_counts(counts, num_modes, &circuit.circuit_type);
+            }
+            other => {
+                // Non-counts results don't decompose into per-shot lines; emit a single JSON doc.
+                let v =
+                    serialize::exec_result_to_json(other, num_modes, shots, &circuit.circuit_type);
+                println!("{}", v);
+            }
+        },
+        Format::Text => {
+            println!("\nResults:");
+            match &result {
+                omega_core::executor::ExecResult::Counts(counts) => {
+                    let mut sorted: Vec<_> = counts.iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(a.1));
+                    if circuit.circuit_type == CircuitType::Photonic {
+                        for (encoded, count) in sorted.iter().take(20) {
+                            let fock = omega_backend_photonics::sim::decode_fock_string(
+                                **encoded,
+                                num_modes as usize,
+                            );
+                            println!("{}: {}", fock, count);
+                        }
+                    } else {
+                        println!("{}", result.format_counts(num_modes));
+                    }
+                }
+                _ => {
+                    println!("{}", result.format_counts(num_modes));
+                }
+            }
+        }
+    }
+}
+
+fn parse_qubo_args(args: &[String]) -> qubo_mode::QuboOptions {
+    let mut path: Option<String> = None;
+    let mut depth: usize = 2;
+    let mut shots: u32 = 2048;
+    let mut seed: Option<u64> = None;
+    let mut optimizer = qubo_mode::Optimizer::CmaEs;
+    let mut top_k: usize = 20;
+    let mut max_iters: usize = 50;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--qubo" => {
+                i += 1;
+                path = Some(args[i].clone());
+            }
+            "--qaoa-depth" => {
+                i += 1;
+                depth = args[i].parse().expect("invalid --qaoa-depth");
+            }
+            "--shots" => {
+                i += 1;
+                shots = args[i].parse().expect("invalid --shots");
+            }
+            "--seed" => {
+                i += 1;
+                seed = Some(args[i].parse().expect("invalid --seed"));
+            }
+            "--optimizer" => {
+                i += 1;
+                optimizer = match args[i].as_str() {
+                    "cma-es" | "cmaes" => qubo_mode::Optimizer::CmaEs,
+                    "gradient" | "grad" => qubo_mode::Optimizer::Gradient,
+                    other => {
+                        eprintln!("Unknown optimizer: {}. Options: cma-es, gradient", other);
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--top-k" => {
+                i += 1;
+                top_k = args[i].parse().expect("invalid --top-k");
+            }
+            "--max-iters" => {
+                i += 1;
+                max_iters = args[i].parse().expect("invalid --max-iters");
+            }
+            "--format" => {
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let path = path.unwrap_or_else(|| {
+        eprintln!("--qubo requires a path to the problem JSON");
+        std::process::exit(1);
+    });
+
+    qubo_mode::QuboOptions {
+        path,
+        depth,
+        shots,
+        seed,
+        optimizer,
+        top_k,
+        max_iters,
+    }
+}
+
+/// Run --shor mode: factor a composite N via the Shor algorithm demo.
+fn run_shor(args: &[String], format: Format) {
+    let mut n: Option<u64> = None;
+    let mut seed: Option<u64> = None;
+    let mut max_attempts: u32 = 16;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shor" => {}
+            "--N" | "--n" => {
+                i += 1;
+                n = Some(args[i].parse().expect("invalid --N"));
+            }
+            "--seed" => {
+                i += 1;
+                seed = Some(args[i].parse().expect("invalid --seed"));
+            }
+            "--max-attempts" => {
+                i += 1;
+                max_attempts = args[i].parse().expect("invalid --max-attempts");
+            }
+            "--format" => {
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let n = n.unwrap_or_else(|| {
+        eprintln!("--shor requires --N <composite>");
+        std::process::exit(1);
+    });
+
+    if n > 63 {
+        eprintln!(
+            "--shor demo is capped at N ≤ 63 (would need {}+ qubits); aborting.",
+            2 * ((n as f64).log2().ceil() as usize) + ((n as f64).log2().ceil() as usize)
+        );
+        std::process::exit(1);
+    }
+
+    let info = |msg: String| {
+        if format.is_machine() {
+            eprintln!("{}", msg);
+        } else {
+            println!("{}", msg);
+        }
+    };
+
+    info(format!("Shor: N={}, max_attempts={}", n, max_attempts));
+    let result = omega_core::shor::factor(n, seed, max_attempts);
+
+    if format.is_machine() {
+        let factors = result.factors.map(|(p, q)| serde_json::json!([p, q]));
+        let doc = serde_json::json!({
+            "mode": "shor",
+            "N": result.n,
+            "factors": factors,
+            "period": result.period,
+            "iterations": result.iterations,
+            "chosen_a": result.chosen_a,
+        });
+        println!("{}", doc);
+    } else {
+        match result.factors {
+            Some((p, q)) => {
+                println!("\nFactored {} = {} × {}", result.n, p, q);
+                if let Some(r) = result.period {
+                    println!("  period (a={}): r = {}", result.chosen_a, r);
+                }
+                println!("  iterations: {}", result.iterations);
+            }
+            None => {
+                println!(
+                    "\nShor demo exhausted {} attempts without a non-trivial factor of {}.",
+                    result.iterations, result.n
+                );
+                if let Some(r) = result.period {
+                    println!("  last recovered period: {}", r);
+                }
+            }
+        }
+    }
+}
+
+/// Parse an observable string like "0.5*Z0+0.3*Z1Z2" or "Z0Z1" into an Observable.
+///
+/// Grammar (informal):
+///   observable = term ('+' term)*
+///   term = [coeff '*'] pauli_string
+///   pauli_string = pauli+
+///   pauli = ('X'|'Y'|'Z'|'I') digit+
+///
+/// (`parse_functional_spec` lives in `omega_core::gradient`, shared
+/// with the WASM host hook.)
+fn parse_observable(s: &str) -> Observable {
+    let s = s.replace(" ", "");
+    let mut terms = Vec::new();
+
+    for part in s.split('+') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        let (coeff, pauli_part) = if let Some(idx) = part.find('*') {
+            let c: f64 = part[..idx].parse().unwrap_or_else(|_| {
+                eprintln!("Invalid coefficient in observable: {}", &part[..idx]);
+                std::process::exit(1);
+            });
+            (c, &part[idx + 1..])
+        } else {
+            // Check if it starts with a digit or minus (coefficient without explicit pauli)
+            if part.starts_with(['X', 'Y', 'Z', 'I']) {
+                (1.0, part)
+            } else {
+                // Try to parse as negative coefficient
+                if let Some(idx) = part.find(['X', 'Y', 'Z', 'I']) {
+                    let c: f64 = part[..idx].parse().unwrap_or(1.0);
+                    (c, &part[idx..])
+                } else {
+                    eprintln!("Invalid observable term: {}", part);
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        let pauli_string = parse_pauli_string(pauli_part);
+        terms.push((coeff, pauli_string));
+    }
+
+    if terms.is_empty() {
+        eprintln!("Empty observable");
+        std::process::exit(1);
+    }
+
+    Observable { terms }
+}
+
+/// Parse a `--noise '{...}'` JSON string into a `NoiseModel`.
+fn parse_noise_model(s: &str) -> omega_backend_statevector::NoiseModel {
+    let v: serde_json::Value = serde_json::from_str(s).unwrap_or_else(|e| {
+        eprintln!("Invalid --noise JSON: {}", e);
+        std::process::exit(1);
+    });
+    let get = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let pauli = v
+        .get("pauli")
+        .map(|p| omega_backend_statevector::PauliRates {
+            p_i: p.get("I").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            p_x: p.get("X").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            p_y: p.get("Y").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            p_z: p.get("Z").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        });
+    omega_backend_statevector::NoiseModel {
+        depolarizing: get("depolarizing"),
+        amplitude_damping: get("amplitude_damping"),
+        phase_damping: get("phase_damping"),
+        pauli,
+        readout_flip: get("readout_flip"),
+    }
+}
+
+/// Parse "Z0Z1X2" into vec of (qubit, PauliOp).
+fn parse_pauli_string(s: &str) -> Vec<(u32, PauliOp)> {
+    let mut result = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let op = match chars[i] {
+            'X' | 'x' => PauliOp::X,
+            'Y' | 'y' => PauliOp::Y,
+            'Z' | 'z' => PauliOp::Z,
+            'I' | 'i' => PauliOp::I,
+            other => {
+                eprintln!("Invalid Pauli operator: {}", other);
+                std::process::exit(1);
+            }
+        };
+        i += 1;
+
+        // Parse qubit index (one or more digits)
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i {
+            eprintln!("Missing qubit index after Pauli operator in: {}", s);
+            std::process::exit(1);
+        }
+        let qubit: u32 = s[start..i].parse().unwrap();
+
+        if !matches!(op, PauliOp::I) {
+            result.push((qubit, op));
+        }
+    }
+
+    result
+}

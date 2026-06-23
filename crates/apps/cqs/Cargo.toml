@@ -1,0 +1,13 @@
+# aria-app-cqs — Hadamard-test overlap estimation (CQS's quantum primitive).
+# Run standalone: cargo run -p aria-app-cqs     (or: aria-verify cqs)
+[package]
+publish = false
+name = "aria-app-cqs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Hadamard-test estimate of a CQS Gram-matrix overlap vs the classical value (numeric)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+omega-core = { path = "../../omega-core" }

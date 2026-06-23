@@ -1,0 +1,39 @@
+-- Quantum GAN generator circuit.
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- qgan)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- The generator is a hardware-efficient ansatz: Layers of RY+RZ on
+-- every qubit, then a linear chain of CX entanglers. Each layer has
+-- 2n trainable angles, so the full ansatz has 2*n*L free parameters.
+-- The discriminator is classical (an MLP in the Rust sibling), so
+-- only the generator lives in Aria.
+--
+-- Output convention: measuring the n qubits in the computational
+-- basis samples from the generator's distribution. The discriminator
+-- sees probabilities / bitstrings, not the raw state.
+
+@assert unitary
+@bound parameters = 2 * n * L
+
+circuit QGANGenerator(n: int, L: int) {
+    qreg q[n]
+    creg c[n]
+
+    let theta = symbolic[2 * n * L]
+
+    repeat layer from 0 to L - 1 {
+        repeat i from 0 to n - 1 {
+            apply RY(theta[2 * n * layer + 2 * i + 0]) on q[i]
+            apply RZ(theta[2 * n * layer + 2 * i + 1]) on q[i]
+        }
+        -- Linear-chain entangler: CX(i, i+1) for i in 0..n-2.
+        repeat i from 0 to n - 2 {
+            apply CX on q[i], q[i + 1]
+        }
+    }
+
+    -- Sample to give the discriminator a concrete bitstring.
+    repeat i from 0 to n - 1 {
+        measure q[i] -> c[i]
+    }
+}

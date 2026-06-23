@@ -1,0 +1,15 @@
+# aria-app-forward — differential forward-⟨Z⟩ harness for the parametrized
+# example circuits (ansätze / feature maps / structural templates) that have no
+# single closed-form scalar oracle. Each runs the circuit through the omega
+# runtime and cross-checks its ⟨Z_q⟩ profile against an INDEPENDENT pure-Rust
+# statevector simulator (aria_verify_core::sim). Run e.g. `aria-verify iqp_born`.
+[package]
+publish = false
+name = "aria-app-forward"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Differential forward-⟨Z⟩ check (omega vs independent statevector) for the parametrized Aria examples."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

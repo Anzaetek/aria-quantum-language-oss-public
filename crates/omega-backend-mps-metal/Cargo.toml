@@ -1,0 +1,35 @@
+[package]
+name = "omega-backend-mps-metal"
+version = "0.1.0"
+edition = "2021"
+description = "Metal-accelerated SVD path for omega-backend-mps bond truncation. Opt-in via the `metal` feature; falls back to the CPU Jacobi SVD when the feature is off, the target isn't macOS, or the Metal device init fails."
+license = "MIT"
+publish = false
+
+# Phase 5 of GPU_PLAN: GPU SVD on Metal for MPS bond truncation. Bench
+# shape settled at 14q × depth 12 × χ=128 (CPU baseline 2.48 s on M4).
+# Apple has no f64 in Metal + a ~100 µs dispatch floor, so the kernel
+# wants block-Jacobi + mixed-precision refinement (acceptance ≥ 2× CPU).
+#
+# This crate ships the feature-gated entry point and the host-side
+# orchestration. The actual Metal Shading Language kernel is staged in
+# `src/jacobi.metal` and will be wired in a follow-up commit — for now
+# the entry point falls back to omega-backend-mps's CPU SVD when the
+# Metal device is unavailable, which keeps the workspace green on
+# Linux runners and on macOS hosts without the `metal` feature.
+
+[features]
+default = []
+metal = ["dep:metal", "dep:objc"]
+
+[dependencies]
+omega-backend-mps = { path = "../omega-backend-mps" }
+num-complex = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+objc = { version = "0.2", optional = true }
+
+[[example]]
+name = "contract_bench"
+path = "examples/contract_bench.rs"

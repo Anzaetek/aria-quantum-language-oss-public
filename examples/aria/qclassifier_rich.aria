@@ -1,0 +1,46 @@
+-- PQC classifier — rich ansatz: AngleEmbedding(Y) + L layers of
+-- [ ring IsingZZ + Rot(phi,theta,omega) per qubit ], read out as <Z_i>.
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- qclassifier_rich)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- IsingZZ(w) = e^{-i w/2 Z⊗Z} is realized as CX(i,j) · RZ(w) · CX(i,j), the
+-- same decomposition the Rust circuit emits (so positional params line up).
+--
+-- Param order (positional): data[0..N-1] (AngleEmbedding RY), then per layer
+-- zz[0..N-1] (ring) and rot[3*N] (Euler), bound as the trainable ansatz weights.
+
+@assert unitary
+@bound parameters = N + L * (N + 3 * N)
+
+circuit QClassifierRich(N: int, L: int) {
+    qreg q[N]
+
+    let data = symbolic[N]
+    let zz = symbolic[L * N]
+    let rot = symbolic[3 * N * L]
+
+    -- AngleEmbedding(rotation="Y"): one data angle per qubit.
+    repeat i from 0 to N - 1 {
+        apply RY(data[i]) on q[i]
+    }
+
+    repeat layer from 0 to L - 1 {
+        -- Ring IsingZZ entanglers: CX, RZ(w), CX on (i, (i+1) mod N).
+        repeat i from 0 to N - 1 {
+            apply CX on q[i], q[(i + 1) % N]
+            apply RZ(zz[layer * N + i]) on q[(i + 1) % N]
+            apply CX on q[i], q[(i + 1) % N]
+        }
+        -- Per-qubit Rot(phi,theta,omega) = RZ RY RZ.
+        repeat i from 0 to N - 1 {
+            apply RZ(rot[3 * (layer * N + i) + 0]) on q[i]
+            apply RY(rot[3 * (layer * N + i) + 1]) on q[i]
+            apply RZ(rot[3 * (layer * N + i) + 2]) on q[i]
+        }
+    }
+}
+
+-- Readout: per-qubit Z expectations feed the classical classification head.
+observable RegimeReadout {
+    1.0 * Z(0)
+}

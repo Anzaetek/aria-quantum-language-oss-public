@@ -1,0 +1,58 @@
+[package]
+name = "omega-backend-statevector-metal"
+version = "0.1.0"
+edition = "2021"
+description = "Metal (Apple Silicon) statevector backend — opt-in via the `metal` feature."
+license = "MIT"
+publish = false
+
+# Phase 1, step 2: shared-mode MTLBuffer allocation lands here. The
+# `metal` crate is target-gated to macOS, so a Linux/Windows build with
+# `--features metal` still compiles — it just emits the
+# MetalError::Unavailable stub from step 1.
+[features]
+default = []
+# `dep:metal` explicitly maps the user-visible `metal` feature onto the
+# optional `metal` crate dep, sidestepping the implicit-feature shadow
+# Cargo would otherwise create. Outside macOS the dep doesn't exist
+# (target-gated), so on Linux+`--features metal` this is a no-op and
+# the stub Backend path remains.
+metal = ["dep:metal", "dep:objc", "omega-core/metal"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+# Used for shared gate-matrix builders (h/x/y/z/.../drx/dry/drz/...) so
+# the Metal adjoint reuses the CPU backend's well-tested derivative
+# matrices rather than re-deriving them. CPU sim code is dead-stripped
+# from the metal binary by the Rust linker.
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+
+# Metal bindings only pulled in on macOS targets, even when --features
+# metal is set elsewhere. This keeps `cargo build --workspace --features
+# metal` green on Linux runners.
+#
+# `objc` is a transitive dep of metal; we depend on it directly so we
+# can drain Metal's autoreleasepool from inside the long-running
+# adjoint backward sweep (otherwise MTLCommandBuffer NSObjects
+# accumulate and the queue eventually blocks at its 64-outstanding
+# cap). Same target gate so non-macOS builds aren't affected.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+objc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "metal_bench"
+harness = false
+required-features = ["metal"]
+
+[[bench]]
+name = "qml_train_bench"
+harness = false
+required-features = ["metal"]

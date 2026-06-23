@@ -1,0 +1,33 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qsvd/src/lib.rs
+--   run: cargo run -p aria-app-qsvd   (or: cargo run -p aria-verify -- qsvd)
+-- VERIFIED: variational singular values σ=√λ(MᵀM) vs the pure-Rust Jacobi SVD of the same M, |Δ| ≤ 1e-3.
+--
+-- QSVD — singular values of a fixed matrix M via variational diagonalization.
+--
+-- WHAT IS COMPUTED: the singular values of an explicit matrix M (defined by
+-- the host application, see crates/apps/qsvd/src/lib.rs).
+--
+-- Because M is symmetric, its singular values are the square roots of the
+-- eigenvalues of G = MᵀM. This ansatz prepares a 1-qubit trial state
+-- |ψ(θ)⟩ = RY(θ)|0⟩; the host writes G as a Pauli sum and the optimizer
+-- (running inside vqe.wasm) maximizes ⟨ψ|G|ψ⟩ to recover the largest
+-- eigenvalue λ₁. The second follows from the 2×2 trace identity
+-- λ₂ = tr(G) − λ₁, and σᵢ = √λᵢ.
+--
+-- The application then compares [σ₁, σ₂] against a pure-Rust classical SVD of
+-- the same M (aria-verify qsvd). They must agree to ≤ 1e-3.
+--
+-- Rust/host counterpart: crates/aria-verify (oracle::singular_values).
+
+@assert unitary
+@prove "qsvd_singular_values" equiv { sqrt(eig(M^dag M)) = singular_values(M) }
+@bound rotation_count = 1
+
+circuit QsvdAnsatz {
+    qreg q[1]
+
+    -- One trainable angle: RY(θ) sweeps the real Bloch meridian, which is
+    -- enough to reach the top eigenvector of a real-symmetric G (no Y term).
+    let theta = symbolic[1]
+    apply RY(theta[0]) on q[0]
+}

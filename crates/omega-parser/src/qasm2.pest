@@ -1,0 +1,87 @@
+// QASM 2.0 PEG grammar for pest
+
+program = { SOI ~ header ~ statement* ~ EOI }
+
+header = { "OPENQASM" ~ version ~ ";" }
+version = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+
+statement = {
+    include_stmt
+  | qubit_decl_v3
+  | bit_decl_v3
+  | qreg_decl
+  | creg_decl
+  | gate_def
+  | measure_stmt
+  | barrier_stmt
+  | reset_stmt
+  | if_stmt
+  | gate_app_stmt
+}
+
+include_stmt = { "include" ~ string_lit ~ ";" }
+string_lit   = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+
+// QASM 2 register declarations.
+qreg_decl = { "qreg" ~ ident ~ "[" ~ integer ~ "]" ~ ";" }
+creg_decl = { "creg" ~ ident ~ "[" ~ integer ~ "]" ~ ";" }
+
+// QASM 3 register declarations — `qubit[n] q;`, `bit[n] c;` — accepted
+// alongside the QASM 2 forms so a header `OPENQASM 3.0;` parses with
+// the same grammar. Both lower to the same `QregDecl` / `CregDecl`
+// AST variant.
+qubit_decl_v3 = { "qubit" ~ "[" ~ integer ~ "]" ~ ident ~ ";" }
+bit_decl_v3   = { "bit"   ~ "[" ~ integer ~ "]" ~ ident ~ ";" }
+
+gate_def = {
+    "gate" ~ ident ~ param_list_def? ~ qubit_list_def ~ "{" ~ gate_body ~ "}"
+}
+param_list_def = { "(" ~ ident ~ ("," ~ ident)* ~ ")" }
+qubit_list_def = { ident ~ ("," ~ ident)* }
+gate_body      = { gate_app_stmt* }
+
+gate_app_stmt = { gate_modifier* ~ gate_name ~ param_list_app? ~ qubit_list_app ~ ";" }
+
+// QASM 3 gate modifiers. `inv @ U` reflects the gate's unitary; `pow(n) @ U`
+// applies the gate `n` times. Modifiers chain right-to-left (`inv @ pow(3) @ x`
+// = `inv @ (x; x; x)` = `x; x; x` since each `x` is self-inverse). Both are
+// accepted but reject in lowering if `n` is non-positive or the inv has no
+// closed-form (the current lowering covers Clifford + rotation gates).
+gate_modifier = { inv_modifier | pow_modifier }
+inv_modifier  = { "inv" ~ "@" }
+pow_modifier  = { "pow" ~ "(" ~ integer ~ ")" ~ "@" }
+gate_name     = @{ ident }
+param_list_app = { "(" ~ expr ~ ("," ~ expr)* ~ ")" }
+qubit_list_app = { qubit_ref ~ ("," ~ qubit_ref)* }
+
+qubit_ref = { ident ~ "[" ~ integer ~ "]" | ident }
+cbit_ref  = { ident ~ "[" ~ integer ~ "]" | ident }
+
+measure_stmt = { "measure" ~ qubit_ref ~ "->" ~ cbit_ref ~ ";" }
+barrier_stmt = { "barrier" ~ qubit_list_app ~ ";" }
+reset_stmt   = { "reset" ~ qubit_ref ~ ";" }
+
+if_stmt = { "if" ~ "(" ~ ident ~ "==" ~ integer ~ ")" ~ gate_app_stmt }
+
+// Expressions (for gate parameters)
+expr = { prefix_op? ~ atom ~ (bin_op ~ prefix_op? ~ atom)* }
+
+atom = {
+    fn_call
+  | "(" ~ expr ~ ")"
+  | "pi"
+  | number
+  | ident
+}
+
+fn_call    = { fn_name ~ "(" ~ expr ~ ")" }
+fn_name    = @{ "sin" | "cos" | "tan" | "exp" | "ln" | "sqrt" }
+prefix_op  = { "-" }
+bin_op     = { "+" | "-" | "*" | "/" }
+
+number  = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (("e" | "E") ~ ("-" | "+")? ~ ASCII_DIGIT+)? }
+integer = @{ ASCII_DIGIT+ }
+ident   = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }

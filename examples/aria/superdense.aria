@@ -1,0 +1,38 @@
+-- Superdense coding: Alice sends 2 classical bits by transmitting 1
+-- qubit of a shared Bell pair.
+-- Rust harness: crates/apps/superdense/src/lib.rs  (cargo run -p aria-app-superdense, or: cargo run -p aria-verify -- superdense)
+-- VERIFIED: argmax decoded 2-bit outcome (1024 shots) vs the deterministic bijection b1|(b0<<1) of Alice's input bits, exact equality.
+--
+-- Pre-shared Bell pair on q[0] (Alice) and q[1] (Bob). Alice encodes
+-- her two bits (b0, b1) by applying:
+--   b1 = 1 -> Z on q[0]
+--   b0 = 1 -> X on q[0]
+-- Then sends q[0] to Bob, who undoes the Bell prep and measures both
+-- qubits. The classical bits he reads out are (b0, b1).
+
+@assert unitary
+@prove "superdense_2for1" equiv { decoded = input bits }
+
+circuit Superdense(b0: int, b1: int) {
+    qreg q[2]
+    creg c[2]
+
+    -- Shared Bell pair: (|00> + |11>) / sqrt(2).
+    apply H on q[0]
+    apply CX on q[0], q[1]
+
+    -- Alice's encoding (local to her qubit q[0]).
+    when b1 == 1 {
+        apply Z on q[0]
+    }
+    when b0 == 1 {
+        apply X on q[0]
+    }
+
+    -- Bob's Bell-basis measurement.
+    apply CX on q[0], q[1]
+    apply H on q[0]
+
+    measure q[0] -> c[0]
+    measure q[1] -> c[1]
+}

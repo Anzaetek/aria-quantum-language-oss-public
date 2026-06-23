@@ -1,0 +1,41 @@
+-- QSVT — quantum singular-value transformation applying f(x) ≈ 1/x
+-- to a block-encoded matrix.
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- qsvt_invert)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- Parameters:
+--   degree  — polynomial degree d (sets the QSVT phase count and the
+--             approximation accuracy of 1/x on [1/κ, 1])
+--   kappa   — condition-number bound κ (sets the approximation domain)
+--
+-- The host program supplies the d+1 phase angles φ₁..φ_{d+1} via
+-- `qsvt_inversion_angles(degree, kappa)`; this template encodes the
+-- alternating signal-rotation / signal-processing structure.
+
+@assert unitary
+@prove "qsvt_inversion_polynomial" equiv { polynomial of A/alpha approximating (A/alpha)^{-1} }
+@bound qsvt_phases = degree + 1
+
+circuit QsvtInvert(degree: int) {
+    qreg q[2]            -- ancilla + 1 system qubit (toy block encoding)
+    creg c[1]
+
+    -- Repeat d+1 alternating signal-rotation / signal-processing blocks.
+    repeat k from 0 to degree {
+        -- Signal rotation: e^{i φ_k Z} on the ancilla.
+        apply RZ(0) on q[0]              -- φ_k baked in by host
+
+        -- Signal-processing unitary (placeholder — host will inject the
+        -- block-encoding unitary or its complement here).
+        apply CX on q[0], q[1]
+
+        -- Reflection on ancilla (omitted on the final iteration).
+        when k < degree {
+            apply H on q[0]
+            apply Z on q[0]
+            apply H on q[0]
+        }
+    }
+
+    measure q[0] -> c[0]
+}

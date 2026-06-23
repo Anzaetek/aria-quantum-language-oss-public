@@ -1,0 +1,13 @@
+# aria-app-deutsch-jozsa — application harness for the `deutsch_jozsa` Aria example.
+# constant/balanced decision vs the truth table.
+# Run standalone: cargo run -p aria-app-deutsch-jozsa     (or: aria-verify deutsch_jozsa)
+[package]
+publish = false
+name = "aria-app-deutsch-jozsa"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "constant/balanced decision vs the truth table."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

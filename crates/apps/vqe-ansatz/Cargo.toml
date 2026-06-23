@@ -1,0 +1,13 @@
+# aria-app-vqe-ansatz — application harness for the `vqe_ansatz` Aria example.
+# H2 ground-state energy (VQE) vs exact min eigenvalue.
+# Run standalone: cargo run -p aria-app-vqe-ansatz     (or: aria-verify vqe_ansatz)
+[package]
+publish = false
+name = "aria-app-vqe-ansatz"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "H2 ground-state energy (VQE) vs exact min eigenvalue."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

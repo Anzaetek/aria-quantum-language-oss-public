@@ -1,0 +1,37 @@
+[package]
+name = "omega-backend-statevector"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dense statevector simulation backend for the omega runtime."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json = { workspace = true }
+# Cross-backend QUBO/QAOA/VQE comparison harness (tests/qubo_compare.rs)
+# extends the same suite to alternate backends so we can spot a
+# divergence the moment one drifts. Dev-deps only — no runtime cost.
+omega-backend-mps = { path = "../omega-backend-mps" }
+omega-backend-statevector-metal = { path = "../omega-backend-statevector-metal" }
+
+[features]
+# Forwards the `--features metal` switch into the comparison harness so
+# the Metal arm activates only when the operator opts in. Default
+# `cargo test --workspace` skips it.
+metal = ["omega-backend-statevector-metal/metal"]
+
+[[bench]]
+name = "sv_bench"
+harness = false

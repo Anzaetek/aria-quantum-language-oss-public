@@ -1,0 +1,39 @@
+-- JL-sketch quantum-kernel feature map (Track C).
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- sketch_qml)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- A d-dimensional classical input is first compressed by a Johnson–Lindenstrauss
+-- random projection to k dims (classical, outside this circuit). The k-dim
+-- sketch is then angle-encoded into k qubits as the quantum feature state
+-- |phi(x)>, and the kernel K(x,y)=|<phi(x)|phi(y)>|^2 is classified downstream.
+-- This is the runnable analogue of "process high-dimensional classical data
+-- with few qubits" (cf. Babbush et al. 2026, arXiv:2604.07639; the
+-- fault-tolerant oracle-sketch itself is out of scope).
+--
+-- Layout:
+--   q[0..k-1]   one wire per sketched feature
+--
+-- Two reupload blocks: RY(x_j) per qubit (placeholder pi/4; caller binds the
+-- standardized sketch value) followed by a ring of CX entanglers.
+
+@assert unitary
+@bound depth = k
+
+circuit SketchQml(k: int) {
+    qreg q[k]
+
+    repeat block from 0 to 1 {
+        repeat j from 0 to k - 1 {
+            apply RY(pi / 4) on q[j]
+        }
+        repeat j from 0 to k - 2 {
+            apply CX on q[j], q[j + 1]
+        }
+    }
+}
+
+-- Feature read-out: the per-qubit Z expectations seed the quantum kernel
+-- |<phi(x)|phi(y)>|^2 used by the downstream kernel-ridge classifier.
+observable FeatureZ {
+    1.0 * Z(0)
+}

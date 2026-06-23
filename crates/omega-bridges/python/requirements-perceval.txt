@@ -1,0 +1,14 @@
+# Perceval (Quandela) — photonic simulator + circuit converter.
+#
+# IMPORTANT (2026-04-29): the Qiskit→Perceval converter
+# (`perceval.converters.QiskitConverter`) used by `perceval_runner.py`
+# was split out of `perceval-quandela` and is no longer present in
+# 1.0.1 or 1.1.0. Operators who want the gate-based bridge to function
+# need to supply the matching converter add-on package (Quandela's
+# documentation has the current name) by adding it here and rebuilding
+# the venv. Without that add-on the runner reports
+# `perceval-converter-missing` and the cross-backend harness skips
+# the Perceval comparisons gracefully.
+perceval-quandela>=0.10
+qiskit>=1.3,<3
+numpy>=1.26

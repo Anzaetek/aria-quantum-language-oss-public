@@ -1,0 +1,39 @@
+[package]
+name = "omega-backend-mps-cuda"
+version = "0.1.0"
+edition = "2021"
+description = "CUDA-accelerated truncated SVD for omega-backend-mps bond compression via cuSOLVER `gesvdj`. Opt-in via the `cuda` feature; falls back to the CPU Jacobi SVD when the feature is off, the target isn't Linux/Windows, or the CUDA driver is unavailable."
+license = "MIT"
+publish = false
+
+# Per `NEXT_SESSION_PLAN.md` 1a (2026-05-13): the CUDA arm of MPS GPU
+# work uses cuSOLVER `cusolverDnZgesvdj` (Jacobi SVD) directly — native
+# f64 makes the 1e-10 forward tolerance reachable in a single pass and
+# sub-microsecond per-op dispatch makes Jacobi viable in a way Metal
+# couldn't. CUDA Graphs amortisation lands in a follow-up commit.
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+omega-backend-mps = { path = "../omega-backend-mps" }
+num-complex = { workspace = true }
+
+# Target-gated to Linux/Windows. `cargo build --workspace --features cuda`
+# on macOS still compiles — the entry point routes to the CPU fallback
+# at runtime via the `#[cfg(...)]` arm below.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["driver", "cusolver", "std", "fallback-dynamic-loading", "cuda-version-from-build-system"], optional = true }
+
+[[example]]
+name = "mps_chi128_bench"
+path = "examples/mps_chi128_bench.rs"
+
+[[example]]
+name = "cuda_profile"
+path = "examples/cuda_profile.rs"
+
+[[example]]
+name = "svd_microbench"
+path = "examples/svd_microbench.rs"

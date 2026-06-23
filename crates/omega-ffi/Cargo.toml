@@ -1,0 +1,18 @@
+[package]
+name = "omega-ffi"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "C FFI bindings for the omega quantum runtime."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-parser = { path = "../omega-parser" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-photonics = { path = "../omega-backend-photonics" }
+num-complex = { workspace = true }

@@ -1,0 +1,565 @@
+//! Bridge endpoint for the `quantum-core` toolkit.
+//!
+//! `quantum-core` produces an `OmegaCircuitIR` JSON document (defined in
+//! `crates/aria-core/src/backends/omega.rs` on the quantum side) with
+//! an explicit `backend` selector. This module mirrors the wire types,
+//! translates them into `omega_core::circuit::CircuitIR`, and dispatches
+//! execution to the matching omega backend:
+//!
+//! | `backend` field         | runtime backend                     |
+//! |-------------------------|-------------------------------------|
+//! | `"Auto"`                | heuristic (Clifford→Pauli, large→MPS, else statevector) |
+//! | `"Statevector"`         | `omega_backend_statevector::StatevectorBackend` |
+//! | `{ "Mps": { … } }`      | `omega_backend_mps::MpsBackend{max_bond_dim}` |
+//! | `"Stabilizer"`          | `omega_backend_pauli::PauliBackend`  |
+//! | `"Photonic"`            | `omega_backend_photonics::PhotonicsBackend` |
+//!
+//! It also exposes a sibling endpoint for **MBQC one-way patterns** (C1.3):
+//! `POST /v1/quantum/execute_pattern` takes an [`OmegaPatternIR`] (the
+//! `quantum-core` measurement-pattern wire type) and runs it on the photonic
+//! graph-state executor (`omega_backend_photonics::mbqc`), returning the
+//! canonical output statevector.
+
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, ParamExpr, Qubit};
+use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode};
+use omega_core::params::ParameterBinding;
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::auth::middleware::check_rights;
+use crate::auth::rights;
+use crate::auth::token::TokenClaims;
+use crate::AppState;
+
+type SharedState = Arc<RwLock<AppState>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum OmegaGateKind {
+    H,
+    X,
+    Y,
+    Z,
+    S,
+    Sdg,
+    T,
+    Tdg,
+    Id,
+    Rx,
+    Ry,
+    Rz,
+    U3,
+    U2,
+    U1,
+    CX,
+    CY,
+    CZ,
+    Swap,
+    CRz,
+    CU3,
+    CCX,
+    CSwap,
+    PhaseShifter,
+    BeamSplitterRx,
+    Measure,
+    Barrier,
+    Reset,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OmegaGateOp {
+    pub gate: OmegaGateKind,
+    pub qubits: Vec<u32>,
+    pub params: Vec<f64>,
+    pub classical_bit: Option<u32>,
+    pub condition: Option<(u32, u64)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum OmegaMidCircuitMode {
+    Skip,
+    Collapse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OmegaBackendSel {
+    Auto,
+    Statevector,
+    Mps { max_bond_dim: u32 },
+    Stabilizer,
+    Photonic,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OmegaCircuitIR {
+    pub num_qubits: u32,
+    pub num_classical_bits: u32,
+    pub ops: Vec<OmegaGateOp>,
+    pub is_photonic: bool,
+    pub mid_circuit_mode: OmegaMidCircuitMode,
+    pub backend: OmegaBackendSel,
+}
+
+impl OmegaGateKind {
+    fn to_core(&self) -> GateKind {
+        match self {
+            OmegaGateKind::H => GateKind::H,
+            OmegaGateKind::X => GateKind::X,
+            OmegaGateKind::Y => GateKind::Y,
+            OmegaGateKind::Z => GateKind::Z,
+            OmegaGateKind::S => GateKind::S,
+            OmegaGateKind::Sdg => GateKind::Sdg,
+            OmegaGateKind::T => GateKind::T,
+            OmegaGateKind::Tdg => GateKind::Tdg,
+            OmegaGateKind::Id => GateKind::Id,
+            OmegaGateKind::Rx => GateKind::Rx,
+            OmegaGateKind::Ry => GateKind::Ry,
+            OmegaGateKind::Rz => GateKind::Rz,
+            OmegaGateKind::U3 => GateKind::U3,
+            OmegaGateKind::U2 => GateKind::U2,
+            OmegaGateKind::U1 => GateKind::U1,
+            OmegaGateKind::CX => GateKind::CX,
+            OmegaGateKind::CY => GateKind::CY,
+            OmegaGateKind::CZ => GateKind::CZ,
+            OmegaGateKind::Swap => GateKind::Swap,
+            OmegaGateKind::CRz => GateKind::CRz,
+            OmegaGateKind::CU3 => GateKind::CU3,
+            OmegaGateKind::CCX => GateKind::CCX,
+            OmegaGateKind::CSwap => GateKind::CSwap,
+            OmegaGateKind::PhaseShifter => GateKind::PhaseShifter,
+            OmegaGateKind::BeamSplitterRx => GateKind::BeamSplitterRx,
+            OmegaGateKind::Measure => GateKind::Measure,
+            OmegaGateKind::Barrier => GateKind::Barrier,
+            OmegaGateKind::Reset => GateKind::Reset,
+        }
+    }
+}
+
+/// Translate the quantum-core wire IR into omega-core's `CircuitIR`.
+pub fn translate_to_core_ir(ir: &OmegaCircuitIR) -> CircuitIR {
+    let circuit_type = if ir.is_photonic {
+        CircuitType::Photonic
+    } else {
+        CircuitType::GateBased
+    };
+    let mut core = CircuitIR::new(ir.num_qubits, circuit_type);
+    core.num_classical_bits = ir.num_classical_bits;
+    for op in &ir.ops {
+        let qubits: SmallVec<[Qubit; 3]> = op.qubits.iter().map(|&q| Qubit(q)).collect();
+        let params: SmallVec<[ParamExpr; 3]> =
+            op.params.iter().map(|&p| ParamExpr::Concrete(p)).collect();
+        core.add_op(GateOp {
+            gate: op.gate.to_core(),
+            qubits,
+            params,
+            classical_bit: op.classical_bit,
+            // Wire format from `quantum-core` carries the legacy
+            // single-bit `(start_bit, expected)` shape. The internal
+            // `GateOp::condition` was widened to `(start_bit,
+            // num_bits, expected)` in commit f47c9e7 (multi-bit creg
+            // `if(c == V)` support). Default `num_bits = 1` keeps the
+            // pre-widening single-bit semantics — a multi-bit `if`
+            // from `quantum-core` would need a wire-schema bump on
+            // both sides; defer until a real caller needs it.
+            condition: op
+                .condition
+                .map(|(start_bit, expected)| (start_bit, 1, expected)),
+        });
+    }
+    core
+}
+
+/// Decide which concrete backend should execute this IR.
+fn resolve_backend(ir: &OmegaCircuitIR) -> OmegaBackendSel {
+    if let OmegaBackendSel::Auto = ir.backend {
+        if ir.is_photonic {
+            return OmegaBackendSel::Photonic;
+        }
+        let clifford_only = ir.ops.iter().all(|op| {
+            matches!(
+                op.gate,
+                OmegaGateKind::H
+                    | OmegaGateKind::X
+                    | OmegaGateKind::Y
+                    | OmegaGateKind::Z
+                    | OmegaGateKind::S
+                    | OmegaGateKind::Sdg
+                    | OmegaGateKind::CX
+                    | OmegaGateKind::CY
+                    | OmegaGateKind::CZ
+                    | OmegaGateKind::Swap
+                    | OmegaGateKind::Measure
+                    | OmegaGateKind::Barrier
+                    | OmegaGateKind::Reset
+                    | OmegaGateKind::Id
+            )
+        });
+        if clifford_only {
+            return OmegaBackendSel::Stabilizer;
+        }
+        if ir.num_qubits >= 20 {
+            return OmegaBackendSel::Mps { max_bond_dim: 64 };
+        }
+        OmegaBackendSel::Statevector
+    } else {
+        ir.backend.clone()
+    }
+}
+
+/// Execute an `OmegaCircuitIR` on the runtime backend selected by its
+/// `backend` field. Returns the raw `ExecResult` variant so the caller
+/// can render it to the wire.
+pub fn execute_quantum_ir(
+    ir: &OmegaCircuitIR,
+    shots: Option<u32>,
+    seed: Option<u64>,
+) -> omega_core::error::Result<(ExecResult, OmegaBackendSel)> {
+    let core = translate_to_core_ir(ir);
+    let binding = ParameterBinding::new();
+    let mid_circuit_mode = match ir.mid_circuit_mode {
+        OmegaMidCircuitMode::Skip => MidCircuitMode::Skip,
+        OmegaMidCircuitMode::Collapse => MidCircuitMode::Collapse,
+    };
+    let config = ExecConfig {
+        shots,
+        seed,
+        mid_circuit_mode,
+    };
+
+    let resolved = resolve_backend(ir);
+    let result = match &resolved {
+        OmegaBackendSel::Auto => unreachable!("resolve_backend never returns Auto"),
+        OmegaBackendSel::Statevector => exec_statevector(&core, &binding, &config)?,
+        OmegaBackendSel::Mps { max_bond_dim } => {
+            omega_backend_mps::MpsBackend::new(*max_bond_dim as usize)
+                .execute(&core, &binding, &config)?
+        }
+        OmegaBackendSel::Stabilizer => {
+            omega_backend_pauli::PauliBackend::new().execute(&core, &binding, &config)?
+        }
+        OmegaBackendSel::Photonic => {
+            omega_backend_photonics::PhotonicsBackend::new().execute(&core, &binding, &config)?
+        }
+    };
+    Ok((result, resolved))
+}
+
+/// Execute a Statevector circuit, routing to the OpenCL device when the
+/// server is built `--features opencl` AND `OMEGA_DEVICE=opencl` resolves
+/// to a usable OpenCL device. Falls back to the CPU statevector backend
+/// (a) without the feature, (b) when OMEGA_DEVICE isn't opencl, or (c) when
+/// no OpenCL device can be opened — never an error path for the caller.
+fn exec_statevector(
+    core: &CircuitIR,
+    binding: &ParameterBinding,
+    config: &ExecConfig,
+) -> omega_core::error::Result<ExecResult> {
+    #[cfg(feature = "opencl")]
+    {
+        use omega_core::device::DeviceKind;
+        if DeviceKind::resolve(None) == DeviceKind::OpenCl {
+            match omega_backend_statevector_opencl::OpenClStatevectorBackend::new() {
+                Ok(backend) => {
+                    eprintln!("[quantum] statevector via OpenCL device");
+                    return backend.execute(core, binding, config);
+                }
+                Err(e) => {
+                    eprintln!("[quantum] OpenCL device unavailable ({e}); CPU statevector");
+                }
+            }
+        }
+    }
+    omega_backend_statevector::StatevectorBackend::new().execute(core, binding, config)
+}
+
+fn backend_name(sel: &OmegaBackendSel) -> String {
+    match sel {
+        OmegaBackendSel::Auto => "auto".into(),
+        OmegaBackendSel::Statevector => "statevector".into(),
+        OmegaBackendSel::Mps { max_bond_dim } => format!("mps(bond={})", max_bond_dim),
+        OmegaBackendSel::Stabilizer => "stabilizer".into(),
+        OmegaBackendSel::Photonic => "photonic".into(),
+    }
+}
+
+fn exec_result_to_json(result: &ExecResult, num_qubits: u32) -> serde_json::Value {
+    match result {
+        ExecResult::Counts(counts) => {
+            let map: std::collections::HashMap<String, u32> = counts
+                .iter()
+                .map(|(bs, ct)| {
+                    (
+                        format!("{:0>width$b}", bs, width = num_qubits as usize),
+                        *ct,
+                    )
+                })
+                .collect();
+            serde_json::json!({ "type": "counts", "counts": map })
+        }
+        ExecResult::Statevector(sv) => {
+            let amps: Vec<[f64; 2]> = sv.iter().map(|c| [c.re, c.im]).collect();
+            serde_json::json!({ "type": "statevector", "amplitudes": amps })
+        }
+        ExecResult::Probabilities(probs) => {
+            serde_json::json!({ "type": "probabilities", "probabilities": probs })
+        }
+    }
+}
+
+// ---------- MBQC pattern IR (C1.3) ----------
+//
+// `quantum-core` ships one-way measurement patterns as a *sibling* wire type
+// (`OmegaPatternIR`, decision C1.1) rather than a gate list, because photonic
+// hardware runs the one-way model natively. These mirror
+// `quantum-core/src/backends/omega.rs`'s `OmegaPatternIR`/`OmegaMeasurement`
+// (u32 wire indices); the bridge converts them to the photonics backend's
+// `MbqcPattern` and dispatches to its cluster-state executor.
+
+/// One adaptive single-qubit measurement on the pattern wire.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OmegaMeasurement {
+    pub qubit: u32,
+    pub angle: f64,
+    pub x_corr_from: Vec<u32>,
+    pub z_corr_from: Vec<u32>,
+}
+
+/// MBQC measurement-pattern wire type (mirrors `mbqc::Pattern`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OmegaPatternIR {
+    pub vertices: Vec<u32>,
+    pub edges: Vec<(u32, u32)>,
+    pub layers: Vec<Vec<OmegaMeasurement>>,
+    pub output: Vec<u32>,
+    /// Always true for now — patterns target the photonic graph-state backend.
+    #[serde(default)]
+    pub is_photonic: bool,
+}
+
+/// Translate the pattern wire IR into the photonics backend's `MbqcPattern`.
+fn to_photonics_pattern(ir: &OmegaPatternIR) -> omega_backend_photonics::MbqcPattern {
+    omega_backend_photonics::MbqcPattern {
+        vertices: ir.vertices.iter().map(|&v| v as usize).collect(),
+        edges: ir
+            .edges
+            .iter()
+            .map(|&(u, v)| (u as usize, v as usize))
+            .collect(),
+        layers: ir
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .iter()
+                    .map(|m| omega_backend_photonics::mbqc::Measurement {
+                        qubit: m.qubit as usize,
+                        angle: m.angle,
+                        x_corr_from: m.x_corr_from.iter().map(|&i| i as usize).collect(),
+                        z_corr_from: m.z_corr_from.iter().map(|&i| i as usize).collect(),
+                    })
+                    .collect()
+            })
+            .collect(),
+        output: ir.output.iter().map(|&v| v as usize).collect(),
+    }
+}
+
+/// Execute an MBQC `OmegaPatternIR` on the photonic one-way backend (C1.3).
+/// Returns the canonical deterministic output statevector over the output
+/// qubits — the same value `quantum-core`'s `simulate_pattern_deterministic`
+/// produces (the C1.4 cross-wire equality).
+pub fn execute_pattern_ir(ir: &OmegaPatternIR) -> ExecResult {
+    let pattern = to_photonics_pattern(ir);
+    let amps = omega_backend_photonics::simulate_mbqc_pattern(&pattern);
+    ExecResult::Statevector(amps)
+}
+
+// ---------- HTTP endpoint ----------
+
+#[derive(Deserialize)]
+pub struct QuantumExecuteReq {
+    pub circuit: OmegaCircuitIR,
+    #[serde(default)]
+    pub shots: Option<u32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+pub async fn execute_quantum_route(
+    Extension(claims): Extension<TokenClaims>,
+    State(_state): State<SharedState>,
+    Json(req): Json<QuantumExecuteReq>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_rights(&claims, rights::EXECUTE) {
+        return resp;
+    }
+    let num_qubits = req.circuit.num_qubits;
+    match execute_quantum_ir(&req.circuit, req.shots, req.seed) {
+        Ok((result, resolved)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "backend": backend_name(&resolved),
+                "result": exec_result_to_json(&result, num_qubits),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct QuantumPatternReq {
+    pub pattern: OmegaPatternIR,
+}
+
+/// `POST /v1/quantum/execute_pattern` — execute an MBQC measurement pattern on
+/// the photonic one-way backend (C1.3). Returns the canonical output
+/// statevector. Requires the `EXECUTE` right.
+pub async fn execute_pattern_route(
+    Extension(claims): Extension<TokenClaims>,
+    State(_state): State<SharedState>,
+    Json(req): Json<QuantumPatternReq>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_rights(&claims, rights::EXECUTE) {
+        return resp;
+    }
+    let n_out = req.pattern.output.len() as u32;
+    let result = execute_pattern_ir(&req.pattern);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "backend": "photonic",
+            "result": exec_result_to_json(&result, n_out),
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bell_ir(backend: OmegaBackendSel) -> OmegaCircuitIR {
+        OmegaCircuitIR {
+            num_qubits: 2,
+            num_classical_bits: 0,
+            is_photonic: false,
+            mid_circuit_mode: OmegaMidCircuitMode::Skip,
+            backend,
+            ops: vec![
+                OmegaGateOp {
+                    gate: OmegaGateKind::H,
+                    qubits: vec![0],
+                    params: vec![],
+                    classical_bit: None,
+                    condition: None,
+                },
+                OmegaGateOp {
+                    gate: OmegaGateKind::CX,
+                    qubits: vec![0, 1],
+                    params: vec![],
+                    classical_bit: None,
+                    condition: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn translate_preserves_shape() {
+        let ir = bell_ir(OmegaBackendSel::Statevector);
+        let core = translate_to_core_ir(&ir);
+        assert_eq!(core.num_qubits, 2);
+        assert_eq!(core.ops.len(), 2);
+        assert!(matches!(core.circuit_type, CircuitType::GateBased));
+    }
+
+    #[test]
+    fn auto_picks_stabilizer_for_clifford_bell() {
+        let ir = bell_ir(OmegaBackendSel::Auto);
+        assert_eq!(resolve_backend(&ir), OmegaBackendSel::Stabilizer);
+    }
+
+    #[test]
+    fn auto_picks_statevector_for_small_non_clifford() {
+        let mut ir = bell_ir(OmegaBackendSel::Auto);
+        ir.ops.push(OmegaGateOp {
+            gate: OmegaGateKind::T,
+            qubits: vec![0],
+            params: vec![],
+            classical_bit: None,
+            condition: None,
+        });
+        assert_eq!(resolve_backend(&ir), OmegaBackendSel::Statevector);
+    }
+
+    #[test]
+    fn auto_picks_mps_for_large_non_clifford() {
+        let mut ir = bell_ir(OmegaBackendSel::Auto);
+        ir.num_qubits = 20;
+        ir.ops.push(OmegaGateOp {
+            gate: OmegaGateKind::T,
+            qubits: vec![0],
+            params: vec![],
+            classical_bit: None,
+            condition: None,
+        });
+        assert!(matches!(
+            resolve_backend(&ir),
+            OmegaBackendSel::Mps { max_bond_dim: 64 }
+        ));
+    }
+
+    #[test]
+    fn auto_picks_photonic_when_flagged() {
+        let mut ir = bell_ir(OmegaBackendSel::Auto);
+        ir.is_photonic = true;
+        assert_eq!(resolve_backend(&ir), OmegaBackendSel::Photonic);
+    }
+
+    #[test]
+    fn explicit_statevector_execution_returns_counts() {
+        let ir = bell_ir(OmegaBackendSel::Statevector);
+        let (result, resolved) = execute_quantum_ir(&ir, Some(256), Some(42)).unwrap();
+        assert_eq!(resolved, OmegaBackendSel::Statevector);
+        match result {
+            ExecResult::Counts(_) => {}
+            other => panic!("expected Counts, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn explicit_stabilizer_execution_on_clifford_circuit() {
+        let ir = bell_ir(OmegaBackendSel::Stabilizer);
+        let (_result, resolved) = execute_quantum_ir(&ir, Some(64), Some(7)).unwrap();
+        assert_eq!(resolved, OmegaBackendSel::Stabilizer);
+    }
+
+    #[test]
+    fn auto_dispatch_executes_without_error() {
+        let ir = bell_ir(OmegaBackendSel::Auto);
+        let (_result, resolved) = execute_quantum_ir(&ir, Some(64), Some(1)).unwrap();
+        // Auto → Stabilizer for a Clifford circuit.
+        assert_eq!(resolved, OmegaBackendSel::Stabilizer);
+    }
+
+    #[test]
+    fn json_roundtrip_wire_format() {
+        let ir = bell_ir(OmegaBackendSel::Mps { max_bond_dim: 32 });
+        let s = serde_json::to_string(&ir).unwrap();
+        assert!(s.contains("\"Mps\""));
+        let parsed: OmegaCircuitIR = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.ops.len(), 2);
+        assert_eq!(parsed.backend, OmegaBackendSel::Mps { max_bond_dim: 32 });
+    }
+}

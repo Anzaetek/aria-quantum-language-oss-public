@@ -1,0 +1,25 @@
+[package]
+name = "omega-backend-photonics"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Photonic/Fock-space simulation backend for the omega runtime."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+num-complex = { workspace = true }
+smallvec = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "photonics_bench"
+harness = false

@@ -1,0 +1,34 @@
+[package]
+name = "omega-backend-mps"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Matrix-product-state simulation backend for the omega runtime."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+smallvec = { workspace = true }
+
+[[bench]]
+name = "mps_bench"
+harness = false
+
+# Investigation: where does MPS wallclock go vs χ + depth + n_qubits?
+# Used 2026-05-12 to determine that the TODO MPS-SVD-on-Metal bench
+# shape (14q × depth 4 / brickwall) doesn't exercise the SVD bottleneck
+# at all — runs flat at ~8 ms across χ ∈ {4..256}. SVD only dominates
+# at depth ≥ 12. See TODO.md for the resulting deferral.
+[[example]]
+name = "mps_chi_profile"
+path = "examples/mps_chi_profile.rs"

@@ -1,0 +1,13 @@
+# aria-app-simon — application harness for the `simon` Aria example.
+# Simon's algorithm: every measured y is orthogonal to the hidden s (y·s = 0).
+# Run standalone: cargo run -p aria-app-simon     (or: aria-verify simon)
+[package]
+publish = false
+name = "aria-app-simon"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Simon's algorithm: every measured y satisfies y·s = 0 mod 2."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

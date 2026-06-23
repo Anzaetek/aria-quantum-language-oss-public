@@ -1,0 +1,13 @@
+# aria-app-qsp — application harness for the `qsp` Aria example.
+# QSP zero-phase identity <Z0> = cos(d*theta) (Chebyshev baseline).
+# Run standalone: cargo run -p aria-app-qsp     (or: aria-verify qsp)
+[package]
+publish = false
+name = "aria-app-qsp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "QSP zero-phase identity: <Z0> = cos(d*theta) (Chebyshev baseline)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

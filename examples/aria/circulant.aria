@@ -1,0 +1,28 @@
+-- ▶ Application harness + classical cross-check: crates/apps/circulant/src/lib.rs
+--   run: cargo run -p aria-app-circulant   (or: cargo run -p aria-verify -- circulant)
+-- VERIFIED: per-basis-state output map of Q vs the exact cyclic permutation σ(x)=(x+1) mod 8; 0 mismatches and min purity ≥ 0.99, |Δ| = 0.
+--
+-- Cyclic-shift generator Q of a circulant matrix: |x⟩ → |x+1 mod 8⟩.
+--
+-- A banded circulant C = Σⱼ cⱼ·Q^{powⱼ} (e.g. the 1-D heat-transfer operator
+-- (−2−ξ)I + Q + Q⁻¹) is a linear combination of powers of this single
+-- generator, which the QFT diagonalizes — that diagonalization is what makes
+-- the circulant solve `x = IDFT(DFT(b)/λ)` work (the solve itself is the Rust
+-- omega-core::circulant module, validated there).
+--
+-- **3 qubits only.** This is the ripple-carry incrementer written as three
+-- unrolled gates. A general `CyclicShift(n)` would need an n−1-control MCX
+-- ladder, which the available gate set (CCX = 2 controls, no ancilla) cannot
+-- express — so the circuit is honestly fixed at n=3, not falsely parameterized.
+-- The carry cascade uses OLD low bits as controls, hence CCX→CX→X order, q[0] LSB.
+
+@assert unitary
+
+circuit CyclicShift() {
+    qreg q[3]
+    creg c[3]
+
+    apply CCX on q[0], q[1], q[2]   -- carry into bit 2 when bits 0,1 are set
+    apply CX on q[0], q[1]          -- carry into bit 1 when bit 0 is set
+    apply X on q[0]                 -- flip bit 0
+}

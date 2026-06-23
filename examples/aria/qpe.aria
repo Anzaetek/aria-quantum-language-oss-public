@@ -1,0 +1,63 @@
+-- Quantum Phase Estimation: estimate phi for a target unitary U with
+-- eigenvalue e^{2*pi*i*phi} on eigenstate |psi>.
+-- Rust harness: crates/apps/qpe/src/lib.rs  (cargo run -p aria-app-qpe, or: cargo run -p aria-verify -- qpe)
+-- VERIFIED: recovered phase φ̂ from the argmax counting-register fraction vs the baked φ=1/8 (3-bit exact), |Δ| ≤ 1e-9.
+--
+-- Layout:
+--   q[0..t-1]     counting register (t-bit precision)
+--   q[t]          eigenstate register (single qubit for this toy U = Rz(2*pi*phi))
+--
+-- The eigenstate of Rz is |1> (up to an irrelevant phase on |0>). We
+-- prepare q[t] = |1>, then apply controlled-Rz(2*pi*phi*2^k) for each
+-- counting qubit, then inverse-QFT the counting register.
+
+@assert unitary
+@prove "qpe_recovers_phase" equiv { measured equals phi times 2 to the t }
+@bound counting_qubits = t
+
+circuit QPE(t: int) {
+    qreg q[t + 1]
+    creg c[t]
+
+    -- Prepare eigenstate.
+    apply X on q[t]
+
+    -- Counting register into uniform superposition.
+    repeat i from 0 to t - 1 {
+        apply H on q[i]
+    }
+
+    -- Controlled phase accumulation. For a concrete demo we bake
+    -- phi = 1/8 so the ideal outcome is 001 binary = 1/8. CP loads the
+    -- forward-QFT image of m = phi*2^t onto the counting register so the
+    -- inverse-QFT below (which is exactly qft^dagger — swaps first, then a
+    -- reverse phase sweep) recovers |m> exactly. The forward QFT puts the
+    -- most-significant phase bit (m/2) on q[0], so q[k] carries phase
+    -- 2*pi*phi*2^(t-1-k) = 2*pi*m/2^(k+1). (Loading 2^k instead would be the
+    -- reversed convention and the swap-first IQFT would NOT invert it.)
+    let phi = 0.125
+    repeat k from 0 to t - 1 {
+        apply CP(2 * 3.14159265358979 * phi * (2 ^ (t - 1 - k))) on q[k], q[t]
+    }
+
+    -- Inverse-QFT on the counting register (q[0..t-1]): the adjoint of the
+    -- forward QFT — inverse bit-reversal, then a reverse phase sweep with
+    -- negated angles + H. Matches CircuitBuilder::inverse_qft and qft.aria's
+    -- IQFT (an H-only stage equals the inverse QFT only at t=1; this is
+    -- correct for all t). Bridged by QuantumProofs.QPEExport.qpe_lowered_exact:
+    -- inverting the lowered QFT on the loaded counting register recovers the
+    -- phase with probability 1.
+    repeat i from 0 to (t / 2) - 1 {
+        apply SWAP on q[i], q[t - 1 - i]
+    }
+    repeat i from t - 1 to 0 step -1 {
+        repeat j from t - 1 to i + 1 step -1 {
+            apply CP(-pi / (2.0 ^ (j - i))) on q[j], q[i]
+        }
+        apply H on q[i]
+    }
+
+    repeat i from 0 to t - 1 {
+        measure q[i] -> c[i]
+    }
+}

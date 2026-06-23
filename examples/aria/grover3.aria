@@ -1,0 +1,68 @@
+-- ▶ Application harness + classical cross-check: crates/apps/grover3/src/lib.rs
+--   run: cargo run -p aria-app-grover3   (or: cargo run -p aria-verify -- grover3)
+-- VERIFIED: argmax == marked index (exact) and measured P(marked) (8192 shots) vs analytic sin²((2k+1)θ), θ=arcsin(1/√8), |Δ| ≤ 0.05.
+--
+-- 3-qubit Grover search for a marked computational basis state.
+--
+-- Aria reads the algorithm top-down: init >> (oracle >> diffusion).repeat(k),
+-- which is exactly how the Rust sibling composes the sub-circuits via `>>`.
+
+@assert unitary
+@prove "grover3_marks_target" equiv { amplifies |marked> }
+@bound iterations = 2   -- floor(pi * sqrt(8) / 4) = 2
+
+circuit Grover3(marked: int) {
+    qreg q[3]
+    creg c[3]
+
+    let k = 2
+
+    -- Uniform superposition
+    apply H on q[0]
+    apply H on q[1]
+    apply H on q[2]
+
+    -- Grover iteration: oracle then diffusion, repeated k times
+    repeat k {
+        -- Oracle: phase-flip the marked state via MCZ decomposed as
+        -- X-mask >> H on target >> CCX >> H >> X-mask
+        oracle phase_flip(marked) on q
+
+        -- Diffusion operator 2|s><s| - I
+        apply H on q[0]
+        apply H on q[1]
+        apply H on q[2]
+        apply X on q[0]
+        apply X on q[1]
+        apply X on q[2]
+        apply H on q[2]
+        apply CCX on q[0], q[1], q[2]
+        apply H on q[2]
+        apply X on q[0]
+        apply X on q[1]
+        apply X on q[2]
+        apply H on q[0]
+        apply H on q[1]
+        apply H on q[2]
+    }
+
+    measure q -> c
+}
+
+-- Oracle sub-circuit: phase-flip |marked>
+circuit phase_flip(marked: int) {
+    qreg q[3]
+
+    -- Flip qubits whose marked-bit is 0, MCZ, then unflip
+    when bit(marked, 0) == 0 { apply X on q[0] }
+    when bit(marked, 1) == 0 { apply X on q[1] }
+    when bit(marked, 2) == 0 { apply X on q[2] }
+
+    apply H on q[2]
+    apply CCX on q[0], q[1], q[2]
+    apply H on q[2]
+
+    when bit(marked, 0) == 0 { apply X on q[0] }
+    when bit(marked, 1) == 0 { apply X on q[1] }
+    when bit(marked, 2) == 0 { apply X on q[2] }
+}

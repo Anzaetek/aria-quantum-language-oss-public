@@ -1,0 +1,31 @@
+-- aria: quantum
+-- Quantum circuit DSL — exercises gates, registers, annotations, bra/ket.
+
+@assert unitary
+@prove "ghz_correct" equiv { creates (|000> + |111>)/sqrt(2) }
+@bound gate_count = 4
+@resource_bound depth = 3
+@note "GHZ state on three qubits"
+
+circuit GHZ3 {
+    qreg q[3]
+    creg c[3]
+    symbolic theta : real
+
+    apply H  on q[0]
+    apply CX on q[0], q[1]
+    apply CX on q[1], q[2]
+    apply RZ(theta) on q[0]
+    apply CCX on q[0], q[1], q[2]
+
+    repeat i from 0 to 2 step 1 {
+        apply RY(pi / 4.0) on q[i]
+    }
+
+    measure q -> c
+}
+
+observable Energy {
+    let h = 0.5
+    h * sin(theta) + sqrt(2.0) * abs(theta)
+}

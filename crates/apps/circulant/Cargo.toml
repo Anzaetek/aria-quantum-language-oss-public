@@ -1,0 +1,13 @@
+# aria-app-circulant — banded-circulant DFT-diagonalization solve harness.
+# Heat-transfer C=(-2-ξ)I+Q+Q⁻¹ solved by DFT, validated vs independent Gaussian.
+# Run standalone: cargo run -p aria-app-circulant   (or: aria-verify circulant)
+[package]
+publish = false
+name = "aria-app-circulant"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Banded-circulant DFT-diagonalization solve vs independent dense solve (synthetic, numeric)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

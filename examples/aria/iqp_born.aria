@@ -1,0 +1,46 @@
+-- IQP Born machine: train-on-classical / deploy-on-quantum generative model
+-- (Recio-Armengol & Bowles 2025, arXiv:2503.02934).
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- iqp_born)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- Circuit:  |psi(theta)> = H^n . D(theta) . H^n |0>
+-- with the diagonal layer D a 1-D chain of single-qubit Z rotations RZ(alpha_j)
+-- and nearest-neighbour ZZ rotations (CX . RZ(beta_j) . CX). Sampling in the
+-- computational basis is classically hard (IQP), so deployment needs a QPU;
+-- but the parity expectations <Z_S> the MMD objective needs are poly-time
+-- (a 1-D transfer matrix), so training is classical and scales to many qubits.
+--
+-- Symbols: alpha[0..n-1] single-qubit Z angles; beta[0..n-2] chain ZZ angles.
+
+@assert unitary
+@bound parameters = 2 * n - 1
+
+circuit IqpBorn(n: int) {
+    qreg q[n]
+    creg c[n]
+
+    let alpha = symbolic[n]
+    let beta = symbolic[n - 1]
+
+    -- First Hadamard layer.
+    repeat j from 0 to n - 1 {
+        apply H on q[j]
+    }
+
+    -- Diagonal D(theta): single-qubit Z rotations ...
+    repeat j from 0 to n - 1 {
+        apply RZ(alpha[j]) on q[j]
+    }
+    -- ... and nearest-neighbour ZZ rotations along the chain.
+    repeat j from 0 to n - 2 {
+        apply CX on q[j], q[j + 1]
+        apply RZ(beta[j]) on q[j + 1]
+        apply CX on q[j], q[j + 1]
+    }
+
+    -- Second Hadamard layer, then measure (deploy = sample on a QPU).
+    repeat j from 0 to n - 1 {
+        apply H on q[j]
+    }
+    measure q -> c
+}

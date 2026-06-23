@@ -1,0 +1,14 @@
+# aria-app-qos — application harness for the QOS oracle-sketching reproduction.
+# QOS expected-unitary sketch converges to the exact phase oracle (~1/N²).
+# Run standalone: cargo run -p aria-app-qos     (or: aria-verify qos)
+[package]
+publish = false
+name = "aria-app-qos"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "QOS oracle-sketching convergence vs exact phase oracle (synthetic, numeric)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+omega-core = { path = "../../omega-core" }

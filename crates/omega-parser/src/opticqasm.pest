@@ -1,0 +1,30 @@
+// OPTICQASM 1.0 PEG grammar for pest
+
+program = { SOI ~ header ~ statement* ~ EOI }
+
+header = { "OPTICQASM" ~ version ~ ";" }
+version = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+
+statement = {
+    photon_decl
+  | gate_app
+}
+
+photon_decl = { "photon" ~ ident ~ "[" ~ integer ~ "]" ~ ";" }
+
+gate_app = { gate_name ~ "(" ~ param_list ~ ")" ~ mode_list ~ ";" }
+
+gate_name  = @{ "ps" | "bs_rx" | "bs_ry" | "bs" | ident }
+param_list = { param ~ ("," ~ param)* }
+param      = { symbol | number }
+symbol     = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
+
+mode_list = { mode_ref ~ ("," ~ mode_ref)* }
+mode_ref  = { ident ~ "[" ~ integer ~ "]" }
+
+number  = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+integer = @{ ASCII_DIGIT+ }
+ident   = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }

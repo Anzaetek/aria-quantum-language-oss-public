@@ -1,0 +1,22 @@
+[package]
+name = "omega-parser"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Program/QASM parser for the omega quantum runtime."
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+pest = { workspace = true }
+pest_derive = { workspace = true }
+thiserror = { workspace = true }
+smallvec = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parser_bench"
+harness = false

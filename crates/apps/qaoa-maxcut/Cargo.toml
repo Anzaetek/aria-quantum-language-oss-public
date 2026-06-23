@@ -1,0 +1,13 @@
+# aria-app-qaoa-maxcut — application harness for the `qaoa_maxcut` Aria example.
+# QAOA MaxCut vs the brute-force optimum.
+# Run standalone: cargo run -p aria-app-qaoa-maxcut     (or: aria-verify qaoa_maxcut)
+[package]
+publish = false
+name = "aria-app-qaoa-maxcut"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "QAOA MaxCut vs the brute-force optimum."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

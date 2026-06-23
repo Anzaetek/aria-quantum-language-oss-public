@@ -1,0 +1,13 @@
+# aria-app-qpe — application harness for the `qpe` Aria example.
+# Quantum phase estimation recovers the baked phase φ = 1/8.
+# Run standalone: cargo run -p aria-app-qpe     (or: aria-verify qpe)
+[package]
+publish = false
+name = "aria-app-qpe"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Quantum phase estimation recovers the baked phase phi = 1/8."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

@@ -1,0 +1,24 @@
+[package]
+name = "omega-wasm-runtime"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Host bindings to run omega WASM guest programs in-process."
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-parser = { path = "../omega-parser" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-photonics = { path = "../omega-backend-photonics" }
+# Pinned to 0.8 to match wasmtime-wasi 36's `cap_rand::RngCore` (re-export
+# of rand 0.8). When wasmtime-wasi/cap-rand update past 0.8 this can
+# revert to `{ workspace = true }`.
+rand = "0.8"
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+smallvec = { workspace = true }

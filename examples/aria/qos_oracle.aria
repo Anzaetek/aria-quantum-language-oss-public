@@ -1,0 +1,34 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qos/src/lib.rs
+--   run: cargo run -p aria-app-qos   (or: cargo run -p aria-verify -- qos)
+-- VERIFIED: exact phase-oracle statevector (omega) vs omega_core::qos::target_state, global-phase-invariant infidelity ≤ 1e-6.
+--
+-- QOS phase oracle: D = diag(e^{iφ·v_x}) applied to |+⟩^n, for v_x = x.
+--
+-- This is the EXACT oracle that Quantum Oracle Sketching (arXiv:2604.07639)
+-- converges to from random samples. The sketching itself (the sampling, the
+-- ~1/N² convergence) is a numerical procedure reproduced in the harness; this
+-- circuit is the oracle's exact endpoint, run for real through omega.
+--
+-- v_x = x is ASYMMETRIC under qubit permutation (unlike popcount), so the
+-- cross-check actually exercises qubit wiring. Built from RZ(φ·2^j) on qubit j:
+-- RZ(θ)=diag(e^{-iθ/2}, e^{+iθ/2}), so the prepared state equals
+-- target_state(v, φ) up to a single GLOBAL phase e^{-iφ(2^n−1)/2} — physically
+-- unobservable, and the harness compares with the global-phase-invariant
+-- infidelity. (The gate set has no bare single-qubit phase gate; RZ is the
+-- honest tool, hence the up-to-global-phase equality.) φ = 0.4.
+
+@assert unitary
+
+circuit PhaseOracle(n: int) {
+    qreg q[n]
+
+    -- |+⟩^n
+    repeat j from 0 to n - 1 {
+        apply H on q[j]
+    }
+
+    -- phase oracle for v_x = x = Σ_j 2^j·b_j  ⇒  RZ(φ·2^j) on qubit j.
+    repeat j from 0 to n - 1 {
+        apply RZ(0.4 * (2.0 ^ j)) on q[j]
+    }
+}

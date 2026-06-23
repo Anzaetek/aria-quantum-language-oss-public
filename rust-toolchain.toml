@@ -1,0 +1,15 @@
+# Pinned toolchain: contributors and CI both build with the same rustc
+# so binaries reproducible from a clean checkout.
+#
+# Bump checklist:
+# 1. Ensure the new version is stable (`rustup show`, `rustc --version`).
+# 2. Update `channel` below.
+# 3. Run `./ci.sh` end-to-end. Pay attention to new clippy warnings
+#    (treated as errors via `-D warnings`).
+# 4. Update STATUS.md "Latest landed" with the bump date and any
+#    clippy-fix notes.
+[toolchain]
+channel = "1.95.0"
+profile = "default"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip1"]

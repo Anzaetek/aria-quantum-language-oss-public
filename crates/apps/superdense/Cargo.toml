@@ -1,0 +1,13 @@
+# aria-app-superdense — application harness for the `superdense` Aria example.
+# Superdense coding: Bob's decoded 2 bits == Alice's input bits.
+# Run standalone: cargo run -p aria-app-superdense  (or: aria-verify superdense)
+[package]
+publish = false
+name = "aria-app-superdense"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Superdense coding: decoded 2 bits == Alice's input bits."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

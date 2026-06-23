@@ -1,0 +1,13 @@
+# aria-app-qsvd — application harness for the `qsvd` Aria example.
+# singular values of a fixed matrix M (variational) vs classical SVD.
+# Run standalone: cargo run -p aria-app-qsvd     (or: aria-verify qsvd)
+[package]
+publish = false
+name = "aria-app-qsvd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "singular values of a fixed matrix M (variational) vs classical SVD."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

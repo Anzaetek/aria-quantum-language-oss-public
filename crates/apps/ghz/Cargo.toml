@@ -1,0 +1,13 @@
+# aria-app-ghz — application harness for the `ghz` Aria example.
+# GHZ-state amplitudes vs the analytic (½ at |000⟩ and |111⟩) distribution.
+# Run standalone: cargo run -p aria-app-ghz     (or: aria-verify ghz)
+[package]
+publish = false
+name = "aria-app-ghz"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "GHZ-state amplitudes vs the analytic |000⟩/|111⟩ distribution."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

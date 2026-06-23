@@ -1,0 +1,63 @@
+-- Quantum kernel / feature-map circuit (Havlicek et al. 2019).
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- quantum_kernel)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- Encodes a classical data vector x in R^n into a quantum state via
+-- an IQP-like feature map: H^n * U_Phi(x) * H^n * U_Phi(x). The kernel
+-- entry K(x, y) = |<phi(y)|phi(x)>|^2 is the probability that running
+-- phi(x)^dagger * phi(y) and measuring returns |0>.
+--
+-- This template expresses only the feature map itself (one-shot
+-- forward pass). The kernel computation loops over pairs (x, y) and
+-- calls this template twice per pair on the Rust side.
+--
+-- Layout:
+--   q[0..n-1]    feature-map register (n = number of features)
+--
+-- Symbols: alpha[0..n-1] (first-order angles), beta[0..n*n-1] (pairwise
+--           angles). The Rust side binds these from the data vector.
+
+@assert unitary
+@bound parameters = n + n * n
+
+circuit QuantumKernelMap(n: int) {
+    qreg q[n]
+
+    let alpha = symbolic[n]
+    let beta  = symbolic[n * n]
+
+    -- First feature-map block.
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+    }
+    repeat i from 0 to n - 1 {
+        apply RZ(alpha[i]) on q[i]
+    }
+    repeat i from 0 to n - 1 {
+        repeat j from 0 to n - 1 {
+            when i < j {
+                apply CX on q[i], q[j]
+                apply RZ(beta[i * n + j]) on q[j]
+                apply CX on q[i], q[j]
+            }
+        }
+    }
+
+    -- Second feature-map block (duplicates the structure so the
+    -- combined map has the required depth-2 entanglement signature).
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+    }
+    repeat i from 0 to n - 1 {
+        apply RZ(alpha[i]) on q[i]
+    }
+    repeat i from 0 to n - 1 {
+        repeat j from 0 to n - 1 {
+            when i < j {
+                apply CX on q[i], q[j]
+                apply RZ(beta[i * n + j]) on q[j]
+                apply CX on q[i], q[j]
+            }
+        }
+    }
+}

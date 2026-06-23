@@ -1,0 +1,41 @@
+-- ▶ Application harness + classical cross-check: crates/apps/swap-test/src/lib.rs
+--   run: cargo run -p aria-app-swap-test   (or: cargo run -p aria-verify -- swap_test)
+-- VERIFIED: measured P(ancilla=0) (8192 shots) vs ½+½|⟨ψ|φ⟩|² with the analytic overlap 0 (orthogonal |+⟩,|−⟩) ⇒ 0.5, |Δ| ≤ 0.02.
+--
+-- SWAP test: measure the fidelity |<psi|phi>|^2 between two n-qubit
+-- states by a single ancilla measurement.
+--
+-- Layout:
+--   q[0]          ancilla
+--   q[1 .. n]     first register  (state |psi>)
+--   q[n+1 .. 2n]  second register (state |phi>)
+--
+-- P(ancilla = 0) = 0.5 + 0.5 * |<psi|phi>|^2. For |psi> = |phi> the
+-- ancilla reads 0 deterministically. This template prepares the pair
+-- |+>^n on both registers so the fidelity is 1 as a smoke-test.
+
+@assert unitary
+
+circuit SwapTest(n: int) {
+    qreg q[2 * n + 1]
+    creg c[1]
+
+    -- Prepare |psi> = |+>^n on the first register.
+    repeat i from 1 to n {
+        apply H on q[i]
+    }
+
+    -- Prepare |phi> = |+>^n on the second register.
+    repeat i from n + 1 to 2 * n {
+        apply H on q[i]
+    }
+
+    -- Ancilla Hadamard, controlled-SWAP pairs, ancilla Hadamard, measure.
+    apply H on q[0]
+    repeat i from 0 to n - 1 {
+        apply CSWAP on q[0], q[i + 1], q[n + i + 1]
+    }
+    apply H on q[0]
+
+    measure q[0] -> c[0]
+}

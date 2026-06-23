@@ -1,0 +1,34 @@
+-- ▶ Application harness + classical cross-check: crates/apps/teleport/src/lib.rs
+--   run: cargo run -p aria-app-teleport   (or: cargo run -p aria-verify -- teleport)
+-- VERIFIED: fraction of the 8 measurement trajectories with Bob's q[2]==Alice's input vs exact teleportation == 1.0, |Δ| = 0.
+--
+-- Quantum teleportation: send an unknown 1-qubit state from Alice to Bob
+-- using a shared Bell pair + 2 classical bits.
+--
+-- Exercises mid-circuit measurement + classically-conditioned gates,
+-- which is the reason the simulator supports measure/reset/continue
+-- execution.
+
+@assert unitary_on_qubit
+@prove "teleport_correct" equiv { q[2] after protocol = q[0] before }
+
+circuit Teleport {
+    qreg q[3]      -- q[0]: Alice's payload, q[1]: shared Bell, q[2]: Bob
+    creg m[2]      -- Alice's measurement outcomes
+
+    -- 1. Prepare the shared Bell pair on (q[1], q[2])
+    apply H on q[1]
+    apply CX on q[1], q[2]
+
+    -- 2. Alice entangles her payload with her half of the Bell pair
+    apply CX on q[0], q[1]
+    apply H on q[0]
+
+    -- 3. Alice measures both her qubits; the outcomes get sent as cbits
+    measure q[0] -> m[0]
+    measure q[1] -> m[1]
+
+    -- 4. Bob's corrective Pauli gates conditioned on Alice's cbits
+    when m[1] == 1 { apply X on q[2] }
+    when m[0] == 1 { apply Z on q[2] }
+}

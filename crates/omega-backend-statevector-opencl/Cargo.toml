@@ -1,0 +1,41 @@
+[package]
+name = "omega-backend-statevector-opencl"
+version = "0.1.0"
+edition = "2021"
+description = "OpenCL (cross-vendor) statevector backend — opt-in via the `opencl` feature."
+license = "MIT"
+publish = false
+
+# The `opencl` feature gates the `ocl` dep on. Mirrors the Metal /
+# CUDA pattern: the dep itself is unconditional once the feature is
+# requested (the `ocl` crate compiles on every supported OS that has
+# an OpenCL ICD; missing-ICD builds surface as a runtime
+# OpenClError::Unavailable from the constructor rather than a
+# compile-time failure). `cargo build --workspace` (no features) stays
+# clean on every host — no OpenCL toolkit required.
+[features]
+default = []
+opencl = ["dep:ocl", "omega-core/opencl"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+# Shared CPU gate-matrix builders. Mirrors the Metal / CUDA crates so
+# the OpenCL adjoint can reuse the well-tested CPU derivative
+# matrices instead of rederiving them. The CPU sim code is
+# dead-stripped from the OpenCL binary at link time.
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+ocl = { version = "0.19", optional = true }
+
+[dev-dependencies]
+omega-core = { path = "../omega-core" }
+smallvec = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "opencl_bench"
+harness = false
+required-features = ["opencl"]

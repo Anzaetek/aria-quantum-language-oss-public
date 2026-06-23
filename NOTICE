@@ -1,0 +1,40 @@
+omega-functions
+Copyright 2024-2026 Anzaetek Inc.
+
+This product includes software developed by Anzaetek Inc.
+(https://anzaetek.com/).
+
+Licensed under the Apache License, Version 2.0. See LICENSE for the full
+license text.
+
+----------------------------------------------------------------------
+
+Attribution requirement (per Section 4(d) of the Apache License):
+
+Derivative works and redistributions must preserve a readable copy of the
+attribution notices above. For binary distributions without an accompanying
+source tree, acceptable locations include:
+
+  - a NOTICE text file bundled alongside the binary;
+  - an "About" / "Help" / "Licenses" screen in the redistributing product;
+  - the product's user-facing documentation.
+
+----------------------------------------------------------------------
+
+Third-party dependencies bundled or declared by this project include, but
+are not limited to:
+
+  - num-complex, ndarray, smallvec, rayon, rand  ........  MIT / Apache-2.0
+  - pest, pest_derive, thiserror, serde, serde_json  ....  MIT / Apache-2.0
+  - axum, tokio, chrono, uuid, base64  .................  MIT / Apache-2.0
+  - wasmtime, wasmtime-wasi  ...........................  Apache-2.0 WITH LLVM-exception
+  - rusqlite (bundles SQLite: Public Domain)  ..........  MIT
+  - ml-dsa, ml-kem  ....................................  Apache-2.0
+  - aes-gcm, hkdf, sha2, subtle  .......................  MIT / Apache-2.0
+  - ciborium  ..........................................  Apache-2.0
+  - pqcrypto-dilithium, pqcrypto-traits  ...............  MIT / Apache-2.0
+  - criterion (dev-dep only)  ..........................  MIT / Apache-2.0
+
+Each dependency remains governed by its own license. Their copyright and
+attribution notices are retained in their respective source trees and in
+Cargo's SPDX metadata.

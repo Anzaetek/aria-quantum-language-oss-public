@@ -1,0 +1,13 @@
+# aria-app-swap-test — application harness for the `swap_test` Aria example.
+# state overlap via the ancilla vs classical inner product.
+# Run standalone: cargo run -p aria-app-swap-test     (or: aria-verify swap_test)
+[package]
+publish = false
+name = "aria-app-swap-test"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "state overlap via the ancilla vs classical inner product."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

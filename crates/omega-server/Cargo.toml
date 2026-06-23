@@ -1,0 +1,63 @@
+[package]
+name = "omega-server"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP/WebSocket server exposing the omega quantum runtime."
+
+[[bin]]
+name = "omega-server"
+path = "src/main.rs"
+
+[features]
+default = ["crypto-ml-dsa"]
+crypto-ml-dsa = []
+crypto-mldsa-c = []
+# Optional rustls-backed HTTPS listener. Off by default — operators
+# who don't need a built-in TLS terminator (e.g. fronting with
+# nginx/caddy) skip it and avoid the rustls + ring transitive deps.
+tls = ["dep:axum-server"]
+# OpenCL statevector backend. When enabled and OMEGA_DEVICE=opencl,
+# /v1/quantum/execute routes Statevector circuits through the OpenCL
+# device (falls back to CPU statevector if no OpenCL device is usable).
+opencl = ["dep:omega-backend-statevector-opencl"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-parser = { path = "../omega-parser" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl", features = ["opencl"], optional = true }
+omega-backend-photonics = { path = "../omega-backend-photonics" }
+omega-backend-mps = { path = "../omega-backend-mps" }
+omega-backend-pauli = { path = "../omega-backend-pauli" }
+omega-wasm-runtime = { path = "../omega-wasm-runtime" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+pqcrypto-mldsa = { workspace = true }
+pqcrypto-traits = { workspace = true }
+ml-dsa = { workspace = true }
+signature = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+smallvec = { workspace = true }
+rand = { workspace = true }
+ml-kem = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+ciborium = { workspace = true }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+
+[dev-dependencies]
+# Trust-store loader tests need scratch directories for the .cbor
+# fixtures they write. Test-only: doesn't affect the production build.
+tempfile = "3.10"

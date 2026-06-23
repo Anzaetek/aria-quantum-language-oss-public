@@ -1,0 +1,48 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qml-classifier/src/lib.rs
+--   run: cargo run -p aria-app-qml-classifier   (or: cargo run -p aria-verify -- qml_classifier)
+-- VERIFIED: test-set predictions sign(⟨Z⟩) (inference through wasm) vs ground-truth labels y=sign(x); accuracy ≥ 0.9.
+--
+-- Data-reuploading binary classifier (Perez-Salinas et al. 2020).
+--
+-- A single-qubit classifier that alternates (data encoding, trainable
+-- rotation) L times, then reads Z(0). The model is universal over
+-- continuous functions as L grows. The caller passes two x-features
+-- via `x0`, `x1` compile-time integers that select which encoding
+-- angle to use.
+--
+-- Layout:
+--   q[0]                  classifier qubit (model output = <Z(0)>)
+--
+-- Symbols: theta[0..3*L-1]  — 3 angles per layer for an RZ * RY * RZ
+--                             Euler rotation after each encoding.
+
+@assert unitary
+@prove "qml_classifier_is_universal_in_L" equiv { covers continuous functions as L -> inf }
+@bound parameters = 3 * L
+
+circuit QMLClassifier(L: int) {
+    qreg q[1]
+
+    -- Trainable angles (optimizer side substitutes floats per step).
+    let theta = symbolic[3 * L]
+    -- Data feature, re-uploaded at every layer. The host binds `x[0]` to
+    -- each sample's feature value; `theta[..]` are the trained weights.
+    let x = symbolic[1]
+
+    repeat layer from 0 to L - 1 {
+        -- Data-reuploading encoding: RY(x) interleaves the input feature
+        -- into the state at every layer.
+        apply RY(x[0]) on q[0]
+
+        -- Trainable Euler rotation (3 angles per layer).
+        apply RZ(theta[3 * layer + 0]) on q[0]
+        apply RY(theta[3 * layer + 1]) on q[0]
+        apply RZ(theta[3 * layer + 2]) on q[0]
+    }
+}
+
+-- Classification head: measure <Z(0)>; sign of the expectation value
+-- assigns the class label (-1 or +1).
+observable ZeroLabel {
+    1.0 * Z(0)
+}

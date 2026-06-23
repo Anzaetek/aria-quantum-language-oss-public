@@ -1,0 +1,13 @@
+# aria-app-teleport — application harness for the `teleport` Aria example.
+# teleported qubit vs the input (exact).
+# Run standalone: cargo run -p aria-app-teleport     (or: aria-verify teleport)
+[package]
+publish = false
+name = "aria-app-teleport"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "teleported qubit vs the input (exact)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

@@ -1,0 +1,27 @@
+# aria-cli — the `aria` command-line front end. Parses Aria source, instantiates
+# circuit templates, runs them on a pluggable backend (pure-Rust statevector by
+# default), and exports to QASM / JSON / Lean.
+[package]
+name = "aria-cli"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Command-line interface for the Aria Quantum Language."
+
+[[bin]]
+name = "aria"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forward GPU / remote backends to aria-runtime so `--backend gpu`/`remote` work.
+metal = ["aria-runtime/metal"]
+cuda = ["aria-runtime/cuda"]
+opencl = ["aria-runtime/opencl"]
+remote = ["aria-runtime/remote"]
+tch = ["aria-runtime/tch"]
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+aria-runtime = { path = "../aria-runtime" }
+omega-core = { path = "../omega-core" }

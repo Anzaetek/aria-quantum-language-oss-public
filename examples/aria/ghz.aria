@@ -1,0 +1,20 @@
+-- GHZ state: (|000> + |111>) / sqrt(2)
+-- Rust harness: crates/apps/ghz/src/lib.rs  (cargo run -p aria-app-ghz, or: cargo run -p aria-verify -- ghz)
+-- VERIFIED: statevector probabilities |aᵢ|² vs the exact (|000⟩+|111⟩)/√2 oracle (½ at |000⟩, ½ at |111⟩, else 0), |Δ| ≤ 1e-9.
+-- Gate-model proof: proofs/lean4/QuantumProofs/GHZPrep.lean
+
+@assert unitary
+@prove "ghz_correct" equiv { creates (|000> + |111>)/sqrt(2) }
+@bound gate_count = 3
+
+circuit GHZ {
+    qreg q[3]
+    creg c[3]
+
+    -- Superpose q[0], then entangle the chain q[0]→q[1]→q[2]
+    apply H on q[0]
+    apply CX on q[0], q[1]
+    apply CX on q[1], q[2]
+
+    measure q -> c
+}

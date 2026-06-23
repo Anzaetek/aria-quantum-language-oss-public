@@ -1,0 +1,49 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qft/src/lib.rs
+--   run: cargo run -p aria-app-qft   (or: cargo run -p aria-verify -- qft)
+-- VERIFIED: output amplitudes (re,im) of QFT|x⟩ vs the classical DFT matrix F·e_x, F[k][j]=exp(2πi·k·j/N)/√N, |Δ| ≤ 1e-6.
+--
+-- Quantum Fourier Transform on n qubits.
+--
+-- The QFT circuit is the Cooley–Tukey decomposition:
+--   for each target i, H on q[i] then controlled phases CP(pi/2^(j-i))
+--   from q[j] to q[i] for j > i, followed by a bit-reversal SWAP layer.
+
+@assert unitary
+@prove "qft_equals_dft" equiv { denote(QFT) = DFT_matrix(2^n) }
+@bound depth = n * (n + 1) / 2
+
+circuit QFT(n: int) {
+    qreg q[n]
+
+    -- Forward pass: H + controlled phases, top to bottom
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+        repeat j from i + 1 to n - 1 {
+            -- Controlled phase rotation by 2*pi / 2^(j - i + 1)
+            apply CP(pi / (2.0 ^ (j - i))) on q[j], q[i]
+        }
+    }
+
+    -- Bit-reversal SWAP layer
+    repeat i from 0 to (n / 2) - 1 {
+        apply SWAP on q[i], q[n - 1 - i]
+    }
+}
+
+-- Inverse QFT: adjoint of the forward QFT, used inside QPE.
+circuit IQFT(n: int) {
+    qreg q[n]
+
+    -- Inverse bit-reversal first
+    repeat i from 0 to (n / 2) - 1 {
+        apply SWAP on q[i], q[n - 1 - i]
+    }
+
+    -- Reverse phase sweep with negated angles
+    repeat i from n - 1 to 0 step -1 {
+        repeat j from n - 1 to i + 1 step -1 {
+            apply CP(-pi / (2.0 ^ (j - i))) on q[j], q[i]
+        }
+        apply H on q[i]
+    }
+}

@@ -1,0 +1,74 @@
+-- Quantum Convolutional Neural Network classifier (Hur et al. 2022).
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- qcnn)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- 4 qubits → 2 → 1. Each convolution is the Qiskit-tutorial 8-gate block
+-- (3 trainable angles); each pooling is the 6-gate block (3 angles). The
+-- surviving wire q[0] is read out as the binary class score <Z(0)>.
+-- 6 two-qubit blocks × 3 = 18 trainable angles.
+
+@assert unitary
+@bound parameters = 18
+
+circuit QCNN {
+    qreg q[4]
+
+    let w = symbolic[18]
+
+    -- ── Convolution layer 1: blocks on (0,1) and (2,3) ──────────────
+    apply RZ(- pi / 2) on q[1]
+    apply CX on q[1], q[0]
+    apply RZ(w[0]) on q[0]
+    apply RY(w[1]) on q[1]
+    apply CX on q[0], q[1]
+    apply RY(w[2]) on q[1]
+    apply CX on q[1], q[0]
+    apply RZ(pi / 2) on q[0]
+
+    apply RZ(- pi / 2) on q[3]
+    apply CX on q[3], q[2]
+    apply RZ(w[3]) on q[2]
+    apply RY(w[4]) on q[3]
+    apply CX on q[2], q[3]
+    apply RY(w[5]) on q[3]
+    apply CX on q[3], q[2]
+    apply RZ(pi / 2) on q[2]
+
+    -- ── Pooling layer 1: fold q[1]→q[0], q[3]→q[2] ──────────────────
+    apply RZ(- pi / 2) on q[1]
+    apply CX on q[1], q[0]
+    apply RZ(w[6]) on q[0]
+    apply RY(w[7]) on q[1]
+    apply CX on q[0], q[1]
+    apply RY(w[8]) on q[1]
+
+    apply RZ(- pi / 2) on q[3]
+    apply CX on q[3], q[2]
+    apply RZ(w[9]) on q[2]
+    apply RY(w[10]) on q[3]
+    apply CX on q[2], q[3]
+    apply RY(w[11]) on q[3]
+
+    -- ── Convolution layer 2: block on the survivors (0,2) ───────────
+    apply RZ(- pi / 2) on q[2]
+    apply CX on q[2], q[0]
+    apply RZ(w[12]) on q[0]
+    apply RY(w[13]) on q[2]
+    apply CX on q[0], q[2]
+    apply RY(w[14]) on q[2]
+    apply CX on q[2], q[0]
+    apply RZ(pi / 2) on q[0]
+
+    -- ── Pooling layer 2: fold q[2]→q[0] ─────────────────────────────
+    apply RZ(- pi / 2) on q[2]
+    apply CX on q[2], q[0]
+    apply RZ(w[15]) on q[0]
+    apply RY(w[16]) on q[2]
+    apply CX on q[0], q[2]
+    apply RY(w[17]) on q[2]
+}
+
+-- Classification head: sign of <Z(0)> is the class label.
+observable ClassScore {
+    1.0 * Z(0)
+}

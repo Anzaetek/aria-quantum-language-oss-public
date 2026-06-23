@@ -1,0 +1,54 @@
+-- HHL (Harrow–Hassidim–Lloyd) — quantum linear-system solver.
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- hhl)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- Solves A x = b for Hermitian A. The diagonal A = diag(1, 2),
+-- b = |1⟩ case (analytic solution x = |1⟩/2) is the smoke test
+-- driven from the Rust side; this Aria template generalizes it
+-- across the counting-register width parameter `n`.
+
+@assert unitary
+@prove "hhl_recovers_inverse" equiv { encodes A^{-1} b in ancilla=|1> branch }
+@bound counting_qubits = n
+
+circuit Hhl(n: int) {
+    qreg q[5]            -- worst-case width: 3 counting + 1 system + 1 ancilla
+    creg c[1]
+
+    -- Step 1: prepare |b⟩ on system qubit (index n).
+    apply X on q[n]
+
+    -- Step 2: QPE on the counting register.
+    repeat i from 0 to n {
+        apply H on q[i]
+    }
+    repeat k from 0 to n {
+        -- controlled-U^{2^k}: phase 2π · 2^k / 2^n on system qubit.
+        let angle = 2 * pi * 2^k / 2^n
+        apply CP(angle) on q[k], q[n]
+    }
+
+    -- Step 3: inverse QFT on counting register (manual, for clarity).
+    repeat i from 0 to n {
+        apply H on q[i]
+    }
+
+    -- Step 4: controlled rotation encoding 1/λ on the ancilla. The
+    -- eigenvalue proxy λ = k + 1 (≥ 1) keeps the angle well-defined.
+    repeat k from 0 to n {
+        let theta = 0.5 / (k + 1)
+        apply CP(theta) on q[k], q[n + 1]
+    }
+
+    -- Step 5: uncompute QPE.
+    repeat k from 0 to n {
+        let angle = -2 * pi * 2^k / 2^n
+        apply CP(angle) on q[k], q[n]
+    }
+    repeat i from 0 to n {
+        apply H on q[i]
+    }
+
+    -- Measure ancilla; post-select on |1⟩ for the solution branch.
+    measure q[n + 1] -> c[0]
+}

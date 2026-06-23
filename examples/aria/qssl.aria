@@ -1,0 +1,48 @@
+-- Quantum Self-Supervised Learning representation network
+-- (Jaderberg et al. 2021, arXiv:2103.14653).
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- qssl)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- The quantum *encoder*: angle-encode N classical features, apply L
+-- variational layers (per-qubit Euler rotation + ring CNOT), and read out
+-- <Z(i)> on every qubit as an N-dim representation vector. The
+-- self-supervised contrastive training that consumes the representation is
+-- classical (out of this circuit).
+--
+-- Layout:
+--   q[0..N-1]   one wire per input feature; <Z(i)> = representation[i]
+--
+-- Symbols: theta[0 .. 3*N*L-1]  — 3 trainable angles per qubit per layer.
+
+@assert unitary
+@bound parameters = 3 * N * L
+
+circuit QSSLEncoder(N: int, L: int) {
+    qreg q[N]
+
+    let theta = symbolic[3 * N * L]
+
+    -- Data encoding: RY(x_i) per qubit (placeholder pi/4; caller binds the
+    -- real data-dependent angle via bind_params).
+    repeat i from 0 to N - 1 {
+        apply RY(pi / 4) on q[i]
+    }
+
+    -- Variational ansatz: L layers of per-qubit Euler rotation + ring CNOT.
+    repeat layer from 0 to L - 1 {
+        repeat i from 0 to N - 1 {
+            apply RZ(theta[3 * (layer * N + i) + 0]) on q[i]
+            apply RY(theta[3 * (layer * N + i) + 1]) on q[i]
+            apply RZ(theta[3 * (layer * N + i) + 2]) on q[i]
+        }
+        repeat i from 0 to N - 2 {
+            apply CX on q[i], q[i + 1]
+        }
+    }
+}
+
+-- Representation head: the per-qubit Z expectations form the feature
+-- vector fed to the classical contrastive loss.
+observable Representation {
+    1.0 * Z(0)
+}

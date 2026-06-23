@@ -1,0 +1,25 @@
+{
+  "name": "tree-sitter-aria",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Aria quantum DSL",
+  "main": "bindings/node",
+  "license": "MIT",
+  "scripts": {
+    "build": "tree-sitter generate && tree-sitter build",
+    "test": "tree-sitter test"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.0.0",
+    "node-gyp-build": "^4.6.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.22.0"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.aria",
+      "file-types": ["aria"],
+      "highlights": "queries/highlights.scm"
+    }
+  ]
+}

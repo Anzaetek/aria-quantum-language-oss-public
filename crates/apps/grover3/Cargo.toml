@@ -1,0 +1,13 @@
+# aria-app-grover3 — application harness for the `grover3` Aria example.
+# Grover search success probability vs analytic.
+# Run standalone: cargo run -p aria-app-grover3     (or: aria-verify grover3)
+[package]
+publish = false
+name = "aria-app-grover3"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Grover search success probability vs analytic."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

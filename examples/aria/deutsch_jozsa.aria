@@ -1,0 +1,42 @@
+-- ▶ Application harness + classical cross-check: crates/apps/deutsch-jozsa/src/lib.rs
+--   run: cargo run -p aria-app-deutsch-jozsa   (or: cargo run -p aria-verify -- deutsch_jozsa)
+-- VERIFIED: measured register vs the truth-table signature for balanced f (all-ones = 2ⁿ−1, n=3), exact equality.
+--
+-- Deutsch-Jozsa: decide whether f: {0,1}^n -> {0,1} is constant or balanced.
+--
+-- One query to f suffices when f is guaranteed to be constant or balanced.
+-- Here f(x) = x_0 XOR x_1 XOR ... XOR x_{n-1}  (balanced).
+--
+-- Layout: n query qubits (q[0..n-1]) + 1 answer qubit (q[n]).
+--   1. Initialize answer to |1>
+--   2. Hadamards everywhere
+--   3. Oracle: for each bit k of the balanced f, CX(q[k], q[n])
+--   4. Hadamards on query qubits
+--   5. Measure - all zeros iff f is constant
+
+@assert unitary
+@prove "dj_balanced_detects_parity" equiv { output = 0^n iff f constant }
+
+circuit DeutschJozsa(n: int) {
+    qreg q[n + 1]
+    creg c[n]
+
+    -- Prepare the answer qubit in |-> so the phase kickback flips with f.
+    apply X on q[n]
+    repeat i from 0 to n {
+        apply H on q[i]
+    }
+
+    -- Balanced oracle: f(x) = XOR of all query bits.
+    repeat k from 0 to n - 1 {
+        apply CX on q[k], q[n]
+    }
+
+    -- Final Hadamards + measurement on the query register.
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+    }
+    repeat i from 0 to n - 1 {
+        measure q[i] -> c[i]
+    }
+}

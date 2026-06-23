@@ -1,0 +1,13 @@
+# aria-app-qft — application harness for the `qft` Aria example.
+# QFT of an input basis state vs the classical DFT matrix.
+# Run standalone: cargo run -p aria-app-qft     (or: aria-verify qft)
+[package]
+publish = false
+name = "aria-app-qft"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "QFT of an input basis state vs the classical DFT matrix."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

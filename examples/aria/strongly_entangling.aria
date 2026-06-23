@@ -1,0 +1,29 @@
+-- StronglyEntanglingLayers ansatz (PennyLane-compatible).
+-- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- strongly_entangling)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+--
+-- Per layer: a Rot(φ,θ,ω) = RZ·RY·RZ Euler rotation on every qubit,
+-- followed by a CX entangling chain. 3 trainable angles per qubit per
+-- layer; optimizers substitute floats per step.
+
+@assert unitary
+@bound parameters = 3 * n * L
+
+circuit StronglyEntangling(n: int, L: int) {
+    qreg q[n]
+
+    let theta = symbolic[3 * n * L]
+
+    repeat layer from 0 to L - 1 {
+        -- Per-qubit ZYZ Euler rotation.
+        repeat i from 0 to n - 1 {
+            apply RZ(theta[3 * (layer * n + i) + 0]) on q[i]
+            apply RY(theta[3 * (layer * n + i) + 1]) on q[i]
+            apply RZ(theta[3 * (layer * n + i) + 2]) on q[i]
+        }
+        -- Entangling CX chain.
+        repeat i from 0 to n - 2 {
+            apply CX on q[i], q[i + 1]
+        }
+    }
+}

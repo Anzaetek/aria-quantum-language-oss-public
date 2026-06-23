@@ -1,0 +1,18 @@
+[package]
+name = "omega-client"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal curl-style CLI for omega-server (bearer-token HTTP)."
+license = "MIT"
+publish = false
+
+# Deliberately small dep set: std + serde_json. HTTPS is out of scope for
+# v1 — front the server with a TLS-terminating reverse proxy or use the
+# loopback interface. PQC WebSocket support is a follow-up.
+[dependencies]
+serde_json = { workspace = true }
+base64 = { workspace = true }
+
+[[bin]]
+name = "omega-client"
+path = "src/main.rs"

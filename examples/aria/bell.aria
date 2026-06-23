@@ -1,0 +1,18 @@
+-- Bell state: (|00> + |11>) / sqrt(2)
+-- Rust harness: crates/apps/bell/src/lib.rs  (cargo run -p aria-app-bell, or: cargo run -p aria-verify -- bell)
+-- VERIFIED: statevector probabilities |aᵢ|² vs the exact (|00⟩+|11⟩)/√2 oracle (½,0,0,½), |Δ| ≤ 1e-9.
+
+@assert unitary
+@prove "bell_correct" equiv { creates (|00> + |11>)/sqrt(2) }
+@bound gate_count = 2
+
+circuit Bell {
+    qreg q[2]
+    creg c[2]
+
+    -- Put q[0] into superposition, then entangle with q[1]
+    apply H on q[0]
+    apply CX on q[0], q[1]
+
+    measure q -> c
+}

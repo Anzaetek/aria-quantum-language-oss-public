@@ -1,0 +1,20 @@
+[package]
+name = "omega-wasm-cli"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command-line runner for omega WASM guest programs."
+
+[[bin]]
+name = "omega-wasm"
+path = "src/main.rs"
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-parser = { path = "../omega-parser" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-wasm-runtime = { path = "../omega-wasm-runtime" }
+serde_json = { workspace = true }
+smallvec = { workspace = true }

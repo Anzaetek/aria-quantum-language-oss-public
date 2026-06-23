@@ -1,0 +1,61 @@
+# aria-runtime — execution layer for the Aria Quantum Language.
+#
+# Lowers the Aria `Circuit` into omega-core's in-process `CircuitIR`
+# (symbol-preserving, so trainable parameters survive for QML) and runs it on
+# a pluggable backend. The pure-Rust statevector backend is the default; MPS,
+# GPU, libtorch (`tch`), and remote backends drop in as additional features
+# and all speak the same `omega_core::executor::Backend` trait.
+[package]
+name = "aria-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Execution runtime for the Aria Quantum Language: lowers Circuit to the omega IR and runs it on pluggable backends."
+
+[features]
+default = []
+# Apple Metal GPU statevector. Verified on macOS; on other targets the metal
+# crate compiles to a runtime-unavailable stub and `--backend gpu` falls back.
+metal = [
+    "dep:omega-backend-statevector-metal",
+    "omega-backend-statevector-metal/metal",
+    "omega-core/metal",
+]
+# NVIDIA CUDA GPU statevector (Linux/Windows + cu12 toolkit).
+cuda = [
+    "dep:omega-backend-statevector-cuda",
+    "omega-backend-statevector-cuda/cuda",
+    "omega-core/cuda",
+]
+# Cross-vendor OpenCL statevector (needs an ICD installed).
+opencl = [
+    "dep:omega-backend-statevector-opencl",
+    "omega-backend-statevector-opencl/opencl",
+    "omega-core/opencl",
+]
+# Delegate execution to a running omega-server over HTTP (`--backend remote`).
+remote = ["dep:ureq", "dep:serde", "dep:serde_json"]
+# libtorch (tch) statevector backend (`--backend tch`). Heavy: links libtorch.
+# Needs LIBTORCH set at build/run time (see INSTALL_LIBTORCH.md).
+tch = ["dep:aria-backend-tch"]
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+omega-core = { path = "../omega-core" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-mps = { path = "../omega-backend-mps" }
+num-complex = { workspace = true }
+ndarray = { workspace = true }
+
+# GPU backends (optional, feature-gated). Each implements omega_core::Backend.
+omega-backend-statevector-metal = { path = "../omega-backend-statevector-metal", optional = true }
+omega-backend-statevector-cuda = { path = "../omega-backend-statevector-cuda", optional = true }
+omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl", optional = true }
+
+# Remote (omega-server HTTP) backend.
+ureq = { version = "2", default-features = false, features = ["json"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+# libtorch backend (optional; the crate is excluded from the default workspace).
+aria-backend-tch = { path = "../aria-backend-tch", optional = true }
