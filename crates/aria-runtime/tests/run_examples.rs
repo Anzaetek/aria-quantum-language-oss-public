@@ -288,6 +288,23 @@ fn gpu_cuda_agrees_with_sim_on_qft() {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_mps_cuda_agrees_with_sim() {
+    // Under a cuda build, `--backend mps` routes bond-compression SVD through
+    // the cuSOLVER gesvdj accelerator (CPU fallback if no device). The GPU-SVD
+    // MPS statevector must reproduce the exact CPU statevector. QFT|00000> is
+    // fully entangling, so the SVD path is genuinely exercised (bond dim > 1).
+    let c = example("qft.aria", "QFT", &[("n", 5)]);
+    let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
+    let mps = statevector(&c, &no_binds(), BackendSel::Mps).unwrap();
+    assert_eq!(cpu.len(), mps.len());
+    for (i, (a, b)) in cpu.iter().zip(mps.iter()).enumerate() {
+        // Native-f64 gesvdj → the 1e-10 forward tolerance is reachable.
+        assert!((a - b).norm() < 1e-10, "amp[{i}]: sim {a} vs mps(gpu) {b}");
+    }
+}
+
 #[cfg(feature = "tch")]
 #[test]
 fn tch_backend_agrees_with_sim_on_qft() {

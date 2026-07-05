@@ -108,9 +108,12 @@ fi
 # assert the GPU statevector / MPS-SVD / pauliprop paths numerically match CPU.
 if [ "${ARIA_CUDA:-0}" = "1" ]; then
   step "+   Optional: CUDA GPU backends"
-  # Statevector GPU ≡ CPU statevector (f32 kernels, tol 1e-5).
-  cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda
-  echo "  OK: CUDA GPU statevector numerically matches CPU"
+  # MPS cuSOLVER gesvdj ≡ CPU Jacobi SVD (native f64: reconstruction + GPU-taken).
+  cargo test -p omega-backend-mps-cuda --features cuda
+  # Statevector GPU ≡ CPU statevector (f32 kernels, tol 1e-5), and the WIRED
+  # `--backend mps` GPU-SVD path ≡ exact CPU statevector (native f64, tol 1e-10).
+  cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda gpu_mps_cuda
+  echo "  OK: CUDA GPU statevector + MPS(gesvdj) numerically match CPU"
 else
   echo
   echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"

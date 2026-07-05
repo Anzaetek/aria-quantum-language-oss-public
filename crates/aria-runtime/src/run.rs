@@ -74,7 +74,7 @@ impl BackendSel {
 pub(crate) fn make_backend(sel: BackendSel) -> Result<Box<dyn Backend>, String> {
     Ok(match sel {
         BackendSel::Sim => Box::new(StatevectorBackend::new()),
-        BackendSel::Mps => Box::new(MpsBackend::new(MPS_BOND)),
+        BackendSel::Mps => Box::new(make_mps()),
         BackendSel::Gpu => make_gpu()?,
         BackendSel::Tch => make_tch()?,
         // Exact engine (no truncation): coeff_min = 0, max_weight = None.
@@ -93,6 +93,19 @@ fn make_tch() -> Result<Box<dyn Backend>, String> {
          (and set LIBTORCH — see INSTALL_LIBTORCH.md)"
             .to_string(),
     )
+}
+
+/// Construct the MPS backend. Under a `cuda` build its bond-compression SVD is
+/// routed through the cuSOLVER `gesvdj` accelerator (`omega-backend-mps-cuda`),
+/// which itself falls back to the CPU Jacobi SVD when no CUDA device is present
+/// — so `--backend mps` transparently uses the GPU when one is available and
+/// the same code is exact-identical otherwise. Metal has no on-GPU SVD arm yet
+/// (see GPU_BACKEND_PLAN.md), so the CPU SVD is used there.
+fn make_mps() -> MpsBackend {
+    let backend = MpsBackend::new(MPS_BOND);
+    #[cfg(feature = "cuda")]
+    let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
+    backend
 }
 
 /// Construct the compiled-in GPU statevector backend, falling back to the

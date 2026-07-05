@@ -38,7 +38,7 @@
 use num_complex::Complex64;
 
 pub use omega_backend_mps::mps::Mps;
-pub use omega_backend_mps::svd::SvdResult;
+pub use omega_backend_mps::svd::{SvdResult, SvdResultFlat};
 
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 mod gesvdj;
@@ -91,6 +91,51 @@ pub fn cuda_truncated_svd(
     }
     let result = omega_backend_mps::svd::truncated_svd(matrix, max_rank, threshold);
     (result, false)
+}
+
+// One cuSOLVER context per thread, initialized on first use and reused across
+// every SVD on that thread — building the handle/stream per call would dwarf
+// the SVD itself. `CudaSvdContext` is `!Send` (holds `RefCell` + driver
+// handles), so a thread-local is exactly the right home; MPS execution runs on
+// one thread per backend call. The outer `Option` is "did we try to init yet",
+// the inner is "is a device actually present".
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+thread_local! {
+    static CUDA_SVD_CTX: std::cell::RefCell<Option<Option<gesvdj::CudaSvdContext>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Flat-buffer truncated SVD in the exact calling convention of
+/// `omega_backend_mps::svd::truncated_svd_flat` — a plain `fn` (so it coerces
+/// to `omega_backend_mps::SvdFlatFn` and can be handed to
+/// `MpsBackend::with_svd_fn`). Runs on the GPU via cuSOLVER `gesvdj` when the
+/// `cuda` feature is on, the host is Linux/Windows, and a CUDA driver is
+/// present; otherwise falls back to the CPU Jacobi SVD. The GPU handle is
+/// amortized across calls via a thread-local context.
+pub fn cuda_svd_flat(
+    matrix: &[Complex64],
+    m: usize,
+    n: usize,
+    stride: usize,
+    max_rank: usize,
+    threshold: f64,
+) -> SvdResultFlat {
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    {
+        let gpu = CUDA_SVD_CTX.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(gesvdj::CudaSvdContext::new());
+            }
+            slot.as_ref()
+                .and_then(|c| c.as_ref())
+                .and_then(|ctx| ctx.truncated_svd_flat(matrix, m, n, stride, max_rank, threshold))
+        });
+        if let Some(result) = gpu {
+            return result;
+        }
+    }
+    omega_backend_mps::svd::truncated_svd_flat(matrix, m, n, stride, max_rank, threshold)
 }
 
 #[cfg(test)]

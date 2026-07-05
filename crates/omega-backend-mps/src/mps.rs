@@ -37,12 +37,24 @@ impl MpsTensor {
     }
 }
 
+/// A truncated-SVD provider in the flat-buffer calling convention used by
+/// [`Mps::apply_2q`] (`(matrix, m, n, stride, max_rank, threshold)`). A plain
+/// `fn` pointer (not a boxed closure) so [`Mps`] stays `Clone` and `Copy`-free
+/// GPU contexts live behind the pointer (e.g. a thread-local cuSOLVER handle in
+/// `omega-backend-mps-cuda`). Default is the CPU Jacobi SVD
+/// [`truncated_svd_flat`]; the CUDA backend injects its `gesvdj` path here.
+pub type SvdFlatFn = fn(&[Complex64], usize, usize, usize, usize, f64) -> SvdResultFlat;
+
 /// Matrix Product State for n qubits.
 #[derive(Clone)]
 pub struct Mps {
     pub tensors: Vec<MpsTensor>,
     pub n: usize,
     pub max_bond_dim: usize,
+    /// Bond-compression SVD. Every two-qubit gate (including the SWAP network
+    /// behind `apply_2q_distant`) routes its truncation through this, so
+    /// swapping in a GPU SVD accelerates the whole circuit. Defaults to CPU.
+    svd_fn: SvdFlatFn,
 }
 
 impl Mps {
@@ -58,7 +70,14 @@ impl Mps {
             tensors,
             n,
             max_bond_dim,
+            svd_fn: truncated_svd_flat,
         }
+    }
+
+    /// Route bond-compression SVDs through `f` (e.g. a GPU `gesvdj`). Applies to
+    /// every subsequent two-qubit gate, distant swaps included.
+    pub fn set_svd_fn(&mut self, f: SvdFlatFn) {
+        self.svd_fn = f;
     }
 
     /// Apply a single-qubit gate (2x2 matrix) to qubit q.
@@ -84,8 +103,12 @@ impl Mps {
     /// Apply a two-qubit gate (4x4 matrix) to adjacent qubits (q, q+1).
     /// Uses SVD to split the result back into two tensors, truncating to max_bond_dim.
     pub fn apply_2q(&mut self, q: usize, gate: &[Complex64; 16]) {
+        // Route through the configured SVD provider (CPU by default, GPU
+        // `gesvdj` when set via `set_svd_fn`). Read the fn pointer out first so
+        // the `&mut self` borrow in `apply_2q_with_svd_flat` doesn't conflict.
+        let svd_fn = self.svd_fn;
         self.apply_2q_with_svd_flat(q, gate, |m, m_dim, n, stride, max_rank, threshold| {
-            truncated_svd_flat(m, m_dim, n, stride, max_rank, threshold)
+            svd_fn(m, m_dim, n, stride, max_rank, threshold)
         });
     }
 

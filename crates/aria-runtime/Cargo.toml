@@ -21,11 +21,13 @@ metal = [
     "omega-backend-statevector-metal/metal",
     "omega-core/metal",
 ]
-# NVIDIA CUDA GPU statevector (Linux/Windows + cu12 toolkit).
+# NVIDIA CUDA GPU statevector + MPS bond-compression SVD (Linux/Windows + cu12).
 cuda = [
     "dep:omega-backend-statevector-cuda",
     "omega-backend-statevector-cuda/cuda",
     "omega-core/cuda",
+    "dep:omega-backend-mps-cuda",
+    "omega-backend-mps-cuda/cuda",
 ]
 # Cross-vendor OpenCL statevector (needs an ICD installed).
 opencl = [
@@ -52,6 +54,8 @@ ndarray = { workspace = true }
 omega-backend-statevector-metal = { path = "../omega-backend-statevector-metal", optional = true }
 omega-backend-statevector-cuda = { path = "../omega-backend-statevector-cuda", optional = true }
 omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl", optional = true }
+# CUDA cuSOLVER `gesvdj` accelerator for MPS bond-compression SVD (opt-in via `cuda`).
+omega-backend-mps-cuda = { path = "../omega-backend-mps-cuda", optional = true }
 
 # Remote (omega-server HTTP) backend.
 ureq = { version = "2", default-features = false, features = ["json"], optional = true }

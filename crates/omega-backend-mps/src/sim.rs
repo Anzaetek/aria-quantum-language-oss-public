@@ -16,6 +16,8 @@ use omega_core::params::ParameterBinding;
 
 use crate::gates;
 use crate::mps::Mps;
+use crate::svd::truncated_svd_flat;
+use crate::SvdFlatFn;
 
 /// MPS-based quantum circuit simulator.
 ///
@@ -24,11 +26,28 @@ use crate::mps::Mps;
 /// For states with bond dimension <= max_bond_dim, the simulation is exact.
 pub struct MpsBackend {
     pub max_bond_dim: usize,
+    /// Bond-compression SVD provider handed to every `Mps` this backend runs.
+    /// CPU Jacobi by default; `with_svd_fn` swaps in a GPU `gesvdj` accelerator
+    /// (see `omega-backend-mps-cuda`). Wiring here means the whole MPS circuit —
+    /// adjacent gates and the SWAP network for distant gates — runs its
+    /// truncations on the GPU, with a transparent CPU fallback.
+    svd_fn: SvdFlatFn,
 }
 
 impl MpsBackend {
     pub fn new(max_bond_dim: usize) -> Self {
-        Self { max_bond_dim }
+        Self {
+            max_bond_dim,
+            svd_fn: truncated_svd_flat,
+        }
+    }
+
+    /// Route this backend's bond-compression SVDs through `f` (e.g. the CUDA
+    /// `gesvdj` accelerator). Falls back to CPU inside `f` when no GPU is
+    /// present, so callers can wire it unconditionally under a `cuda` build.
+    pub fn with_svd_fn(mut self, f: SvdFlatFn) -> Self {
+        self.svd_fn = f;
+        self
     }
 }
 
@@ -51,6 +70,7 @@ impl Backend for MpsBackend {
 
         let n = circuit.num_qubits as usize;
         let mut mps = Mps::zero_state(n, self.max_bond_dim);
+        mps.set_svd_fn(self.svd_fn);
         let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
