@@ -24,7 +24,9 @@ anger* read any file under [`examples/aria/`](examples/aria).
   case-sensitive — gate *names* are conventionally upper-case (`H`, `CX`), but
   the gate lookup is exact (see §6).
 - **Integer literals**: `0`, `42`. **Float literals**: `3.14`, `0.125`,
-  `2.0`. **Booleans**: `true`, `false` (lower to `1` / `0`).
+  `2.0`, and scientific notation `1e-05`, `2.5E+3`, `1e5` (an exponent makes
+  the literal a float even without a `.`). **Booleans**: `true`, `false`
+  (lower to `1` / `0`).
 - **`pi`** is a built-in constant (π).
 - **Keywords** (reserved): `circuit observable qreg creg let var apply on
   repeat from to step measure oracle when pi symbolic true false`.

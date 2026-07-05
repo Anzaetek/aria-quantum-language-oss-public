@@ -332,11 +332,39 @@ impl<'a> Lexer<'a> {
                             break;
                         }
                     }
+                    // Scientific-notation exponent: `e`/`E`, optional sign,
+                    // then at least one digit (`1e-05`, `2.5E+3`). Consumed
+                    // only when the full pattern matches, so an identifier
+                    // right after a number (`1e`) still lexes as before.
+                    let mut saw_exp = false;
+                    if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+                        let mut j = self.pos + 1;
+                        if matches!(self.src.get(j).copied(), Some(b'+') | Some(b'-')) {
+                            j += 1;
+                        }
+                        if self.src.get(j).copied().is_some_and(|c| c.is_ascii_digit()) {
+                            saw_exp = true;
+                            while self.pos < j {
+                                self.bump();
+                            }
+                            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                self.bump();
+                            }
+                        }
+                    }
                     let lit = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
-                    if saw_dot {
+                    if saw_dot || saw_exp {
                         let v: f64 = lit
                             .parse()
                             .map_err(|_| format!("line {line}: invalid float literal '{lit}'"))?;
+                        // Rust's f64 parse yields Ok(inf) on exponent
+                        // overflow (`1e999`); a non-finite angle silently
+                        // NaN-poisons the whole state, so reject it here.
+                        if !v.is_finite() {
+                            return Err(format!(
+                                "line {line}: float literal '{lit}' overflows f64"
+                            ));
+                        }
                         Tok::Float(v)
                     } else {
                         let v: i64 = lit
@@ -1986,6 +2014,38 @@ circuit Bell {
             .annotations
             .iter()
             .any(|a| matches!(a, Annotation::Assert(Property::Unitary))));
+    }
+
+    #[test]
+    fn parse_scientific_notation_float_literals() {
+        // Regression: `RY(1e-05)` used to lex as Int(1) + Ident("e") + ...,
+        // silently executing as RY(1.0). The exponent must survive.
+        const SRC: &str = r#"
+circuit Sci {
+    qreg q[1]
+    apply RY(1e-05) on q[0]
+    apply RY(2.5e-4) on q[0]
+    apply RY(1E+3) on q[0]
+    apply RY(1e5) on q[0]
+}
+"#;
+        let prog = parse_aria(SRC).expect("parse");
+        let circ = prog.instantiate("Sci", &[]).expect("instantiate");
+        let angles: Vec<f64> = circ
+            .instructions
+            .iter()
+            .map(|i| i.gate.params[0].try_as_f64().expect("concrete"))
+            .collect();
+        assert_eq!(angles, vec![1e-05, 2.5e-4, 1e3, 1e5]);
+    }
+
+    #[test]
+    fn overflowing_float_literal_is_rejected() {
+        // f64 parse yields Ok(inf) on `1e999`; accepting it NaN-poisons the
+        // state downstream, so the lexer must reject non-finite literals.
+        let src = "circuit Bad {\n  qreg q[1]\n  apply RY(1e999) on q[0]\n}\n";
+        let err = parse_aria(src).unwrap_err();
+        assert!(err.contains("overflows"), "got: {err}");
     }
 
     #[test]
