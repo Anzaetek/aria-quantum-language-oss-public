@@ -79,6 +79,7 @@ fn gate_matrix(g: &GateKind, theta: f64) -> [[C; 2]; 2] {
             let (c, s) = ((theta / 2.0).cos(), (theta / 2.0).sin());
             [[r(c), r(-s)], [r(s), r(c)]]
         }
+        GateKind::U1 => [[r(1.0), r(0.0)], [r(0.0), C::from_polar(1.0, theta)]],
         _ => panic!("oracle: unhandled 1q gate {g:?}"),
     }
 }
@@ -170,6 +171,97 @@ fn obs(term: Vec<(u32, PauliOp)>) -> Observable {
 
 fn pp_exact() -> PauliPropBackend {
     PauliPropBackend::new()
+}
+
+/// Deep non-Clifford circuit reused by the max_freq test: 4 qubits, 6 layers of
+/// CX + Rz + Rx, observable ⟨Z0 Z2⟩.
+fn deep_noncliff() -> (CircuitIR, Observable) {
+    let mut ops = Vec::new();
+    for q in 0..4 {
+        ops.push(op(GateKind::H, &[q], &[]));
+    }
+    for layer in 0..6 {
+        for q in 0..3 {
+            ops.push(op(GateKind::CX, &[q, q + 1], &[]));
+        }
+        for q in 0..4 {
+            ops.push(op(GateKind::Rz, &[q], &[0.3 + 0.1 * layer as f64]));
+            ops.push(op(GateKind::Rx, &[q], &[0.2]));
+        }
+    }
+    (circuit(4, ops), obs(vec![(0, PauliOp::Z), (2, PauliOp::Z)]))
+}
+
+#[test]
+fn max_freq_truncation_stays_within_budget_and_converges() {
+    // PauliPropagation.jl-style split-frequency truncation: capping the number
+    // of non-Clifford sin-branches must (1) keep the true error within the
+    // reported dropped-mass budget for every cap, and (2) improve monotonically
+    // — a looser cap keeps a superset of terms, so the error is non-increasing
+    // and vanishes once the cap exceeds the deepest surviving path.
+    //
+    // (dropped_mass itself is NOT monotone in max_freq: a looser cap lets more
+    // branches spawn, so more of their over-budget children get dropped
+    // downstream. The certified bound error ≤ dropped_mass still holds.)
+    let (c, o) = deep_noncliff();
+    let params = ParameterBinding::new();
+    let exact = pp_exact().expectation(&c, &params, &o).unwrap();
+
+    let mut prev_err = f64::INFINITY;
+    let mut last_err = f64::INFINITY;
+    for max_freq in [1u32, 2, 3, 5, 8, 24] {
+        let engine = PauliPropBackend::new().max_freq(Some(max_freq));
+        let (approx, dropped) = engine.expectation_with_budget(&c, &params, &o).unwrap();
+        let err = (approx - exact).abs();
+        assert!(
+            err <= dropped + 1e-9,
+            "max_freq={max_freq}: error {err} exceeded dropped-mass budget {dropped}"
+        );
+        assert!(
+            err <= prev_err + 1e-9,
+            "max_freq={max_freq}: error {err} worse than tighter cap's {prev_err}"
+        );
+        prev_err = err;
+        last_err = err;
+    }
+    // A cap past the deepest path (24 ≥ #rotations on any path) is exact.
+    assert!(
+        last_err <= 1e-9,
+        "loosest max_freq did not converge to exact: err {last_err}"
+    );
+}
+
+#[test]
+fn u1_matches_statevector_and_rz() {
+    // U1(λ) propagates identically to Rz(λ) (global phase cancels under
+    // conjugation). Check ⟨X0⟩ on H;U1(λ) against the dense oracle and Rz.
+    let lambda = 0.9;
+    let params = ParameterBinding::new();
+    let o = obs(vec![(0, PauliOp::X)]);
+
+    let c_u1 = circuit(
+        1,
+        vec![
+            op(GateKind::H, &[0], &[]),
+            op(GateKind::U1, &[0], &[lambda]),
+        ],
+    );
+    let got = pp_exact().expectation(&c_u1, &params, &o).unwrap();
+    let oracle = oracle_expectation(&c_u1, &o);
+    assert!(
+        (got - oracle).abs() <= 1e-9,
+        "U1 expectation {got} vs oracle {oracle}"
+    );
+
+    let c_rz = circuit(
+        1,
+        vec![
+            op(GateKind::H, &[0], &[]),
+            op(GateKind::Rz, &[0], &[lambda]),
+        ],
+    );
+    let got_rz = pp_exact().expectation(&c_rz, &params, &o).unwrap();
+    assert!((got - got_rz).abs() <= 1e-12, "U1 {got} != Rz {got_rz}");
 }
 
 // ----- tests ----------------------------------------------------------------

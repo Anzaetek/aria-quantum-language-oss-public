@@ -64,10 +64,21 @@ pub fn mul_raw(x1: &[bool], z1: &[bool], x2: &[bool], z2: &[bool]) -> (PauliKey,
     (PauliKey { x, z }, sign)
 }
 
+/// A term's coefficient plus its **split frequency**: the number of sin-branches
+/// (non-Clifford splits) the cheapest path to this Pauli has taken. This is the
+/// axis PauliPropagation.jl's `max_freq` truncation acts on. When two paths reach
+/// the same Pauli, the coefficients add and the frequency is the **minimum** —
+/// the term is reachable within the smaller budget, so that's the honest bound.
+#[derive(Clone, Copy, Debug)]
+pub struct Weighted {
+    pub coeff: Complex64,
+    pub freq: u32,
+}
+
 /// A weighted sum of Pauli strings `Σ cₚ · P`, the observable as it propagates.
 #[derive(Clone, Debug, Default)]
 pub struct PauliSum {
-    pub terms: std::collections::HashMap<PauliKey, Complex64>,
+    pub terms: std::collections::HashMap<PauliKey, Weighted>,
     /// L1 mass of coefficients dropped by truncation so far (an error budget).
     pub dropped_mass: f64,
 }
@@ -80,21 +91,43 @@ impl PauliSum {
         }
     }
 
-    /// Add `coeff · P`, merging onto any existing entry for `P`.
+    /// Add `coeff · P` at split-frequency 0 (Clifford / seed terms).
     pub fn add(&mut self, key: PauliKey, coeff: Complex64) {
-        let e = self.terms.entry(key).or_insert(Complex64::new(0.0, 0.0));
-        *e += coeff;
+        self.add_weighted(key, coeff, 0);
     }
 
-    /// Drop terms below `coeff_min` (by magnitude) or above `max_weight`
-    /// (by Pauli weight); accumulate the dropped magnitude into `dropped_mass`.
-    pub fn truncate(&mut self, coeff_min: f64, max_weight: Option<usize>) {
+    /// Add `coeff · P` carrying split-frequency `freq`, merging onto any existing
+    /// entry: coefficients sum, frequency takes the minimum.
+    pub fn add_weighted(&mut self, key: PauliKey, coeff: Complex64, freq: u32) {
+        self.terms
+            .entry(key)
+            .and_modify(|w| {
+                w.coeff += coeff;
+                w.freq = w.freq.min(freq);
+            })
+            .or_insert(Weighted { coeff, freq });
+    }
+
+    /// Iterate terms in a canonical (symplectic-key-sorted) order. The
+    /// propagation `HashMap` is order-nondeterministic; callers that need
+    /// reproducibility (GPU batch layout, top-K decisions) go through this.
+    pub fn sorted_terms(&self) -> Vec<(&PauliKey, &Weighted)> {
+        let mut v: Vec<_> = self.terms.iter().collect();
+        v.sort_by(|(a, _), (b, _)| a.x.cmp(&b.x).then_with(|| a.z.cmp(&b.z)));
+        v
+    }
+
+    /// Drop terms below `coeff_min` (by magnitude), above `max_weight` (Pauli
+    /// weight), or above `max_freq` (split frequency); accumulate the dropped
+    /// magnitude into `dropped_mass`.
+    pub fn truncate(&mut self, coeff_min: f64, max_weight: Option<usize>, max_freq: Option<u32>) {
         let mut dropped = 0.0;
-        self.terms.retain(|k, c| {
-            let too_small = c.norm() < coeff_min;
-            let too_heavy = max_weight.is_some_and(|w| k.weight() > w);
-            if too_small || too_heavy {
-                dropped += c.norm();
+        self.terms.retain(|k, w| {
+            let too_small = w.coeff.norm() < coeff_min;
+            let too_heavy = max_weight.is_some_and(|m| k.weight() > m);
+            let too_deep = max_freq.is_some_and(|m| w.freq > m);
+            if too_small || too_heavy || too_deep {
+                dropped += w.coeff.norm();
                 false
             } else {
                 true

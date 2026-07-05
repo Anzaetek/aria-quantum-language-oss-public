@@ -50,7 +50,8 @@ fn usage() {
          aria parse  <file.aria> [--circuit NAME] [--int k=v]...\n  \
          aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...\n              \
          [--shots N] [--seed S] [--backend sim|mps|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]\n              \
-         (pauliprop computes --expectation only)\n              \
+         (pauliprop computes --expectation only; truncate deep circuits with\n              \
+          [--truncate C] [--max-weight W] [--max-freq F])\n              \
          [--url URL --token TOK   (for --backend remote)]\n  \
          aria train  <file.aria> --circuit NAME --observable OBS [--int k=v]...\n              \
          [--steps N] [--lr R] [--seed S] [--init-scale S]\n  \
@@ -279,6 +280,46 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
     let sel = BackendSel::parse(backend_str)?;
 
     if let Some(obs) = a.opt("expectation") {
+        // Pauli-propagation truncation knobs (PauliPropagation.jl's three axes).
+        // When any is set, use the truncated engine and also print the certified
+        // dropped-mass error budget. Without them the exact engine is used and
+        // the output format is unchanged.
+        let truncate = a
+            .opt("truncate")
+            .map(|s| {
+                s.parse::<f64>()
+                    .map_err(|_| format!("bad --truncate '{s}'"))
+            })
+            .transpose()?;
+        let max_weight = a
+            .opt("max-weight")
+            .map(|s| {
+                s.parse::<usize>()
+                    .map_err(|_| format!("bad --max-weight '{s}'"))
+            })
+            .transpose()?;
+        let max_freq = a
+            .opt("max-freq")
+            .map(|s| {
+                s.parse::<u32>()
+                    .map_err(|_| format!("bad --max-freq '{s}'"))
+            })
+            .transpose()?;
+        if truncate.is_some() || max_weight.is_some() || max_freq.is_some() {
+            if sel != BackendSel::PauliProp {
+                return Err(
+                    "--truncate/--max-weight/--max-freq require --backend pauliprop".into(),
+                );
+            }
+            let trunc = aria_runtime::PauliPropTruncation {
+                coeff_min: truncate.unwrap_or(0.0),
+                max_weight,
+                max_freq,
+            };
+            let (val, budget) = aria_runtime::expectation_pauliprop(&circuit, obs, &binds, trunc)?;
+            println!("<{obs}> = {val:.12}  (dropped-mass budget {budget:.3e})");
+            return Ok(());
+        }
         let val = expectation(&circuit, obs, &binds, sel)?;
         println!("<{obs}> = {val:.12}");
         return Ok(());

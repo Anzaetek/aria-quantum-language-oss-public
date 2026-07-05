@@ -308,3 +308,33 @@ pub fn expectation(
         .expectation(&low.ir, &ParameterBinding::new(), &obs)
         .map_err(|e| e.to_string())
 }
+
+/// Truncation knobs for the Pauli-propagation backend (PauliPropagation.jl's
+/// three axes). All-default = the exact engine.
+#[derive(Clone, Copy, Default)]
+pub struct PauliPropTruncation {
+    /// Drop terms with coefficient magnitude below this (`0.0` = keep all).
+    pub coeff_min: f64,
+    /// Drop terms with Pauli weight above this (`None` = no cap).
+    pub max_weight: Option<usize>,
+    /// Drop terms above this split frequency / number of sin-branches
+    /// (`None` = no cap).
+    pub max_freq: Option<u32>,
+}
+
+/// Pauli-propagation expectation with explicit truncation, returning
+/// `(value, dropped_mass)` — the certified L1 error budget. This is the Aria
+/// front-end for the deep-non-Clifford regime PauliPropagation.jl targets; the
+/// exact (all-default) engine is reachable through [`expectation`] as usual.
+pub fn expectation_pauliprop(
+    circuit: &Circuit,
+    observable: &str,
+    bindings: &HashMap<String, f64>,
+    trunc: PauliPropTruncation,
+) -> Result<(f64, f64), String> {
+    let low = concrete_ir(circuit, bindings)?;
+    let obs = Observable::parse(observable)?;
+    PauliPropBackend::with_truncation_freq(trunc.coeff_min, trunc.max_weight, trunc.max_freq)
+        .expectation_with_budget(&low.ir, &ParameterBinding::new(), &obs)
+        .map_err(|e| e.to_string())
+}

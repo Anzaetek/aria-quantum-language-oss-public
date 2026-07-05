@@ -28,6 +28,11 @@ pub struct PauliPropBackend {
     pub coeff_min: f64,
     /// Drop terms whose Pauli weight exceeds this (`None` = no cap).
     pub max_weight: Option<usize>,
+    /// Drop terms whose split frequency (number of non-Clifford sin-branches on
+    /// the cheapest path to them) exceeds this (`None` = no cap). This is
+    /// PauliPropagation.jl's `max_freq` truncation axis. Over-budget sin-branches
+    /// are never even created, so it also bounds the tree fan-out directly.
+    pub max_freq: Option<u32>,
 }
 
 impl Default for PauliPropBackend {
@@ -35,6 +40,7 @@ impl Default for PauliPropBackend {
         Self {
             coeff_min: 0.0,
             max_weight: None,
+            max_freq: None,
         }
     }
 }
@@ -45,12 +51,33 @@ impl PauliPropBackend {
         Self::default()
     }
 
-    /// Engine with a coefficient-magnitude truncation threshold.
+    /// Engine with coefficient-magnitude and Pauli-weight truncation.
     pub fn with_truncation(coeff_min: f64, max_weight: Option<usize>) -> Self {
         Self {
             coeff_min,
             max_weight,
+            max_freq: None,
         }
+    }
+
+    /// Engine with the full truncation triple, including PauliPropagation.jl's
+    /// split-frequency cap (`max_freq`).
+    pub fn with_truncation_freq(
+        coeff_min: f64,
+        max_weight: Option<usize>,
+        max_freq: Option<u32>,
+    ) -> Self {
+        Self {
+            coeff_min,
+            max_weight,
+            max_freq,
+        }
+    }
+
+    /// Builder: set the split-frequency cap.
+    pub fn max_freq(mut self, max_freq: Option<u32>) -> Self {
+        self.max_freq = max_freq;
+        self
     }
 
     /// L1 dropped-coefficient mass from the *last* `expectation` call is not
@@ -64,9 +91,9 @@ impl PauliPropBackend {
     ) -> Result<(f64, f64)> {
         let sum = self.propagate(circuit, params, observable)?;
         let mut val = Complex64::new(0.0, 0.0);
-        for (k, c) in &sum.terms {
+        for (k, w) in &sum.terms {
             if k.is_all_iz() {
-                val += c;
+                val += w.coeff;
             }
         }
         Ok((val.re, sum.dropped_mass))
@@ -102,8 +129,8 @@ impl PauliPropBackend {
         }
         for op in circuit.ops.iter().rev() {
             self.conjugate(op, params, n, &mut sum)?;
-            if self.coeff_min > 0.0 || self.max_weight.is_some() {
-                sum.truncate(self.coeff_min, self.max_weight);
+            if self.coeff_min > 0.0 || self.max_weight.is_some() || self.max_freq.is_some() {
+                sum.truncate(self.coeff_min, self.max_weight, self.max_freq);
             }
         }
         Ok(sum)
@@ -148,6 +175,13 @@ impl PauliPropBackend {
                 &gen_single(n, q(0), 'y'),
                 resolve(&op.params[0], params)?,
             ),
+            // U1(λ) = diag(1, e^{iλ}) = e^{iλ/2}·Rz(λ); the global phase cancels
+            // under conjugation, so it propagates exactly as Rz(λ).
+            GateKind::U1 => self.branch(
+                sum,
+                &gen_single(n, q(0), 'z'),
+                resolve(&op.params[0], params)?,
+            ),
             GateKind::T => self.branch(sum, &gen_single(n, q(0), 'z'), std::f64::consts::FRAC_PI_4),
             GateKind::Tdg => {
                 self.branch(sum, &gen_single(n, q(0), 'z'), -std::f64::consts::FRAC_PI_4)
@@ -165,7 +199,7 @@ impl PauliPropBackend {
             ref other => {
                 return Err(OmegaError::Unsupported(format!(
                     "pauliprop: gate {other:?} not yet supported \
-                     (Clifford + Rx/Ry/Rz/T/Tdg/CRz)"
+                     (Clifford H/X/Y/Z/S/Sdg/CX/CZ/Swap + Rx/Ry/Rz/U1/T/Tdg/CRz)"
                 )));
             }
         }
@@ -173,15 +207,17 @@ impl PauliPropBackend {
     }
 
     /// Apply a single-qubit Clifford's local `(X→, Z→)` images to every term.
+    /// Cliffords map one Pauli to one Pauli, so the split frequency is carried
+    /// through unchanged.
     fn map_single(&self, sum: &mut PauliSum, q: usize, img: SingleImg) {
         let mut out = PauliSum::new();
         out.dropped_mass = sum.dropped_mass;
-        for (key, coeff) in sum.terms.drain() {
+        for (key, w) in sum.terms.drain() {
             let (nx, nz, f) = img.apply(key.x[q], key.z[q]);
             let mut k = key;
             k.x[q] = nx;
             k.z[q] = nz;
-            out.add(k, coeff * f);
+            out.add_weighted(k, w.coeff * f, w.freq);
         }
         *sum = out;
     }
@@ -190,7 +226,7 @@ impl PauliPropBackend {
     fn map_two(&self, sum: &mut PauliSum, c: usize, t: usize, img: TwoImg) {
         let mut out = PauliSum::new();
         out.dropped_mass = sum.dropped_mass;
-        for (key, coeff) in sum.terms.drain() {
+        for (key, w) in sum.terms.drain() {
             // Compose the four generator images present on (c, t).
             let mut acc = Gen2::ident();
             if key.x[c] {
@@ -210,7 +246,7 @@ impl PauliPropBackend {
             k.z[c] = acc.zc;
             k.x[t] = acc.xt;
             k.z[t] = acc.zt;
-            out.add(k, coeff * acc.f);
+            out.add_weighted(k, w.coeff * acc.f, w.freq);
         }
         *sum = out;
     }
@@ -224,7 +260,7 @@ impl PauliPropBackend {
         let (cos, sin) = (theta.cos(), theta.sin());
         let mut out = PauliSum::new();
         out.dropped_mass = sum.dropped_mass;
-        for (key, coeff) in sum.terms.drain() {
+        for (key, w) in sum.terms.drain() {
             // Anticommute ⇔ odd symplectic product ⟨P, R⟩ = Σ (Pₓ·R_z ⊕ P_z·Rₓ).
             let mut anti = false;
             for i in 0..key.x.len() {
@@ -233,13 +269,22 @@ impl PauliPropBackend {
                 }
             }
             if !anti {
-                out.add(key, coeff); // commutes → unchanged
+                out.add_weighted(key, w.coeff, w.freq); // commutes → unchanged
                 continue;
             }
-            out.add(key.clone(), coeff * cos);
+            // cosθ·P keeps the same frequency; the sin child gains one split.
+            out.add_weighted(key.clone(), w.coeff * cos, w.freq);
+            let child_freq = w.freq + 1;
+            let sin_coeff = w.coeff * I * sin * r.factor;
+            if self.max_freq.is_some_and(|m| child_freq > m) {
+                // Over the split-frequency budget: don't create the child, but
+                // certify the discarded L1 mass so the error stays bounded.
+                out.dropped_mass += sin_coeff.norm();
+                continue;
+            }
             // R · P (R on the left): raw product carries the ± sign.
             let (rk, sign) = mul_raw(&r.gx, &r.gz, &key.x, &key.z);
-            out.add(rk, coeff * I * sin * r.factor * sign);
+            out.add_weighted(rk, sin_coeff * sign, child_freq);
         }
         *sum = out;
     }

@@ -18,7 +18,10 @@ pub mod train;
 pub mod remote;
 
 pub use lower::{lower, Lowered};
-pub use run::{counts_width, expectation, run_counts, statevector, BackendSel};
+pub use run::{
+    counts_width, expectation, expectation_pauliprop, run_counts, statevector, BackendSel,
+    PauliPropTruncation,
+};
 pub use train::{train_expectation, TrainConfig, TrainResult};
 
 #[cfg(feature = "remote")]
