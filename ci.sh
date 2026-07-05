@@ -102,6 +102,20 @@ else
   echo "  (skipping tch backend — set LIBTORCH to enable; see INSTALL_LIBTORCH.md)"
 fi
 
+# Optional: CUDA GPU backends (opt-in; needs an NVIDIA GPU + CUDA toolkit).
+# GPU paths are always optional with a CPU fallback, so the default CI above
+# stays green on machines without a GPU. Set ARIA_CUDA=1 on a CUDA box to
+# assert the GPU statevector / MPS-SVD / pauliprop paths numerically match CPU.
+if [ "${ARIA_CUDA:-0}" = "1" ]; then
+  step "+   Optional: CUDA GPU backends"
+  # Statevector GPU ≡ CPU statevector (f32 kernels, tol 1e-5).
+  cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda
+  echo "  OK: CUDA GPU statevector numerically matches CPU"
+else
+  echo
+  echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"
+fi
+
 # Optional: Lean 4 proof tree (opt-in; needs a warm mathlib cache via elan/lake).
 # Makes `aria export --lean` self-contained and ships the proven circulant
 # correspondence + noise-deviation theorems.

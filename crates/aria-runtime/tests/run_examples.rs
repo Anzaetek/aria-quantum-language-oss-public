@@ -272,6 +272,22 @@ fn gpu_metal_agrees_with_sim_on_qft() {
     }
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_cuda_agrees_with_sim_on_qft() {
+    // The CUDA GPU statevector must reproduce the CPU statevector. Kernels
+    // are f32-interleaved, so the tolerance is looser than the exact-f64 CPU
+    // path but far tighter than any physically meaningful deviation. QFT|0000>
+    // is asymmetric across all amplitudes, so this also pins qubit/bit order.
+    let c = example("qft.aria", "QFT", &[("n", 4)]);
+    let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
+    let gpu = statevector(&c, &no_binds(), BackendSel::Gpu).unwrap();
+    assert_eq!(cpu.len(), gpu.len());
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).norm() < 1e-5, "amp[{i}]: sim {a} vs gpu {b}");
+    }
+}
+
 #[cfg(feature = "tch")]
 #[test]
 fn tch_backend_agrees_with_sim_on_qft() {
