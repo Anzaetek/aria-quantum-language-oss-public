@@ -14,6 +14,9 @@ use aria_core::ast::Circuit;
 use aria_core::backends::omega::to_omega_ir;
 use omega_core::executor::ExecResult;
 
+use crate::lower::lower;
+use crate::run::{measure_pairs, project_counts_onto_creg};
+
 /// Connection to a running omega-server.
 pub struct Remote {
     pub url: String,
@@ -61,5 +64,50 @@ pub fn run_counts_remote(
         let state = u64::from_str_radix(k, 2).map_err(|_| format!("bad bitstring key '{k}'"))?;
         map.insert(state, val.as_u64().unwrap_or(0) as u32);
     }
-    Ok(ExecResult::Counts(map))
+    let res = ExecResult::Counts(map);
+    // Same creg semantics as the local backends, decided by the SAME
+    // lowering as run_counts (not by the wire IR, whose mid-circuit
+    // detection uses a different meta-gate set): project final-measurement
+    // programs onto the classical register; mid-circuit programs keep
+    // full-register keying. Circuits lower() can't handle (e.g. photonic
+    // gates) keep the server's raw keying.
+    match lower(&bound) {
+        Ok(low) if !low.needs_collapse => project_counts_onto_creg(res, &measure_pairs(&low)),
+        _ => Ok(res),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aria_core::ast::parse_aria;
+
+    #[test]
+    fn remote_counts_are_projected_onto_creg() {
+        // 2 qubits, only q[0] measured into c[0]: a server response keyed
+        // over the full register must collapse to creg-width keys, using
+        // the same lowering-derived mapping as the local backends.
+        let src = "circuit Partial() {\n  qreg q[2]\n  creg c[1]\n  apply H on q[1]\n  measure q[0] -> c[0]\n}\n";
+        let circuit = parse_aria(src)
+            .unwrap()
+            .instantiate("Partial", &[])
+            .unwrap();
+        let low = lower(&circuit).unwrap();
+        assert!(!low.needs_collapse);
+        assert_eq!(measure_pairs(&low), vec![(0, 0)]);
+
+        let mut map: HashMap<u64, u32> = HashMap::new();
+        map.insert(0b00, 40); // q0=0
+        map.insert(0b10, 41); // q0=0
+        map.insert(0b01, 10); // q0=1
+        map.insert(0b11, 9); //  q0=1
+        let res = project_counts_onto_creg(ExecResult::Counts(map), &measure_pairs(&low)).unwrap();
+        if let ExecResult::Counts(m) = res {
+            assert_eq!(m.get(&0), Some(&81));
+            assert_eq!(m.get(&1), Some(&19));
+            assert_eq!(m.len(), 2);
+        } else {
+            panic!("expected counts");
+        }
+    }
 }

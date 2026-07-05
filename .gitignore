@@ -18,3 +18,4 @@ Cargo.lock.bk
 # Lean 4 / lake build artifacts + mathlib cache (multi-GB; never commit)
 proofs/lean4/.lake/
 **/*.olean
+fixes/

@@ -16,7 +16,8 @@ ARIA_CRATES=(-p aria-core -p aria-runtime -p aria-cli -p aria-verify-core \
 FMT_CRATES=(-p aria-runtime -p aria-cli -p aria-verify-core -p aria-verify \
   "${APP_CRATES[@]}")
 # Pure-Rust omega crates the default Aria build links against.
-OMEGA_CORE=(-p omega-core -p omega-backend-statevector -p omega-backend-mps)
+OMEGA_CORE=(-p omega-core -p omega-backend-statevector -p omega-backend-mps \
+  -p omega-backend-pauliprop)
 # WASM guests loaded into omega-wasm-runtime by the application harnesses.
 WASM_GUESTS=(vqe omega_app)
 

@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use aria_core::ast::Circuit;
 use num_complex::Complex64;
 use omega_backend_mps::MpsBackend;
+use omega_backend_pauliprop::PauliPropBackend;
 use omega_backend_statevector::StatevectorBackend;
+use omega_core::circuit::GateKind as OGateKind;
 use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode, Observable};
 use omega_core::params::ParameterBinding;
 
@@ -35,6 +37,11 @@ pub enum BackendSel {
     Gpu,
     /// libtorch (`tch`) statevector backend (feature `tch`).
     Tch,
+    /// Pauli-propagation (`omega-backend-pauliprop`): Heisenberg-picture
+    /// evolution of the observable. Expectation values only — `--shots` /
+    /// `--statevector` are rejected by the backend with a clear error.
+    /// Exact and width-unbounded on Clifford circuits.
+    PauliProp,
 }
 
 impl BackendSel {
@@ -44,8 +51,9 @@ impl BackendSel {
             "mps" => Ok(Self::Mps),
             "gpu" => Ok(Self::Gpu),
             "tch" => Ok(Self::Tch),
+            "pauliprop" => Ok(Self::PauliProp),
             other => Err(format!(
-                "unknown backend '{other}' (available: sim, mps, gpu, tch; remote via --url)"
+                "unknown backend '{other}' (available: sim, mps, gpu, tch, pauliprop; remote via --url)"
             )),
         }
     }
@@ -56,6 +64,7 @@ impl BackendSel {
             Self::Mps => "mps",
             Self::Gpu => "gpu",
             Self::Tch => "tch",
+            Self::PauliProp => "pauliprop",
         }
     }
 }
@@ -68,6 +77,8 @@ pub(crate) fn make_backend(sel: BackendSel) -> Result<Box<dyn Backend>, String> 
         BackendSel::Mps => Box::new(MpsBackend::new(MPS_BOND)),
         BackendSel::Gpu => make_gpu()?,
         BackendSel::Tch => make_tch()?,
+        // Exact engine (no truncation): coeff_min = 0, max_weight = None.
+        BackendSel::PauliProp => Box::new(PauliPropBackend::new()),
     })
 }
 
@@ -140,7 +151,87 @@ fn concrete_ir(circuit: &Circuit, bindings: &HashMap<String, f64>) -> Result<Low
     lower(&bound)
 }
 
+/// `measure qubit -> clbit` pairs of a lowered circuit, in program order.
+/// Empty when the program declares no measure-to-creg mapping. The single
+/// source of the pair-extraction semantics — the remote path lowers the
+/// same bound circuit and calls this too.
+pub(crate) fn measure_pairs(low: &Lowered) -> Vec<(u32, u32)> {
+    low.ir
+        .ops
+        .iter()
+        .filter(|op| op.gate == OGateKind::Measure)
+        .filter_map(|op| {
+            let q = op.qubits.first()?.0;
+            op.classical_bit.map(|c| (q, c))
+        })
+        .collect()
+}
+
+/// Project full-register sampled counts onto the classical register via the
+/// program's `measure → creg` statements (OpenQASM semantics). Backends
+/// sample the full qubit register at the end of the circuit; when the
+/// program declares an explicit mapping, the reported counts must be keyed
+/// over creg bits, one bit per `measure`, in `c[j]` order. A later measure
+/// into the same classical bit overwrites the earlier one. Shared by the
+/// local and remote (omega-server) execution paths.
+///
+/// Counts keys are `u64`, so a measure targeting bit ≥ 64 of either register
+/// cannot be represented — that's a loud error, not a masked shift.
+pub(crate) fn project_counts_onto_creg(
+    res: ExecResult,
+    pairs: &[(u32, u32)],
+) -> Result<ExecResult, String> {
+    if pairs.is_empty() {
+        return Ok(res);
+    }
+    if let Some(&(q, c)) = pairs.iter().find(|&&(q, c)| q >= 64 || c >= 64) {
+        return Err(format!(
+            "measure q[{q}] -> c[{c}]: sampled-count keys are u64, so register \
+             indices ≥ 64 cannot be reported; reduce the register or drop --shots"
+        ));
+    }
+    match res {
+        ExecResult::Counts(counts) => {
+            let mut projected: HashMap<u64, u32> = HashMap::new();
+            for (outcome, n) in counts {
+                let mut key = 0u64;
+                for &(q, c) in pairs {
+                    let bit = (outcome >> q) & 1;
+                    key = (key & !(1u64 << c)) | (bit << c);
+                }
+                *projected.entry(key).or_insert(0) += n;
+            }
+            Ok(ExecResult::Counts(projected))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Width in bits of the outcome keys produced by [`run_counts`] for the same
+/// `(circuit, bindings)`: the creg width when counts are projected onto the
+/// classical register, otherwise the full qubit register width. CLI front
+/// ends use this to format bitstrings. Takes the same `bindings` as
+/// [`run_counts`] so the two lower the circuit identically — deciding from
+/// the unbound circuit would disagree whenever parameters are only
+/// lowerable after binding (e.g. `sin(theta)`).
+pub fn counts_width(circuit: &Circuit, bindings: &HashMap<String, f64>) -> usize {
+    match concrete_ir(circuit, bindings) {
+        Ok(low) if !low.needs_collapse && !measure_pairs(&low).is_empty() => {
+            (low.ir.num_classical_bits as usize).max(1)
+        }
+        _ => circuit.n_qubits().max(1),
+    }
+}
+
 /// Execute and return measurement counts (basis-state integer → count).
+///
+/// When the program measures into a classical register and all measurements
+/// are terminal, counts are keyed over the creg (see
+/// [`project_counts_onto_creg`]); a program with no `measure` statements
+/// keeps the legacy full-register keying. Mid-circuit-measurement programs
+/// (gates after a measure) also keep full-register keying, since the final
+/// sample of a measured qubit can legitimately differ from the recorded
+/// classical bit.
 pub fn run_counts(
     circuit: &Circuit,
     bindings: &HashMap<String, f64>,
@@ -158,9 +249,13 @@ pub fn run_counts(
             MidCircuitMode::Skip
         },
     };
-    make_backend(sel)?
+    let res = make_backend(sel)?
         .execute(&low.ir, &ParameterBinding::new(), &cfg)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if low.needs_collapse {
+        return Ok(res);
+    }
+    project_counts_onto_creg(res, &measure_pairs(&low))
 }
 
 /// Exact statevector (no sampling; measurement gates are skipped).

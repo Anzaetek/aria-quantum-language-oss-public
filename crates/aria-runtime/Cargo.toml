@@ -44,6 +44,7 @@ aria-core = { path = "../aria-core" }
 omega-core = { path = "../omega-core" }
 omega-backend-statevector = { path = "../omega-backend-statevector" }
 omega-backend-mps = { path = "../omega-backend-mps" }
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
 num-complex = { workspace = true }
 ndarray = { workspace = true }
 

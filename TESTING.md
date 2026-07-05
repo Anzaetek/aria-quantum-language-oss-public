@@ -10,6 +10,16 @@ $ cargo build -p aria-cli
 $ ARIA=target/debug/aria
 ```
 
+> **Use a release build beyond ~20 qubits.** The debug binary is limited by
+> speed (not memory): statevector runs that finish in seconds under
+> `--release` appear to hang around 28 qubits in a debug build. For anything
+> wide, build with:
+>
+> ```console
+> $ cargo build --release -p aria-cli
+> $ ARIA=target/release/aria
+> ```
+
 ---
 
 ## 1. Bell state — statevector is exact (tol ≤ 1e-6)
@@ -34,7 +44,18 @@ $ $ARIA run examples/aria/bell.aria --circuit Bell --expectation "Z0 Z1"
 <Z0 Z1> = 1.000000000000
 ```
 
-Check: value `= 1.000000000000` (±1e-10).
+Check: value `= 1.000000000000` (±1e-10). Cross-check the Pauli-propagation
+backend agrees (it evolves the observable instead of the state; exact on
+Clifford circuits at any width):
+
+```console
+$ $ARIA run examples/aria/bell.aria --circuit Bell --expectation "Z0 Z1" --backend pauliprop
+<Z0 Z1> = 1.000000000000
+```
+
+Note: `pauliprop` computes expectation values only — `--shots` /
+`--statevector` on it fail with an explicit "expectation-value backend"
+error rather than mis-sampling.
 
 ## 3. Bell — sampled counts balanced & correlated (tol ±5%)
 

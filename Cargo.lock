@@ -315,6 +315,7 @@ dependencies = [
  "ndarray",
  "num-complex",
  "omega-backend-mps",
+ "omega-backend-pauliprop",
  "omega-backend-statevector",
  "omega-backend-statevector-cuda",
  "omega-backend-statevector-metal",

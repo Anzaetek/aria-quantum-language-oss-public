@@ -5,7 +5,7 @@
 //! - `aria list   <file.aria>`                         — list circuit templates
 //! - `aria parse  <file.aria> [--circuit NAME] [--int k=v]...`
 //! - `aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...
-//!   [--shots N] [--seed S] [--backend sim|mps|gpu|tch|remote] [--statevector] [--expectation OBS]`
+//!   [--shots N] [--seed S] [--backend sim|mps|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]`
 //! - `aria export <file.aria> --circuit NAME (--qasm|--json|--lean|--gate-model) [--int k=v]...`
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use aria_core::ast::{parse_aria, Circuit};
 use aria_runtime::{
-    expectation, run_counts, statevector, train_expectation, BackendSel, TrainConfig,
+    counts_width, expectation, run_counts, statevector, train_expectation, BackendSel, TrainConfig,
 };
 use omega_core::executor::ExecResult;
 
@@ -49,7 +49,8 @@ fn usage() {
          aria list   <file.aria>\n  \
          aria parse  <file.aria> [--circuit NAME] [--int k=v]...\n  \
          aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...\n              \
-         [--shots N] [--seed S] [--backend sim|mps|gpu|tch|remote] [--statevector] [--expectation OBS]\n              \
+         [--shots N] [--seed S] [--backend sim|mps|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]\n              \
+         (pauliprop computes --expectation only)\n              \
          [--url URL --token TOK   (for --backend remote)]\n  \
          aria train  <file.aria> --circuit NAME --observable OBS [--int k=v]...\n              \
          [--steps N] [--lr R] [--seed S] [--init-scale S]\n  \
@@ -266,7 +267,7 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
                 token: a.opt("token").map(str::to_string),
             };
             let res = aria_runtime::run_counts_remote(&circuit, &binds, shots, seed, &remote)?;
-            print_counts(res, circuit.n_qubits());
+            print_counts(res, counts_width(&circuit, &binds));
             return Ok(());
         }
         #[cfg(not(feature = "remote"))]
@@ -299,7 +300,7 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
     }
 
     let res = run_counts(&circuit, &binds, shots, seed, sel)?;
-    print_counts(res, circuit.n_qubits());
+    print_counts(res, counts_width(&circuit, &binds));
     Ok(())
 }
 
