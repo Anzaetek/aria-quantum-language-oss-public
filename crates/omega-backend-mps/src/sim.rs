@@ -87,9 +87,12 @@ impl Backend for MpsBackend {
                 Ok(ExecResult::Statevector(sv))
             }
             Some(shots) => {
+                // Right environments depend only on the final state, not on
+                // the outcomes drawn — compute once, reuse for every shot.
+                let envs = mps.right_environments();
                 let mut counts = HashMap::new();
                 for _ in 0..shots {
-                    let outcome = mps.sample(&mut rng);
+                    let outcome = mps.sample_with_envs(&envs, &mut rng);
                     *counts.entry(outcome).or_insert(0) += 1;
                 }
                 Ok(ExecResult::Counts(counts))

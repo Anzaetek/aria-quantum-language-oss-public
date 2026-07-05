@@ -38,6 +38,7 @@ impl MpsTensor {
 }
 
 /// Matrix Product State for n qubits.
+#[derive(Clone)]
 pub struct Mps {
     pub tensors: Vec<MpsTensor>,
     pub n: usize,
@@ -272,74 +273,200 @@ impl Mps {
         sv
     }
 
+    /// Right-environment matrices for exact sequential sampling.
+    ///
+    /// `envs[q]` is the Hermitian `bond_left(q) × bond_left(q)` contraction
+    /// of sites `q..n` over their physical indices (row-major;
+    /// `envs[n]` is the 1×1 identity):
+    ///
+    ///   E_n = [1],   E_q[l,l'] = Σ_s Σ_{r,r'} A_q[l,s,r] E_{q+1}[r,r'] Ā_q[l',s,r']
+    ///
+    /// Sampling site q must weight each branch by `w E_{q+1} w†`, not by
+    /// `|w|²`: the latter assumes the chain right of q contracts to the
+    /// identity (right-canonical form), which gate application via plain
+    /// `U√S / √S V†` SVD splits does not maintain — that assumption is what
+    /// biased sampled counts while `to_statevector()` stayed exact.
+    pub fn right_environments(&self) -> Vec<Vec<Complex64>> {
+        let zero = Complex64::new(0.0, 0.0);
+        let mut envs: Vec<Vec<Complex64>> = vec![Vec::new(); self.n + 1];
+        envs[self.n] = vec![Complex64::new(1.0, 0.0)];
+        for q in (0..self.n).rev() {
+            let t = &self.tensors[q];
+            let (bl, br) = (t.bond_left, t.bond_right);
+            let e_next = &envs[q + 1];
+            let mut e = vec![zero; bl * bl];
+            for s in 0..2 {
+                // tmp[l, r'] = Σ_r A[l,s,r] · E_{q+1}[r,r']
+                let mut tmp = vec![zero; bl * br];
+                for l in 0..bl {
+                    for r in 0..br {
+                        let a = t.get(l, s, r);
+                        for rp in 0..br {
+                            tmp[l * br + rp] += a * e_next[r * br + rp];
+                        }
+                    }
+                }
+                // E_q[l, l'] += Σ_{r'} tmp[l, r'] · conj(A[l',s,r'])
+                for l in 0..bl {
+                    for lp in 0..bl {
+                        let mut sum = zero;
+                        for rp in 0..br {
+                            sum += tmp[l * br + rp] * t.get(lp, s, rp).conj();
+                        }
+                        e[l * bl + lp] += sum;
+                    }
+                }
+            }
+            envs[q] = e;
+        }
+        envs
+    }
+
     /// Sample a measurement outcome.
+    ///
+    /// Convenience wrapper that recomputes the right environments on every
+    /// call; when drawing many shots from the same state, compute
+    /// [`Mps::right_environments`] once and use [`Mps::sample_with_envs`].
     pub fn sample(&self, rng: &mut impl rand::Rng) -> u64 {
-        // Sequential sampling: measure each qubit from left to right
+        self.sample_with_envs(&self.right_environments(), rng)
+    }
+
+    /// Sample a measurement outcome using precomputed right environments
+    /// (see [`Mps::right_environments`]).
+    pub fn sample_with_envs(&self, envs: &[Vec<Complex64>], rng: &mut impl rand::Rng) -> u64 {
+        let zero = Complex64::new(0.0, 0.0);
         let mut result = 0u64;
         let mut left_vec = vec![Complex64::new(1.0, 0.0)];
+        // Scratch buffers recycled across sites (and, via the swap below,
+        // with left_vec): this loop runs shots × n times, so per-site
+        // allocations dominate otherwise.
+        let mut w = [Vec::new(), Vec::new()];
 
         for q in 0..self.n {
             let t = &self.tensors[q];
-            // Compute probability of qubit q being 0
-            let mut p0 = 0.0;
-            let mut p1 = 0.0;
+            let (bl, br) = (t.bond_left, t.bond_right);
+            let e_next = &envs[q + 1];
 
-            for bit in 0..2 {
-                let mut prob = 0.0;
-                for r in 0..t.bond_right {
-                    let mut val = Complex64::new(0.0, 0.0);
-                    for l in 0..t.bond_left {
-                        val += left_vec[l] * t.get(l, bit, r);
+            // w_s[r] = Σ_l v[l] A[l,s,r];  p_s = Re(w_s E_{q+1} w_s†) ≥ 0.
+            let mut p = [0.0f64; 2];
+            for (bit, (w_bit, p_bit)) in w.iter_mut().zip(p.iter_mut()).enumerate() {
+                w_bit.clear();
+                w_bit.resize(br, zero);
+                for (r, w_r) in w_bit.iter_mut().enumerate() {
+                    for l in 0..bl {
+                        *w_r += left_vec[l] * t.get(l, bit, r);
                     }
-                    prob += val.norm_sqr();
                 }
-                if bit == 0 {
-                    p0 = prob;
-                } else {
-                    p1 = prob;
+                let mut prob = zero;
+                for r in 0..br {
+                    for rp in 0..br {
+                        prob += w_bit[r] * e_next[r * br + rp] * w_bit[rp].conj();
+                    }
                 }
+                *p_bit = prob.re.max(0.0);
             }
 
-            let total = p0 + p1;
-            let bit = if rng.random::<f64>() < p0 / total {
-                0
+            let total = p[0] + p[1];
+            let bit = if total > 0.0 && rng.random::<f64>() < p[0] / total {
+                0usize
             } else {
-                1
+                1usize
             };
             result |= (bit as u64) << q;
 
-            // Update left_vec conditioned on measurement outcome
-            let norm = if bit == 0 { p0.sqrt() } else { p1.sqrt() };
-            let mut new_left = vec![Complex64::new(0.0, 0.0); t.bond_right];
-            for r in 0..t.bond_right {
-                let mut val = Complex64::new(0.0, 0.0);
-                for l in 0..t.bond_left {
-                    val += left_vec[l] * t.get(l, bit as usize, r);
-                }
-                new_left[r] = val / norm;
+            // Condition on the outcome; rescale so the running prefix
+            // stays O(1) (only probability *ratios* matter downstream).
+            let norm = p[bit].sqrt();
+            let inv = if norm > 0.0 { 1.0 / norm } else { 1.0 };
+            std::mem::swap(&mut left_vec, &mut w[bit]);
+            for v in &mut left_vec {
+                *v *= inv;
             }
-            left_vec = new_left;
         }
 
         result
     }
 
+    /// Left-environment matrix of sites `0..q` (row-major
+    /// `bond_left(q) × bond_left(q)`; the 1×1 identity for q = 0) — the
+    /// mirror image of [`Mps::right_environments`]:
+    ///
+    ///   L_0 = [1],   L_{k+1}[r,r'] = Σ_s Σ_{l,l'} L_k[l,l'] A_k[l,s,r] Ā_k[l',s,r']
+    fn left_environment(&self, q: usize) -> Vec<Complex64> {
+        let zero = Complex64::new(0.0, 0.0);
+        let mut env = vec![Complex64::new(1.0, 0.0)];
+        for k in 0..q {
+            let t = &self.tensors[k];
+            let (bl, br) = (t.bond_left, t.bond_right);
+            let mut next = vec![zero; br * br];
+            for s in 0..2 {
+                // u[l', r] = Σ_l L[l,l'] · A[l,s,r]
+                let mut u = vec![zero; bl * br];
+                for l in 0..bl {
+                    for lp in 0..bl {
+                        let e = env[l * bl + lp];
+                        for r in 0..br {
+                            u[lp * br + r] += e * t.get(l, s, r);
+                        }
+                    }
+                }
+                // L'[r, r'] += Σ_{l'} u[l', r] · conj(A[l',s,r'])
+                for lp in 0..bl {
+                    for r in 0..br {
+                        let ur = u[lp * br + r];
+                        for rp in 0..br {
+                            next[r * br + rp] += ur * t.get(lp, s, rp).conj();
+                        }
+                    }
+                }
+            }
+            env = next;
+        }
+        env
+    }
+
     /// Mid-circuit projective measurement of a single qubit.
     /// Computes P(q=0), samples outcome, projects the local tensor,
     /// and renormalizes. Returns the measurement outcome (0 or 1).
+    ///
+    /// The outcome probabilities contract the full state — left environment,
+    /// local tensor, right environment — because local tensor norms are only
+    /// the true marginals when the chain is canonical around site q, which
+    /// plain-SVD gate splits do not maintain (same mechanism as the sampling
+    /// fix in [`Mps::sample_with_envs`]).
     pub fn measure_site(&mut self, q: usize, rng: &mut impl rand::Rng) -> u8 {
+        let left = self.left_environment(q);
+        let right = self.right_environments();
+        let e_next = &right[q + 1];
         let t = &self.tensors[q];
         let bl = t.bond_left;
         let br = t.bond_right;
+        let zero = Complex64::new(0.0, 0.0);
 
-        // Compute norms for physical dim 0 and 1
+        // p(b) = Σ_{l,l',r,r'} L[l,l'] A[l,b,r] E[r,r'] conj(A[l',b,r'])
         let mut norm_sq = [0.0_f64; 2];
-        for phys in 0..2 {
+        for (phys, p_bit) in norm_sq.iter_mut().enumerate() {
+            // m[l, r'] = Σ_r A[l,b,r] · E[r,r']
+            let mut m = vec![zero; bl * br];
             for l in 0..bl {
                 for r in 0..br {
-                    norm_sq[phys] += t.get(l, phys, r).norm_sqr();
+                    let a = t.get(l, phys, r);
+                    for rp in 0..br {
+                        m[l * br + rp] += a * e_next[r * br + rp];
+                    }
                 }
             }
+            let mut p = zero;
+            for l in 0..bl {
+                for lp in 0..bl {
+                    let mut g = zero; // g = Σ_{r'} m[l,r'] conj(A[l',b,r'])
+                    for rp in 0..br {
+                        g += m[l * br + rp] * t.get(lp, phys, rp).conj();
+                    }
+                    p += left[l * bl + lp] * g;
+                }
+            }
+            *p_bit = p.re.max(0.0);
         }
 
         let total = norm_sq[0] + norm_sq[1];
@@ -429,6 +556,115 @@ mod tests {
         assert!(sv[1].norm() < 1e-8);
         assert!(sv[2].norm() < 1e-8);
         assert!((sv[3].re - expected).abs() < 1e-8, "|11> = {}", sv[3]);
+    }
+
+    #[test]
+    fn sampling_matches_statevector_probabilities() {
+        // Regression: sequential sampling used to assume a right-canonical
+        // chain (right environment = identity), which plain-SVD gate splits
+        // do not produce — sampled frequencies were biased ~10σ while the
+        // contracted statevector stayed exact. State: H q0; RY(0.7) q1;
+        // CX q0,q3 (distant → SWAP chain); CX q1,q2. Bond dimension 2, so
+        // truncation cannot explain any deviation.
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let isq2 = 1.0 / 2.0_f64.sqrt();
+        let h = [
+            Complex64::new(isq2, 0.0),
+            Complex64::new(isq2, 0.0),
+            Complex64::new(isq2, 0.0),
+            Complex64::new(-isq2, 0.0),
+        ];
+        let (c, s) = ((0.35f64).cos(), (0.35f64).sin());
+        let ry = [
+            Complex64::new(c, 0.0),
+            Complex64::new(-s, 0.0),
+            Complex64::new(s, 0.0),
+            Complex64::new(c, 0.0),
+        ];
+        let o = Complex64::new(0.0, 0.0);
+        let i = Complex64::new(1.0, 0.0);
+        let cx = [i, o, o, o, o, i, o, o, o, o, o, i, o, o, i, o];
+
+        let mut mps = Mps::zero_state(4, 16);
+        mps.apply_1q(0, &h);
+        mps.apply_1q(1, &ry);
+        mps.apply_2q_distant(0, 3, &cx);
+        mps.apply_2q_distant(1, 2, &cx);
+
+        let exact: Vec<f64> = mps.to_statevector().iter().map(|a| a.norm_sqr()).collect();
+
+        let shots = 20000usize;
+        let mut rng = StdRng::seed_from_u64(7);
+        let envs = mps.right_environments();
+        let mut freq = vec![0.0f64; 16];
+        for _ in 0..shots {
+            freq[mps.sample_with_envs(&envs, &mut rng) as usize] += 1.0 / shots as f64;
+        }
+
+        // SE ≈ sqrt(p(1-p)/shots) ≤ 0.0035; 0.015 is > 4σ for every outcome.
+        for (basis, (&p, &f)) in exact.iter().zip(freq.iter()).enumerate() {
+            assert!(
+                (p - f).abs() < 0.015,
+                "|{basis:04b}>: exact p = {p:.4}, sampled f = {f:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn measure_site_matches_statevector_marginals() {
+        // Regression: measure_site used local tensor norms for the outcome
+        // probability — the same environment-=-identity assumption that
+        // biased terminal sampling. Measuring every site sequentially must
+        // reproduce the exact joint distribution on a non-canonical chain.
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let isq2 = 1.0 / 2.0_f64.sqrt();
+        let h = [
+            Complex64::new(isq2, 0.0),
+            Complex64::new(isq2, 0.0),
+            Complex64::new(isq2, 0.0),
+            Complex64::new(-isq2, 0.0),
+        ];
+        let (c, s) = ((0.35f64).cos(), (0.35f64).sin());
+        let ry = [
+            Complex64::new(c, 0.0),
+            Complex64::new(-s, 0.0),
+            Complex64::new(s, 0.0),
+            Complex64::new(c, 0.0),
+        ];
+        let o = Complex64::new(0.0, 0.0);
+        let i = Complex64::new(1.0, 0.0);
+        let cx = [i, o, o, o, o, i, o, o, o, o, o, i, o, o, i, o];
+
+        let mut mps = Mps::zero_state(4, 16);
+        mps.apply_1q(0, &h);
+        mps.apply_1q(1, &ry);
+        mps.apply_2q_distant(0, 3, &cx);
+        mps.apply_2q_distant(1, 2, &cx);
+
+        let exact: Vec<f64> = mps.to_statevector().iter().map(|a| a.norm_sqr()).collect();
+
+        let trials = 20000usize;
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut freq = vec![0.0f64; 16];
+        for _ in 0..trials {
+            let mut state = mps.clone();
+            let mut outcome = 0usize;
+            for q in 0..4 {
+                outcome |= (state.measure_site(q, &mut rng) as usize) << q;
+            }
+            freq[outcome] += 1.0 / trials as f64;
+        }
+
+        for (basis, (&p, &f)) in exact.iter().zip(freq.iter()).enumerate() {
+            assert!(
+                (p - f).abs() < 0.015,
+                "|{basis:04b}>: exact p = {p:.4}, measured f = {f:.4}"
+            );
+        }
     }
 
     #[test]
