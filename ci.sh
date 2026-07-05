@@ -114,7 +114,9 @@ if [ "${ARIA_CUDA:-0}" = "1" ]; then
   cargo test -p omega-backend-pauliprop-cuda --features cuda
   # Statevector GPU ≡ CPU statevector (f32 kernels, tol 1e-5), and the WIRED
   # `--backend mps` GPU-SVD path ≡ exact CPU statevector (native f64, tol 1e-10).
-  cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda gpu_mps_cuda
+  # (cargo test takes one positional filter, so run the two gates separately.)
+  cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda_agrees_with_sim_on_qft
+  cargo test -p aria-runtime --features cuda --test run_examples gpu_mps_cuda_agrees_with_sim
   echo "  OK: CUDA GPU statevector + MPS(gesvdj) + pauliprop(branch) match CPU"
 else
   echo

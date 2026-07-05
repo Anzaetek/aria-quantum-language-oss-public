@@ -179,9 +179,13 @@ fn run(
 ) -> bool {
     use cudarc::driver::PushKernelArg;
 
-    let w = rx.len().max(1);
+    // Word count per symplectic string. `rx` was packed from the n-qubit
+    // generator, so `w == n.div_ceil(64)` — the SAME width `pack_bits(&key.x)`
+    // produces for every term, keeping the SoA layout consistent. Bail to the
+    // CPU on the degenerate `n == 0` / empty-sum cases rather than fudge widths.
+    let w = rx.len();
     let num = sum.terms.len();
-    if num == 0 {
+    if num == 0 || w == 0 {
         return false;
     }
 
