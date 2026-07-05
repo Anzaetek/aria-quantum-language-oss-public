@@ -1,0 +1,24 @@
+[package]
+name = "omega-backend-pauliprop-cuda"
+version = "0.1.0"
+edition = "2021"
+description = "CUDA accelerator for the omega-backend-pauliprop non-Clifford branch step. Batches the per-term anticommute test + P → cosθ·P + i sinθ·(R·P) expansion over packed u64-word symplectic arrays via an NVRTC kernel. Opt-in via the `cuda` feature; transparently falls back to the CPU branch when the feature is off, the target isn't Linux/Windows, no CUDA driver is present, or the term count is below the GPU-worthwhile threshold."
+license = "MIT"
+publish = false
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
+num-complex = { workspace = true }
+
+# Target-gated to Linux/Windows, mirroring omega-backend-mps-cuda. The crate
+# still compiles on macOS / without the feature; the entry point routes to the
+# CPU branch at runtime via the `#[cfg(...)]` arms.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "std", "fallback-dynamic-loading", "cuda-version-from-build-system"], optional = true }
+
+[dev-dependencies]
+omega-core = { path = "../omega-core" }

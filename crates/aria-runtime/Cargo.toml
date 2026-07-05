@@ -28,6 +28,8 @@ cuda = [
     "omega-core/cuda",
     "dep:omega-backend-mps-cuda",
     "omega-backend-mps-cuda/cuda",
+    "dep:omega-backend-pauliprop-cuda",
+    "omega-backend-pauliprop-cuda/cuda",
 ]
 # Cross-vendor OpenCL statevector (needs an ICD installed).
 opencl = [
@@ -56,6 +58,8 @@ omega-backend-statevector-cuda = { path = "../omega-backend-statevector-cuda", o
 omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl", optional = true }
 # CUDA cuSOLVER `gesvdj` accelerator for MPS bond-compression SVD (opt-in via `cuda`).
 omega-backend-mps-cuda = { path = "../omega-backend-mps-cuda", optional = true }
+# CUDA branch-expansion accelerator for the pauliprop backend (opt-in via `cuda`).
+omega-backend-pauliprop-cuda = { path = "../omega-backend-pauliprop-cuda", optional = true }
 
 # Remote (omega-server HTTP) backend.
 ureq = { version = "2", default-features = false, features = ["json"], optional = true }

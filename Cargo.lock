@@ -317,6 +317,7 @@ dependencies = [
  "omega-backend-mps",
  "omega-backend-mps-cuda",
  "omega-backend-pauliprop",
+ "omega-backend-pauliprop-cuda",
  "omega-backend-statevector",
  "omega-backend-statevector-cuda",
  "omega-backend-statevector-metal",
@@ -2350,6 +2351,16 @@ dependencies = [
  "num-complex",
  "omega-core",
  "smallvec",
+]
+
+[[package]]
+name = "omega-backend-pauliprop-cuda"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "num-complex",
+ "omega-backend-pauliprop",
+ "omega-core",
 ]
 
 [[package]]

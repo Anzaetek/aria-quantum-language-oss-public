@@ -19,6 +19,25 @@ use crate::pauli::{mul_raw, PauliKey, PauliSum};
 const I: Complex64 = Complex64::new(0.0, 1.0);
 const ONE: Complex64 = Complex64::new(1.0, 0.0);
 
+/// Accelerator hook for the non-Clifford **branch** step — the hot per-term loop
+/// `P → cosθ·P + i sinθ·(R·P)`. The generator `R` is passed in packed u64-word
+/// symplectic form (`rx`, `rz`, `factor`), with the already-computed `cos`/`sin`,
+/// the `max_freq` cap, and qubit count `n`. The hook replaces `sum` with the
+/// branched result and returns `true` iff it handled the work; returning `false`
+/// (e.g. no GPU present, or too few terms to be worth a device round-trip) lets
+/// the CPU path run unchanged, so semantics are identical either way. The CUDA
+/// implementation lives in `omega-backend-pauliprop-cuda`.
+pub type BranchHook = fn(
+    sum: &mut PauliSum,
+    rx: &[u64],
+    rz: &[u64],
+    factor: Complex64,
+    cos: f64,
+    sin: f64,
+    max_freq: Option<u32>,
+    n: usize,
+) -> bool;
+
 /// Pauli-propagation simulator. Truncation off (`coeff_min = 0`, `max_weight =
 /// None`) ⇒ exact; tighten either knob to approximate deep non-Clifford
 /// circuits. Exact and cheap for Clifford circuits at any width.
@@ -33,6 +52,9 @@ pub struct PauliPropBackend {
     /// PauliPropagation.jl's `max_freq` truncation axis. Over-budget sin-branches
     /// are never even created, so it also bounds the tree fan-out directly.
     pub max_freq: Option<u32>,
+    /// Optional GPU accelerator for the branch step (see [`BranchHook`]). `None`
+    /// = pure CPU. Skipped from `Debug`/equality — it's a code pointer.
+    branch_hook: Option<BranchHook>,
 }
 
 impl Default for PauliPropBackend {
@@ -41,6 +63,7 @@ impl Default for PauliPropBackend {
             coeff_min: 0.0,
             max_weight: None,
             max_freq: None,
+            branch_hook: None,
         }
     }
 }
@@ -57,7 +80,14 @@ impl PauliPropBackend {
             coeff_min,
             max_weight,
             max_freq: None,
+            branch_hook: None,
         }
+    }
+
+    /// Install a GPU accelerator for the branch step (see [`BranchHook`]).
+    pub fn with_branch_hook(mut self, hook: BranchHook) -> Self {
+        self.branch_hook = Some(hook);
+        self
     }
 
     /// Engine with the full truncation triple, including PauliPropagation.jl's
@@ -71,6 +101,7 @@ impl PauliPropBackend {
             coeff_min,
             max_weight,
             max_freq,
+            branch_hook: None,
         }
     }
 
@@ -258,6 +289,17 @@ impl PauliPropBackend {
     /// CRz → 2-qubit), so the fan-out is bounded only by truncation.
     fn branch(&self, sum: &mut PauliSum, r: &Gen, theta: f64) {
         let (cos, sin) = (theta.cos(), theta.sin());
+        // Offer the branch expansion to an accelerator (GPU). If it declines
+        // (no device / too few terms), fall through to the CPU loop below — the
+        // two are semantically identical, so results never depend on the path.
+        if let Some(hook) = self.branch_hook {
+            let n = r.gx.len();
+            let rx = pack_bits(&r.gx);
+            let rz = pack_bits(&r.gz);
+            if hook(sum, &rx, &rz, r.factor, cos, sin, self.max_freq, n) {
+                return;
+            }
+        }
         let mut out = PauliSum::new();
         out.dropped_mass = sum.dropped_mass;
         for (key, w) in sum.terms.drain() {
@@ -506,6 +548,26 @@ fn gen_zz(n: usize, c: usize, t: usize) -> Gen {
         gz,
         factor: ONE,
     }
+}
+
+/// Pack a per-qubit boolean vector into little-endian u64 words: qubit `i` is
+/// bit `i % 64` of word `i / 64`. The GPU branch kernel consumes this SoA layout.
+pub fn pack_bits(bits: &[bool]) -> Vec<u64> {
+    let words = bits.len().div_ceil(64);
+    let mut out = vec![0u64; words];
+    for (i, &b) in bits.iter().enumerate() {
+        if b {
+            out[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    out
+}
+
+/// Inverse of [`pack_bits`] for `n` qubits.
+pub fn unpack_bits(words: &[u64], n: usize) -> Vec<bool> {
+    (0..n)
+        .map(|i| (words[i / 64] >> (i % 64)) & 1 == 1)
+        .collect()
 }
 
 /// Resolve a (concrete or symbolic) parameter to a number.

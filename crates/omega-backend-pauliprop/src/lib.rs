@@ -13,5 +13,5 @@
 pub mod pauli;
 pub mod sim;
 
-pub use pauli::{PauliKey, PauliSum};
-pub use sim::PauliPropBackend;
+pub use pauli::{PauliKey, PauliSum, Weighted};
+pub use sim::{pack_bits, unpack_bits, BranchHook, PauliPropBackend};

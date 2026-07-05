@@ -77,9 +77,25 @@ pub(crate) fn make_backend(sel: BackendSel) -> Result<Box<dyn Backend>, String> 
         BackendSel::Mps => Box::new(make_mps()),
         BackendSel::Gpu => make_gpu()?,
         BackendSel::Tch => make_tch()?,
-        // Exact engine (no truncation): coeff_min = 0, max_weight = None.
-        BackendSel::PauliProp => Box::new(PauliPropBackend::new()),
+        // Exact engine (no truncation: coeff_min = 0, max_weight = None), with
+        // the GPU branch accelerator wired under a cuda build.
+        BackendSel::PauliProp => Box::new(make_pauliprop(0.0, None, None)),
     })
+}
+
+/// Construct the Pauli-propagation backend with the given truncation, installing
+/// the CUDA branch accelerator (`omega-backend-pauliprop-cuda`) under a `cuda`
+/// build. The accelerator falls back to the CPU branch per-gate when no device
+/// is present or the term count is small, so results are identical either way.
+pub(crate) fn make_pauliprop(
+    coeff_min: f64,
+    max_weight: Option<usize>,
+    max_freq: Option<u32>,
+) -> PauliPropBackend {
+    let backend = PauliPropBackend::with_truncation_freq(coeff_min, max_weight, max_freq);
+    #[cfg(feature = "cuda")]
+    let backend = backend.with_branch_hook(omega_backend_pauliprop_cuda::cuda_branch);
+    backend
 }
 
 #[allow(unreachable_code, unused)]
@@ -334,7 +350,7 @@ pub fn expectation_pauliprop(
 ) -> Result<(f64, f64), String> {
     let low = concrete_ir(circuit, bindings)?;
     let obs = Observable::parse(observable)?;
-    PauliPropBackend::with_truncation_freq(trunc.coeff_min, trunc.max_weight, trunc.max_freq)
+    make_pauliprop(trunc.coeff_min, trunc.max_weight, trunc.max_freq)
         .expectation_with_budget(&low.ir, &ParameterBinding::new(), &obs)
         .map_err(|e| e.to_string())
 }
