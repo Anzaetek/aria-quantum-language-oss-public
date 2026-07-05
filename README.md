@@ -128,15 +128,33 @@ Every backend implements `omega_core::executor::Backend`
 | `--backend` | Crate | Status | Notes |
 |-------------|-------|--------|-------|
 | `sim` (default) | `omega-backend-statevector` | ✅ | Pure-Rust CPU statevector, exact |
-| `mps` | `omega-backend-mps` | ✅ | Pure-Rust MPS, scales with bounded entanglement |
+| `mps` | `omega-backend-mps` (+ `-mps-cuda`) | ✅ | Pure-Rust MPS, scales with bounded entanglement. Under `--features cuda`, bond-compression SVD runs on the GPU (cuSOLVER `gesvdj`) with CPU fallback |
 | `gpu` | `omega-backend-statevector-{metal,cuda,opencl}` | ✅ | Build `--features metal` (or `cuda`/`opencl`); auto-falls back to `sim` if the device is unavailable |
+| `pauliprop` | `omega-backend-pauliprop` (+ `-pauliprop-cuda`) | ✅ | Heisenberg Pauli-propagation; **expectation values only**. Exact & width-unbounded on Clifford; truncate deep non-Clifford with `--truncate C --max-weight W --max-freq F` (certified dropped-mass error bound). Under `--features cuda` the non-Clifford branch step runs on the GPU with CPU fallback |
 | `remote` | omega-server HTTP | ✅ | `--features remote`, then `--backend remote --url …`; delegate to a running omega-server |
 | `tch` | `aria-backend-tch` | ✅ | `--features tch` (needs `LIBTORCH`); a libtorch `tch::Tensor` statevector. `aria run/train --backend tch` |
 
 ```console
 $ cargo run -p aria-cli --features metal -- run examples/aria/qft.aria \
       --circuit QFT --int n=3 --backend gpu --statevector
+
+# NVIDIA CUDA (statevector, MPS-SVD, and pauliprop branch all GPU-accelerated):
+$ cargo run -p aria-cli --features cuda -- run examples/aria/qft.aria \
+      --circuit QFT --int n=4 --backend gpu --statevector
+$ cargo run -p aria-cli --features cuda -- run examples/aria/bell.aria \
+      --circuit Bell --expectation "Z0 Z1" --backend pauliprop --max-freq 6
 ```
+
+Every GPU path is **optional and falls back to the CPU** when the feature is off
+or no device is present, so the default build stays pure-Rust and portable.
+
+**Pauli propagation** (`--backend pauliprop`) follows the PauliPropagation.jl
+paradigm — it back-propagates the observable as a truncated sum of weighted Pauli
+strings, with all three of PP.jl's truncation axes (`coeff_min`, `max_weight`,
+`max_freq`) and a certified L1 dropped-mass error bound. The engine is shared with
+the omega-functions toolkit; see [`crates/omega-backend-pauliprop`](crates/omega-backend-pauliprop)
+and, for the fuller feature set (stabilizer tableau, ECC, `quantum expect`/`ecc`
+subcommands), the upstream `omega-functions` crates.
 
 To embed your own high-performance simulator, implement `Backend` and register a
 variant in `aria-runtime`'s `BackendSel` — no changes to the language core.

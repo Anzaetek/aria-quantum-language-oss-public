@@ -57,6 +57,20 @@ Note: `pauliprop` computes expectation values only — `--shots` /
 `--statevector` on it fail with an explicit "expectation-value backend"
 error rather than mis-sampling.
 
+**Truncation knobs (deep non-Clifford, PauliPropagation.jl-style).** For circuits
+where the Pauli tree explodes, cap it on any of three axes and read the certified
+error budget. On a Clifford circuit nothing is dropped, so the budget is 0:
+
+```console
+$ $ARIA run examples/aria/bell.aria --circuit Bell --expectation "Z0 Z1" \
+      --backend pauliprop --truncate 1e-3 --max-weight 4 --max-freq 6
+<Z0 Z1> = 1.000000000000  (dropped-mass budget 0.000e0)
+```
+
+Check: value `= 1.000000000000` (±1e-10) and `dropped-mass budget 0.000e0`. The
+budget is a hard bound: `|approx − exact| ≤ budget` always (numerically gated in
+`omega-backend-pauliprop`'s `max_freq_truncation_stays_within_budget_and_converges`).
+
 ## 3. Bell — sampled counts balanced & correlated (tol ±5%)
 
 ```console
@@ -130,6 +144,42 @@ $ cargo test -p aria-runtime --features metal --test run_examples gpu_metal
 Check: `gpu_metal_agrees_with_sim_on_qft ... ok` — the Metal statevector matches
 the CPU statevector on QFT(n=3) to ≤ 1e-6. (Build `aria` with `--features metal`
 and use `--backend gpu` to run on the GPU.)
+
+### 9a. CUDA GPU backends agree with CPU (NVIDIA; opt-in `ARIA_CUDA=1`)
+
+On a CUDA host (Linux/Windows + an NVIDIA GPU), three GPU paths are numerically
+gated against the CPU. All are optional and fall back to the CPU when the feature
+is off or no device is present, so `./ci.sh` stays green without a GPU; set
+`ARIA_CUDA=1 ./ci.sh` to run them, or invoke directly:
+
+```console
+$ cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda gpu_mps_cuda
+$ cargo test -p omega-backend-mps-cuda --features cuda
+$ cargo test -p omega-backend-pauliprop-cuda --features cuda
+```
+
+Checks (each test prints `... ok`):
+- `gpu_cuda_agrees_with_sim_on_qft` — CUDA statevector == CPU statevector on
+  QFT(n=4), ≤ 1e-5 (f32 kernels).
+- `gpu_mps_cuda_agrees_with_sim` — `--backend mps` with the cuSOLVER `gesvdj`
+  bond-compression SVD == exact CPU statevector on QFT(n=5), ≤ 1e-10 (native f64).
+- `gpu_branch_matches_cpu_exact` / `gpu_branch_matches_cpu_with_max_freq` — the
+  GPU Pauli-propagation branch (value **and** certified dropped-mass budget) ==
+  the CPU branch, ≤ 1e-9, on a deep non-Clifford Trotter circuit.
+
+End-to-end (build with `--features cuda`); the GPU result equals the CPU-only
+build bit-for-bit:
+
+```console
+$ cargo run -p aria-cli --features cuda -- run examples/aria/qft.aria \
+      --circuit QFT --int n=4 --backend gpu --statevector      # == --backend sim
+$ cargo run -p aria-cli --features cuda -- run examples/aria/bell.aria \
+      --circuit Bell --expectation "Z0 Z1" --backend pauliprop  # branch on GPU
+<Z0 Z1> = 1.000000000000
+```
+
+Metal (Apple Silicon) has the statevector arm; the MPS-SVD and pauliprop-branch
+Metal arms are deferred to the mac dev box (see `GPU_BACKEND_PLAN.md`).
 
 ## 10. Remote backend via omega-server (tol ±5%)
 
