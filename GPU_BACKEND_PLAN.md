@@ -1,5 +1,11 @@
 # GPU Backends + PauliPropagation.jl Parity — Work Plan
 
+> **Status (2026-07-05): COMPLETE on this CUDA box.** Phases 0–5 landed and CI-green
+> (default + `ARIA_CUDA=1`). StateVector, MPS (cuSOLVER `gesvdj`), and PauliProp
+> (NVRTC branch kernel) GPU paths are **wired into `--backend` and numerically
+> gated vs CPU**; PauliPropagation.jl `max_freq`/`U1`/CLI knobs added. Only the
+> **Metal (Mac M4/M5)** arms remain — deferred to the mac dev box (see below).
+
 > Active dev repo: **`aria-quantum-language-oss-public`** (per the README banner,
 > all future dev lands here). Rules from `CLAUDE.md` apply: local CI is the
 > single source of truth (`./ci.sh`), **commit often, never push**, every
@@ -129,6 +135,24 @@ in sync; omega-functions is canonical).
 4. Brutal subagent review of the entire diff (correctness, determinism, fallback
    safety, numeric gates); fix findings.
 - **Acceptance:** CI green (incl. opt-in CUDA stage on this box); review clean.
+
+## TODO — Metal / Mac (M4 + M5), deferred to the mac dev box
+
+The Metal arms compile everywhere (target-gated, runtime-fallback), but are
+**not test-verified here** — this is the Linux/CUDA box. When on a Mac:
+
+- **Build + numeric-verify on Apple Silicon M4 and M5** (both, if available):
+  - `aria run --backend gpu --features metal --statevector` ≡ `--backend sim`
+    (statevector Metal, `gpu_metal_agrees_with_sim_on_qft`).
+  - MPS Metal (`omega-backend-mps-metal`): the SVD-on-GPU half is *deferred*
+    on Apple GPUs (no native f64 / higher dispatch latency — see
+    `omega-backend-mps-cuda/src/lib.rs` header). Verify the contraction-on-GPU
+    + CPU-SVD split still matches CPU MPS numerically, and re-benchmark whether
+    M4/M5 change the f64/dispatch calculus enough to move SVD on-device.
+  - PauliProp Metal: only after the CUDA path lands (Phase 4); port the kernel
+    or keep the Metal arm as a documented CPU fallback.
+- Add an opt-in `ARIA_METAL=1` ci.sh stage mirroring `ARIA_CUDA=1`.
+- Confirm M4/M5 unified-memory sizing for wide statevector/MPS runs.
 
 ## Cross-cutting rules
 - **Commit often**, small logical commits, author **Anzaetek Team
