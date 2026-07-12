@@ -1,0 +1,31 @@
+[package]
+name = "omega-backend-pauliprop-metal"
+version = "0.1.0"
+edition = "2021"
+description = "Apple Metal accelerator for the omega-backend-pauliprop non-Clifford branch step. Batches the per-term symplectic anticommute test + P⊕R child-key generation over packed u64-word arrays in a Metal compute kernel (integer-only, so exact); the f64 coefficient arithmetic and the term merge stay on the CPU, giving bit-for-bit parity with the CPU branch. Opt-in via the `metal` feature; transparently falls back to the CPU branch when the feature is off, the target isn't macOS, no Metal device is present, or the term count is below the GPU-worthwhile threshold."
+license = "MIT"
+publish = false
+
+# Metal sibling of omega-backend-pauliprop-cuda. Apple GPUs have no native f64,
+# so — unlike the CUDA arm, which runs the whole branch (coefficients included)
+# on device in f64 — this crate keeps every floating-point operation on the CPU
+# and offloads only the integer symplectic work (the O(terms × n) anticommute
+# test and the child Pauli key). That split is what buys exact parity: the GPU
+# never touches a coefficient.
+
+[features]
+default = []
+metal = ["dep:metal"]
+
+[dependencies]
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
+num-complex = { workspace = true }
+
+# Target-gated to macOS, mirroring omega-backend-mps-metal. The crate still
+# compiles on Linux / without the feature; the entry point routes to the CPU
+# branch at runtime via the `#[cfg(...)]` arms.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+
+[dev-dependencies]
+omega-core = { path = "../omega-core" }

@@ -3,8 +3,16 @@
 > **Status (2026-07-05): COMPLETE on this CUDA box.** Phases 0–5 landed and CI-green
 > (default + `ARIA_CUDA=1`). StateVector, MPS (cuSOLVER `gesvdj`), and PauliProp
 > (NVRTC branch kernel) GPU paths are **wired into `--backend` and numerically
-> gated vs CPU**; PauliPropagation.jl `max_freq`/`U1`/CLI knobs added. Only the
-> **Metal (Mac M4/M5)** arms remain — deferred to the mac dev box (see below).
+> gated vs CPU**; PauliPropagation.jl `max_freq`/`U1`/CLI knobs added.
+>
+> **Status (2026-07-06): Metal arms COMPLETE on Apple M5 Max.** All three GPU
+> paths are now wired and numerically gated vs CPU under `ARIA_METAL=1`:
+> StateVector (f32, ≤1e-6), MPS **two-site θ-contraction** (f32; SVD stays on
+> CPU — Apple has no native f64, so on-GPU Jacobi SVD is the one deferred piece),
+> and PauliProp **branch** (new `omega-backend-pauliprop-metal` crate: integer
+> symplectic work on the GPU, f64 coefficients on the CPU → **exact**, ≤1e-9).
+> An `ARIA_METAL=1 ./ci.sh` stage mirrors `ARIA_CUDA=1`. Only M4 re-verification
+> and the deferred on-GPU SVD remain (see below).
 
 > Active dev repo: **`aria-quantum-language-oss-public`** (per the README banner,
 > all future dev lands here). Rules from `CLAUDE.md` apply: local CI is the
@@ -136,23 +144,39 @@ in sync; omega-functions is canonical).
    safety, numeric gates); fix findings.
 - **Acceptance:** CI green (incl. opt-in CUDA stage on this box); review clean.
 
-## TODO — Metal / Mac (M4 + M5), deferred to the mac dev box
+## Metal / Mac — DONE on Apple M5 Max (2026-07-06)
 
-The Metal arms compile everywhere (target-gated, runtime-fallback), but are
-**not test-verified here** — this is the Linux/CUDA box. When on a Mac:
+All three Metal arms are wired into `--backend` and numerically gated vs CPU on
+an Apple **M5 Max**, verified under `ARIA_METAL=1 ./ci.sh`:
 
-- **Build + numeric-verify on Apple Silicon M4 and M5** (both, if available):
-  - `aria run --backend gpu --features metal --statevector` ≡ `--backend sim`
-    (statevector Metal, `gpu_metal_agrees_with_sim_on_qft`).
-  - MPS Metal (`omega-backend-mps-metal`): the SVD-on-GPU half is *deferred*
-    on Apple GPUs (no native f64 / higher dispatch latency — see
-    `omega-backend-mps-cuda/src/lib.rs` header). Verify the contraction-on-GPU
-    + CPU-SVD split still matches CPU MPS numerically, and re-benchmark whether
-    M4/M5 change the f64/dispatch calculus enough to move SVD on-device.
-  - PauliProp Metal: only after the CUDA path lands (Phase 4); port the kernel
-    or keep the Metal arm as a documented CPU fallback.
-- Add an opt-in `ARIA_METAL=1` ci.sh stage mirroring `ARIA_CUDA=1`.
-- Confirm M4/M5 unified-memory sizing for wide statevector/MPS runs.
+- ✅ **StateVector Metal** — `aria run --backend gpu --features metal --statevector`
+  ≡ `--backend sim` (`gpu_metal_agrees_with_sim_on_qft`, ≤1e-6, f32 kernels).
+  Plus the full `omega-backend-statevector-metal` suite (adjoint/QML training
+  parity), all green on this box.
+- ✅ **MPS Metal θ-contraction** — the two-site contraction runs on the GPU
+  (f32), the SVD stays on CPU. Wired via a new `Contract2qFn` hook on
+  `omega-backend-mps` (mirrors the `SvdFlatFn` CUDA hook), engaged above the
+  bond-dim threshold. `gpu_mps_metal_agrees_with_sim` ≡ exact CPU statevector on
+  a 12q entangling brickwork (≤1e-3, f32). The **SVD-on-GPU half stays deferred**
+  on Apple GPUs (no native f64 / ~100 µs dispatch — see
+  `omega-backend-mps-cuda/src/lib.rs` header); re-open triggers unchanged.
+- ✅ **PauliProp Metal branch** — new crate `omega-backend-pauliprop-metal`,
+  sibling of `-cuda`. Because Apple has no native f64, it offloads only the
+  **integer** symplectic work (anticommute parity + sign + child key `R·P`) to
+  the GPU and keeps every coefficient on the CPU in f64 — so the result is
+  **bit-for-bit the CPU branch**, not an f32 approximation. Wired via
+  `with_branch_hook`; `gpu_pauliprop_metal_agrees_with_sim` + the crate's
+  `gpu_branch_matches_cpu_{exact,with_max_freq}` gate value **and** dropped-mass
+  ≤1e-9.
+- ✅ **`ARIA_METAL=1` ci.sh stage** added, mirroring `ARIA_CUDA=1`.
+
+Remaining (not blocking):
+- **M4 re-verification** — this box is an M5 Max; the arms are target-gated and
+  device-probed, so M4 should behave identically, but a second-device run is
+  still open. Also confirm M4/M5 unified-memory sizing for wide runs.
+- **On-GPU SVD for MPS** — deferred by Apple's f64/dispatch limits; re-open per
+  the `omega-backend-mps-metal` crate header triggers (batched SVD via MLX /
+  Accelerate, randomized SVD, or block Lanczos).
 
 ## Cross-cutting rules
 - **Commit often**, small logical commits, author **Anzaetek Team

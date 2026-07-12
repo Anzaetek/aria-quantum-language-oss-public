@@ -305,6 +305,109 @@ fn gpu_mps_cuda_agrees_with_sim() {
     }
 }
 
+/// Brickwork of `RY`+`CX` over `n` qubits and `layers` layers — genuinely
+/// entangling, so the MPS middle bond climbs toward its cap. For `n = 12` the
+/// middle Schmidt rank can never exceed 2^6 = 64 (the MPS bond cap), so there is
+/// no truncation and the MPS state equals the exact statevector up to the f32
+/// round-off of the Metal contraction.
+#[cfg(feature = "metal")]
+fn brickwork(n: usize, layers: usize) -> String {
+    let mut s = format!("circuit BW() {{\n  qreg q[{n}]\n");
+    for i in 0..n {
+        s += &format!("  apply H on q[{i}]\n");
+    }
+    for l in 0..layers {
+        let mut i = l % 2;
+        while i + 1 < n {
+            let theta = 0.3 + 0.1 * l as f64 + 0.05 * i as f64;
+            s += &format!("  apply RY({theta}) on q[{i}]\n");
+            s += &format!("  apply CX on q[{i}], q[{}]\n", i + 1);
+            i += 2;
+        }
+    }
+    s += "}\n";
+    s
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn gpu_mps_metal_agrees_with_sim() {
+    // Under a metal build, `--backend mps` routes the two-site θ-contraction
+    // through the Metal GPU (SVD stays on CPU). It engages only above the
+    // bond-dim threshold (32), so we need a wide, fully-entangling circuit — a
+    // 12-qubit RY+CX brickwork drives the middle bond up to the 64 cap, well
+    // past 32, with no truncation (rank ≤ 2^6 = 64). The GPU contraction runs in
+    // f32 (Apple has no native f64), so the tolerance is the f32 accumulation
+    // floor — far tighter than any physically meaningful drift.
+    // Lower the GPU bond threshold so the Metal contraction engages on this
+    // moderate circuit deterministically (production keeps the tuned 32). The
+    // path still runs the real f32 kernel — this only changes *when* it's used.
+    unsafe { std::env::set_var("MPS_METAL_MIN_BOND", "4") };
+    let src = brickwork(12, 8);
+    let c = inline(&src, "BW");
+    let before = omega_backend_mps_metal::metal_contraction_count();
+    let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
+    let mps = statevector(&c, &no_binds(), BackendSel::Mps).unwrap();
+    let ran = omega_backend_mps_metal::metal_contraction_count() - before;
+    if ran == 0 {
+        eprintln!("skipping assertion: no Metal device (GPU contraction never ran)");
+        return;
+    }
+    eprintln!("metal contractions dispatched: {ran}");
+    assert_eq!(cpu.len(), mps.len());
+    let max_diff = cpu
+        .iter()
+        .zip(mps.iter())
+        .map(|(a, b)| (a - b).norm())
+        .fold(0.0, f64::max);
+    eprintln!("max amplitude diff sim vs mps(metal): {max_diff:.3e}");
+    assert!(
+        max_diff < 1e-3,
+        "sim vs mps(metal) max amplitude diff {max_diff:.3e} exceeds f32 floor"
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn gpu_pauliprop_metal_agrees_with_sim() {
+    // Under a metal build, `--backend pauliprop` offloads the symplectic branch
+    // step to the Metal GPU while keeping f64 coefficients on the CPU — so it is
+    // exact, not approximate. Force the GPU path on so the accelerator runs even
+    // at modest term counts.
+    unsafe { std::env::set_var("PAULIPROP_GPU_MIN", "0") };
+    // GHZ is Clifford — no branch splits, so it never exercises the GPU branch
+    // hook; it's here only as an exact cross-check of the two backends.
+    let c = example("ghz.aria", "GHZ", &[]);
+    let pp = expectation(&c, "Z0 Z1", &no_binds(), BackendSel::PauliProp).unwrap();
+    let sv = expectation(&c, "Z0 Z1", &no_binds(), SIM).unwrap();
+    assert!(
+        (pp - sv).abs() < 1e-9,
+        "GHZ <Z0 Z1>: pauliprop {pp} vs sim {sv}"
+    );
+
+    // Non-Clifford circuit: RY/RZ make `branch()` fire, so the Metal hook runs.
+    // Read the counter around *this* run and skip the assertion if it never
+    // moved — otherwise the test would silently pass on pauliprop-CPU vs
+    // statevector-CPU even when the GPU path never executed.
+    let c2 = inline(
+        "circuit T() {\n  qreg q[4]\n  apply H on q[0]\n  apply CX on q[0], q[1]\n  \
+         apply RY(0.6) on q[2]\n  apply CX on q[1], q[2]\n  apply RZ(0.4) on q[3]\n  \
+         apply CX on q[2], q[3]\n}\n",
+        "T",
+    );
+    let before = omega_backend_pauliprop_metal::gpu_branch_count();
+    let pp2 = expectation(&c2, "Z0 Z3", &no_binds(), BackendSel::PauliProp).unwrap();
+    if omega_backend_pauliprop_metal::gpu_branch_count() == before {
+        eprintln!("skipping assertion: no Metal device (GPU branch never ran)");
+        return;
+    }
+    let sv2 = expectation(&c2, "Z0 Z3", &no_binds(), SIM).unwrap();
+    assert!(
+        (pp2 - sv2).abs() < 1e-9,
+        "<Z0 Z3>: pauliprop {pp2} vs sim {sv2}"
+    );
+}
+
 #[cfg(feature = "tch")]
 #[test]
 fn tch_backend_agrees_with_sim_on_qft() {

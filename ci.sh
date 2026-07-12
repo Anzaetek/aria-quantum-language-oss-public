@@ -123,6 +123,32 @@ else
   echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"
 fi
 
+# Optional: Metal GPU backends (opt-in; needs an Apple Silicon Mac). Mirrors the
+# ARIA_CUDA stage: GPU paths are always optional with a CPU fallback, so the
+# default CI above stays green off-Mac. Set ARIA_METAL=1 on a Mac to assert the
+# GPU statevector / MPS-θ-contraction / pauliprop-branch paths numerically match
+# CPU. Uses --release: the Metal QML/statevector suites are slow in a debug build.
+if [ "${ARIA_METAL:-0}" = "1" ]; then
+  step "+   Optional: Metal GPU backends"
+  # PauliProp GPU branch: integer symplectic on the GPU, f64 coefficients on the
+  # CPU (Apple has no native f64) → exact (exact + max_freq, incl. dropped-mass).
+  cargo test --release -p omega-backend-pauliprop-metal --features metal
+  # MPS Metal θ-contraction ≡ CPU (f32 kernel; SVD stays on CPU per GPU_BACKEND_PLAN).
+  cargo test --release -p omega-backend-mps-metal --features metal
+  # Statevector Metal full suite (f32 kernels + adjoint/QML training parity).
+  cargo test --release -p omega-backend-statevector-metal --features metal
+  # WIRED end-to-end: `--backend gpu` (statevector, tol 1e-6), `--backend mps`
+  # (θ-contraction, f32), and `--backend pauliprop` (branch, exact) all match the
+  # CPU. (cargo test takes one positional filter, so run each gate separately.)
+  cargo test --release -p aria-runtime --features metal --test run_examples gpu_metal_agrees_with_sim_on_qft
+  cargo test --release -p aria-runtime --features metal --test run_examples gpu_mps_metal_agrees_with_sim
+  cargo test --release -p aria-runtime --features metal --test run_examples gpu_pauliprop_metal_agrees_with_sim
+  echo "  OK: Metal GPU statevector + MPS(θ-contraction) + pauliprop(branch) match CPU"
+else
+  echo
+  echo "  (skipping Metal backends — set ARIA_METAL=1 on an Apple Silicon Mac to enable)"
+fi
+
 # Optional: Lean 4 proof tree (opt-in; needs a warm mathlib cache via elan/lake).
 # Makes `aria export --lean` self-contained and ships the proven circulant
 # correspondence + noise-deviation theorems.

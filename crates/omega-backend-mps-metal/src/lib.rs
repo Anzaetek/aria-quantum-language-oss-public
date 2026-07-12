@@ -62,7 +62,10 @@
 //! the CPU `truncated_svd` so a future implementation can swap behind
 //! a feature flag with zero code change at the call site.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use num_complex::Complex64;
+use omega_backend_mps::mps::MpsTensor;
 
 pub use omega_backend_mps::svd::SvdResult;
 
@@ -70,7 +73,48 @@ pub mod contract;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod metal_runtime;
 
-pub use contract::{apply_two_site_gate_metal, mps_apply_2q_metal, MIN_BOND_DIM_FOR_METAL};
+pub use contract::{
+    apply_two_site_gate_metal, min_bond_dim_for_metal, mps_apply_2q_metal, MIN_BOND_DIM_FOR_METAL,
+};
+
+/// Number of two-site gates whose θ-contraction actually ran on the Metal GPU
+/// this process (telemetry, mirrors the pauliprop/CUDA arms' branch counters).
+pub static METAL_CONTRACTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Read [`METAL_CONTRACTIONS`] — "X of N two-qubit gates dispatched to the GPU".
+pub fn metal_contraction_count() -> u64 {
+    METAL_CONTRACTIONS.load(Ordering::Relaxed)
+}
+
+/// Two-site-gate accelerator in the exact calling convention of
+/// `omega_backend_mps::Contract2qFn` — install with
+/// `MpsBackend::with_contract_fn(metal_contract_2q)`. Returns `Some` only when
+/// the Metal θ-contraction actually ran (device present and bond ≥
+/// [`MIN_BOND_DIM_FOR_METAL`]); `None` tells the MPS backend to use its own
+/// built-in exact-f64 path, so wiring this under a `metal` build never changes
+/// results below the GPU threshold. Above it, the contraction runs in f32 (Apple
+/// GPUs have no native f64) — the same precision stance as the Metal
+/// statevector backend.
+pub fn metal_contract_2q(
+    left: &MpsTensor,
+    right: &MpsTensor,
+    gate: &[Complex64; 16],
+    max_bond_dim: usize,
+    threshold: f64,
+) -> Option<(MpsTensor, MpsTensor)> {
+    // Below the GPU threshold, decline immediately so the MPS backend takes its
+    // own exact-f64 path — no wasted CPU recompute inside the metal helper.
+    if left.bond_right < min_bond_dim_for_metal() {
+        return None;
+    }
+    let (nl, nr, used) = apply_two_site_gate_metal(left, right, gate, max_bond_dim, threshold);
+    if used {
+        METAL_CONTRACTIONS.fetch_add(1, Ordering::Relaxed);
+        Some((nl, nr))
+    } else {
+        None
+    }
+}
 
 /// Metal-accelerated truncated SVD. Falls back to the CPU Jacobi SVD
 /// when the `metal` feature is off, the host isn't macOS, or the Metal

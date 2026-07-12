@@ -32,6 +32,7 @@ members = [
     "crates/omega-backend-pauli",
     "crates/omega-backend-pauliprop",
     "crates/omega-backend-pauliprop-cuda",
+    "crates/omega-backend-pauliprop-metal",
     "crates/omega-tensor",
     "crates/omega-ffi",
     "crates/omega-wasm-runtime",

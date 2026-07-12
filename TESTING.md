@@ -135,15 +135,43 @@ $ $ARIA export examples/aria/qft.aria --circuit QFT --int n=3 --json | python3 -
 
 Check: QASM contains exactly one `cx q[0], q[1];`; QFT(n=3) JSON has 7 instructions.
 
-## 9. GPU backend agrees with CPU (tol ≤ 1e-6, macOS/Metal)
+## 9. Metal GPU backends agree with CPU (Apple Silicon; opt-in `ARIA_METAL=1`)
+
+On an Apple Silicon Mac, three GPU paths are numerically gated against the CPU —
+the same three the CUDA arm wires (§9a). All are optional and fall back to the
+CPU when the feature is off, the host isn't macOS, or no device is present, so
+`./ci.sh` stays green off-Mac; set `ARIA_METAL=1 ./ci.sh` to run them, or invoke
+directly:
 
 ```console
-$ cargo test -p aria-runtime --features metal --test run_examples gpu_metal
+$ cargo test --release -p aria-runtime --features metal --test run_examples gpu_metal_agrees_with_sim_on_qft
+$ cargo test --release -p aria-runtime --features metal --test run_examples gpu_mps_metal_agrees_with_sim
+$ cargo test --release -p aria-runtime --features metal --test run_examples gpu_pauliprop_metal_agrees_with_sim
+$ cargo test --release -p omega-backend-mps-metal --features metal
+$ cargo test --release -p omega-backend-pauliprop-metal --features metal
 ```
 
-Check: `gpu_metal_agrees_with_sim_on_qft ... ok` — the Metal statevector matches
-the CPU statevector on QFT(n=3) to ≤ 1e-6. (Build `aria` with `--features metal`
-and use `--backend gpu` to run on the GPU.)
+Checks (each prints `... ok`):
+- `gpu_metal_agrees_with_sim_on_qft` — Metal statevector == CPU statevector on
+  QFT(n=3), ≤ 1e-6 (f32 kernels). Use `--backend gpu` to run on the GPU.
+- `gpu_mps_metal_agrees_with_sim` — `--backend mps` with the Metal two-site
+  θ-contraction (the SVD stays on CPU) == exact CPU statevector on a 12-qubit
+  entangling brickwork, ≤ 1e-3 (f32 contraction). Apple GPUs have no native f64,
+  so on-GPU Jacobi SVD is deferred; the contraction is the GPU-friendly half.
+- `gpu_pauliprop_metal_agrees_with_sim` / `gpu_branch_matches_cpu_*` — the Metal
+  Pauli-propagation branch == the CPU branch, ≤ 1e-9. The GPU runs only the
+  integer symplectic work (anticommute test + child key); the f64 coefficient
+  arithmetic stays on the CPU, so the result is **exact**, not approximate.
+
+End-to-end (build with `--features metal`):
+
+```console
+$ cargo run --release -p aria-cli --features metal -- run examples/aria/qft.aria \
+      --circuit QFT --int n=4 --backend gpu --statevector      # == --backend sim
+$ cargo run --release -p aria-cli --features metal -- run examples/aria/bell.aria \
+      --circuit Bell --expectation "Z0 Z1" --backend pauliprop  # branch on GPU
+<Z0 Z1> = 1.000000000000
+```
 
 ### 9a. CUDA GPU backends agree with CPU (NVIDIA; opt-in `ARIA_CUDA=1`)
 
@@ -178,8 +206,10 @@ $ cargo run -p aria-cli --features cuda -- run examples/aria/bell.aria \
 <Z0 Z1> = 1.000000000000
 ```
 
-Metal (Apple Silicon) has the statevector arm; the MPS-SVD and pauliprop-branch
-Metal arms are deferred to the mac dev box (see `GPU_BACKEND_PLAN.md`).
+Metal (Apple Silicon) wires all three arms too — statevector, the MPS two-site
+θ-contraction (SVD stays on CPU), and the pauliprop branch — verified under
+`ARIA_METAL=1` (§9). The one piece deferred on Metal is on-GPU Jacobi SVD, which
+Apple's lack of native f64 rules out (see `GPU_BACKEND_PLAN.md`).
 
 ## 10. Remote backend via omega-server (tol ±5%)
 

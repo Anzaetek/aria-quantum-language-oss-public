@@ -20,6 +20,17 @@ use omega_backend_mps::svd::truncated_svd;
 /// wallclock, so the caller takes the CPU path.
 pub const MIN_BOND_DIM_FOR_METAL: usize = 32;
 
+/// The effective bond-dim threshold, [`MIN_BOND_DIM_FOR_METAL`] by default but
+/// overridable at runtime via `MPS_METAL_MIN_BOND` — used by tests to force the
+/// GPU contraction on a modest circuit whose bonds don't reach 32. Production
+/// leaves it unset and gets the tuned 32.
+pub fn min_bond_dim_for_metal() -> usize {
+    std::env::var("MPS_METAL_MIN_BOND")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MIN_BOND_DIM_FOR_METAL)
+}
+
 /// Apply a two-qubit gate to adjacent MPS sites with Metal-accelerated
 /// θ-contraction. SVD stays on CPU.
 ///
@@ -43,7 +54,7 @@ pub fn apply_two_site_gate_metal(
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     {
-        if left.bond_right >= MIN_BOND_DIM_FOR_METAL {
+        if left.bond_right >= min_bond_dim_for_metal() {
             if let Some((nl, nr)) = metal_path(left, right, gate, max_bond_dim, threshold) {
                 return (nl, nr, true);
             }
