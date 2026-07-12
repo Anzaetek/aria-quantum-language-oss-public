@@ -292,6 +292,14 @@ Check: `14/14 passed` (exit code 0). Per-example numeric goldens:
 | `circulant`          | cyclic-shift generator Q (circulant.aria, 3q) via omega | exact permutation σ(x)=(x+1) mod 8 | 0 mis-mapped basis states; purity ≥0.99 |
 | `cqs`                | Hadamard-test overlap Re⟨ψ\|Z\|ψ⟩ (cqs.aria) via omega | cos(π/3)=0.5 via `cqs::apply_pauli` | \|Δ\| ≤ 0.05 (8192 shots, ≈0.005) |
 | `noise`              | depolarizing law anchor + real cqs.aria Hadamard test under noise | (1−4p/3)cosθ; noiseless overlap 0.5 | worst \|Δ\| ≤ 4σ≈0.022 (≈0.009); overlap degrades 0.5→0.15; p*=0.075 |
+| `qec_grover`         | encoded 2-qubit Grover on Steane [[7,1,3]] (transversal, pauliprop) | ⟨Z̄ᵢ⟩=(−1)^bit(marked); statevector | Δ≤1e-6 (≈2.2e-16); all marked∈{0..3} + pauliprop==statevector |
+| `qec_qft`            | logical QFT: QFT\|0⟩ uniform + QFT∘QFT⁻¹ roundtrip | uniform 1/16; recovered=1 | Δ≤1e-9 (≈4.4e-16) |
+| `qec_qpe`            | logical QPE: φ=j/2ᵐ (m=3) recovered as a clean delta | φ̂ = true φ (all 8 phases) | Δ≤1e-6 (=0) |
+| `qec_memory`         | surface-code memory under neutral-atom (ZZ-biased) noise, 8k shots | pL(d=5)<pL(d=3); p_lz>p_lx | both inequalities hold (violation margins =0, tol 1e-9) |
+
+The four `qec_*` demos run key algorithms on **transversally QEC-encoded logical
+qubits** via the `aria-qec` crate (Steane [[7,1,3]] + rotated surface code) and
+are native-only (no wasm guest). `aria-verify -- all` reports `36/36 passed`.
 
 Run a single example: `cargo run -q -p aria-verify -- qsvd`. Force the native
 fallback (no wasm guest): add `--native`.
@@ -315,3 +323,32 @@ $ cargo run -q -p aria-verify --features remote -- \
 Check: both examples PASS — `grover3` P(marked) within 0.05 of 0.9453, and
 `bernstein_vazirani` recovers `0101`. (`ci.sh` automates this as a best-effort
 stage; the in-process transport in §13 is the canonical path.)
+
+## 15. QEC encoded demos cross-checked against Qiskit (opt-in `ARIA_QEC_XCHECK=1`)
+
+The three algorithmic QEC demos (`qec-grover`, `qec-qft`, `qec-qpe`) are
+cross-validated against an **independent SDK**. The tool exports the *exact* aria
+logical circuit (`aria export --qasm` on the `examples/aria/qec_*.aria` twins),
+runs it through Qiskit `Statevector` (exact) — plus a **stim** stabilizer tableau
+for the Clifford Grover — and asserts **aria == Qiskit == analytic**, ≤ 1e-9.
+Python runs in a venv (per repo policy); `run.sh` auto-creates one with qiskit.
+
+```console
+$ tools/qec_cross_check/run.sh          # auto-builds .venv + installs qiskit/stim
+# or point at an existing venv:
+$ QEC_PYTHON=/path/to/venv/bin/python tools/qec_cross_check/run.sh
+# or as an opt-in ci.sh stage:
+$ ARIA_QEC_XCHECK=1 ./ci.sh
+```
+
+Check: `20 passed, 0 failed` (exit code 0). Cases:
+
+| case | independent reference | golden / tol |
+|------|-----------------------|--------------|
+| `qec-grover` marked∈{0,1,2,3} | Qiskit `Statevector` + stim stabilizer tableau | argmax==marked, P(marked)==1; aria==qiskit (Δ≈8.9e-16) |
+| `qec-qft` | Qiskit `Statevector` (aria's `QFT`+`IQFT` circuits) | QFT\|0000⟩ uniform (maxdev≤1e-9); QFT∘QFT⁻¹\|x⟩=\|x⟩, x∈{0,5,11,15} |
+| `qec-qpe` | Qiskit `Statevector` (aria's `QPEDemo(m=3)`, φ=3/8) | counting register →\|011⟩=3, P==1; aria==qiskit |
+
+`qec-memory` is a code-capacity Monte-Carlo (MWPM decoding); it is validated
+internally by the distance-suppression signature in §13 (`pL(d=5) < pL(d=3)`),
+not by an exact statevector cross-check. See `tools/qec_cross_check/README.md`.
