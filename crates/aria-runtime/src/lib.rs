@@ -19,8 +19,8 @@ pub mod remote;
 
 pub use lower::{lower, Lowered};
 pub use run::{
-    counts_width, expectation, expectation_pauliprop, run_counts, statevector, BackendSel,
-    PauliPropTruncation,
+    counts_width, expectation, expectation_noisy, expectation_pauliprop, parse_noise_model,
+    run_counts, run_counts_noisy, statevector, BackendSel, PauliPropTruncation,
 };
 pub use train::{train_expectation, TrainConfig, TrainResult};
 

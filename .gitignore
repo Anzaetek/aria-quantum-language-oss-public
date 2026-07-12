@@ -19,3 +19,4 @@ Cargo.lock.bk
 proofs/lean4/.lake/
 **/*.olean
 fixes/
+.codegraph

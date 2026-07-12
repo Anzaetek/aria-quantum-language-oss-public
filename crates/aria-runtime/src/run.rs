@@ -10,11 +10,12 @@ use std::collections::HashMap;
 
 use aria_core::ast::Circuit;
 use num_complex::Complex64;
-use omega_backend_mps::MpsBackend;
+use omega_backend_mps::{MpsBackend, NoisyMpsBackend};
 use omega_backend_pauliprop::PauliPropBackend;
-use omega_backend_statevector::StatevectorBackend;
+use omega_backend_statevector::{NoisyStatevectorBackend, StatevectorBackend};
 use omega_core::circuit::GateKind as OGateKind;
 use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode, Observable};
+use omega_core::noise::NoiseModel;
 use omega_core::params::ParameterBinding;
 
 use crate::lower::{lower, Lowered};
@@ -95,6 +96,12 @@ pub(crate) fn make_pauliprop(
     let backend = PauliPropBackend::with_truncation_freq(coeff_min, max_weight, max_freq);
     #[cfg(feature = "cuda")]
     let backend = backend.with_branch_hook(omega_backend_pauliprop_cuda::cuda_branch);
+    // Metal arm: symplectic branch work on the GPU, f64 coefficients on the CPU
+    // (Apple has no native f64), so the result is exact. Falls back per-gate when
+    // no device is present or the term count is small. `not(cuda)` because a hook
+    // is single-valued — a cuda box never also wires the metal arm.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let backend = backend.with_branch_hook(omega_backend_pauliprop_metal::metal_branch);
     backend
 }
 
@@ -115,12 +122,22 @@ fn make_tch() -> Result<Box<dyn Backend>, String> {
 /// routed through the cuSOLVER `gesvdj` accelerator (`omega-backend-mps-cuda`),
 /// which itself falls back to the CPU Jacobi SVD when no CUDA device is present
 /// — so `--backend mps` transparently uses the GPU when one is available and
-/// the same code is exact-identical otherwise. Metal has no on-GPU SVD arm yet
-/// (see GPU_BACKEND_PLAN.md), so the CPU SVD is used there.
+/// the same code is exact-identical otherwise. Under a `metal` build the
+/// two-site θ-contraction is routed to the GPU instead (SVD stays on CPU —
+/// Apple has no native f64, so on-GPU Jacobi SVD is deferred; see
+/// GPU_BACKEND_PLAN.md), engaging only above the bond-dim threshold.
 fn make_mps() -> MpsBackend {
     let backend = MpsBackend::new(MPS_BOND);
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
+    // Metal arm: the two-site θ-contraction runs on the GPU (SVD stays on CPU —
+    // Apple has no native f64, so on-GPU Jacobi SVD is deferred; see
+    // GPU_BACKEND_PLAN.md). Only engages above the bond-dim threshold; below it,
+    // and when no device is present, `--backend mps` is exact-f64 as before.
+    // `not(cuda)` so a (hypothetical) dual-vendor build keeps CUDA's native-f64
+    // gesvdj SVD rather than the f32 Metal contraction.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let backend = backend.with_contract_fn(omega_backend_mps_metal::metal_contract_2q);
     backend
 }
 
@@ -285,6 +302,108 @@ pub fn run_counts(
         return Ok(res);
     }
     project_counts_onto_creg(res, &measure_pairs(&low))
+}
+
+/// Parse a `--noise '{...}'` JSON string into a [`NoiseModel`].
+///
+/// Delegates to [`omega_core::noise::NoiseModel::from_json`], which accepts
+/// both the scalar (idealized-machine) and per-qubit (calibrated-hardware)
+/// forms and rejects unknown keys.
+pub fn parse_noise_model(s: &str) -> Result<NoiseModel, String> {
+    NoiseModel::from_json(s)
+}
+
+/// Execute with a per-gate noise model, returning measurement counts.
+///
+/// Noise is a trajectory (Monte-Carlo quantum-jump) simulation, so it is only
+/// meaningful on the statevector backend (`--backend sim`/`statevector`). Any
+/// other selection is a hard error rather than a silent noiseless run — the
+/// whole point of this path is that `--noise` never gets dropped on the floor.
+/// Otherwise mirrors [`run_counts`]: same lowering, same creg projection.
+pub fn run_counts_noisy(
+    circuit: &Circuit,
+    bindings: &HashMap<String, f64>,
+    shots: u32,
+    seed: Option<u64>,
+    sel: BackendSel,
+    model: &NoiseModel,
+) -> Result<ExecResult, String> {
+    let low = concrete_ir(circuit, bindings)?;
+    let cfg = ExecConfig {
+        shots: Some(shots),
+        seed,
+        mid_circuit_mode: if low.needs_collapse {
+            MidCircuitMode::Collapse
+        } else {
+            MidCircuitMode::Skip
+        },
+    };
+    // Both trajectory samplers apply the same shared model. MPS composes with
+    // whatever GPU accelerators this build wired (Metal θ-contraction / CUDA
+    // SVD) — the channels are CPU-side, the heavy contraction stays on device.
+    let backend: Box<dyn Backend> = match sel {
+        BackendSel::Sim => Box::new(NoisyStatevectorBackend::with_model(model.clone(), seed)),
+        BackendSel::Mps => Box::new(make_noisy_mps(model.clone())),
+        other => {
+            return Err(format!(
+                "--noise sampling is supported on --backend sim or mps; backend '{}' cannot \
+                 apply a noise model to sampled counts (pauliprop applies noise to --expectation)",
+                other.name()
+            ));
+        }
+    };
+    let res = backend
+        .execute(&low.ir, &ParameterBinding::new(), &cfg)
+        .map_err(|e| e.to_string())?;
+    if low.needs_collapse {
+        return Ok(res);
+    }
+    project_counts_onto_creg(res, &measure_pairs(&low))
+}
+
+/// Construct the noisy MPS trajectory backend with the same GPU accelerators as
+/// [`make_mps`] — noise composes with them (see [`NoisyMpsBackend`]). The
+/// channels run on the CPU (f64, exact); the heavy two-qubit contraction / bond
+/// SVD stays on the device.
+///
+/// NOTE(cuda): the CUDA SVD arm is compiled and wired identically to
+/// [`make_mps`], but — unlike the Metal arm, which is exercised on macOS in this
+/// repo's tests — it is not executed on the CI host (no NVIDIA device). Its
+/// composition with noise is code-identical to the verified Metal path.
+fn make_noisy_mps(model: NoiseModel) -> NoisyMpsBackend {
+    let backend = NoisyMpsBackend::with_model(MPS_BOND, model);
+    #[cfg(feature = "cuda")]
+    let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let backend = backend.with_contract_fn(omega_backend_mps_metal::metal_contract_2q);
+    backend
+}
+
+/// Expectation value under a noise model. Only the Pauli-propagation backend
+/// folds noise into an expectation value *exactly* (its Heisenberg adjoint), so
+/// this routes there; `sim`/`mps` compute analytic (noiseless) expectations, so
+/// noisy expectation on them is rejected — sample with `--shots` instead.
+pub fn expectation_noisy(
+    circuit: &Circuit,
+    observable: &str,
+    bindings: &HashMap<String, f64>,
+    sel: BackendSel,
+    model: &NoiseModel,
+) -> Result<f64, String> {
+    if sel != BackendSel::PauliProp {
+        return Err(format!(
+            "--noise with --expectation is only supported on --backend pauliprop (its Heisenberg \
+             adjoint folds noise into the expectation exactly); backend '{}' computes an analytic \
+             noiseless expectation — use --shots for a noisy estimate instead",
+            sel.name()
+        ));
+    }
+    let low = concrete_ir(circuit, bindings)?;
+    let obs = Observable::parse(observable)?;
+    make_pauliprop(0.0, None, None)
+        .with_noise(model.clone())
+        .expectation(&low.ir, &ParameterBinding::new(), &obs)
+        .map_err(|e| e.to_string())
 }
 
 /// Exact statevector (no sampling; measurement gates are skipped).

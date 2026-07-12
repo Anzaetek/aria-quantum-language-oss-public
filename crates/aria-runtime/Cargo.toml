@@ -20,6 +20,10 @@ metal = [
     "dep:omega-backend-statevector-metal",
     "omega-backend-statevector-metal/metal",
     "omega-core/metal",
+    "dep:omega-backend-mps-metal",
+    "omega-backend-mps-metal/metal",
+    "dep:omega-backend-pauliprop-metal",
+    "omega-backend-pauliprop-metal/metal",
 ]
 # NVIDIA CUDA GPU statevector + MPS bond-compression SVD (Linux/Windows + cu12).
 cuda = [
@@ -38,7 +42,7 @@ opencl = [
     "omega-core/opencl",
 ]
 # Delegate execution to a running omega-server over HTTP (`--backend remote`).
-remote = ["dep:ureq", "dep:serde", "dep:serde_json"]
+remote = ["dep:ureq", "dep:serde"]
 # libtorch (tch) statevector backend (`--backend tch`). Heavy: links libtorch.
 # Needs LIBTORCH set at build/run time (see INSTALL_LIBTORCH.md).
 tch = ["dep:aria-backend-tch"]
@@ -51,6 +55,8 @@ omega-backend-mps = { path = "../omega-backend-mps" }
 omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
 num-complex = { workspace = true }
 ndarray = { workspace = true }
+# Used to parse the `--noise` model JSON (see run::parse_noise_model).
+serde_json = { workspace = true }
 
 # GPU backends (optional, feature-gated). Each implements omega_core::Backend.
 omega-backend-statevector-metal = { path = "../omega-backend-statevector-metal", optional = true }
@@ -60,11 +66,23 @@ omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl
 omega-backend-mps-cuda = { path = "../omega-backend-mps-cuda", optional = true }
 # CUDA branch-expansion accelerator for the pauliprop backend (opt-in via `cuda`).
 omega-backend-pauliprop-cuda = { path = "../omega-backend-pauliprop-cuda", optional = true }
+# Metal θ-contraction accelerator for MPS two-site gates (opt-in via `metal`).
+omega-backend-mps-metal = { path = "../omega-backend-mps-metal", optional = true }
+# Metal branch-expansion accelerator for the pauliprop backend (opt-in via `metal`).
+omega-backend-pauliprop-metal = { path = "../omega-backend-pauliprop-metal", optional = true }
 
 # Remote (omega-server HTTP) backend.
 ureq = { version = "2", default-features = false, features = ["json"], optional = true }
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 
 # libtorch backend (optional; the crate is excluded from the default workspace).
 aria-backend-tch = { path = "../aria-backend-tch", optional = true }
+
+[dev-dependencies]
+# Read the Metal accelerators' telemetry counters in the metal-gated parity
+# tests. No feature here: when aria-runtime is tested with `--features metal`,
+# Cargo unifies these onto the same (metal-enabled) crate instances the runtime
+# drives, so the counters the tests read are the ones the runtime increments.
+# On non-macOS / default builds they compile to inert stubs.
+omega-backend-mps-metal = { path = "../omega-backend-mps-metal" }
+omega-backend-pauliprop-metal = { path = "../omega-backend-pauliprop-metal" }

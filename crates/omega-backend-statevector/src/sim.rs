@@ -7,6 +7,7 @@ use rand::{Rng, RngExt, SeedableRng};
 use omega_core::circuit::*;
 use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
+use omega_core::noise::NoiseModel;
 use omega_core::params::ParameterBinding;
 
 use crate::gates;
@@ -22,7 +23,7 @@ pub struct StatevectorBackend;
 /// bit-flipped (`readout_flip`). Running many shots reproduces the
 /// density-matrix dynamics without ever materialising ρ.
 pub struct NoisyStatevectorBackend {
-    model: crate::noise::NoiseModel,
+    model: NoiseModel,
     seed: Option<u64>,
 }
 
@@ -216,8 +217,8 @@ impl NoisyStatevectorBackend {
     /// Legacy constructor: single depolarizing rate on every gate.
     pub fn new(error_rate: f64, seed: Option<u64>) -> Self {
         Self {
-            model: crate::noise::NoiseModel {
-                depolarizing: error_rate,
+            model: NoiseModel {
+                depolarizing: omega_core::noise::Depolarizing::uniform(error_rate),
                 ..Default::default()
             },
             seed,
@@ -225,12 +226,70 @@ impl NoisyStatevectorBackend {
     }
 
     /// Composable-model constructor.
-    pub fn with_model(model: crate::noise::NoiseModel, seed: Option<u64>) -> Self {
+    pub fn with_model(model: NoiseModel, seed: Option<u64>) -> Self {
         Self { model, seed }
     }
 
-    pub fn model(&self) -> &crate::noise::NoiseModel {
+    pub fn model(&self) -> &NoiseModel {
         &self.model
+    }
+
+    /// Evolve one trajectory to its final state, applying each gate followed by
+    /// the per-gate noise channel on every qubit it touched. In `Collapse` mode,
+    /// `measure` ops project the state and record (readout-flipped) outcomes into
+    /// the returned classical register; in `Skip` mode measures are elided and
+    /// the terminal distribution is read by sampling the returned state.
+    fn evolve(
+        &self,
+        circuit: &CircuitIR,
+        params: &ParameterBinding,
+        config: &ExecConfig,
+        rng: &mut impl Rng,
+    ) -> Result<(Vec<Complex64>, Vec<u8>)> {
+        let n = circuit.num_qubits as usize;
+        let dim = 1usize << n;
+        let mut state = vec![Complex64::new(0.0, 0.0); dim];
+        state[0] = Complex64::new(1.0, 0.0);
+        let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
+
+        for op in &circuit.ops {
+            if !op.condition_satisfied(&classical_bits) {
+                continue;
+            }
+            match &op.gate {
+                GateKind::Measure => {
+                    if config.mid_circuit_mode == MidCircuitMode::Collapse {
+                        let q = op.qubits[0].0 as usize;
+                        let mut outcome = projective_measure(&mut state, n, q, rng);
+                        outcome =
+                            crate::noise::maybe_flip_readout(&self.model.readout, q, outcome, rng);
+                        if let Some(cbit) = op.classical_bit {
+                            if (cbit as usize) < classical_bits.len() {
+                                classical_bits[cbit as usize] = outcome;
+                            }
+                        }
+                    }
+                }
+                GateKind::Barrier => continue,
+                _ => {
+                    apply_gate(&mut state, n, op, params)?;
+                    if !self.model.noiseless() {
+                        let arity = op.qubits.len();
+                        for &qubit in &op.qubits {
+                            crate::noise::apply_channel(
+                                &self.model,
+                                &mut state,
+                                n,
+                                qubit.0 as usize,
+                                arity,
+                                rng,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok((state, classical_bits))
     }
 }
 
@@ -246,59 +305,61 @@ impl Backend for NoisyStatevectorBackend {
         config: &ExecConfig,
     ) -> Result<ExecResult> {
         let n = circuit.num_qubits as usize;
-        let dim = 1usize << n;
-
-        let mut state = vec![Complex64::new(0.0, 0.0); dim];
-        state[0] = Complex64::new(1.0, 0.0);
-
-        let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
 
         let mut rng = match self.seed {
             Some(s) => StdRng::seed_from_u64(s),
             None => rand::make_rng::<StdRng>(),
         };
 
-        for op in &circuit.ops {
-            if !op.condition_satisfied(&classical_bits) {
-                continue;
-            }
-
-            match &op.gate {
-                GateKind::Measure => {
-                    if config.mid_circuit_mode == MidCircuitMode::Collapse {
-                        let q = op.qubits[0].0 as usize;
-                        let mut outcome = projective_measure(&mut state, n, q, &mut rng);
-                        outcome =
-                            crate::noise::maybe_flip(self.model.readout_flip, outcome, &mut rng);
-                        if let Some(cbit) = op.classical_bit {
-                            if (cbit as usize) < classical_bits.len() {
-                                classical_bits[cbit as usize] = outcome;
-                            }
-                        }
-                    }
-                }
-                GateKind::Barrier => continue,
-                _ => {
-                    apply_gate(&mut state, n, op, params)?;
-
-                    // Apply the configured per-gate noise channel to each
-                    // qubit the gate acted on.
-                    if !self.model.noiseless() {
-                        for &qubit in &op.qubits {
-                            let q = qubit.0 as usize;
-                            crate::noise::apply_channel(&self.model, &mut state, n, q, &mut rng);
-                        }
-                    }
-                }
-            }
-        }
-
         match config.shots {
-            None => Ok(ExecResult::Statevector(state)),
+            // Exact-state mode: a single state vector can only carry one
+            // trajectory (it can't represent a mixed state), so we return the
+            // final state of one evolution. Callers wanting the noisy
+            // distribution use the sampling path below.
+            None => {
+                let (state, _cbits) = self.evolve(circuit, params, config, &mut rng)?;
+                Ok(ExecResult::Statevector(state))
+            }
+            // Per-trajectory Monte-Carlo when a channel acts during evolution
+            // OR when mid-circuit measurement collapses the state (the latter is
+            // inherently stochastic per shot, so it can't reuse one evolution).
+            Some(shots)
+                if self.model.has_gate_channel() || collapses(circuit, config) =>
+            {
+                // One independent trajectory per shot — this is what turns a
+                // per-gate channel (amplitude damping, depolarizing, …) into the
+                // right shot statistics instead of one branch drawn once and
+                // replayed for every shot.
+                let collapse = collapses(circuit, config);
+                let mut counts: HashMap<u64, u32> = HashMap::new();
+                for _ in 0..shots {
+                    let (state, cbits) = self.evolve(circuit, params, config, &mut rng)?;
+                    let outcome = if collapse {
+                        // Mid-circuit measures already recorded the (readout-
+                        // flipped) outcomes into the creg during evolution; key
+                        // by the creg to match the noiseless backend.
+                        creg_to_u64(&cbits)
+                    } else {
+                        let sample = sample_counts(&state, n, 1, Some(rng.random()));
+                        // `sample_counts` with shots=1 yields exactly one key.
+                        let mut o = sample.into_keys().next().unwrap_or(0);
+                        if !self.model.readout.is_zero() {
+                            o = flip_readout_bits(o, n, &self.model.readout, &mut rng);
+                        }
+                        o
+                    };
+                    *counts.entry(outcome).or_insert(0) += 1;
+                }
+                Ok(ExecResult::Counts(counts))
+            }
             Some(shots) => {
+                // Fast path: no channel acts during evolution, so a single
+                // evolution's state is exact and every shot samples from it. Any
+                // readout flip is applied independently per shot afterwards.
+                let (state, _cbits) = self.evolve(circuit, params, config, &mut rng)?;
                 let mut counts = sample_counts(&state, n, shots, Some(rng.random()));
-                if self.model.readout_flip > 0.0 {
-                    counts = apply_readout_flip(counts, n, self.model.readout_flip, &mut rng);
+                if !self.model.readout.is_zero() {
+                    counts = apply_readout_flip(counts, n, &self.model.readout, &mut rng);
                 }
                 Ok(ExecResult::Counts(counts))
             }
@@ -306,23 +367,57 @@ impl Backend for NoisyStatevectorBackend {
     }
 }
 
-/// Independently bit-flip each qubit of each shot outcome with probability `p`.
+/// True when this run collapses mid-circuit measurements into the classical
+/// register (so each shot is an independent stochastic trajectory keyed by the
+/// creg, matching the noiseless backend).
+fn collapses(circuit: &CircuitIR, config: &ExecConfig) -> bool {
+    config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0
+}
+
+/// Pack the classical register (bit `i` = cbit `i`) into a `u64` counts key,
+/// identical to the noiseless backend's collapse-mode encoding.
+fn creg_to_u64(classical_bits: &[u8]) -> u64 {
+    let mut bits = 0u64;
+    for (i, b) in classical_bits.iter().enumerate() {
+        if i >= 64 {
+            break;
+        }
+        bits |= ((*b as u64) & 1) << i;
+    }
+    bits
+}
+
+/// Flip each qubit `q` of one measured outcome with its (bit-dependent,
+/// per-qubit) readout-error probability. `readout` may be asymmetric, so the
+/// flip probability depends on the qubit's *true* bit.
+fn flip_readout_bits(
+    bits: u64,
+    n: usize,
+    readout: &omega_core::noise::ReadoutError,
+    rng: &mut impl Rng,
+) -> u64 {
+    let mut flipped = bits;
+    for q in 0..n {
+        let true_bit = ((bits >> q) & 1) as u8;
+        let p = readout.flip_prob(q, true_bit);
+        if p > 0.0 && rng.random::<f64>() < p {
+            flipped ^= 1u64 << q;
+        }
+    }
+    flipped
+}
+
+/// Apply per-qubit readout error independently to every shot in `counts`.
 fn apply_readout_flip(
     counts: HashMap<u64, u32>,
     n: usize,
-    p: f64,
+    readout: &omega_core::noise::ReadoutError,
     rng: &mut impl Rng,
 ) -> HashMap<u64, u32> {
     let mut out: HashMap<u64, u32> = HashMap::new();
     for (bits, count) in counts {
         for _ in 0..count {
-            let mut flipped = bits;
-            for q in 0..n {
-                let r: f64 = rng.random();
-                if r < p {
-                    flipped ^= 1u64 << q;
-                }
-            }
+            let flipped = flip_readout_bits(bits, n, readout, rng);
             *out.entry(flipped).or_insert(0) += 1;
         }
     }
@@ -1244,7 +1339,7 @@ mod tests {
     #[test]
     fn noise_noiseless_model_matches_clean() {
         let backend =
-            NoisyStatevectorBackend::with_model(crate::noise::NoiseModel::default(), Some(0));
+            NoisyStatevectorBackend::with_model(NoiseModel::default(), Some(0));
         let circuit = make_bell_circuit();
         let cfg = ExecConfig {
             shots: Some(2048),
@@ -1266,8 +1361,8 @@ mod tests {
         // Prepare |1⟩ (via X), apply amplitude damping with γ=1 repeatedly.
         // After one jump with γ=1, state should collapse to |0⟩ on every trajectory.
         let circuit = single_x_circuit();
-        let model = crate::noise::NoiseModel {
-            amplitude_damping: 1.0,
+        let model = NoiseModel {
+            amplitude_damping: 1.0.into(),
             ..Default::default()
         };
         let backend = NoisyStatevectorBackend::with_model(model, Some(42));
@@ -1293,8 +1388,8 @@ mod tests {
         let mut circuit = CircuitIR::new(1, CircuitType::GateBased);
         circuit.num_classical_bits = 1;
         // Start in |0⟩ (no gates needed); just sample 2000 shots with heavy readout flip.
-        let model = crate::noise::NoiseModel {
-            readout_flip: 1.0, // always flip
+        let model = NoiseModel {
+            readout: omega_core::noise::ReadoutError::symmetric(1.0), // always flip
             ..Default::default()
         };
         let backend = NoisyStatevectorBackend::with_model(model, Some(1));
@@ -1328,12 +1423,11 @@ mod tests {
             classical_bit: None,
             condition: None,
         });
-        let model = crate::noise::NoiseModel {
-            pauli: Some(crate::noise::PauliRates {
-                p_i: 0.0,
-                p_x: 1.0,
-                p_y: 0.0,
-                p_z: 0.0,
+        let model = NoiseModel {
+            pauli: Some(omega_core::noise::PauliChannel {
+                x: 1.0.into(),
+                y: 0.0.into(),
+                z: 0.0.into(),
             }),
             ..Default::default()
         };
@@ -1368,8 +1462,8 @@ mod tests {
             classical_bit: None,
             condition: None,
         });
-        let model = crate::noise::NoiseModel {
-            phase_damping: 0.5,
+        let model = NoiseModel {
+            phase_damping: 0.5.into(),
             ..Default::default()
         };
         let backend = NoisyStatevectorBackend::with_model(model, Some(3));

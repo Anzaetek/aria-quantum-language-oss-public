@@ -9,6 +9,8 @@ pub mod gates;
 pub mod noise;
 mod sim;
 
-pub use noise::{NoiseModel, PauliRates};
+// The noise data model is shared across backends (see `omega_core::noise`);
+// re-exported here for the callers that construct it alongside this backend.
+pub use omega_core::noise::{Depolarizing, NoiseModel, PauliChannel, Rate, ReadoutError};
 pub use sim::NoisyStatevectorBackend;
 pub use sim::StatevectorBackend;

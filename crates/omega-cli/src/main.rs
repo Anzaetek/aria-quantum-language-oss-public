@@ -61,8 +61,11 @@ fn print_usage() {
     );
     eprintln!("  --input N0,N1,...      Input Fock state (photonics only)");
     eprintln!("  --format FMT           Output format: text (default), json, jsonl");
-    eprintln!("  --noise JSON           Noise model for the statevector backend, e.g.");
-    eprintln!("                         '{{\"depolarizing\":0.001,\"amplitude_damping\":0.0005,\"readout_flip\":0.02}}'");
+    eprintln!("  --noise JSON           Per-gate + readout noise model. Sampled on --backend");
+    eprintln!("                         statevector or mps; applied to --expectation on pauliprop.");
+    eprintln!("                         Uniform (idealized): '{{\"depolarizing\":0.001,\"amplitude_damping\":5e-4,\"readout_flip\":0.02}}'");
+    eprintln!("                         Per-qubit (calibrated): '{{\"amplitude_damping\":[0.004,0.006],");
+    eprintln!("                           \"depolarizing\":{{\"1q\":0.001,\"2q\":0.012}},\"readout\":[{{\"p10\":0.02,\"p01\":0.03}}]}}'");
     eprintln!();
     eprintln!("QUBO solve mode (--qubo):");
     eprintln!("  --qubo FILE            QUBO problem JSON ({{\"n\":N,\"Q\":[[i,j,c],...]}})");
@@ -136,6 +139,16 @@ fn main() {
     }
 
     let format = parse_format(&args);
+
+    // --qubo / --shor have their own arg parsers with catch-all arms that would
+    // silently swallow --noise. These modes don't model gate noise, so reject it
+    // loudly rather than drop it (the core principle of the noise wiring).
+    if args.iter().any(|a| a == "--noise")
+        && (args.iter().any(|a| a == "--qubo") || args.iter().any(|a| a == "--shor"))
+    {
+        eprintln!("--noise is not supported in --qubo / --shor mode. Drop --noise.");
+        std::process::exit(1);
+    }
 
     // Check for --qubo mode (doesn't take a circuit file as positional arg).
     if args.iter().any(|a| a == "--qubo") {
@@ -460,6 +473,17 @@ fn main() {
         return;
     }
 
+    // Gradient modes are analytic (noiseless) — never let `--noise` be silently
+    // dropped on the floor there.
+    if noise_json.is_some() && (gradient_str.is_some() || gradient_fn_str.is_some()) {
+        eprintln!(
+            "--noise is not supported with --gradient / --gradient-of-fn (gradients are computed \
+             analytically on the noiseless circuit). Drop --noise, or estimate a noisy gradient \
+             by sampling with --shots."
+        );
+        std::process::exit(1);
+    }
+
     // --- Mode: gradient-of-functional ---
     if let Some(ref spec_str) = gradient_fn_str {
         let (functional, spec_kind) = parse_functional_spec(spec_str).unwrap_or_else(|e| {
@@ -731,13 +755,30 @@ fn main() {
 
         info(format!("Observable: {}", obs_str));
 
+        // Noise on an expectation value is exact only via the pauliprop
+        // Heisenberg adjoint; statevector/mps expectations are analytic and
+        // noiseless, so `--noise` there would be silently dropped — reject it.
+        let exp_noise = noise_json.as_deref().map(parse_noise_model);
+        if exp_noise.is_some() && !matches!(chosen, "pauliprop" | "pp") {
+            eprintln!(
+                "--noise with --expectation is only supported on --backend pauliprop \
+                 (got '{chosen}'); statevector/mps compute an analytic noiseless expectation. \
+                 Use --shots for a noisy sampled estimate instead."
+            );
+            std::process::exit(1);
+        }
+
         let val = match chosen {
             "statevector" | "sv" => {
                 StatevectorBackend::new().expectation(&circuit, &params, &observable)
             }
             "mps" => MpsBackend::new(64).expectation(&circuit, &params, &observable),
             "pauliprop" | "pp" => {
-                PauliPropBackend::new().expectation(&circuit, &params, &observable)
+                let backend = match &exp_noise {
+                    Some(model) => PauliPropBackend::new().with_noise(model.clone()),
+                    None => PauliPropBackend::new(),
+                };
+                backend.expectation(&circuit, &params, &observable)
             }
             "photonics" => {
                 let b = input_state
@@ -821,6 +862,30 @@ fn main() {
     };
 
     let noise_model = noise_json.as_deref().map(parse_noise_model);
+
+    // Sampling noise is applied by the two trajectory samplers (statevector and
+    // MPS). Any other backend would silently return the *noiseless* distribution
+    // — a user who passed `--noise` would believe they measured a noisy circuit
+    // when they did not. Fail loudly instead of dropping the model on the floor.
+    // (pauliprop applies noise to `--expectation`, handled in that mode above.)
+    if noise_model.is_some() && !matches!(chosen, "statevector" | "sv" | "mps") {
+        eprintln!(
+            "--noise sampling is supported on --backend statevector or mps (got '{chosen}'); \
+             this backend cannot apply a noise model to sampled counts. Re-run with \
+             --backend statevector/mps, or drop --noise."
+        );
+        std::process::exit(1);
+    }
+    // A noise model needs shots: a single state vector can't carry a stochastic
+    // channel. Reject `--statevector --noise` rather than return one random
+    // trajectory dressed up as "the" state (matches the aria CLI).
+    if noise_model.is_some() && shots.is_none() {
+        eprintln!(
+            "--noise requires sampling (--shots N); a single --statevector output cannot carry \
+             a stochastic noise channel. Drop --statevector, or drop --noise."
+        );
+        std::process::exit(1);
+    }
 
     // Resolve the compute device requested via `--device`.
     // Honours OMEGA_DEVICE if --device wasn't passed; falls back to CPU
@@ -991,7 +1056,15 @@ fn main() {
                     StatevectorBackend::new().execute(&circuit, &params, &config)
                 }
             }
-            "mps" => MpsBackend::new(64).execute(&circuit, &params, &config),
+            "mps" => {
+                if let Some(model) = &noise_model {
+                    info(format!("Noise model: {:?}", model));
+                    omega_backend_mps::NoisyMpsBackend::with_model(64, model.clone())
+                        .execute(&circuit, &params, &config)
+                } else {
+                    MpsBackend::new(64).execute(&circuit, &params, &config)
+                }
+            }
             "pauli" | "stabilizer" => PauliBackend::new().execute(&circuit, &params, &config),
             "pauliprop" | "pp" => {
                 eprintln!(
@@ -1292,27 +1365,14 @@ fn parse_observable(s: &str) -> Observable {
 }
 
 /// Parse a `--noise '{...}'` JSON string into a `NoiseModel`.
+///
+/// Delegates to the shared [`omega_core::noise::NoiseModel`] parser, which
+/// accepts both scalar (uniform) and per-qubit forms and rejects unknown keys.
 fn parse_noise_model(s: &str) -> omega_backend_statevector::NoiseModel {
-    let v: serde_json::Value = serde_json::from_str(s).unwrap_or_else(|e| {
-        eprintln!("Invalid --noise JSON: {}", e);
+    omega_core::noise::NoiseModel::from_json(s).unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(1);
-    });
-    let get = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
-    let pauli = v
-        .get("pauli")
-        .map(|p| omega_backend_statevector::PauliRates {
-            p_i: p.get("I").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            p_x: p.get("X").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            p_y: p.get("Y").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            p_z: p.get("Z").and_then(|x| x.as_f64()).unwrap_or(0.0),
-        });
-    omega_backend_statevector::NoiseModel {
-        depolarizing: get("depolarizing"),
-        amplitude_damping: get("amplitude_damping"),
-        phase_damping: get("phase_damping"),
-        pauli,
-        readout_flip: get("readout_flip"),
-    }
+    })
 }
 
 /// Parse "Z0Z1X2" into vec of (qubit, PauliOp).

@@ -65,7 +65,7 @@ fn trajectory_average<F: Fn(&[Complex64]) -> f64>(
 
 fn depolarizing(p: f64) -> NoiseModel {
     NoiseModel {
-        depolarizing: p,
+        depolarizing: omega_backend_statevector::Depolarizing::uniform(p),
         ..Default::default()
     }
 }
@@ -144,7 +144,7 @@ pub fn run(_transport: Transport) -> Result<Verdict, String> {
     let mut worst_ad = 0.0f64;
     for &g in &PS {
         let model = NoiseModel {
-            amplitude_damping: g,
+            amplitude_damping: g.into(),
             ..Default::default()
         };
         let z = trajectory_average(&ryc, &ryp, &model, &z_of)?;

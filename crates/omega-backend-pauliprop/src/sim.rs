@@ -12,6 +12,7 @@ use num_complex::Complex64;
 use omega_core::circuit::{CircuitIR, GateKind, GateOp, ParamExpr};
 use omega_core::error::{OmegaError, Result};
 use omega_core::executor::{Backend, ExecConfig, ExecResult, Observable, PauliOp};
+use omega_core::noise::NoiseModel;
 use omega_core::params::ParameterBinding;
 
 use crate::pauli::{mul_raw, PauliKey, PauliSum};
@@ -55,6 +56,11 @@ pub struct PauliPropBackend {
     /// Optional GPU accelerator for the branch step (see [`BranchHook`]). `None`
     /// = pure CPU. Skipped from `Debug`/equality — it's a code pointer.
     branch_hook: Option<BranchHook>,
+    /// Optional per-gate + readout noise model. `None` = exact, noise-free
+    /// Heisenberg evolution. When set, each channel's *adjoint* is applied to
+    /// the propagating observable — deterministically and exactly (no
+    /// trajectories), which is the natural home for Pauli-Lindblad noise.
+    noise: Option<NoiseModel>,
 }
 
 impl Default for PauliPropBackend {
@@ -64,6 +70,7 @@ impl Default for PauliPropBackend {
             max_weight: None,
             max_freq: None,
             branch_hook: None,
+            noise: None,
         }
     }
 }
@@ -81,12 +88,21 @@ impl PauliPropBackend {
             max_weight,
             max_freq: None,
             branch_hook: None,
+            noise: None,
         }
     }
 
     /// Install a GPU accelerator for the branch step (see [`BranchHook`]).
     pub fn with_branch_hook(mut self, hook: BranchHook) -> Self {
         self.branch_hook = Some(hook);
+        self
+    }
+
+    /// Attach a per-gate + readout noise model (applied via its Heisenberg
+    /// adjoint during propagation). Composes with truncation and the branch
+    /// accelerator.
+    pub fn with_noise(mut self, model: NoiseModel) -> Self {
+        self.noise = Some(model);
         self
     }
 
@@ -102,6 +118,7 @@ impl PauliPropBackend {
             max_weight,
             max_freq,
             branch_hook: None,
+            noise: None,
         }
     }
 
@@ -158,13 +175,117 @@ impl PauliPropBackend {
             }
             sum.add(key, c);
         }
+        // Readout error is the *last* thing to happen in forward time
+        // (measurement), so in the backward (adjoint) propagation it is applied
+        // *first* — to the raw observable, before any gate.
+        if let Some(model) = &self.noise {
+            self.apply_readout_adjoint(model, n, &mut sum)?;
+        }
         for op in circuit.ops.iter().rev() {
+            // The per-gate channel follows its gate in forward time, so its
+            // adjoint precedes the gate's adjoint here.
+            if let Some(model) = &self.noise {
+                self.apply_gate_noise_adjoint(model, op, &mut sum);
+            }
             self.conjugate(op, params, n, &mut sum)?;
             if self.coeff_min > 0.0 || self.max_weight.is_some() || self.max_freq.is_some() {
                 sum.truncate(self.coeff_min, self.max_weight, self.max_freq);
             }
         }
         Ok(sum)
+    }
+
+    /// Apply the adjoint of the per-gate noise channel that follows `op`.
+    ///
+    /// Each single-qubit Pauli-Lindblad channel acts diagonally on the Pauli
+    /// basis — `N†(P) = λ_P · P` — so the adjoint just rescales each term by a
+    /// factor set by its local Pauli on the affected qubit. Amplitude damping is
+    /// the one non-unital channel: `Z → (1−γ)Z + γ·I`, which additionally spawns
+    /// a lower-weight identity term.
+    ///
+    /// **Order matters.** The statevector backend applies the forward channels
+    /// in the order depolarizing → Pauli → amplitude-damping → phase, so the
+    /// Heisenberg adjoint on the observable must apply them in *reverse*:
+    /// amplitude damping first, then the diagonal channels. If a diagonal
+    /// channel ran first it would rescale the parent `Z` before amplitude
+    /// damping spawns its identity term, wrongly scaling that identity by the
+    /// diagonal factor. The diagonal channels commute with each other, so only
+    /// amplitude damping's leading position is load-bearing.
+    fn apply_gate_noise_adjoint(&self, model: &NoiseModel, op: &GateOp, sum: &mut PauliSum) {
+        if matches!(op.gate, GateKind::Measure | GateKind::Barrier) {
+            return;
+        }
+        let arity = op.qubits.len();
+        for qb in &op.qubits {
+            let q = qb.0 as usize;
+
+            // Amplitude damping γ (non-unital): X,Y → √(1−γ)·; Z → (1−γ)Z + γ·I.
+            // Applied FIRST (see the ordering note above) so the spawned identity
+            // term is not rescaled by the diagonal channels below.
+            let gamma = model.amplitude_damping.at(q);
+            if gamma > 0.0 {
+                apply_amplitude_damping_adjoint(sum, q, gamma);
+            }
+
+            // Depolarizing: identity untouched, any non-I Pauli → (1 − 4p/3).
+            let p = model.depolarizing.at(q, arity);
+            if p > 0.0 {
+                let lam = 1.0 - 4.0 * p / 3.0;
+                scale_by_local_pauli(sum, q, |x, z| if x || z { lam } else { 1.0 });
+            }
+
+            // Phase damping λ: X, Y → (1 − λ); I, Z unchanged.
+            let lambda = model.phase_damping.at(q);
+            if lambda > 0.0 {
+                scale_by_local_pauli(sum, q, |x, _z| if x { 1.0 - lambda } else { 1.0 });
+            }
+
+            // Explicit Pauli channel (p_x, p_y, p_z): Pauli-transfer eigenvalues.
+            if let Some(pauli) = &model.pauli {
+                let (px, py, pz) = (pauli.x.at(q), pauli.y.at(q), pauli.z.at(q));
+                if px + py + pz > 0.0 {
+                    let pi = 1.0 - px - py - pz;
+                    scale_by_local_pauli(sum, q, |x, z| match (x, z) {
+                        (false, false) => 1.0,        // I
+                        (true, false) => pi + px - py - pz, // X
+                        (false, true) => pi - px - py + pz, // Z
+                        (true, true) => pi - px + py - pz,  // Y
+                    });
+                }
+            }
+        }
+    }
+
+    /// Apply the adjoint of readout error to the freshly-seeded observable.
+    ///
+    /// Readout is modelled as an independent bit-flip on each qubit's Z-basis
+    /// outcome, so its adjoint scales the measured `Z`/`Y` components by
+    /// `1 − 2p` (leaving `X`), matching `readout_flip` on the statevector
+    /// sampler. This backend produces expectation values (no shots), so only
+    /// **symmetric** readout has an unambiguous meaning here; asymmetric readout
+    /// (`p10 ≠ p01`) is rejected — sample it on `--backend sim` instead.
+    fn apply_readout_adjoint(&self, model: &NoiseModel, n: usize, sum: &mut PauliSum) -> Result<()> {
+        if model.readout.is_zero() {
+            return Ok(());
+        }
+        for q in 0..n {
+            let p10 = model.readout.p10.at(q);
+            let p01 = model.readout.p01.at(q);
+            if (p10 - p01).abs() > 1e-12 {
+                return Err(OmegaError::Unsupported(format!(
+                    "pauliprop expectation backend: asymmetric readout (p10={p10}, p01={p01}) \
+                     on qubit {q} is not representable as an expectation-value rescale; \
+                     sample it on --backend sim instead"
+                )));
+            }
+            let p = p10;
+            if p > 0.0 {
+                // Bit-flip adjoint: Z,Y → (1−2p)·; X unchanged; I unchanged.
+                let lam = 1.0 - 2.0 * p;
+                scale_by_local_pauli(sum, q, |_x, z| if z { lam } else { 1.0 });
+            }
+        }
+        Ok(())
     }
 
     /// Conjugate the whole sum by one gate `Gᵏ`: `O ← Gᵏ† O Gᵏ`.
@@ -573,6 +694,42 @@ pub fn unpack_bits(words: &[u64], n: usize) -> Vec<bool> {
 /// Resolve a (concrete or symbolic) parameter to a number.
 fn resolve(expr: &ParamExpr, params: &ParameterBinding) -> Result<f64> {
     params.resolve(expr)
+}
+
+/// Rescale every term's coefficient by a factor determined by its local Pauli
+/// `(x, z)` on qubit `q`. Used for the diagonal (Pauli-Lindblad) channel
+/// adjoints, which map each Pauli to a scalar multiple of itself — so the keys
+/// don't change and we can mutate coefficients in place.
+fn scale_by_local_pauli<F: Fn(bool, bool) -> f64>(sum: &mut PauliSum, q: usize, factor: F) {
+    for (key, w) in sum.terms.iter_mut() {
+        let f = factor(key.x[q], key.z[q]);
+        if f != 1.0 {
+            w.coeff *= f;
+        }
+    }
+}
+
+/// Adjoint of amplitude damping on qubit `q`: `X,Y → √(1−γ)·`, `I → I`, and the
+/// non-unital `Z → Z + γ·I` (which spawns a lower-weight identity companion).
+/// Rebuilds the term map so spawned/merged keys accumulate correctly.
+fn apply_amplitude_damping_adjoint(sum: &mut PauliSum, q: usize, gamma: f64) {
+    let s = (1.0 - gamma).sqrt();
+    let old = std::mem::take(&mut sum.terms);
+    for (key, w) in old {
+        match (key.x[q], key.z[q]) {
+            (false, false) => sum.add_weighted(key, w.coeff, w.freq), // I
+            (true, false) | (true, true) => sum.add_weighted(key, w.coeff * s, w.freq), // X, Y
+            (false, true) => {
+                // Z → (1−γ)·Z + γ·I: the Z term is attenuated and a companion
+                // identity-on-q term is added with weight γ. (Λ†(Z) =
+                // diag(1, 2γ−1) = γ·I + (1−γ)·Z.)
+                let mut ident = key.clone();
+                ident.z[q] = false;
+                sum.add_weighted(key, w.coeff * (1.0 - gamma), w.freq);
+                sum.add_weighted(ident, w.coeff * gamma, w.freq);
+            }
+        }
+    }
 }
 
 impl Backend for PauliPropBackend {

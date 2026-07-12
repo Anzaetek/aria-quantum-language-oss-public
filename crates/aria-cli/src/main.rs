@@ -50,6 +50,7 @@ fn usage() {
          aria parse  <file.aria> [--circuit NAME] [--int k=v]...\n  \
          aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...\n              \
          [--shots N] [--seed S] [--backend sim|mps|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]\n              \
+         [--noise JSON  (sampled counts on --backend sim, e.g. '{{\"readout_flip\":0.02,\"amplitude_damping\":5e-4}}')]\n              \
          (pauliprop computes --expectation only; truncate deep circuits with\n              \
           [--truncate C] [--max-weight W] [--max-freq F])\n              \
          [--url URL --token TOK   (for --backend remote)]\n  \
@@ -255,11 +256,26 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
         .map(|s| s.parse().map_err(|_| format!("bad --seed '{s}'")))
         .transpose()?;
 
+    // Per-gate noise model (trajectory simulation). Parsed here so a bad spec
+    // or a channel that can't be applied fails loudly — `--noise` must never be
+    // silently discarded (that's the exact bug this path fixes).
+    let noise = a
+        .opt("noise")
+        .map(aria_runtime::parse_noise_model)
+        .transpose()?;
+
     let src = read_source(path)?;
     let circuit = instantiate(&src, name, &ints)?;
 
     // Remote omega-server backend (counts only).
     if backend_str == "remote" {
+        if noise.is_some() {
+            return Err(
+                "--noise is not supported with --backend remote; run the noisy \
+                 trajectory simulation locally with --backend sim"
+                    .into(),
+            );
+        }
         #[cfg(feature = "remote")]
         {
             let url = a.opt("url").ok_or("--backend remote requires --url URL")?;
@@ -280,6 +296,14 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
     let sel = BackendSel::parse(backend_str)?;
 
     if let Some(obs) = a.opt("expectation") {
+        // Noisy expectation is exact only on the Pauli-propagation backend
+        // (Heisenberg adjoint); route there. sim/mps expectations are analytic
+        // and noiseless, so `expectation_noisy` rejects them with guidance.
+        if let Some(model) = &noise {
+            let val = aria_runtime::expectation_noisy(&circuit, obs, &binds, sel, model)?;
+            println!("<{obs}> = {val:.12}");
+            return Ok(());
+        }
         // Pauli-propagation truncation knobs (PauliPropagation.jl's three axes).
         // When any is set, use the truncated engine and also print the certified
         // dropped-mass error budget. Without them the exact engine is used and
@@ -326,6 +350,14 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
     }
 
     if a.has("statevector") {
+        if noise.is_some() {
+            return Err(
+                "--noise applies to sampled counts, not --statevector (a single exact \
+                 state vector can't carry a stochastic noise channel; drop --statevector \
+                 and use --shots N)"
+                    .into(),
+            );
+        }
         let sv = statevector(&circuit, &binds, sel)?;
         for (i, amp) in sv.iter().enumerate() {
             if amp.norm() > 1e-12 {
@@ -340,7 +372,10 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let res = run_counts(&circuit, &binds, shots, seed, sel)?;
+    let res = match &noise {
+        Some(model) => aria_runtime::run_counts_noisy(&circuit, &binds, shots, seed, sel, model)?,
+        None => run_counts(&circuit, &binds, shots, seed, sel)?,
+    };
     print_counts(res, counts_width(&circuit, &binds));
     Ok(())
 }

@@ -1,66 +1,37 @@
-//! Composable noise model for trajectory-based simulation.
+//! Trajectory application of the shared [`NoiseModel`] for the statevector
+//! backend.
 //!
-//! Every channel is applied per-qubit immediately after each gate that
-//! touches the qubit, via the Monte-Carlo quantum-jump method:
-//! draw the Kraus branch weighted by ⟨ψ|E_k†E_k|ψ⟩, apply that operator,
-//! then renormalise. Aggregating many shots reproduces the density-matrix
-//! dynamics without ever materialising ρ.
+//! The noise *data model* lives in [`omega_core::noise`]; this module is the
+//! statevector-specific *application*: each channel is applied per-qubit
+//! immediately after each gate that touches the qubit, via the Monte-Carlo
+//! quantum-jump method — draw the Kraus branch weighted by ⟨ψ|E_k†E_k|ψ⟩,
+//! apply that operator, then renormalise. Aggregating many shots reproduces the
+//! density-matrix dynamics without ever materialising ρ. Rates are read
+//! per-qubit and per gate arity, so the same code serves a uniform idealized
+//! device and a calibrated one.
 
 use num_complex::Complex64;
 use rand::{Rng, RngExt};
 
+use omega_core::noise::{NoiseModel, ReadoutError};
+
 use crate::gates;
 use crate::sim::apply_1q;
 
-/// Configurable per-gate noise model. Each rate defaults to `0.0` so the
-/// all-zero model reduces to exact noise-free simulation.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct NoiseModel {
-    /// Single-qubit depolarizing rate. After each gate, with probability
-    /// `depolarizing`, a uniformly chosen X/Y/Z is applied to each
-    /// affected qubit.
-    pub depolarizing: f64,
-    /// Amplitude-damping rate γ. Kraus operators
-    /// `E_0 = [[1,0],[0,√(1-γ)]]`, `E_1 = [[0,√γ],[0,0]]`.
-    pub amplitude_damping: f64,
-    /// Phase-damping rate γ. Trajectory-form: apply Z with probability γ/2.
-    pub phase_damping: f64,
-    /// Arbitrary Pauli channel `(p_I, p_X, p_Y, p_Z)`. The four entries
-    /// must sum to ≤ 1; the remainder is treated as identity.
-    pub pauli: Option<PauliRates>,
-    /// Bit-flip probability applied to every classical measurement outcome.
-    pub readout_flip: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PauliRates {
-    pub p_i: f64,
-    pub p_x: f64,
-    pub p_y: f64,
-    pub p_z: f64,
-}
-
-impl NoiseModel {
-    pub fn noiseless(&self) -> bool {
-        self.depolarizing == 0.0
-            && self.amplitude_damping == 0.0
-            && self.phase_damping == 0.0
-            && self.pauli.is_none()
-            && self.readout_flip == 0.0
-    }
-}
-
-/// Apply the full per-gate channel to qubit `q`.
+/// Apply the full per-gate channel to qubit `q`, for a gate acting on `arity`
+/// qubits (the arity selects the 1q vs 2q depolarizing rate).
 pub fn apply_channel<R: Rng>(
     model: &NoiseModel,
     state: &mut [Complex64],
     n: usize,
     q: usize,
+    arity: usize,
     rng: &mut R,
 ) {
-    if model.depolarizing > 0.0 {
+    let depol = model.depolarizing.at(q, arity);
+    if depol > 0.0 {
         let r: f64 = rng.random();
-        if r < model.depolarizing {
+        if r < depol {
             let choice: f64 = rng.random();
             if choice < 1.0 / 3.0 {
                 apply_1q(state, n, q, &gates::x());
@@ -72,28 +43,33 @@ pub fn apply_channel<R: Rng>(
         }
     }
 
-    if let Some(rates) = model.pauli {
-        let r: f64 = rng.random();
-        let c_x = rates.p_x;
-        let c_y = c_x + rates.p_y;
-        let c_z = c_y + rates.p_z;
-        if r < c_x {
-            apply_1q(state, n, q, &gates::x());
-        } else if r < c_y {
-            apply_1q(state, n, q, &gates::y());
-        } else if r < c_z {
-            apply_1q(state, n, q, &gates::z());
+    if let Some(pauli) = &model.pauli {
+        let (px, py, pz) = (pauli.x.at(q), pauli.y.at(q), pauli.z.at(q));
+        if px + py + pz > 0.0 {
+            let r: f64 = rng.random();
+            let c_x = px;
+            let c_y = c_x + py;
+            let c_z = c_y + pz;
+            if r < c_x {
+                apply_1q(state, n, q, &gates::x());
+            } else if r < c_y {
+                apply_1q(state, n, q, &gates::y());
+            } else if r < c_z {
+                apply_1q(state, n, q, &gates::z());
+            }
         }
     }
 
-    if model.amplitude_damping > 0.0 {
-        apply_amplitude_damping(state, n, q, model.amplitude_damping, rng);
+    let gamma = model.amplitude_damping.at(q);
+    if gamma > 0.0 {
+        apply_amplitude_damping(state, n, q, gamma, rng);
     }
 
-    if model.phase_damping > 0.0 {
-        // Trajectory form: Z is applied with probability γ/2.
+    let lambda = model.phase_damping.at(q);
+    if lambda > 0.0 {
+        // Trajectory form: Z is applied with probability λ/2.
         let r: f64 = rng.random();
-        if r < 0.5 * model.phase_damping {
+        if r < 0.5 * lambda {
             apply_1q(state, n, q, &gates::z());
         }
     }
@@ -158,8 +134,15 @@ fn apply_amplitude_damping<R: Rng>(
     }
 }
 
-/// Flip a classical bit outcome with probability `p`.
-pub fn maybe_flip<R: Rng>(p: f64, outcome: u8, rng: &mut R) -> u8 {
+/// Flip a measured bit on qubit `q` per the (possibly asymmetric, per-qubit)
+/// readout error, given the true outcome bit.
+pub fn maybe_flip_readout<R: Rng>(
+    readout: &ReadoutError,
+    q: usize,
+    outcome: u8,
+    rng: &mut R,
+) -> u8 {
+    let p = readout.flip_prob(q, outcome);
     if p <= 0.0 {
         return outcome;
     }

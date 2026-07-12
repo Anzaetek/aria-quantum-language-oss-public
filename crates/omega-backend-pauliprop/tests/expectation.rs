@@ -621,3 +621,181 @@ fn surface_code_syndrome_via_expectation() {
         "syndrome bit should be 1"
     );
 }
+
+// ----- noise (Pauli-Lindblad adjoint) parity --------------------------------
+//
+// Each check pins the noisy expectation to its closed-form density-matrix value
+// — the same number Qiskit Aer's density-matrix simulator would return. The
+// pauliprop engine computes these *exactly* (no trajectories) via the channel
+// adjoints, so the tolerance is machine-epsilon, not Monte-Carlo.
+
+use omega_backend_pauliprop::PauliPropBackend as PP;
+use omega_core::noise::{Depolarizing, NoiseModel, PauliChannel, ReadoutError};
+
+fn noisy(model: NoiseModel) -> PP {
+    PP::new().with_noise(model)
+}
+
+#[test]
+fn noise_depolarizing_scales_z_by_1_minus_4p_over_3() {
+    // ⟨Z⟩ of RY(θ)|0⟩ under single-qubit depolarizing p is (1−4p/3)·cosθ.
+    let theta = 0.7_f64;
+    let p = 0.15_f64;
+    let c = circuit(1, vec![op(GateKind::Ry, &[0], &[theta])]);
+    let o = obs(vec![(0, PauliOp::Z)]);
+    let got = noisy(NoiseModel {
+        depolarizing: Depolarizing::uniform(p),
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &o)
+    .unwrap();
+    let want = (1.0 - 4.0 * p / 3.0) * theta.cos();
+    assert!((got - want).abs() <= 1e-12, "depol ⟨Z⟩ {got} vs {want}");
+}
+
+#[test]
+fn noise_amplitude_damping_on_excited_state() {
+    // X|0⟩ = |1⟩, then amplitude damping γ: ⟨Z⟩ = P0 − P1 = γ − (1−γ) = 2γ−1.
+    let gamma = 0.3_f64;
+    let c = circuit(1, vec![op(GateKind::X, &[0], &[])]);
+    let o = obs(vec![(0, PauliOp::Z)]);
+    let got = noisy(NoiseModel {
+        amplitude_damping: gamma.into(),
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &o)
+    .unwrap();
+    let want = 2.0 * gamma - 1.0;
+    assert!((got - want).abs() <= 1e-12, "ampdamp ⟨Z⟩ {got} vs {want}");
+}
+
+#[test]
+fn noise_phase_damping_attenuates_coherence() {
+    // ⟨X⟩ of |+⟩ = H|0⟩ under phase damping λ is (1−λ); Z-populations untouched.
+    let lambda = 0.4_f64;
+    let c = circuit(1, vec![op(GateKind::H, &[0], &[])]);
+    let got_x = noisy(NoiseModel {
+        phase_damping: lambda.into(),
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &obs(vec![(0, PauliOp::X)]))
+    .unwrap();
+    assert!((got_x - (1.0 - lambda)).abs() <= 1e-12, "dephase ⟨X⟩ {got_x}");
+    // ⟨Z⟩ of |+⟩ stays 0 under pure dephasing.
+    let got_z = noisy(NoiseModel {
+        phase_damping: lambda.into(),
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &obs(vec![(0, PauliOp::Z)]))
+    .unwrap();
+    assert!(got_z.abs() <= 1e-12, "dephase ⟨Z⟩ {got_z} should be 0");
+}
+
+#[test]
+fn noise_pauli_channel_x_flips_z_sign_fraction() {
+    // Pure X Pauli channel with p_x, fired by an Id gate on |0⟩ (noise acts
+    // after a gate, as on the statevector backend): ⟨Z⟩ = (1−2 p_x).
+    let px = 0.25_f64;
+    let c = circuit(1, vec![op(GateKind::Id, &[0], &[])]);
+    let o = obs(vec![(0, PauliOp::Z)]);
+    let got = noisy(NoiseModel {
+        pauli: Some(PauliChannel {
+            x: px.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &o)
+    .unwrap();
+    assert!((got - (1.0 - 2.0 * px)).abs() <= 1e-12, "pauli-X ⟨Z⟩ {got}");
+}
+
+#[test]
+fn noise_symmetric_readout_scales_z() {
+    // Symmetric readout p on |1⟩ (=X|0⟩): ⟨Z⟩ = (1−2p)·(−1) = 2p−1.
+    let p = 0.1_f64;
+    let c = circuit(1, vec![op(GateKind::X, &[0], &[])]);
+    let o = obs(vec![(0, PauliOp::Z)]);
+    let got = noisy(NoiseModel {
+        readout: ReadoutError::symmetric(p),
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &o)
+    .unwrap();
+    assert!((got - (2.0 * p - 1.0)).abs() <= 1e-12, "readout ⟨Z⟩ {got}");
+}
+
+#[test]
+fn noise_asymmetric_readout_rejected() {
+    // Asymmetric readout has no unambiguous expectation-value meaning here.
+    let c = circuit(1, vec![]);
+    let o = obs(vec![(0, PauliOp::Z)]);
+    let res = noisy(NoiseModel {
+        readout: ReadoutError {
+            p10: 0.02.into(),
+            p01: 0.05.into(),
+        },
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &o);
+    assert!(res.is_err(), "asymmetric readout should be rejected");
+}
+
+#[test]
+fn noise_combined_ampdamp_and_depolarizing_order() {
+    // Regression for the adjoint-ordering bug: amplitude damping (non-unital)
+    // combined with depolarizing on the same qubit. X|0⟩=|1⟩, then depol p and
+    // amplitude damping γ. Density-matrix reference:
+    //   ⟨Z⟩ = γ + (1−γ)·(−(1−4p/3))
+    // because damping spawns a γ·I term that depol must NOT rescale, while the
+    // surviving (1−γ)Z is attenuated by both depol (1−4p/3) and the X flip.
+    let p = 0.3_f64;
+    let gamma = 0.5_f64;
+    let c = circuit(1, vec![op(GateKind::X, &[0], &[])]);
+    let o = obs(vec![(0, PauliOp::Z)]);
+    let got = noisy(NoiseModel {
+        depolarizing: Depolarizing::uniform(p),
+        amplitude_damping: gamma.into(),
+        ..Default::default()
+    })
+    .expectation(&c, &ParameterBinding::new(), &o)
+    .unwrap();
+    let want = gamma + (1.0 - gamma) * (-(1.0 - 4.0 * p / 3.0));
+    assert!(
+        (got - want).abs() <= 1e-12,
+        "combined ampdamp+depol ⟨Z⟩ {got} vs {want}"
+    );
+}
+
+#[test]
+fn noise_per_qubit_depolarizing() {
+    // Per-qubit depolarizing: q0 clean, q1 with p. On RY(θ) both, ⟨Z0⟩=cosθ,
+    // ⟨Z1⟩=(1−4p/3)cosθ.
+    let theta = 0.9_f64;
+    let p = 0.2_f64;
+    let c = circuit(
+        2,
+        vec![
+            op(GateKind::Ry, &[0], &[theta]),
+            op(GateKind::Ry, &[1], &[theta]),
+        ],
+    );
+    let model = NoiseModel {
+        depolarizing: Depolarizing {
+            one_q: omega_core::noise::Rate::PerQubit(vec![0.0, p]),
+            two_q: omega_core::noise::Rate::Uniform(0.0),
+        },
+        ..Default::default()
+    };
+    let z0 = noisy(model.clone())
+        .expectation(&c, &ParameterBinding::new(), &obs(vec![(0, PauliOp::Z)]))
+        .unwrap();
+    let z1 = noisy(model)
+        .expectation(&c, &ParameterBinding::new(), &obs(vec![(1, PauliOp::Z)]))
+        .unwrap();
+    assert!((z0 - theta.cos()).abs() <= 1e-12, "q0 clean ⟨Z0⟩ {z0}");
+    assert!(
+        (z1 - (1.0 - 4.0 * p / 3.0) * theta.cos()).abs() <= 1e-12,
+        "q1 noisy ⟨Z1⟩ {z1}"
+    );
+}

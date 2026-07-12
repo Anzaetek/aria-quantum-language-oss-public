@@ -5,5 +5,5 @@ pub mod mps;
 mod sim;
 pub mod svd;
 
-pub use mps::SvdFlatFn;
-pub use sim::MpsBackend;
+pub use mps::{Contract2qFn, SvdFlatFn};
+pub use sim::{MpsBackend, NoisyMpsBackend};

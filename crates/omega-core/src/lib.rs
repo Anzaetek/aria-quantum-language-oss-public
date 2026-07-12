@@ -10,6 +10,7 @@ pub mod executor;
 pub mod ffi_types;
 pub mod gradient;
 pub mod grover;
+pub mod noise;
 pub mod optimize;
 pub mod params;
 pub mod plugin;

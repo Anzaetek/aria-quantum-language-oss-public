@@ -45,6 +45,19 @@ impl MpsTensor {
 /// [`truncated_svd_flat`]; the CUDA backend injects its `gesvdj` path here.
 pub type SvdFlatFn = fn(&[Complex64], usize, usize, usize, usize, f64) -> SvdResultFlat;
 
+/// A two-site-gate accelerator in the calling convention of [`Mps::apply_2q`]:
+/// given the adjacent `(left, right)` tensors, the 4×4 `gate`, the bond cap, and
+/// the SVD threshold, it does the whole contract-gate-SVD-split on an
+/// accelerator and returns the post-truncation `(left, right)`. It returns
+/// `Some` only when the accelerator actually ran; `None` means "not handled —
+/// use the built-in path", so [`Mps::apply_2q`] transparently falls back and
+/// the result never depends on whether the hook was installed. This is the
+/// Metal arm's injection point (contraction on GPU, SVD on CPU — see
+/// `omega-backend-mps-metal`); the CUDA arm instead swaps the SVD via
+/// [`SvdFlatFn`]. A plain `fn` pointer so [`Mps`] stays `Clone`.
+pub type Contract2qFn =
+    fn(&MpsTensor, &MpsTensor, &[Complex64; 16], usize, f64) -> Option<(MpsTensor, MpsTensor)>;
+
 /// Matrix Product State for n qubits.
 #[derive(Clone)]
 pub struct Mps {
@@ -55,6 +68,11 @@ pub struct Mps {
     /// behind `apply_2q_distant`) routes its truncation through this, so
     /// swapping in a GPU SVD accelerates the whole circuit. Defaults to CPU.
     svd_fn: SvdFlatFn,
+    /// Optional two-site-gate accelerator (see [`Contract2qFn`]). `None` = the
+    /// built-in contract+SVD path. When set (e.g. the Metal contraction), each
+    /// adjacent two-qubit gate is offered to it first, with a transparent
+    /// fall-through to the built-in path on `None`.
+    contract_fn: Option<Contract2qFn>,
 }
 
 impl Mps {
@@ -71,6 +89,7 @@ impl Mps {
             n,
             max_bond_dim,
             svd_fn: truncated_svd_flat,
+            contract_fn: None,
         }
     }
 
@@ -78,6 +97,13 @@ impl Mps {
     /// every subsequent two-qubit gate, distant swaps included.
     pub fn set_svd_fn(&mut self, f: SvdFlatFn) {
         self.svd_fn = f;
+    }
+
+    /// Route each adjacent two-qubit gate through the accelerator `f` (e.g. the
+    /// Metal θ-contraction) before falling back to the built-in path. Applies to
+    /// every subsequent two-qubit gate, distant swaps included.
+    pub fn set_contract_fn(&mut self, f: Contract2qFn) {
+        self.contract_fn = Some(f);
     }
 
     /// Apply a single-qubit gate (2x2 matrix) to qubit q.
@@ -103,6 +129,26 @@ impl Mps {
     /// Apply a two-qubit gate (4x4 matrix) to adjacent qubits (q, q+1).
     /// Uses SVD to split the result back into two tensors, truncating to max_bond_dim.
     pub fn apply_2q(&mut self, q: usize, gate: &[Complex64; 16]) {
+        assert!(q + 1 < self.n, "q+1 out of range");
+
+        // Offer the whole contract-gate-SVD to an accelerator first (e.g. Metal
+        // θ-contraction). It returns `Some` only when it actually ran; `None`
+        // falls through to the built-in path below, so the result is identical
+        // whether or not the hook is installed.
+        if let Some(cf) = self.contract_fn {
+            if let Some((nl, nr)) = cf(
+                &self.tensors[q],
+                &self.tensors[q + 1],
+                gate,
+                self.max_bond_dim,
+                1e-14,
+            ) {
+                self.tensors[q] = nl;
+                self.tensors[q + 1] = nr;
+                return;
+            }
+        }
+
         // Route through the configured SVD provider (CPU by default, GPU
         // `gesvdj` when set via `set_svd_fn`). Read the fn pointer out first so
         // the `&mut self` borrow in `apply_2q_with_svd_flat` doesn't conflict.

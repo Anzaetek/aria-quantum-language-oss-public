@@ -7,17 +7,18 @@ use std::collections::HashMap;
 
 use num_complex::Complex64;
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, RngExt, SeedableRng};
 
 use omega_core::circuit::*;
 use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
+use omega_core::noise::{NoiseModel, ReadoutError};
 use omega_core::params::ParameterBinding;
 
 use crate::gates;
 use crate::mps::Mps;
 use crate::svd::truncated_svd_flat;
-use crate::SvdFlatFn;
+use crate::{Contract2qFn, SvdFlatFn};
 
 /// MPS-based quantum circuit simulator.
 ///
@@ -32,6 +33,11 @@ pub struct MpsBackend {
     /// adjacent gates and the SWAP network for distant gates — runs its
     /// truncations on the GPU, with a transparent CPU fallback.
     svd_fn: SvdFlatFn,
+    /// Optional two-site-gate accelerator handed to every `Mps` this backend
+    /// runs (the Metal θ-contraction; see `omega-backend-mps-metal`). `None` =
+    /// the built-in contract+SVD path. Transparent CPU fall-through, so wiring
+    /// it under a `metal` build never changes results below the GPU threshold.
+    contract_fn: Option<Contract2qFn>,
 }
 
 impl MpsBackend {
@@ -39,6 +45,7 @@ impl MpsBackend {
         Self {
             max_bond_dim,
             svd_fn: truncated_svd_flat,
+            contract_fn: None,
         }
     }
 
@@ -47,6 +54,15 @@ impl MpsBackend {
     /// present, so callers can wire it unconditionally under a `cuda` build.
     pub fn with_svd_fn(mut self, f: SvdFlatFn) -> Self {
         self.svd_fn = f;
+        self
+    }
+
+    /// Route each adjacent two-qubit gate through the accelerator `f` (the Metal
+    /// θ-contraction). Falls back to the built-in path inside `f` when no Metal
+    /// device is present or the bond is below its threshold, so callers can wire
+    /// it unconditionally under a `metal` build.
+    pub fn with_contract_fn(mut self, f: Contract2qFn) -> Self {
+        self.contract_fn = Some(f);
         self
     }
 }
@@ -71,6 +87,9 @@ impl Backend for MpsBackend {
         let n = circuit.num_qubits as usize;
         let mut mps = Mps::zero_state(n, self.max_bond_dim);
         mps.set_svd_fn(self.svd_fn);
+        if let Some(cf) = self.contract_fn {
+            mps.set_contract_fn(cf);
+        }
         let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -182,6 +201,342 @@ impl Backend for MpsBackend {
         }
         Ok(out)
     }
+}
+
+/// MPS backend with a per-gate + readout noise model (trajectory Monte-Carlo).
+///
+/// Mirrors [`NoisyStatevectorBackend`](omega_backend_statevector) but on a
+/// matrix-product state. Noise **composes** with the same GPU accelerators as
+/// [`MpsBackend`]: the channels are cheap single-site CPU operations, while the
+/// heavy two-qubit θ-contraction / bond SVD still runs on the device (Metal /
+/// CUDA) via the wired `contract_fn` / `svd_fn`.
+///
+/// Each shot is one independent trajectory: unitary channels (depolarizing,
+/// dephasing, Pauli) are unravelled as a random single-qubit gate; amplitude
+/// damping uses the local quantum-jump probability `γ·P(qubit = 1)` computed
+/// from the MPS. Aggregating trajectories reproduces the density-matrix result.
+pub struct NoisyMpsBackend {
+    pub max_bond_dim: usize,
+    svd_fn: SvdFlatFn,
+    contract_fn: Option<Contract2qFn>,
+    model: NoiseModel,
+}
+
+impl NoisyMpsBackend {
+    /// Build with the given bond dimension and noise model (CPU SVD, no GPU
+    /// contraction hook). Wire accelerators with [`Self::with_svd_fn`] /
+    /// [`Self::with_contract_fn`], exactly as for [`MpsBackend`].
+    pub fn with_model(max_bond_dim: usize, model: NoiseModel) -> Self {
+        Self {
+            max_bond_dim,
+            svd_fn: truncated_svd_flat,
+            contract_fn: None,
+            model,
+        }
+    }
+
+    /// Route bond-compression SVDs through `f` (e.g. the CUDA `gesvdj`
+    /// accelerator); composes with the noise trajectories.
+    pub fn with_svd_fn(mut self, f: SvdFlatFn) -> Self {
+        self.svd_fn = f;
+        self
+    }
+
+    /// Route adjacent two-qubit gates through `f` (the Metal θ-contraction);
+    /// composes with the noise trajectories.
+    pub fn with_contract_fn(mut self, f: Contract2qFn) -> Self {
+        self.contract_fn = Some(f);
+        self
+    }
+
+    fn fresh_mps(&self, n: usize) -> Mps {
+        let mut mps = Mps::zero_state(n, self.max_bond_dim);
+        mps.set_svd_fn(self.svd_fn);
+        if let Some(cf) = self.contract_fn {
+            mps.set_contract_fn(cf);
+        }
+        mps
+    }
+
+    /// Evolve one noisy trajectory to a final MPS (and the classical register,
+    /// for `Collapse`-mode mid-circuit measurement).
+    fn evolve(
+        &self,
+        circuit: &CircuitIR,
+        params: &ParameterBinding,
+        config: &ExecConfig,
+        rng: &mut StdRng,
+    ) -> Result<(Mps, Vec<u8>)> {
+        let n = circuit.num_qubits as usize;
+        let mut mps = self.fresh_mps(n);
+        let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
+
+        for op in &circuit.ops {
+            if !op.condition_satisfied(&classical_bits) {
+                continue;
+            }
+            match &op.gate {
+                GateKind::Measure => {
+                    if config.mid_circuit_mode == MidCircuitMode::Collapse {
+                        let q = op.qubits[0].0 as usize;
+                        let mut outcome = mps.measure_site(q, rng);
+                        if !self.model.readout.is_zero() {
+                            let p = self.model.readout.flip_prob(q, outcome);
+                            if p > 0.0 && rng.random::<f64>() < p {
+                                outcome ^= 1;
+                            }
+                        }
+                        if let Some(cbit) = op.classical_bit {
+                            if (cbit as usize) < classical_bits.len() {
+                                classical_bits[cbit as usize] = outcome;
+                            }
+                        }
+                    }
+                }
+                GateKind::Barrier => continue,
+                _ => {
+                    apply_gate_mps(&mut mps, op, params)?;
+                    if self.model.has_gate_channel() {
+                        let arity = op.qubits.len();
+                        for qb in &op.qubits {
+                            apply_mps_channel(&mut mps, &self.model, qb.0 as usize, arity, rng);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((mps, classical_bits))
+    }
+}
+
+impl Backend for NoisyMpsBackend {
+    fn name(&self) -> &str {
+        "noisy-mps"
+    }
+
+    fn execute(
+        &self,
+        circuit: &CircuitIR,
+        params: &ParameterBinding,
+        config: &ExecConfig,
+    ) -> Result<ExecResult> {
+        if circuit.circuit_type == CircuitType::Photonic {
+            return Err(OmegaError::Unsupported(
+                "MPS backend does not support photonic circuits".into(),
+            ));
+        }
+        let n = circuit.num_qubits as usize;
+        let mut rng: StdRng = match config.seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => rand::make_rng::<StdRng>(),
+        };
+
+        match config.shots {
+            // One trajectory's final state (a single MPS can't carry a mixture).
+            None => {
+                let (mps, _cbits) = self.evolve(circuit, params, &config_skip_shots(config), &mut rng)?;
+                Ok(ExecResult::Statevector(mps.to_statevector()))
+            }
+            // Per-trajectory when a channel acts during evolution OR when
+            // mid-circuit measurement collapses the state (inherently stochastic
+            // per shot).
+            Some(shots) if self.model.has_gate_channel() || mps_collapses(circuit, config) => {
+                let collapse = mps_collapses(circuit, config);
+                let mut counts = HashMap::new();
+                for _ in 0..shots {
+                    let (mps, cbits) = self.evolve(circuit, params, config, &mut rng)?;
+                    let outcome = if collapse {
+                        // Mid-circuit measures recorded (readout-flipped) outcomes
+                        // into the creg during evolution; key by the creg.
+                        mps_creg_to_u64(&cbits)
+                    } else {
+                        let mut o = mps.sample(&mut rng);
+                        if !self.model.readout.is_zero() {
+                            o = flip_all_readout(o, n, &self.model.readout, &mut rng);
+                        }
+                        o
+                    };
+                    *counts.entry(outcome).or_insert(0) += 1;
+                }
+                Ok(ExecResult::Counts(counts))
+            }
+            Some(shots) => {
+                // Readout-only: no channel acts during evolution, so a single
+                // evolution is exact and every shot samples from it.
+                let (mps, _cbits) = self.evolve(circuit, params, config, &mut rng)?;
+                let envs = mps.right_environments();
+                let mut counts = HashMap::new();
+                for _ in 0..shots {
+                    let mut outcome = mps.sample_with_envs(&envs, &mut rng);
+                    if !self.model.readout.is_zero() {
+                        outcome = flip_all_readout(outcome, n, &self.model.readout, &mut rng);
+                    }
+                    *counts.entry(outcome).or_insert(0) += 1;
+                }
+                Ok(ExecResult::Counts(counts))
+            }
+        }
+    }
+}
+
+/// A copy of `config` forced to statevector (no-shots) mode.
+fn config_skip_shots(config: &ExecConfig) -> ExecConfig {
+    let mut c = config.clone();
+    c.shots = None;
+    c
+}
+
+/// Apply the per-gate noise channel to qubit `q` of the MPS. Order matches the
+/// statevector backend (depolarizing, Pauli, amplitude damping, phase damping).
+fn apply_mps_channel<R: Rng>(
+    mps: &mut Mps,
+    model: &NoiseModel,
+    q: usize,
+    arity: usize,
+    rng: &mut R,
+) {
+    // Depolarizing: with prob p, a uniformly chosen X/Y/Z (unitary unravelling).
+    let p = model.depolarizing.at(q, arity);
+    if p > 0.0 && rng.random::<f64>() < p {
+        match (rng.random::<f64>() * 3.0) as u8 {
+            0 => mps.apply_1q(q, &gates::x()),
+            1 => mps.apply_1q(q, &gates::y()),
+            _ => mps.apply_1q(q, &gates::z()),
+        }
+    }
+
+    // Explicit Pauli channel.
+    if let Some(pauli) = &model.pauli {
+        let (px, py, pz) = (pauli.x.at(q), pauli.y.at(q), pauli.z.at(q));
+        if px + py + pz > 0.0 {
+            let r = rng.random::<f64>();
+            if r < px {
+                mps.apply_1q(q, &gates::x());
+            } else if r < px + py {
+                mps.apply_1q(q, &gates::y());
+            } else if r < px + py + pz {
+                mps.apply_1q(q, &gates::z());
+            }
+        }
+    }
+
+    // Amplitude damping: local quantum jump with p_jump = γ·P(qubit = 1).
+    let gamma = model.amplitude_damping.at(q);
+    if gamma > 0.0 {
+        apply_amplitude_damping_mps(mps, q, gamma, rng);
+    }
+
+    // Phase damping λ: apply Z with probability λ/2 (unitary unravelling).
+    let lambda = model.phase_damping.at(q);
+    if lambda > 0.0 && rng.random::<f64>() < 0.5 * lambda {
+        mps.apply_1q(q, &gates::z());
+    }
+}
+
+/// Amplitude damping on qubit `q` of the MPS via the quantum-jump method.
+///
+/// `p_jump = γ·P(qubit = 1)`, with `P(1) = (1 − ⟨Z_q⟩)/2` read from the MPS.
+/// On a jump, `E₁ ∝ |0⟩⟨1|` transfers the excitation to |0⟩; otherwise
+/// `E₀ = diag(1, √(1−γ))` attenuates it. Either branch renormalises globally
+/// (the local norm is wrong for an entangled site).
+fn apply_amplitude_damping_mps<R: Rng>(mps: &mut Mps, q: usize, gamma: f64, rng: &mut R) {
+    let norm_sq = mps_norm_sq(mps);
+    if norm_sq <= 0.0 {
+        return;
+    }
+    let z = site_z_numerator(mps, q) / norm_sq;
+    let p1 = ((1.0 - z) / 2.0).clamp(0.0, 1.0);
+    if p1 <= 0.0 {
+        return;
+    }
+    let zero = Complex64::new(0.0, 0.0);
+    let one = Complex64::new(1.0, 0.0);
+    if rng.random::<f64>() < gamma * p1 {
+        // Jump: E₁ = [[0, √γ], [0, 0]] (|1⟩ → √γ|0⟩); global renorm absorbs √γ.
+        mps.apply_1q(q, &[zero, Complex64::new(gamma.sqrt(), 0.0), zero, zero]);
+    } else {
+        // No jump: E₀ = diag(1, √(1−γ)).
+        mps.apply_1q(q, &[one, zero, zero, Complex64::new((1.0 - gamma).sqrt(), 0.0)]);
+    }
+    renormalize_mps(mps);
+}
+
+/// Scale the whole MPS to unit norm by rescaling one site tensor.
+fn renormalize_mps(mps: &mut Mps) {
+    let norm_sq = mps_norm_sq(mps);
+    if norm_sq > 0.0 {
+        let inv = 1.0 / norm_sq.sqrt();
+        for a in mps.tensors[0].data.iter_mut() {
+            *a *= inv;
+        }
+    }
+}
+
+/// Unnormalised `⟨ψ|Z_q|ψ⟩` via transfer-matrix contraction (Z contributes a
+/// `(-1)^s` sign at the physical index of site `q`). Divide by `mps_norm_sq`
+/// for the true expectation.
+fn site_z_numerator(mps: &Mps, q: usize) -> f64 {
+    let zero = Complex64::new(0.0, 0.0);
+    let mut env = vec![Complex64::new(1.0, 0.0)];
+    let mut env_dim = 1usize;
+    for (site, t) in mps.tensors.iter().enumerate() {
+        let bl = t.bond_left;
+        let br = t.bond_right;
+        let mut new_env = vec![zero; br * br];
+        for l1 in 0..bl {
+            for l2 in 0..bl {
+                let e = env[l1 * env_dim + l2];
+                if e.norm_sqr() < 1e-30 {
+                    continue;
+                }
+                for s in 0..2 {
+                    let sign = if site == q && s == 1 { -1.0 } else { 1.0 };
+                    for r1 in 0..br {
+                        let a1 = t.get(l1, s, r1).conj();
+                        for r2 in 0..br {
+                            new_env[r1 * br + r2] += e * a1 * t.get(l2, s, r2) * sign;
+                        }
+                    }
+                }
+            }
+        }
+        env = new_env;
+        env_dim = br;
+    }
+    env[0].re
+}
+
+/// True when this run collapses mid-circuit measurements into the classical
+/// register (each shot an independent stochastic trajectory keyed by the creg).
+fn mps_collapses(circuit: &CircuitIR, config: &ExecConfig) -> bool {
+    config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0
+}
+
+/// Pack the classical register (bit `i` = cbit `i`) into a `u64` counts key,
+/// matching the statevector backend's collapse-mode encoding.
+fn mps_creg_to_u64(classical_bits: &[u8]) -> u64 {
+    let mut bits = 0u64;
+    for (i, b) in classical_bits.iter().enumerate() {
+        if i >= 64 {
+            break;
+        }
+        bits |= ((*b as u64) & 1) << i;
+    }
+    bits
+}
+
+/// Flip each qubit of a sampled outcome with its per-qubit (possibly
+/// asymmetric) readout-error probability.
+fn flip_all_readout<R: Rng>(bits: u64, n: usize, readout: &ReadoutError, rng: &mut R) -> u64 {
+    let mut flipped = bits;
+    for q in 0..n {
+        let true_bit = ((bits >> q) & 1) as u8;
+        let p = readout.flip_prob(q, true_bit);
+        if p > 0.0 && rng.random::<f64>() < p {
+            flipped ^= 1u64 << q;
+        }
+    }
+    flipped
 }
 
 fn apply_gate_mps(mps: &mut Mps, op: &GateOp, params: &ParameterBinding) -> Result<()> {
@@ -705,6 +1060,95 @@ mod tests {
                 "expectation_multi disagreed with expectation: {m} vs {single}"
             );
         }
+    }
+
+    // ----- noise (trajectory) parity vs analytic density-matrix values -----
+
+    use omega_core::noise::{Depolarizing, NoiseModel, Rate};
+
+    fn p1_of(counts: &HashMap<u64, u32>, shots: u32) -> f64 {
+        *counts.get(&1).unwrap_or(&0) as f64 / shots as f64
+    }
+
+    #[test]
+    fn noise_mps_amplitude_damping_matches_analytic() {
+        // X|0⟩ = |1⟩ then amplitude damping γ: P(1) = 1 − γ.
+        let mut circuit = empty_circuit(1);
+        circuit.ops.push(make_op(GateKind::X, &[0]));
+        let gamma = 0.5_f64;
+        let backend = NoisyMpsBackend::with_model(
+            64,
+            NoiseModel {
+                amplitude_damping: gamma.into(),
+                ..Default::default()
+            },
+        );
+        let cfg = ExecConfig {
+            shots: Some(20000),
+            seed: Some(7),
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let result = backend.execute(&circuit, &ParameterBinding::new(), &cfg).unwrap();
+        let p1 = p1_of(result.counts(), 20000);
+        assert!((p1 - (1.0 - gamma)).abs() < 0.02, "MPS ampdamp P(1)={p1}");
+    }
+
+    #[test]
+    fn noise_mps_depolarizing_matches_analytic() {
+        // X|0⟩ = |1⟩ then depolarizing p: P(1) = 1 − 2p/3.
+        let mut circuit = empty_circuit(1);
+        circuit.ops.push(make_op(GateKind::X, &[0]));
+        let p = 0.3_f64;
+        let backend = NoisyMpsBackend::with_model(
+            64,
+            NoiseModel {
+                depolarizing: Depolarizing::uniform(p),
+                ..Default::default()
+            },
+        );
+        let cfg = ExecConfig {
+            shots: Some(20000),
+            seed: Some(11),
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let result = backend.execute(&circuit, &ParameterBinding::new(), &cfg).unwrap();
+        let p1 = p1_of(result.counts(), 20000);
+        assert!((p1 - (1.0 - 2.0 * p / 3.0)).abs() < 0.02, "MPS depol P(1)={p1}");
+    }
+
+    #[test]
+    fn noise_mps_per_qubit_amplitude_damping() {
+        // Two qubits both |1⟩; only q1 damps (γ=0.8): P(q0=1)≈1, P(q1=1)≈0.2.
+        let mut circuit = empty_circuit(2);
+        circuit.ops.push(make_op(GateKind::X, &[0]));
+        circuit.ops.push(make_op(GateKind::X, &[1]));
+        let backend = NoisyMpsBackend::with_model(
+            64,
+            NoiseModel {
+                amplitude_damping: Rate::PerQubit(vec![0.0, 0.8]),
+                ..Default::default()
+            },
+        );
+        let cfg = ExecConfig {
+            shots: Some(20000),
+            seed: Some(5),
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let result = backend.execute(&circuit, &ParameterBinding::new(), &cfg).unwrap();
+        let counts = result.counts();
+        let shots = 20000.0_f64;
+        let mut q0_one = 0.0_f64;
+        let mut q1_one = 0.0_f64;
+        for (bits, c) in counts.iter() {
+            if bits & 1 != 0 {
+                q0_one += *c as f64;
+            }
+            if bits & 2 != 0 {
+                q1_one += *c as f64;
+            }
+        }
+        assert!((q0_one / shots - 1.0).abs() < 0.01, "P(q0=1)={}", q0_one / shots);
+        assert!((q1_one / shots - 0.2).abs() < 0.02, "P(q1=1)={}", q1_one / shots);
     }
 
     #[test]
