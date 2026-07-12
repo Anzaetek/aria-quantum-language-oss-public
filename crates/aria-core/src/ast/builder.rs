@@ -64,8 +64,16 @@ impl CircuitBuilder {
         self.circuit.apply(s(), vec![self.q(q)]);
         self
     }
+    pub fn sdg(&mut self, q: usize) -> &mut Self {
+        self.circuit.apply(GateDef::new(GateKind::Sdg), vec![self.q(q)]);
+        self
+    }
     pub fn t(&mut self, q: usize) -> &mut Self {
         self.circuit.apply(t(), vec![self.q(q)]);
+        self
+    }
+    pub fn tdg(&mut self, q: usize) -> &mut Self {
+        self.circuit.apply(GateDef::new(GateKind::Tdg), vec![self.q(q)]);
         self
     }
     pub fn rx(&mut self, q: usize, theta: f64) -> &mut Self {
