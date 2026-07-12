@@ -341,7 +341,9 @@ $ QEC_PYTHON=/path/to/venv/bin/python tools/qec_cross_check/run.sh
 $ ARIA_QEC_XCHECK=1 ./ci.sh
 ```
 
-Check: `20 passed, 0 failed` (exit code 0). Cases:
+`run.sh` runs two independent cross-checks; both must pass.
+
+**(a) Encoded algorithms vs Qiskit** — `check_qec.py`, `20 passed, 0 failed`:
 
 | case | independent reference | golden / tol |
 |------|-----------------------|--------------|
@@ -349,6 +351,18 @@ Check: `20 passed, 0 failed` (exit code 0). Cases:
 | `qec-qft` | Qiskit `Statevector` (aria's `QFT`+`IQFT` circuits) | QFT\|0000⟩ uniform (maxdev≤1e-9); QFT∘QFT⁻¹\|x⟩=\|x⟩, x∈{0,5,11,15} |
 | `qec-qpe` | Qiskit `Statevector` (aria's `QPEDemo(m=3)`, φ=3/8) | counting register →\|011⟩=3, P==1; aria==qiskit |
 
-`qec-memory` is a code-capacity Monte-Carlo (MWPM decoding); it is validated
-internally by the distance-suppression signature in §13 (`pL(d=5) < pL(d=3)`),
-not by an exact statevector cross-check. See `tools/qec_cross_check/README.md`.
+**(b) Surface-code decoder vs PyMatching** — `check_decoder.py`, `12 passed, 0
+failed`. `qec-memory`'s engine is aria-qec's exact minimum-weight decoder
+(`ecc/mwpm.rs`); it is cross-checked against **PyMatching** (the MWPM decoder the
+QEC community pairs with stim) on identical error samples, for d ∈ {3,5} × both
+CSS sectors:
+
+| assertion | result |
+|-----------|--------|
+| all weight ≤ ⌊(d−1)/2⌋ errors correctable | holds (PyMatching) |
+| shot-for-shot logical-class agreement ≥ 99% | **100.00%** (20k shots each) |
+| logical-rate agreement aria ≈ PyMatching (≤3σ) | e.g. d=3 X: 0.0367 vs 0.0367; d=5 X: 0.0251 vs 0.0251 |
+
+Both decoders independently reproduce the distance suppression `pL(d=5) <
+pL(d=3)` the `qec-memory` demo asserts in §13. See
+`tools/qec_cross_check/README.md`.
