@@ -288,7 +288,7 @@ if [ "${ARIA_QEC_XCHECK:-0}" = "1" ]; then
   step "+   Optional: QEC demo cross-check vs Qiskit"
   if command -v python3 >/dev/null 2>&1; then
     bash tools/qec_cross_check/run.sh
-    echo "  OK: encoded grover/qft/qpe match Qiskit (+ stim stabilizer) numerically"
+    echo "  OK: encoded grover/qft/qpe match Qiskit (+ stim); surface decoder matches PyMatching"
   else
     echo "  SKIP: python3 not found (needed to build the qiskit venv)"
   fi

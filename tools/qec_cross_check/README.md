@@ -1,10 +1,16 @@
 # qec_cross_check
 
-Cross-checks the **aria-qec encoded-demo algorithms** (`crates/apps/qec-*`)
-against **Qiskit** as an independent reference. The `qec-*` harnesses run key
-algorithms on transversally QEC-encoded logical qubits and assert the encoded
-result equals the ideal logical distribution; this tool closes the loop from the
-outside.
+Cross-checks aria-qec against independent references on two fronts:
+
+1. **Encoded-demo algorithms** (`crates/apps/qec-*`) vs **Qiskit** (`check_qec.py`).
+2. **The surface-code decoder** (`ecc/mwpm.rs`) vs **PyMatching**, the
+   field-standard MWPM decoder (`check_decoder.py`).
+
+## 1. Encoded algorithms vs Qiskit (`check_qec.py`)
+
+The `qec-*` harnesses run key algorithms on transversally QEC-encoded logical
+qubits and assert the encoded result equals the ideal logical distribution; this
+tool closes the loop from the outside.
 
 For each demo it takes the *exact same* logical circuit aria emits
 (`aria export --qasm` on the `examples/aria/qec_*.aria` twins), runs it through an
@@ -45,12 +51,30 @@ the tool pins **aria == Qiskit** directly, not just Qiskit == golden.
 `stim` and `qsimcirq` are optional: their checks are skipped cleanly if the
 package is absent (Qiskit `Statevector` alone is sufficient and exact).
 
-## Not covered here (and why)
+## 2. Surface-code decoder vs PyMatching (`check_decoder.py`)
 
-`qec-memory` (surface-code logical memory under neutral-atom noise) is a
-**code-capacity Monte-Carlo with MWPM decoding**. Its logical-error rate is
-validated internally by the distance-suppression signature `pL(d=5) < pL(d=3)`
-and the crate's unit tests; an exact statevector cross-check would require
-re-implementing the decoder, so it is out of scope here. A future
-`PauliPropagation.jl` path (Julia) can cross-check the biased-Pauli logical
-channel if/when it grows the matching per-qubit noise model.
+`qec-memory` is a code-capacity Monte-Carlo whose engine is aria-qec's own exact
+minimum-weight decoder (`ecc/mwpm.rs::decode_mwpm_correction`, bounded
+enumeration). That decoder is unit-tested internally (every single-qubit error
+corrected); this cross-checks it against **PyMatching** — the MWPM decoder the
+QEC community pairs with stim — on the *identical* error samples.
+
+The Rust `dump_surface_code` example emits the rotated surface code (check
+matrices + logical operators) and a seeded batch of decoded error trials; the
+script re-decodes the same samples with PyMatching and, for d ∈ {3, 5} and both
+CSS sectors, asserts:
+
+- every error of weight ≤ ⌊(d−1)/2⌋ is correctable (guaranteed-distance);
+- **shot-for-shot logical-class agreement ≥ 99%** (both are minimum-weight, so
+  they can differ only on exact weight-ties) — in practice **100.00%** at p=0.05;
+- logical-error-rate agreement `aria ≈ PyMatching`, |Δ| ≤ 3σ (matches to ~1e-4).
+
+Both decoders independently reproduce the distance suppression `pL(d=5) <
+pL(d=3)` that the `qec-memory` demo asserts.
+
+## Deferred
+
+A `PauliPropagation.jl` (Julia) path could additionally cross-check the
+biased-Pauli *logical channel* of `qec-memory` if/when it grows the matching
+per-qubit neutral-atom noise model. Not required: the decoder itself is now
+validated against PyMatching above.

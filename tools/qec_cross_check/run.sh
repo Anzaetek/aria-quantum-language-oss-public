@@ -19,7 +19,7 @@ if ! "$PY" -c "import qiskit" >/dev/null 2>&1; then
     python3 -m venv "$here/.venv"
     PY="$here/.venv/bin/python"
     "$PY" -m pip install -q --upgrade pip
-    "$PY" -m pip install -q qiskit numpy
+    "$PY" -m pip install -q qiskit numpy pymatching
     # Optional extra references (best effort; the script skips them if absent).
     "$PY" -m pip install -q stim qsimcirq cirq 2>/dev/null || true
   else
@@ -33,4 +33,16 @@ echo "Building aria CLI..."
 ( cd "$repo" && cargo build -q -p aria-cli )
 
 echo "reference python: $("$PY" -c 'import qiskit;print("qiskit",qiskit.__version__)')"
-exec "$PY" "$here/check_qec.py"
+
+# (1) Encoded-algorithm circuits vs Qiskit (+ stim). (2) The surface-code decoder
+# vs PyMatching. Run both; fail if either does.
+rc=0
+"$PY" "$here/check_qec.py" || rc=$?
+if "$PY" -c "import pymatching" >/dev/null 2>&1; then
+  echo
+  "$PY" "$here/check_decoder.py" || rc=$?
+else
+  echo
+  echo "  (skipping decoder cross-check — pymatching not installed)"
+fi
+exit "$rc"
