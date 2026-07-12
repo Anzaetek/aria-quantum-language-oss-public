@@ -15,6 +15,7 @@
 //! Monte-Carlo ([`memory`]), and the effective-logical-channel extractor
 //! ([`channel`]).
 
+pub mod algo;
 pub mod channel;
 pub mod compile;
 pub mod distill;
@@ -22,7 +23,14 @@ pub mod memory;
 pub mod metrics;
 pub mod noise;
 pub mod patch;
+pub mod run;
 pub mod transversal;
+
+pub use algo::{
+    logical_grover2, qft_distribution, qft_roundtrip_distribution, qpe_distribution,
+    statevector_distribution,
+};
+pub use run::{logical_x_expectation, logical_z_expectation, logical_zz_expectation};
 
 pub use channel::{
     channel_rate_rounds, extract_surface_memory_channel, surface_memory_rate_rounds,
