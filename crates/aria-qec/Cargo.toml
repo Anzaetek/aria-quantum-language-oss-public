@@ -1,0 +1,20 @@
+# aria-qec — transversal low-overhead quantum error correction on the omega
+# backends. Surface / Steane / repetition codes + MWPM decoding (ecc), and a
+# transversal logical-circuit layer (patch geometry, transversal gadgets,
+# hardware noise models, magic-state distillation, effective-logical-channel
+# extraction) that runs encoded QFT / QPE / Grover on statevector / MPS /
+# Pauli-propagation. Ported from the `quantum` toolkit's ecc/ + logical/ modules.
+[package]
+name = "aria-qec"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Transversal low-overhead QEC (surface/Steane codes, transversal gates, magic-state distillation) on the omega backends."
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+omega-core = { path = "../omega-core" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-pauli = { path = "../omega-backend-pauli" }
+omega-backend-mps = { path = "../omega-backend-mps" }
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }

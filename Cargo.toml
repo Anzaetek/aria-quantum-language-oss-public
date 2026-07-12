@@ -47,6 +47,7 @@ members = [
     "crates/aria-runtime",
     "crates/aria-cli",
     "crates/aria-verify-core",
+    "crates/aria-qec",
     "crates/apps/qsvd",
     "crates/apps/qft",
     "crates/apps/vqe-ansatz",
