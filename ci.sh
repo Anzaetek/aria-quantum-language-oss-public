@@ -279,4 +279,22 @@ else
   echo "  (skipping Lean proof tree — set ARIA_LEAN=1 to enable; needs lake + mathlib cache)"
 fi
 
+# Optional: QEC encoded-demo cross-check against Qiskit (opt-in; needs a Python
+# venv with qiskit). Mirrors the GPU/Lean stages: default CI stays green without
+# qiskit. Set ARIA_QEC_XCHECK=1 to export the aria QEC demo circuits (grover/
+# qft/qpe) and assert an independent SDK (Qiskit Statevector, + stim stabilizer)
+# reproduces aria's distributions exactly (aria == qiskit == analytic, ≤ 1e-9).
+if [ "${ARIA_QEC_XCHECK:-0}" = "1" ]; then
+  step "+   Optional: QEC demo cross-check vs Qiskit"
+  if command -v python3 >/dev/null 2>&1; then
+    bash tools/qec_cross_check/run.sh
+    echo "  OK: encoded grover/qft/qpe match Qiskit (+ stim stabilizer) numerically"
+  else
+    echo "  SKIP: python3 not found (needed to build the qiskit venv)"
+  fi
+else
+  echo
+  echo "  (skipping QEC cross-check — set ARIA_QEC_XCHECK=1 with a qiskit venv to enable)"
+fi
+
 printf '\n\033[1;32mAll CI stages passed.\033[0m\n'

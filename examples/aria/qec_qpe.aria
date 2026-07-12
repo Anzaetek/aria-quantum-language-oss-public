@@ -49,3 +49,38 @@ circuit QPE(m: int, phi: real) {
         measure q[k] -> c[k]
     }
 }
+
+-- Concrete, fully-baked instance for the QASM cross-check (tools/qec_cross_check):
+-- m=3, phi = 3/8 = 0.375 (an exact 3-bit phase), so the counting register must
+-- collapse to |011> = 3. Same convention as QPE above, with phi folded to a
+-- constant so `aria export --qasm --int m=3` yields a parameter-free circuit.
+circuit QPEDemo(m: int) {
+    qreg q[m + 1]
+    creg c[m]
+
+    let phi = 3.0 / 8.0
+
+    apply X on q[m]
+
+    repeat k from 0 to m - 1 {
+        apply H on q[k]
+    }
+
+    repeat k from 0 to m - 1 {
+        apply CP(2 * pi * phi * (2 ^ k)) on q[k], q[m]
+    }
+
+    repeat i from 0 to (m / 2) - 1 {
+        apply SWAP on q[i], q[m - 1 - i]
+    }
+    repeat j from 0 to m - 1 {
+        repeat l from 0 to j - 1 {
+            apply CP(-pi / (2.0 ^ (j - l))) on q[l], q[j]
+        }
+        apply H on q[j]
+    }
+
+    repeat k from 0 to m - 1 {
+        measure q[k] -> c[k]
+    }
+}
