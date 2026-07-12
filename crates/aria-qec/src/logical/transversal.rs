@@ -15,8 +15,8 @@
 
 use std::f64::consts::PI;
 
-use aria_core::ast::CircuitBuilder;
 use crate::ecc::codes::{QECCode, SteaneCode};
+use aria_core::ast::CircuitBuilder;
 
 use super::distill::MagicStateProtocol;
 use super::patch::{PatchLayout, StabilizerCode};
@@ -92,6 +92,7 @@ pub trait TransversalCode {
     /// reports the gadget cost: in `Faithful` mode a residual logical error
     /// (small-angle injection, or a distilled magic state's infidelity when
     /// `magic` is supplied); in `IdealLogical` mode none.
+    #[allow(clippy::too_many_arguments)]
     fn emit_rz(
         &self,
         b: &mut CircuitBuilder,

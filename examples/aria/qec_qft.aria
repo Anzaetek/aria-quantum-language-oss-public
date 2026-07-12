@@ -1,0 +1,50 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qec-qft/src/lib.rs
+--   run: cargo run -p aria-app-qec-qft   (or: cargo run -p aria-verify -- qec_qft)
+-- VERIFIED: QFT∘QFT⁻¹|x⟩ recovers |x⟩ with probability 1 for x ∈ {0,5,11,15}, and QFT|x⟩ is
+--           uniform (max |p_k − 1/2^n| ≤ 1e-9). n = 4.
+--
+-- Logical Quantum Fourier Transform on n=4 qubits — the LOGICAL twin of the
+-- encoded harness, which realizes each H and controlled-phase transversally on
+-- Steane [[7,1,3]] patches (Clifford H/CZ transversal; the CP(π/2^k) rotations
+-- via the small-angle logical-Rz gadget in aria-qec::logical::transversal).
+--
+-- Two numeric facts the harness checks: (1) QFT of any basis state is a uniform
+-- superposition; (2) QFT then inverse-QFT is the identity.
+
+@assert unitary
+@prove "qft_equals_dft" equiv { denote(QFT) = DFT_matrix(2^n) }
+@bound depth = n * (n + 1) / 2
+
+circuit QFT(n: int) {
+    qreg q[n]
+
+    -- Forward pass: H + controlled phases, top to bottom.
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+        repeat j from i + 1 to n - 1 {
+            apply CP(pi / (2.0 ^ (j - i))) on q[j], q[i]
+        }
+    }
+
+    -- Bit-reversal SWAP layer.
+    repeat i from 0 to (n / 2) - 1 {
+        apply SWAP on q[i], q[n - 1 - i]
+    }
+}
+
+-- Inverse QFT: adjoint of the forward transform. QFT >> IQFT = identity, the
+-- roundtrip the harness asserts on encoded qubits.
+circuit IQFT(n: int) {
+    qreg q[n]
+
+    repeat i from 0 to (n / 2) - 1 {
+        apply SWAP on q[i], q[n - 1 - i]
+    }
+
+    repeat i from n - 1 to 0 step -1 {
+        repeat j from n - 1 to i + 1 step -1 {
+            apply CP(-pi / (2.0 ^ (j - i))) on q[j], q[i]
+        }
+        apply H on q[i]
+    }
+}

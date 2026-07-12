@@ -39,6 +39,12 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("simon", aria_app_simon::run),
         ("qpe", aria_app_qpe::run),
         ("qsp", aria_app_qsp::run),
+        // Encoded (QEC) demos — algorithms run on transversally-encoded logical
+        // qubits via the aria-qec crate (Steane [[7,1,3]] + rotated surface code).
+        ("qec_grover", aria_app_qec_grover::run),
+        ("qec_qft", aria_app_qec_qft::run),
+        ("qec_qpe", aria_app_qec_qpe::run),
+        ("qec_memory", aria_app_qec_memory::run),
         // Parametrized circuits — differential forward-⟨Z⟩ vs an independent sim.
         ("iqp_born", aria_app_forward::iqp_born),
         ("quantum_kernel", aria_app_forward::quantum_kernel),

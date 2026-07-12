@@ -1,0 +1,15 @@
+# aria-app-qec-grover — 2-qubit Grover run on *encoded* Steane [[7,1,3]] logical
+# qubits (transversal, pure Clifford). Verifies the algorithm survives encoding:
+# logical ⟨Z̄⟩ = (−1)^marked for every marked state, and pauliprop == statevector.
+# Run standalone: cargo run -p aria-app-qec-grover   (or: aria-verify qec-grover)
+[package]
+publish = false
+name = "aria-app-qec-grover"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Encoded 2-qubit Grover on the Steane [[7,1,3]] code — logical read-out, backend cross-check."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+aria-qec = { path = "../../aria-qec" }

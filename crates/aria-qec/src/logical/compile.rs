@@ -30,13 +30,22 @@ pub enum LogicalOp {
     X(usize),
     Z(usize),
     /// Transversal logical CNOT (qubit-wise physical CX, `ctrl` → `tgt`).
-    Cx { ctrl: usize, tgt: usize },
+    Cx {
+        ctrl: usize,
+        tgt: usize,
+    },
     /// Transversal logical CZ.
-    Cz { a: usize, b: usize },
+    Cz {
+        a: usize,
+        b: usize,
+    },
     /// Non-Clifford logical T = Rz(π/4).
     T(usize),
     /// Non-Clifford logical Rz(θ).
-    Rz { patch: usize, theta: f64 },
+    Rz {
+        patch: usize,
+        theta: f64,
+    },
 }
 
 /// A logical circuit: `n_patches` logical qubits + an op list.
@@ -180,14 +189,27 @@ pub fn compile_physical_opts(
             LogicalOp::Cx { ctrl, tgt } => rounds += code.emit_cx(&mut b, &layout, ctrl, tgt),
             LogicalOp::Cz { a, b: bp } => rounds += code.emit_cz(&mut b, &layout, a, bp),
             LogicalOp::T(p) => {
-                let c = code.emit_t(&mut b, &layout, p, opts.noncliff, opts.magic.as_ref(), opts.p_ph);
+                let c = code.emit_t(
+                    &mut b,
+                    &layout,
+                    p,
+                    opts.noncliff,
+                    opts.magic.as_ref(),
+                    opts.p_ph,
+                );
                 rounds += c.syndrome_rounds;
                 magic_states += c.magic_states;
                 injected += c.injected_pl;
             }
             LogicalOp::Rz { patch, theta } => {
                 let c = code.emit_rz(
-                    &mut b, &layout, patch, theta, opts.noncliff, opts.magic.as_ref(), opts.p_ph,
+                    &mut b,
+                    &layout,
+                    patch,
+                    theta,
+                    opts.noncliff,
+                    opts.magic.as_ref(),
+                    opts.p_ph,
                 );
                 rounds += c.syndrome_rounds;
                 magic_states += c.magic_states;

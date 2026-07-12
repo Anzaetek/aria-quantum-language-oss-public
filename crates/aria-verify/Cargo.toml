@@ -44,3 +44,7 @@ aria-app-simon = { path = "../apps/simon" }
 aria-app-qpe = { path = "../apps/qpe" }
 aria-app-qsp = { path = "../apps/qsp" }
 aria-app-forward = { path = "../apps/forward" }
+aria-app-qec-grover = { path = "../apps/qec-grover" }
+aria-app-qec-qft = { path = "../apps/qec-qft" }
+aria-app-qec-qpe = { path = "../apps/qec-qpe" }
+aria-app-qec-memory = { path = "../apps/qec-memory" }

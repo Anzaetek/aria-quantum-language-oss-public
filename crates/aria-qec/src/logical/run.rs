@@ -33,7 +33,10 @@ fn expect_string(
     let obs = Observable {
         terms: vec![(
             1.0,
-            string.iter().map(|&(q, b)| (q as u32, pauli_op(b))).collect(),
+            string
+                .iter()
+                .map(|&(q, b)| (q as u32, pauli_op(b)))
+                .collect(),
         )],
     };
     let ir = to_omega_core_ir(&prog.circuit);
@@ -145,8 +148,18 @@ mod tests {
         let prog = prog_from(|lc| {
             lc.prep_plus(0).prep_zero(1).cx(0, 1);
         });
-        assert!(logical_z_expectation(&prog, 0, SimBackend::PauliProp).unwrap().abs() < TOL);
-        assert!(logical_z_expectation(&prog, 1, SimBackend::PauliProp).unwrap().abs() < TOL);
+        assert!(
+            logical_z_expectation(&prog, 0, SimBackend::PauliProp)
+                .unwrap()
+                .abs()
+                < TOL
+        );
+        assert!(
+            logical_z_expectation(&prog, 1, SimBackend::PauliProp)
+                .unwrap()
+                .abs()
+                < TOL
+        );
         let zz = logical_zz_expectation(&prog, 0, 1, SimBackend::PauliProp).unwrap();
         assert!((zz - 1.0).abs() < TOL, "⟨Z̄_c Z̄_t⟩ = {zz}");
     }
@@ -157,7 +170,11 @@ mod tests {
         // so read on the exact statevector backend). One patch = 7 qubits.
         use crate::logical::compile::compile_physical;
         let code = SteaneTransversal::new();
-        for &theta in &[0.0_f64, std::f64::consts::FRAC_PI_4, std::f64::consts::FRAC_PI_3] {
+        for &theta in &[
+            0.0_f64,
+            std::f64::consts::FRAC_PI_4,
+            std::f64::consts::FRAC_PI_3,
+        ] {
             let mut lc = LogicalCircuit::new(1);
             lc.prep_plus(0).rz(0, theta);
             let prog = compile_physical(&lc, &code);
@@ -207,9 +224,7 @@ mod tests {
         lc.prep_plus(0).t(0);
         let prog = compile_physical_opts(&lc, &code, &opts);
         assert_eq!(prog.resource.magic_states, 1);
-        assert!(
-            (prog.resource.injected_logical_error - magic.output_infidelity()).abs() < 1e-18
-        );
+        assert!((prog.resource.injected_logical_error - magic.output_infidelity()).abs() < 1e-18);
         // The circuit still applies the exact rotation ⇒ ⟨X̄⟩ = cos(π/4).
         let xbar = logical_x_expectation(&prog, 0, SimBackend::Statevector).unwrap();
         assert!((xbar - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-9);

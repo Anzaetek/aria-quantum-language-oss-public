@@ -9,11 +9,12 @@ APP_CRATES=(-p aria-app-qsvd -p aria-app-qft -p aria-app-vqe-ansatz \
   -p aria-app-swap-test -p aria-app-teleport -p aria-app-qaoa-maxcut \
   -p aria-app-qml-classifier -p aria-app-qos -p aria-app-circulant -p aria-app-cqs -p aria-app-noise \
   -p aria-app-bell -p aria-app-ghz -p aria-app-superdense -p aria-app-simon -p aria-app-qpe \
-  -p aria-app-qsp -p aria-app-forward)
+  -p aria-app-qsp -p aria-app-forward \
+  -p aria-app-qec-grover -p aria-app-qec-qft -p aria-app-qec-qpe -p aria-app-qec-memory)
 ARIA_CRATES=(-p aria-core -p aria-runtime -p aria-cli -p aria-verify-core \
-  -p aria-verify "${APP_CRATES[@]}")
+  -p aria-qec -p aria-verify "${APP_CRATES[@]}")
 # Crates we keep rustfmt-clean (aria-core is ported verbatim — left as-is).
-FMT_CRATES=(-p aria-runtime -p aria-cli -p aria-verify-core -p aria-verify \
+FMT_CRATES=(-p aria-runtime -p aria-cli -p aria-verify-core -p aria-qec -p aria-verify \
   "${APP_CRATES[@]}")
 # Pure-Rust omega crates the default Aria build links against.
 OMEGA_CORE=(-p omega-core -p omega-backend-statevector -p omega-backend-mps \

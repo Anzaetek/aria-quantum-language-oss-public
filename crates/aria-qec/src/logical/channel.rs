@@ -133,7 +133,12 @@ mod tests {
         let noise = NoiseModel::neutral_atom(0.06);
         let ch = extract_surface_memory_channel(&code, &noise, 60_000, 3);
         let direct = super::super::memory::surface_memory_rate(&code, &noise, 60_000, 3);
-        assert!((ch.total() - direct).abs() < 1e-9, "{} vs {}", ch.total(), direct);
+        assert!(
+            (ch.total() - direct).abs() < 1e-9,
+            "{} vs {}",
+            ch.total(),
+            direct
+        );
     }
 
     #[test]
@@ -141,7 +146,12 @@ mod tests {
         // ZZ-biased noise ⇒ logical Z (phase) errors dominate logical X.
         let code = SurfaceCode::new(3);
         let ch = extract_surface_memory_channel(&code, &NoiseModel::neutral_atom(0.08), 80_000, 5);
-        assert!(ch.p_lz > ch.p_lx, "p_lz {} should exceed p_lx {}", ch.p_lz, ch.p_lx);
+        assert!(
+            ch.p_lz > ch.p_lx,
+            "p_lz {} should exceed p_lx {}",
+            ch.p_lz,
+            ch.p_lx
+        );
     }
 
     #[test]
@@ -159,7 +169,9 @@ mod tests {
         let physical = surface_memory_rate_rounds(&code, &noise, rounds, shots, 21);
 
         // 3σ binomial tolerance on `shots`.
-        let se = (physical * (1.0 - physical) / shots as f64).sqrt().max(1e-4);
+        let se = (physical * (1.0 - physical) / shots as f64)
+            .sqrt()
+            .max(1e-4);
         assert!(
             (predicted - physical).abs() < 3.0 * se + 3e-3,
             "channel {predicted} vs physical {physical} (3σ={:.4})",

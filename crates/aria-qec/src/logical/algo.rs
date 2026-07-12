@@ -14,9 +14,9 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+use crate::ecc::run::{to_omega_core_ir, SimBackend};
 use aria_core::ast::nodes::Circuit;
 use aria_core::ast::CircuitBuilder;
-use crate::ecc::run::{to_omega_core_ir, SimBackend};
 
 use super::compile::LogicalCircuit;
 
@@ -170,9 +170,7 @@ pub fn qpe_distribution(m: usize, phase: f64) -> HashMap<u64, f64> {
 mod tests {
     use super::*;
     use crate::logical::compile::compile_physical;
-    use crate::logical::metrics::{
-        grover_success_prob, qpe_phase_error, readout_bitflip, tvd,
-    };
+    use crate::logical::metrics::{grover_success_prob, qpe_phase_error, readout_bitflip, tvd};
     use crate::logical::run::logical_z_expectation;
     use crate::logical::transversal::SteaneTransversal;
 

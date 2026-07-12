@@ -1,0 +1,51 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qec-qpe/src/lib.rs
+--   run: cargo run -p aria-app-qec-qpe   (or: cargo run -p aria-verify -- qec_qpe)
+-- VERIFIED: for every exact m-bit phase φ = j/2^m (m=3, j = 0..7) the counting register
+--           collapses to a clean delta at j, so the recovered φ̂ = argmax/2^m equals φ, |Δ| ≤ 1e-6.
+--
+-- Logical Quantum Phase Estimation — the LOGICAL twin of the encoded harness,
+-- which runs the same circuit transversally on Steane [[7,1,3]] logical qubits.
+-- Target unitary U = P(2πφ) with eigenstate |1⟩ on q[m]; the m-qubit counting
+-- register is q[0..m-1] (qubit 0 = LSB, read directly as Σ q_k·2^k).
+--
+-- Convention (matches aria-qec::logical::algo::qpe_distribution): counting qubit
+-- k applies U^(2^k) = CP(2π·φ·2^k), then a standard inverse-QFT (leading
+-- bit-reversal swap + reverse phase sweep) places round(φ·2^m) in the register.
+
+@assert unitary
+@prove "qpe_recovers_phase" equiv { measured equals phi times 2 to the m }
+@bound counting_qubits = m
+
+circuit QPE(m: int, phi: real) {
+    qreg q[m + 1]
+    creg c[m]
+
+    -- Prepare the eigenstate |1⟩ of the phase gate.
+    apply X on q[m]
+
+    -- Counting register into uniform superposition.
+    repeat k from 0 to m - 1 {
+        apply H on q[k]
+    }
+
+    -- Controlled powers U^(2^k): counting qubit k (control) → target q[m].
+    repeat k from 0 to m - 1 {
+        apply CP(2 * pi * phi * (2 ^ k)) on q[k], q[m]
+    }
+
+    -- Standard inverse-QFT on the counting register: leading bit-reversal swap,
+    -- then a reverse phase sweep (negated angles) + H, qubit 0 = LSB.
+    repeat i from 0 to (m / 2) - 1 {
+        apply SWAP on q[i], q[m - 1 - i]
+    }
+    repeat j from 0 to m - 1 {
+        repeat l from 0 to j - 1 {
+            apply CP(-pi / (2.0 ^ (j - l))) on q[l], q[j]
+        }
+        apply H on q[j]
+    }
+
+    repeat k from 0 to m - 1 {
+        measure q[k] -> c[k]
+    }
+}
