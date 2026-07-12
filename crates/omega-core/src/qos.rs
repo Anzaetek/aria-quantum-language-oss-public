@@ -305,10 +305,16 @@ mod tests {
         let mut prev = f64::INFINITY;
         for &n in &[64u64, 256, 1024, 4096, 16384] {
             let inf = infidelity(&state_sketch(&v, phi, p, n), &target);
-            assert!(inf < prev, "infidelity should decrease: {inf} !< {prev} at N={n}");
+            assert!(
+                inf < prev,
+                "infidelity should decrease: {inf} !< {prev} at N={n}"
+            );
             prev = inf;
         }
-        assert!(prev <= 1e-8, "infidelity at N=16384 should be tiny, got {prev}");
+        assert!(
+            prev <= 1e-8,
+            "infidelity at N=16384 should be tiny, got {prev}"
+        );
     }
 
     #[test]
@@ -353,7 +359,10 @@ mod tests {
         let i_n = infidelity(&state_sketch(&v, phi, p, 1000), &target);
         let i_2n = infidelity(&state_sketch(&v, phi, p, 2000), &target);
         let ratio = i_n / i_2n;
-        assert!((3.9..4.1).contains(&ratio), "expected ~4× drop, got {ratio}");
+        assert!(
+            (3.9..4.1).contains(&ratio),
+            "expected ~4× drop, got {ratio}"
+        );
     }
 
     #[test]
@@ -373,7 +382,10 @@ mod tests {
             let v: Vec<f64> = (0..dim).map(|_| lcg(&mut s) * 2.0 - 1.0).collect();
             let phi = 0.3 + lcg(&mut s) * 0.7; // 0.3..=1.0
             let slope = scaling_exponent(&v, phi, 0.5, &counts);
-            assert!((slope + 2.0).abs() <= 0.05, "fuzz slope {slope} (phi={phi})");
+            assert!(
+                (slope + 2.0).abs() <= 0.05,
+                "fuzz slope {slope} (phi={phi})"
+            );
         }
     }
 

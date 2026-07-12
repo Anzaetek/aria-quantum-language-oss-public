@@ -265,7 +265,10 @@ mod tests {
             .zip(x_lu.iter())
             .map(|(d, l)| (d - l).norm())
             .fold(0.0_f64, f64::max);
-        assert!(max_diff <= 1e-9, "asymmetric DFT vs LU mismatch {max_diff:.3e}");
+        assert!(
+            max_diff <= 1e-9,
+            "asymmetric DFT vs LU mismatch {max_diff:.3e}"
+        );
         // and its eigenvalues are genuinely complex (test is non-degenerate).
         assert!(
             c.eigenvalues().iter().any(|z| z.im.abs() > 0.1),
@@ -340,9 +343,16 @@ mod tests {
                 .collect();
             // Eigenvalues, `+` convention: circEigen[k] = Σ_m v[m]·ω^{km}.
             let eig: Vec<Complex64> = (0..n)
-                .map(|k| (0..n).map(|m| v[m] * w(2.0 * PI * (k * m) as f64 / n as f64)).sum())
+                .map(|k| {
+                    (0..n)
+                        .map(|m| v[m] * w(2.0 * PI * (k * m) as f64 / n as f64))
+                        .sum()
+                })
                 .collect();
-            assert!(eig.iter().all(|z| z.norm() > 1e-6), "circulant must be nonsingular");
+            assert!(
+                eig.iter().all(|z| z.norm() > 1e-6),
+                "circulant must be nonsingular"
+            );
             // Conjugation operator `op(d) = Fᴴ·diag(d)·F`, entrywise:
             //   op(d)[a][b] = (1/N) Σ_k ω^{k(b−a)} · d[k].
             let op = |d: &[Complex64]| -> Vec<Vec<Complex64>> {
@@ -368,7 +378,11 @@ mod tests {
             for a in 0..n {
                 for b in 0..n {
                     let sc: Complex64 = (0..n).map(|k| s[a][k] * c[k][b]).sum();
-                    let exp = if a == b { Complex64::new(1.0, 0.0) } else { Complex64::new(0.0, 0.0) };
+                    let exp = if a == b {
+                        Complex64::new(1.0, 0.0)
+                    } else {
+                        Complex64::new(0.0, 0.0)
+                    };
                     assert!((sc - exp).norm() <= 1e-9, "S·C ≠ I at N={n}, ({a},{b})");
                 }
             }
@@ -387,8 +401,10 @@ mod tests {
                     c_inv[i][j] = col[i];
                 }
             }
-            let eps: Vec<Complex64> =
-                synthetic_b(n, 0x9e + nbits as u64).iter().map(|z| z * 0.1).collect();
+            let eps: Vec<Complex64> = synthetic_b(n, 0x9e + nbits as u64)
+                .iter()
+                .map(|z| z * 0.1)
+                .collect();
             let mu: Vec<Complex64> = inv_eig.iter().zip(&eps).map(|(r, e)| r + e).collect();
             let s_mu = op(&mu);
             let dev_pred = op(&eps);
@@ -443,9 +459,14 @@ mod tests {
                 );
             }
             // Vanishing/linearity: ‖deviation‖ ≤ max|ε| · ‖b‖ (F is an isometry).
-            let dev_norm = (x_noisy[0] - x_exact[0]).norm().hypot((x_noisy[1] - x_exact[1]).norm());
+            let dev_norm = (x_noisy[0] - x_exact[0])
+                .norm()
+                .hypot((x_noisy[1] - x_exact[1]).norm());
             let bnorm = bvec[0].norm().hypot(bvec[1].norm());
-            assert!(dev_norm <= eps.abs() * bnorm + 1e-12, "deviation exceeds ‖ε‖·‖b‖");
+            assert!(
+                dev_norm <= eps.abs() * bnorm + 1e-12,
+                "deviation exceeds ‖ε‖·‖b‖"
+            );
             if eps == 0.0 {
                 assert!(dev_norm <= 1e-12, "zero noise must give zero deviation");
             }
@@ -484,7 +505,10 @@ mod tests {
         let c = Circulant::heat_transfer(7, 0.2);
         let analytic_even = (4.0 + 0.2) / 0.2;
         let rel = (c.condition_number() - analytic_even).abs() / analytic_even;
-        assert!(rel > 0.01, "odd-N should deviate from the even-N closed form");
+        assert!(
+            rel > 0.01,
+            "odd-N should deviate from the even-N closed form"
+        );
     }
 
     #[test]

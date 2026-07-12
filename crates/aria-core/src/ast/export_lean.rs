@@ -334,8 +334,11 @@ fn gate_model_cert(circuit: &Circuit) -> Option<GateModelCert> {
     // Bell: H@0; CX(0→1) on 2 qubits.
     if circuit.n_qubits() == 2 {
         if let [h, cx] = gates.as_slice() {
-            if h.gate.kind == GateKind::H && q(h, 0) == Some(0)
-                && cx.gate.kind == GateKind::CX && q(cx, 0) == Some(0) && q(cx, 1) == Some(1)
+            if h.gate.kind == GateKind::H
+                && q(h, 0) == Some(0)
+                && cx.gate.kind == GateKind::CX
+                && q(cx, 0) == Some(0)
+                && q(cx, 1) == Some(1)
             {
                 return Some(GateModelCert {
                     import: "QuantumProofs.BellPrep",
@@ -354,9 +357,14 @@ fn gate_model_cert(circuit: &Circuit) -> Option<GateModelCert> {
     // `@assert unitary` on a GHZ circuit is CLOSED sorry-free, not dropped.
     if circuit.n_qubits() == 3 {
         if let [h, cx1, cx2] = gates.as_slice() {
-            if h.gate.kind == GateKind::H && q(h, 0) == Some(0)
-                && cx1.gate.kind == GateKind::CX && q(cx1, 0) == Some(0) && q(cx1, 1) == Some(1)
-                && cx2.gate.kind == GateKind::CX && q(cx2, 0) == Some(1) && q(cx2, 1) == Some(2)
+            if h.gate.kind == GateKind::H
+                && q(h, 0) == Some(0)
+                && cx1.gate.kind == GateKind::CX
+                && q(cx1, 0) == Some(0)
+                && q(cx1, 1) == Some(1)
+                && cx2.gate.kind == GateKind::CX
+                && q(cx2, 0) == Some(1)
+                && q(cx2, 1) == Some(2)
             {
                 return Some(GateModelCert {
                     import: "QuantumProofs.GHZPrep",
@@ -417,7 +425,9 @@ pub fn render_gate_model_spec(circuit: &Circuit, name: &str) -> Option<String> {
     out.push_str(&format!("import {}\n\n", cert.import));
     out.push_str(&format!("namespace Exported.GateModel.{nm}\n\n"));
     out.push_str("open QuantumProofs QuantumProofs.CircuitSemantics\n\n");
-    out.push_str(&format!("/-- Gate-model circuit for `{name}` ({n} qubits). -/\n"));
+    out.push_str(&format!(
+        "/-- Gate-model circuit for `{name}` ({n} qubits). -/\n"
+    ));
     out.push_str(&render_circuit_def(circuit));
     out.push_str("\n\n");
     out.push_str(&format!(
@@ -865,9 +875,34 @@ fn render_grover_spec(name: &str) -> String {
 /// otherwise produce an uncompilable `theorem 2x :` / `theorem end :`).
 fn safe_lean_ident(s: &str, fallback: &str) -> String {
     const KEYWORDS: &[&str] = &[
-        "end", "def", "theorem", "lemma", "namespace", "open", "import", "by", "exact", "let",
-        "fun", "match", "with", "in", "do", "if", "then", "else", "structure", "inductive",
-        "class", "instance", "example", "variable", "section", "where", "deriving", "axiom",
+        "end",
+        "def",
+        "theorem",
+        "lemma",
+        "namespace",
+        "open",
+        "import",
+        "by",
+        "exact",
+        "let",
+        "fun",
+        "match",
+        "with",
+        "in",
+        "do",
+        "if",
+        "then",
+        "else",
+        "structure",
+        "inductive",
+        "class",
+        "instance",
+        "example",
+        "variable",
+        "section",
+        "where",
+        "deriving",
+        "axiom",
     ];
     let san = sanitize_lean(s);
     let first_ok = san
@@ -974,7 +1009,8 @@ mod tests {
         });
         let spec = render_gate_model_spec(&circ, "Bell").expect("Bell recognized");
         assert!(spec.contains("import QuantumProofs.BellPrep"));
-        assert!(spec.contains("theorem circuit_eq : circuit = QuantumProofs.BellPrep.bell_circuit := rfl"));
+        assert!(spec
+            .contains("theorem circuit_eq : circuit = QuantumProofs.BellPrep.bell_circuit := rfl"));
         assert!(spec.contains("theorem bell_correct")); // @prove name → label
         assert!(spec.contains("exact QuantumProofs.BellPrep.bell_state_prep_correct"));
         assert!(spec.contains("exact QuantumProofs.BellPrep.bell_unitary"));
@@ -1016,7 +1052,11 @@ mod tests {
     fn gate_model_spec_recognizes_ghz() {
         // GHZ (H@0; CX 0→1; CX 1→2 on 3 qubits) is the second recognized circuit,
         // closed sorry-free by QuantumProofs.GHZPrep.ghz_state_prep_correct.
-        let mut circ = CircuitBuilder::new("GHZ", 3, 0).h(0).cx(0, 1).cx(1, 2).build();
+        let mut circ = CircuitBuilder::new("GHZ", 3, 0)
+            .h(0)
+            .cx(0, 1)
+            .cx(1, 2)
+            .build();
         circ.annotate(Annotation::Prove {
             name: "ghz_correct".into(),
             property: Property::Custom("creates (|000> + |111>)/sqrt(2)".into()),
@@ -1029,7 +1069,10 @@ mod tests {
         assert!(spec.contains("exact QuantumProofs.GHZPrep.ghz_state_prep_correct"));
         // `ghz_unitary` is proved → the `@assert unitary` is CLOSED sorry-free.
         assert!(spec.contains("theorem circuit_unitary"), "{spec}");
-        assert!(spec.contains("exact QuantumProofs.GHZPrep.ghz_unitary"), "{spec}");
+        assert!(
+            spec.contains("exact QuantumProofs.GHZPrep.ghz_unitary"),
+            "{spec}"
+        );
         assert!(!spec.contains("omitted, not verified"), "{spec}");
         assert!(
             !spec.lines().any(|l| l.trim() == "sorry") && !spec.contains(":= by sorry"),
@@ -1051,7 +1094,9 @@ mod tests {
         let src = std::fs::read_to_string(&aria_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", aria_path.display()));
         let prog = crate::ast::parse_aria(&src).expect("qft.aria parses");
-        let circuit = prog.instantiate("QFT", &[("n", 3)]).expect("QFT instantiates");
+        let circuit = prog
+            .instantiate("QFT", &[("n", 3)])
+            .expect("QFT instantiates");
         let emitted = render_gate_model_spec(&circuit, "QFT").expect("QFT recognized");
         assert_eq!(
             emitted, committed,
@@ -1106,10 +1151,18 @@ mod tests {
         }
         // Bell / QFT are NOT recognized as QPE.
         let bell = CircuitBuilder::new("bell", 2, 0).h(0).cx(0, 1).build();
-        assert_eq!(super::qpe_recognized(&bell), None, "Bell wrongly recognized as QPE");
+        assert_eq!(
+            super::qpe_recognized(&bell),
+            None,
+            "Bell wrongly recognized as QPE"
+        );
         let mut b = CircuitBuilder::new("qft", 3, 0);
         b.qft(&[0, 1, 2]);
-        assert_eq!(super::qpe_recognized(&b.build()), None, "QFT wrongly recognized as QPE");
+        assert_eq!(
+            super::qpe_recognized(&b.build()),
+            None,
+            "QFT wrongly recognized as QPE"
+        );
         // A QPE with one perturbed cascade angle is NOT recognized (structural guard).
         let mut c = super::qpe_canonical_circuit(3, 0.125);
         let mut perturbed = false;
@@ -1121,7 +1174,11 @@ mod tests {
             }
         }
         assert!(perturbed, "no CP gate to perturb");
-        assert_eq!(super::qpe_recognized(&c), None, "perturbed-angle QPE wrongly recognized");
+        assert_eq!(
+            super::qpe_recognized(&c),
+            None,
+            "perturbed-angle QPE wrongly recognized"
+        );
     }
 
     #[test]
@@ -1166,10 +1223,18 @@ mod tests {
     fn grover_recognized_only_for_canonical_grover() {
         // The canonical gate-model Grover(3) for |111⟩ is recognized.
         let c = super::grover_canonical_circuit(7);
-        assert_eq!(super::grover_recognized(&c), Some(3), "Grover(3) |111⟩ not recognized");
+        assert_eq!(
+            super::grover_recognized(&c),
+            Some(3),
+            "Grover(3) |111⟩ not recognized"
+        );
         // A different marked state (|011⟩, with X-masks) is NOT the proved case.
         let c011 = super::grover_canonical_circuit(3);
-        assert_eq!(super::grover_recognized(&c011), None, "non-|111⟩ Grover wrongly recognized");
+        assert_eq!(
+            super::grover_recognized(&c011),
+            None,
+            "non-|111⟩ Grover wrongly recognized"
+        );
         // QFT(3) is not Grover.
         let mut b = CircuitBuilder::new("qft", 3, 0);
         b.qft(&[0, 1, 2]);

@@ -48,7 +48,7 @@ pub fn apply_pauli(pauli: &[u8], state: &[Complex64]) -> Vec<Complex64> {
             let bit = (x >> q) & 1;
             match pq {
                 2 => ph *= Complex64::i() * if bit == 1 { -1.0 } else { 1.0 }, // Y|b⟩ = i(−1)^b|1−b⟩
-                3 if bit == 1 => ph = -ph,                                      // Z|1⟩ = −|1⟩
+                3 if bit == 1 => ph = -ph,                                     // Z|1⟩ = −|1⟩
                 _ => {}
             }
         }
@@ -166,11 +166,7 @@ pub struct CqsResult {
 
 /// CQS solve of `A x = b` over the Pauli `ansatz` (each a length-`n` string).
 /// Returns `Err` if `Q` is singular (the ansatz is rank-deficient).
-pub fn cqs_solve(
-    a: &PauliLcu,
-    b: &[Complex64],
-    ansatz: &[Vec<u8>],
-) -> Result<CqsResult, String> {
+pub fn cqs_solve(a: &PauliLcu, b: &[Complex64], ansatz: &[Vec<u8>]) -> Result<CqsResult, String> {
     let k = ansatz.len();
     let psi: Vec<Vec<Complex64>> = ansatz.iter().map(|p| apply_pauli(p, b)).collect();
     let apsi: Vec<Vec<Complex64>> = psi.iter().map(|s| a.apply(s)).collect();
@@ -319,7 +315,11 @@ mod tests {
             let mut terms: Vec<(Complex64, Vec<u8>)> = (0..nterms)
                 .map(|_| {
                     let re = lcg(&mut s) * 2.0 - 1.0;
-                    let im = if lcg(&mut s) < 0.3 { lcg(&mut s) * 2.0 - 1.0 } else { 0.0 };
+                    let im = if lcg(&mut s) < 0.3 {
+                        lcg(&mut s) * 2.0 - 1.0
+                    } else {
+                        0.0
+                    };
                     let p: Vec<u8> = (0..n).map(|_| (lcg(&mut s) * 4.0) as u8 % 4).collect();
                     (Complex64::new(re, im), p)
                 })
@@ -333,11 +333,18 @@ mod tests {
                 .map(|mask| (0..n).map(|q| ((mask >> q) & 1) as u8).collect())
                 .collect();
             if let Ok(res) = cqs_solve(&a, &b, &ansatz) {
-                assert!(res.residual < 1e-8, "fuzz residual {:.2e} (n={n})", res.residual);
+                assert!(
+                    res.residual < 1e-8,
+                    "fuzz residual {:.2e} (n={n})",
+                    res.residual
+                );
                 solved += 1;
             }
         }
-        assert!(solved > 250, "too many singular draws ({solved}/300 solved)");
+        assert!(
+            solved > 250,
+            "too many singular draws ({solved}/300 solved)"
+        );
     }
 
     /// Hermitian, well-conditioned, non-block-diagonal 2-qubit A.
@@ -400,7 +407,10 @@ mod tests {
         let a = synthetic_a();
         let b = e0(4);
         let dup = vec![vec![0, 0], vec![0, 0]]; // {II, II}
-        assert!(cqs_solve(&a, &b, &dup).is_err(), "duplicate ansatz must error");
+        assert!(
+            cqs_solve(&a, &b, &dup).is_err(),
+            "duplicate ansatz must error"
+        );
     }
 
     #[test]

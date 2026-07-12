@@ -69,17 +69,17 @@ pub enum OmegaMidCircuitMode {
 /// backend selection exposed by `omega-runtime` (statevector / MPS /
 /// Clifford+stabilizer / photonic). `Auto` asks the runtime to pick the
 /// most efficient backend the circuit is compatible with.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum OmegaBackend {
     #[default]
     Auto,
     Statevector,
-    Mps { max_bond_dim: u32 },
+    Mps {
+        max_bond_dim: u32,
+    },
     Stabilizer,
     Photonic,
 }
-
 
 /// Omega-compatible circuit IR.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

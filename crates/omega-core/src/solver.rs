@@ -148,7 +148,7 @@ pub fn gershgorin_condition_estimate(a: &Array2<Complex64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{array, Array1, Array2};
 
     fn cmplx(r: f64) -> Complex64 {
         Complex64::new(r, 0.0)

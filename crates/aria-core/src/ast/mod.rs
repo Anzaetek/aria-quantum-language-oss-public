@@ -8,7 +8,7 @@ pub mod opticqasm;
 pub mod qasm;
 
 pub use annotation::{Annotation, CmpOp, Property};
-pub use aria::{AriaProgram, CircuitTemplate, ObservableTemplate, parse_aria, parse_aria_circuit};
+pub use aria::{parse_aria, parse_aria_circuit, AriaProgram, CircuitTemplate, ObservableTemplate};
 pub use builder::CircuitBuilder;
 pub use expr::ParamExpr;
 pub use json::{from_json, to_json};

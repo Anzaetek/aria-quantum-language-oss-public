@@ -19,5 +19,5 @@ pub mod ast;
 pub mod backends;
 
 pub use ast::{
-    AriaProgram, Circuit, CircuitTemplate, ObservableTemplate, parse_aria, parse_aria_circuit,
+    parse_aria, parse_aria_circuit, AriaProgram, Circuit, CircuitTemplate, ObservableTemplate,
 };
