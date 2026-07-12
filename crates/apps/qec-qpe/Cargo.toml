@@ -1,0 +1,13 @@
+# aria-app-qec-qpe — logical Quantum Phase Estimation via the transversal QEC layer.
+# Run standalone: cargo run -p aria-app-qec-qpe   (or: aria-verify qec-qpe)
+[package]
+publish = false
+name = "aria-app-qec-qpe"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Logical QPE: φ = j/2^m recovered as a clean delta, via aria-qec."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+aria-qec = { path = "../../aria-qec" }

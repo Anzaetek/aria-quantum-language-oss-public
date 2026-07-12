@@ -1,0 +1,13 @@
+# aria-app-qec-qft — logical QFT via the transversal QEC layer.
+# Run standalone: cargo run -p aria-app-qec-qft   (or: aria-verify qec-qft)
+[package]
+publish = false
+name = "aria-app-qec-qft"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Logical QFT: QFT|input⟩ is uniform and QFT∘QFT⁻¹ = identity, via aria-qec."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+aria-qec = { path = "../../aria-qec" }

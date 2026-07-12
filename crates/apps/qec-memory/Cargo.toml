@@ -1,0 +1,14 @@
+# aria-app-qec-memory — surface-code logical memory: distance suppression + the
+# extracted effective logical channel, under a neutral-atom (ZZ-biased) noise model.
+# Run standalone: cargo run -p aria-app-qec-memory   (or: aria-verify qec-memory)
+[package]
+publish = false
+name = "aria-app-qec-memory"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Surface-code memory: pL(d=5) < pL(d=3) under neutral-atom noise + ZZ-biased effective channel."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+aria-qec = { path = "../../aria-qec" }

@@ -33,6 +33,17 @@ and the numeric check — nothing else in the file. Run one standalone with
 | `teleport.aria`          | `crates/apps/teleport`           | Bob's qubit vs Alice's input               |
 | `qaoa_maxcut.aria`       | `crates/apps/qaoa-maxcut`        | QAOA cut vs brute-force MaxCut             |
 | `qml_classifier.aria`    | `crates/apps/qml-classifier`     | confusion matrix vs ground-truth labels    |
+| `qec_grover.aria`        | `crates/apps/qec-grover`         | encoded 2-qubit Grover ⟨Z̄⟩=±1 vs marked   |
+| `qec_qft.aria`           | `crates/apps/qec-qft`            | encoded QFT uniform + QFT∘QFT⁻¹ = identity |
+| `qec_qpe.aria`           | `crates/apps/qec-qpe`            | encoded QPE φ̂ vs exact φ = j/2^m           |
+
+The three `qec_*` examples are LOGICAL twins: the harness runs each algorithm
+transversally encoded on Steane [[7,1,3]] logical qubits (via the `aria-qec`
+crate) and checks the encoded result equals the ideal, proving the algorithm is
+invariant under the low-overhead QEC encoding. A fourth encoded demo,
+`crates/apps/qec-memory` (surface-code memory: pL(d=5) < pL(d=3) under
+neutral-atom noise), is native-only (no `.aria` twin — it is a Monte-Carlo, not
+a fixed circuit).
 
 See [`../../TESTING.md`](../../TESTING.md) §13–14 for the per-example numeric
 goldens and the socket transport. The remaining `.aria` files (`bell`, `qpe`,

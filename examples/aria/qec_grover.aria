@@ -1,0 +1,47 @@
+-- ▶ Application harness + classical cross-check: crates/apps/qec-grover/src/lib.rs
+--   run: cargo run -p aria-app-qec-grover   (or: cargo run -p aria-verify -- qec_grover)
+-- VERIFIED: for every marked m ∈ {0,1,2,3}, the logical ⟨Z̄_0⟩,⟨Z̄_1⟩ = (-1)^bit(m), and the
+--           transversally-encoded run (pauliprop) matches the ideal statevector, |Δ| ≤ 1e-6.
+--
+-- 2-qubit Grover (one iteration) — pure Clifford (H, X, CZ), so it succeeds with
+-- certainty. This DSL file is the LOGICAL twin: the harness takes exactly this
+-- circuit and runs it transversally encoded on two Steane [[7,1,3]] patches
+-- (each logical qubit → 7 physical data qubits, gates applied qubit-for-qubit),
+-- proving the algorithm is invariant under the low-overhead QEC encoding.
+--
+-- One iteration is exact because for n=2 the optimal Grover angle is π/4:
+-- oracle then diffusion rotates |s⟩ exactly onto |marked⟩.
+
+@assert unitary
+@prove "grover2_marks_target" equiv { amplifies |marked> }
+@bound iterations = 1   -- floor(pi/(4·arcsin(1/2))) = 1, exact for n=2
+
+circuit Grover2(marked: int) {
+    qreg q[2]
+    creg c[2]
+
+    -- Uniform superposition over the two logical qubits.
+    apply H on q[0]
+    apply H on q[1]
+
+    -- Oracle: phase-flip |marked>. Conjugate CZ by X on the qubits whose marked
+    -- bit is 0, so the flipped state is exactly |marked>.
+    when bit(marked, 0) == 0 { apply X on q[0] }
+    when bit(marked, 1) == 0 { apply X on q[1] }
+    apply CZ on q[0], q[1]
+    when bit(marked, 0) == 0 { apply X on q[0] }
+    when bit(marked, 1) == 0 { apply X on q[1] }
+
+    -- Diffuser 2|s><s| - I = H X·CZ·X H.
+    apply H on q[0]
+    apply H on q[1]
+    apply X on q[0]
+    apply X on q[1]
+    apply CZ on q[0], q[1]
+    apply X on q[0]
+    apply X on q[1]
+    apply H on q[0]
+    apply H on q[1]
+
+    measure q -> c
+}

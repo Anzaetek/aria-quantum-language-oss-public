@@ -137,7 +137,7 @@ impl QECCode for SteaneCode {
 
     fn syndrome_circuit(&self) -> Circuit {
         let mut b = CircuitBuilder::new("steane_syndrome", 13, 6); // 7 data + 6 ancilla
-        // X stabilizer measurements (ancilla 7, 8, 9)
+                                                                   // X stabilizer measurements (ancilla 7, 8, 9)
         for (s_idx, stab) in X_STABS.iter().enumerate() {
             let anc = 7 + s_idx;
             b.h(anc);

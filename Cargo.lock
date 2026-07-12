@@ -202,6 +202,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-app-qec-grover"
+version = "0.1.0"
+dependencies = [
+ "aria-qec",
+ "aria-verify-core",
+]
+
+[[package]]
+name = "aria-app-qec-memory"
+version = "0.1.0"
+dependencies = [
+ "aria-qec",
+ "aria-verify-core",
+]
+
+[[package]]
+name = "aria-app-qec-qft"
+version = "0.1.0"
+dependencies = [
+ "aria-qec",
+ "aria-verify-core",
+]
+
+[[package]]
+name = "aria-app-qec-qpe"
+version = "0.1.0"
+dependencies = [
+ "aria-qec",
+ "aria-verify-core",
+]
+
+[[package]]
 name = "aria-app-qft"
 version = "0.1.0"
 dependencies = [
@@ -307,6 +339,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-qec"
+version = "0.1.0"
+dependencies = [
+ "aria-core",
+ "omega-backend-mps",
+ "omega-backend-pauli",
+ "omega-backend-pauliprop",
+ "omega-backend-statevector",
+ "omega-core",
+]
+
+[[package]]
 name = "aria-runtime"
 version = "0.1.0"
 dependencies = [
@@ -344,6 +388,10 @@ dependencies = [
  "aria-app-grover3",
  "aria-app-noise",
  "aria-app-qaoa-maxcut",
+ "aria-app-qec-grover",
+ "aria-app-qec-memory",
+ "aria-app-qec-qft",
+ "aria-app-qec-qpe",
  "aria-app-qft",
  "aria-app-qml-classifier",
  "aria-app-qos",
