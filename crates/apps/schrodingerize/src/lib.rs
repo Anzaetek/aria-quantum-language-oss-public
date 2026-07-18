@@ -21,7 +21,14 @@ fn recovery(transport: Transport, s: i64) -> Result<f64, String> {
     let lowered = harness::load_lowered("schrodingerize.aria", "Schrodingerize", &[("s", s)])?;
     let (flat, _) =
         harness::execute_report(transport, lowered.ir, harness::AppMode::Statevector, &[])?;
-    // interleaved (re, im); amplitudes are real, sum the p ≥ 0 block (indices 2 and 3).
+    // interleaved (re, im) over 4 amplitudes ⇒ 8 flats; sum the real parts of the p ≥ 0 block
+    // (grid indices 2 and 3 → re at flats 4 and 6). Guard the length instead of indexing blind.
+    if flat.len() < 7 {
+        return Err(format!(
+            "schrodingerize: short statevector ({} flats)",
+            flat.len()
+        ));
+    }
     Ok(flat[4] + flat[6])
 }
 
