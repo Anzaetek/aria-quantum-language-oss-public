@@ -680,7 +680,10 @@ fn noise_phase_damping_attenuates_coherence() {
     })
     .expectation(&c, &ParameterBinding::new(), &obs(vec![(0, PauliOp::X)]))
     .unwrap();
-    assert!((got_x - (1.0 - lambda)).abs() <= 1e-12, "dephase ⟨X⟩ {got_x}");
+    assert!(
+        (got_x - (1.0 - lambda)).abs() <= 1e-12,
+        "dephase ⟨X⟩ {got_x}"
+    );
     // ⟨Z⟩ of |+⟩ stays 0 under pure dephasing.
     let got_z = noisy(NoiseModel {
         phase_damping: lambda.into(),

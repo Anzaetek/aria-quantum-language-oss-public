@@ -323,9 +323,7 @@ impl Backend for NoisyStatevectorBackend {
             // Per-trajectory Monte-Carlo when a channel acts during evolution
             // OR when mid-circuit measurement collapses the state (the latter is
             // inherently stochastic per shot, so it can't reuse one evolution).
-            Some(shots)
-                if self.model.has_gate_channel() || collapses(circuit, config) =>
-            {
+            Some(shots) if self.model.has_gate_channel() || collapses(circuit, config) => {
                 // One independent trajectory per shot — this is what turns a
                 // per-gate channel (amplitude damping, depolarizing, …) into the
                 // right shot statistics instead of one branch drawn once and
@@ -1338,8 +1336,7 @@ mod tests {
 
     #[test]
     fn noise_noiseless_model_matches_clean() {
-        let backend =
-            NoisyStatevectorBackend::with_model(NoiseModel::default(), Some(0));
+        let backend = NoisyStatevectorBackend::with_model(NoiseModel::default(), Some(0));
         let circuit = make_bell_circuit();
         let cfg = ExecConfig {
             shots: Some(2048),

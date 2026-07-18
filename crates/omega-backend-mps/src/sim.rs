@@ -334,7 +334,8 @@ impl Backend for NoisyMpsBackend {
         match config.shots {
             // One trajectory's final state (a single MPS can't carry a mixture).
             None => {
-                let (mps, _cbits) = self.evolve(circuit, params, &config_skip_shots(config), &mut rng)?;
+                let (mps, _cbits) =
+                    self.evolve(circuit, params, &config_skip_shots(config), &mut rng)?;
                 Ok(ExecResult::Statevector(mps.to_statevector()))
             }
             // Per-trajectory when a channel acts during evolution OR when
@@ -456,7 +457,10 @@ fn apply_amplitude_damping_mps<R: Rng>(mps: &mut Mps, q: usize, gamma: f64, rng:
         mps.apply_1q(q, &[zero, Complex64::new(gamma.sqrt(), 0.0), zero, zero]);
     } else {
         // No jump: E₀ = diag(1, √(1−γ)).
-        mps.apply_1q(q, &[one, zero, zero, Complex64::new((1.0 - gamma).sqrt(), 0.0)]);
+        mps.apply_1q(
+            q,
+            &[one, zero, zero, Complex64::new((1.0 - gamma).sqrt(), 0.0)],
+        );
     }
     renormalize_mps(mps);
 }
@@ -1088,7 +1092,9 @@ mod tests {
             seed: Some(7),
             mid_circuit_mode: MidCircuitMode::Skip,
         };
-        let result = backend.execute(&circuit, &ParameterBinding::new(), &cfg).unwrap();
+        let result = backend
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .unwrap();
         let p1 = p1_of(result.counts(), 20000);
         assert!((p1 - (1.0 - gamma)).abs() < 0.02, "MPS ampdamp P(1)={p1}");
     }
@@ -1111,9 +1117,14 @@ mod tests {
             seed: Some(11),
             mid_circuit_mode: MidCircuitMode::Skip,
         };
-        let result = backend.execute(&circuit, &ParameterBinding::new(), &cfg).unwrap();
+        let result = backend
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .unwrap();
         let p1 = p1_of(result.counts(), 20000);
-        assert!((p1 - (1.0 - 2.0 * p / 3.0)).abs() < 0.02, "MPS depol P(1)={p1}");
+        assert!(
+            (p1 - (1.0 - 2.0 * p / 3.0)).abs() < 0.02,
+            "MPS depol P(1)={p1}"
+        );
     }
 
     #[test]
@@ -1134,7 +1145,9 @@ mod tests {
             seed: Some(5),
             mid_circuit_mode: MidCircuitMode::Skip,
         };
-        let result = backend.execute(&circuit, &ParameterBinding::new(), &cfg).unwrap();
+        let result = backend
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .unwrap();
         let counts = result.counts();
         let shots = 20000.0_f64;
         let mut q0_one = 0.0_f64;
@@ -1147,8 +1160,16 @@ mod tests {
                 q1_one += *c as f64;
             }
         }
-        assert!((q0_one / shots - 1.0).abs() < 0.01, "P(q0=1)={}", q0_one / shots);
-        assert!((q1_one / shots - 0.2).abs() < 0.02, "P(q1=1)={}", q1_one / shots);
+        assert!(
+            (q0_one / shots - 1.0).abs() < 0.01,
+            "P(q0=1)={}",
+            q0_one / shots
+        );
+        assert!(
+            (q1_one / shots - 0.2).abs() < 0.02,
+            "P(q1=1)={}",
+            q1_one / shots
+        );
     }
 
     #[test]

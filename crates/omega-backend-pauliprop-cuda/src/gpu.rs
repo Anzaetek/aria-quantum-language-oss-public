@@ -2,17 +2,33 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use num_complex::Complex64;
 use omega_backend_pauliprop::{pack_bits, unpack_bits, PauliKey, PauliSum};
 
-/// PTX virtual arch. `compute_70` PTX JIT-compiles forward onto every newer
-/// device (verified on RTX PRO 6000 / sm_120), matching the statevector-cuda
-/// backend's choice.
-const NVRTC_ARCH: &str = "compute_70";
+/// Virtual arch target for the NVRTC compile, detected from the live device's
+/// compute capability (`compute_{major}{minor}`), matching statevector-cuda.
+///
+/// A fixed `compute_70` floor breaks on a CUDA-13 toolkit (Volta was dropped
+/// from NVRTC → `NVRTC_ERROR_INVALID_OPTION`), e.g. the DGX Spark / GB10
+/// (sm_121). Previously that failure was swallowed by `Ctx::new`'s `.ok()?`,
+/// silently routing every branch to the CPU fallback. Detecting the device's
+/// own arch compiles correctly on every toolkit. Cached: device 0's arch is
+/// stable per process.
+fn nvrtc_arch(ctx: &Arc<CudaContext>) -> Option<&'static str> {
+    static ARCH: OnceLock<String> = OnceLock::new();
+    if let Some(a) = ARCH.get() {
+        return Some(a.as_str());
+    }
+    let (major, minor) = ctx.compute_capability().ok()?;
+    Some(
+        ARCH.get_or_init(|| format!("compute_{major}{minor}"))
+            .as_str(),
+    )
+}
 
 /// Number of branch steps run on the GPU this process (telemetry).
 pub static GPU_BRANCHES: AtomicU64 = AtomicU64::new(0);
@@ -115,7 +131,7 @@ impl Ctx {
         let ctx = CudaContext::new(0).ok()?;
         let stream = ctx.default_stream();
         let opts = CompileOptions {
-            arch: Some(NVRTC_ARCH),
+            arch: Some(nvrtc_arch(&ctx)?),
             name: Some("branch_expand".to_string()),
             ..Default::default()
         };

@@ -62,9 +62,13 @@ fn print_usage() {
     eprintln!("  --input N0,N1,...      Input Fock state (photonics only)");
     eprintln!("  --format FMT           Output format: text (default), json, jsonl");
     eprintln!("  --noise JSON           Per-gate + readout noise model. Sampled on --backend");
-    eprintln!("                         statevector or mps; applied to --expectation on pauliprop.");
+    eprintln!(
+        "                         statevector or mps; applied to --expectation on pauliprop."
+    );
     eprintln!("                         Uniform (idealized): '{{\"depolarizing\":0.001,\"amplitude_damping\":5e-4,\"readout_flip\":0.02}}'");
-    eprintln!("                         Per-qubit (calibrated): '{{\"amplitude_damping\":[0.004,0.006],");
+    eprintln!(
+        "                         Per-qubit (calibrated): '{{\"amplitude_damping\":[0.004,0.006],"
+    );
     eprintln!("                           \"depolarizing\":{{\"1q\":0.001,\"2q\":0.012}},\"readout\":[{{\"p10\":0.02,\"p01\":0.03}}]}}'");
     eprintln!();
     eprintln!("QUBO solve mode (--qubo):");

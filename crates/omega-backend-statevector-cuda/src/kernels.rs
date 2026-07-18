@@ -9,7 +9,7 @@
 //! [`CudaFunction`] handles via the [`KernelLibrary`] held inside the
 //! [`crate::imp::DeviceHandle`].
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
@@ -108,12 +108,32 @@ const KERNEL_APPLY_DIAGONAL_CHAIN_DUAL_POOLED: &str =
 const KERNEL_PAULI_Y_ACCUMULATE_THEN_DAGGER_BOTH_POOLED: &str =
     include_str!("kernels/pauli_y_accumulate_then_dagger_both_pooled.cu");
 
-/// Compute capability target for the embedded NVRTC compile. PTX is
-/// forward-compatible to every newer arch — compute_70 (Volta) covers
-/// every NVIDIA GPU we plausibly target (Volta / Turing / Ampere /
-/// Hopper / Blackwell), and the driver JIT-compiles to the host's
-/// actual SASS at module load.
-const NVRTC_ARCH: &str = "compute_70";
+/// Virtual arch target for the embedded NVRTC compile, detected from the
+/// live device's compute capability (`compute_{major}{minor}`).
+///
+/// A fixed floor no longer works: CUDA 13 dropped Volta from NVRTC, so
+/// `compute_70` yields `NVRTC_ERROR_INVALID_OPTION` on a CUDA-13 toolkit
+/// (e.g. the DGX Spark / GB10, sm_121). Targeting the device's own arch is
+/// correct on every toolkit — NVRTC always accepts the arch of a device the
+/// same-version driver can run — and skips the PTX→SASS JIT at module load.
+///
+/// Cached in a process-global `OnceLock`: device 0's arch is stable for the
+/// process, and every kernel compiles for the same device.
+fn nvrtc_arch(ctx: &Arc<CudaContext>) -> Result<&'static str, CudaError> {
+    static ARCH: OnceLock<String> = OnceLock::new();
+    if let Some(a) = ARCH.get() {
+        return Ok(a.as_str());
+    }
+    let (major, minor) = ctx
+        .compute_capability()
+        .map_err(|e| CudaError::KernelCompile {
+            kernel: "<arch-detect>",
+            reason: format!("compute_capability: {e}"),
+        })?;
+    Ok(ARCH
+        .get_or_init(|| format!("compute_{major}{minor}"))
+        .as_str())
+}
 
 /// Pre-compiled, loaded CUDA functions ready for `launch_builder`.
 /// Cloning is cheap (refcounted Arcs).
@@ -324,7 +344,7 @@ fn load_kernel(
     function_name: &'static str,
 ) -> Result<(Arc<CudaModule>, CudaFunction), CudaError> {
     let opts = CompileOptions {
-        arch: Some(NVRTC_ARCH),
+        arch: Some(nvrtc_arch(ctx)?),
         name: Some(function_name.to_string()),
         ..Default::default()
     };
@@ -356,7 +376,7 @@ fn load_kernel_multi(
     function_names: &[&'static str],
 ) -> Result<(Arc<CudaModule>, Vec<CudaFunction>), CudaError> {
     let opts = CompileOptions {
-        arch: Some(NVRTC_ARCH),
+        arch: Some(nvrtc_arch(ctx)?),
         name: Some(label.to_string()),
         ..Default::default()
     };
