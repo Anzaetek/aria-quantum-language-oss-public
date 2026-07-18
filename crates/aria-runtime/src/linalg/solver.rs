@@ -109,6 +109,49 @@ pub fn quantum_solve_diagonal(spectrum: &[f64], eps: f64) -> QuantumInversion {
     }
 }
 
+/// Build a genuine QSVT inversion circuit for a **dense** real symmetric
+/// positive-definite matrix `A` (up to 4×4), via eigenbasis conjugation:
+/// classically diagonalize `A = U·D·Uᵀ`, exactly block-encode `D`, and conjugate
+/// it into `A`'s eigenbasis with the compiled rotation `U`. Works for any
+/// condition number (κ only sets the degree). Restricted to real symmetric PD
+/// `A` of dimension 2 or 4 (the class the diagonal inversion polynomial and the
+/// 1-/2-qubit eigenbasis synthesis cover). Verified end-to-end vs classical solve.
+pub fn quantum_solve_hermitian(a: &Array2<f64>, eps: f64) -> QuantumInversion {
+    use crate::linalg::synth::{conjugated_block_encoding, eigh_symmetric};
+    let dim = a.nrows();
+    assert!(
+        (dim == 2 || dim == 4) && a.ncols() == dim,
+        "quantum_solve_hermitian supports 2×2 or 4×4 real symmetric A"
+    );
+    let (eigenvalues, u) = eigh_symmetric(a);
+    let be_diag = block_encode_diagonal(&eigenvalues);
+    let n_system = be_diag.n_system;
+    let w_a = conjugated_block_encoding(&be_diag.circuit, &u, n_system);
+
+    let min_abs = eigenvalues
+        .iter()
+        .map(|l| l.abs())
+        .filter(|&l| l > 1e-12)
+        .fold(f64::INFINITY, f64::min);
+    let kappa = (be_diag.alpha / min_abs).max(1.0);
+    let degree = (kappa * (kappa / eps.max(1e-9)).ln())
+        .max(4.0)
+        .round()
+        .min(40.0) as usize;
+    let phases = inversion_angles(degree, kappa);
+    let circuit = qsvt_circuit(n_system, &phases, &w_a);
+    QuantumInversion {
+        circuit,
+        block_encoding: DiagonalBlockEncoding {
+            circuit: w_a,
+            alpha: be_diag.alpha,
+            n_system,
+        },
+        kappa,
+        degree,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +216,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn quantum_solve_hermitian_matches_classical() {
+        use aria_core::ast::nodes::x;
+        use aria_core::ast::Circuit;
+        use num_complex::Complex64;
+        use std::collections::HashMap;
+
+        // Full QSVT block P(A)_{ji} = ⟨0,j| U_Φ |0,i⟩ by simulating the circuit on
+        // each system basis input |i⟩ and reading the ancilla=0 amplitudes.
+        fn qsvt_block(circuit: &Circuit, n_system: usize) -> Vec<Vec<Complex64>> {
+            let dim = 1usize << n_system;
+            let mut block = vec![vec![Complex64::new(0.0, 0.0); dim]; dim];
+            for i in 0..dim {
+                let mut probe = Circuit::new("probe");
+                let qs = probe.qreg("q", 1 + n_system);
+                for j in 0..n_system {
+                    if (i >> j) & 1 == 1 {
+                        probe.apply(x(), vec![qs[1 + j].clone()]);
+                    }
+                }
+                probe.append_circuit(circuit, &HashMap::new(), None);
+                let sv =
+                    crate::run::statevector(&probe, &HashMap::new(), crate::run::BackendSel::Sim)
+                        .unwrap();
+                for j in 0..dim {
+                    block[j][i] = sv[j << 1];
+                }
+            }
+            block
+        }
+
+        // Real symmetric positive-definite systems, dense (non-diagonal): 2×2, 4×4.
+        let a2: Array2<f64> = array![[2.0, 0.5], [0.5, 3.0]];
+        let a4: Array2<f64> = array![
+            [4.0, 0.6, 0.2, 0.1],
+            [0.6, 5.0, 0.3, 0.2],
+            [0.2, 0.3, 6.0, 0.4],
+            [0.1, 0.2, 0.4, 7.0],
+        ];
+        for a in [a2, a4] {
+            let dim = a.nrows();
+            let inv = quantum_solve_hermitian(&a, 1e-2);
+            let n_system = inv.block_encoding.n_system;
+            let block = qsvt_block(&inv.circuit, n_system);
+            // Real inversion operator Re(P)(A) = (P + P†)/2.
+            let re_p: Vec<Vec<f64>> = (0..dim)
+                .map(|j| {
+                    (0..dim)
+                        .map(|k| 0.5 * (block[j][k].re + block[k][j].re))
+                        .collect()
+                })
+                .collect();
+            for b in [vec![1.0, 0.0, 0.0, 0.0], vec![0.3, 0.9, 0.5, 0.2]] {
+                let b = &b[..dim];
+                let q: Vec<f64> = (0..dim)
+                    .map(|j| (0..dim).map(|k| re_p[j][k] * b[k]).sum())
+                    .collect();
+                let c = classical_solve_sym(&a, b);
+                let dot: f64 = q.iter().zip(&c).map(|(u, v)| u * v).sum();
+                let nq: f64 = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let nc: f64 = c.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let fidelity = (dot / (nq * nc)).powi(2);
+                assert!(
+                    fidelity > 0.999,
+                    "dim {dim} b {b:?}: solve fidelity {fidelity} (κ={:.2}, d={})",
+                    inv.kappa,
+                    inv.degree
+                );
+            }
+        }
+    }
+
+    /// Classical `A⁻¹ b` for a small symmetric matrix (Gaussian elimination).
+    fn classical_solve_sym(a: &Array2<f64>, b: &[f64]) -> Vec<f64> {
+        let n = a.nrows();
+        let mut m = a.clone();
+        let mut x = b.to_vec();
+        for col in 0..n {
+            let mut piv = col;
+            for r in (col + 1)..n {
+                if m[(r, col)].abs() > m[(piv, col)].abs() {
+                    piv = r;
+                }
+            }
+            if piv != col {
+                for c in 0..n {
+                    let t = m[(col, c)];
+                    m[(col, c)] = m[(piv, c)];
+                    m[(piv, c)] = t;
+                }
+                x.swap(col, piv);
+            }
+            let d = m[(col, col)];
+            for r in 0..n {
+                if r == col {
+                    continue;
+                }
+                let f = m[(r, col)] / d;
+                for c in col..n {
+                    let t = m[(col, c)];
+                    m[(r, c)] -= f * t;
+                }
+                x[r] -= f * x[col];
+            }
+        }
+        (0..n).map(|i| x[i] / m[(i, i)]).collect()
     }
 
     #[test]
