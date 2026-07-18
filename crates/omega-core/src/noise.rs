@@ -140,8 +140,16 @@ impl Depolarizing {
                     ));
                 }
             }
-            let one_q = obj.get("1q").map(Rate::from_json).transpose()?.unwrap_or_default();
-            let two_q = obj.get("2q").map(Rate::from_json).transpose()?.unwrap_or_default();
+            let one_q = obj
+                .get("1q")
+                .map(Rate::from_json)
+                .transpose()?
+                .unwrap_or_default();
+            let two_q = obj
+                .get("2q")
+                .map(Rate::from_json)
+                .transpose()?
+                .unwrap_or_default();
             Ok(Depolarizing { one_q, two_q })
         } else {
             let r = Rate::from_json(v)?;
@@ -176,9 +184,7 @@ impl PauliChannel {
             // `I` is accepted for backward compatibility (it was the identity
             // rate) but ignored — the identity weight is implied by 1 − x − y − z.
             if !matches!(k.as_str(), "I" | "X" | "Y" | "Z") {
-                return Err(format!(
-                    "unknown pauli key '{k}' (recognised: I, X, Y, Z)"
-                ));
+                return Err(format!("unknown pauli key '{k}' (recognised: I, X, Y, Z)"));
             }
         }
         let get = |k: &str| obj.get(k).map(Rate::from_json).transpose();
@@ -297,7 +303,11 @@ impl NoiseModel {
         self.depolarizing.is_zero()
             && self.amplitude_damping.is_zero()
             && self.phase_damping.is_zero()
-            && self.pauli.as_ref().map(PauliChannel::is_zero).unwrap_or(true)
+            && self
+                .pauli
+                .as_ref()
+                .map(PauliChannel::is_zero)
+                .unwrap_or(true)
             && self.readout.is_zero()
     }
 
@@ -332,7 +342,10 @@ impl NoiseModel {
         }
 
         let rate = |k: &str| -> Result<Rate, String> {
-            obj.get(k).map(Rate::from_json).transpose().map(Option::unwrap_or_default)
+            obj.get(k)
+                .map(Rate::from_json)
+                .transpose()
+                .map(Option::unwrap_or_default)
         };
 
         let depolarizing = obj
@@ -400,9 +413,10 @@ mod tests {
 
     #[test]
     fn asymmetric_readout() {
-        let m =
-            NoiseModel::from_json(r#"{"readout":[{"p10":0.02,"p01":0.03},{"p10":0.01,"p01":0.05}]}"#)
-                .unwrap();
+        let m = NoiseModel::from_json(
+            r#"{"readout":[{"p10":0.02,"p01":0.03},{"p10":0.01,"p01":0.05}]}"#,
+        )
+        .unwrap();
         assert_eq!(m.readout.flip_prob(0, 0), 0.02);
         assert_eq!(m.readout.flip_prob(0, 1), 0.03);
         assert_eq!(m.readout.flip_prob(1, 1), 0.05);

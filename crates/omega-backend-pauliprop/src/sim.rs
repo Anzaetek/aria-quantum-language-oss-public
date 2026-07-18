@@ -246,7 +246,7 @@ impl PauliPropBackend {
                 if px + py + pz > 0.0 {
                     let pi = 1.0 - px - py - pz;
                     scale_by_local_pauli(sum, q, |x, z| match (x, z) {
-                        (false, false) => 1.0,        // I
+                        (false, false) => 1.0,              // I
                         (true, false) => pi + px - py - pz, // X
                         (false, true) => pi - px - py + pz, // Z
                         (true, true) => pi - px + py - pz,  // Y
@@ -264,7 +264,12 @@ impl PauliPropBackend {
     /// sampler. This backend produces expectation values (no shots), so only
     /// **symmetric** readout has an unambiguous meaning here; asymmetric readout
     /// (`p10 ≠ p01`) is rejected — sample it on `--backend sim` instead.
-    fn apply_readout_adjoint(&self, model: &NoiseModel, n: usize, sum: &mut PauliSum) -> Result<()> {
+    fn apply_readout_adjoint(
+        &self,
+        model: &NoiseModel,
+        n: usize,
+        sum: &mut PauliSum,
+    ) -> Result<()> {
         if model.readout.is_zero() {
             return Ok(());
         }
