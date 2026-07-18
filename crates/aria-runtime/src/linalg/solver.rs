@@ -9,11 +9,10 @@
 //! KEEP-IN-SYNC with the toolkit source.
 
 use crate::linalg::block_encode::{block_encode_dense, DenseBlockEncoding};
-use crate::linalg::qsvt::qsvt_circuit;
+use crate::linalg::qsvt::{inversion_angles, qsvt_circuit};
 use aria_core::ast::Circuit;
 use ndarray::Array2;
 use num_complex::Complex64;
-use omega_core::chebyshev::qsvt_inversion_angles;
 use omega_core::solver::gershgorin_condition_estimate;
 
 /// Build the *quantum* circuit recipe for `A x = b`.
@@ -29,15 +28,17 @@ use omega_core::solver::gershgorin_condition_estimate;
 ///   estimate; a real implementation would use SVD.
 /// - `qsvt_degree` — polynomial degree used (heuristic from κ and ε).
 ///
-/// Suitable for resource estimation; circuit accuracy depends on
-/// the placeholder `qsvt_circuit` until the Wang-Lin angle reduction
-/// is wired in (see `omega_core::chebyshev::qsvt_inversion_angles` doc).
+/// The QSVT phases come from the real angle finder
+/// [`crate::linalg::qsvt::inversion_angles`] (Wang–Lin least-squares over the
+/// exact QSP response), and the circuit interleaves them with the block-encoding
+/// signal. Overall numeric fidelity is still bounded by the toy LCU SELECT in
+/// [`block_encode_dense`], so this remains a resource-estimation recipe; the
+/// angle/QSVT layer itself is numerically validated in the `qsvt` tests.
 pub fn quantum_solve_circuit(
     a: &Array2<Complex64>,
     eps: f64,
 ) -> (Circuit, DenseBlockEncoding, f64, usize) {
     let dense_be = block_encode_dense(a);
-    let n_system = (a.nrows() as f64).log2().round() as usize;
 
     // Crude condition-number estimate via Gershgorin disks: the
     // spectrum lies in the union of disks centered at A[i,i] with
@@ -50,8 +51,11 @@ pub fn quantum_solve_circuit(
     let d_raw = (kappa * (kappa / eps.max(1e-9)).ln()).max(4.0).round() as usize;
     let degree = d_raw.min(64);
 
-    let angles = qsvt_inversion_angles(degree, kappa);
-    let circuit = qsvt_circuit(n_system, &angles);
+    let phases = inversion_angles(degree, kappa);
+    // The block encoding spans `n_ancilla + n_system` qubits; drive QSVT over the
+    // same register so the composed signal is well-formed (ancilla = qubit 0).
+    let n_qsvt_system = dense_be.circuit.n_qubits().saturating_sub(1);
+    let circuit = qsvt_circuit(n_qsvt_system, &phases, &dense_be.circuit);
     (circuit, dense_be, kappa, degree)
 }
 

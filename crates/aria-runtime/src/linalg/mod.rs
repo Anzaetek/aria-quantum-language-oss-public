@@ -20,5 +20,5 @@ pub mod solver;
 
 pub use block_encode::{block_encode_dense, DenseBlockEncoding};
 pub use lcu::{lcu_block_encoding, lcu_one_norm, LcuTerm};
-pub use qsvt::{inversion_angles, qsvt_circuit, sign_function_angles};
+pub use qsvt::{inversion_angles, qsvt_circuit};
 pub use solver::quantum_solve_circuit;

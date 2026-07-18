@@ -33,11 +33,19 @@ circuit Hhl(n: int) {
         apply H on q[i]
     }
 
-    -- Step 4: controlled rotation encoding 1/λ on the ancilla. The
-    -- eigenvalue proxy λ = k + 1 (≥ 1) keeps the angle well-defined.
+    -- Step 4: controlled rotation encoding 1/λ on the ancilla. HHL needs a
+    -- controlled-RY here — rotate the fresh |0⟩ ancilla by ~C/λ so that
+    -- post-selecting ancilla = |1⟩ yields the 1/λ-weighted A⁻¹|b⟩ amplitude.
+    -- A controlled-PHASE (the previous version) is diagonal, so on a |0⟩ ancilla
+    -- it is a no-op: the ancilla never leaves |0⟩ and the solution branch is
+    -- empty for every input. Aria has no native CRY, so decompose
+    -- CRY(φ) = RY(φ/2)·CX·RY(-φ/2)·CX (φ = C/λ, eigenvalue proxy λ = k + 1).
     repeat k from 0 to n {
         let theta = 0.5 / (k + 1)
-        apply CP(theta) on q[k], q[n + 1]
+        apply RY(theta / 2) on q[n + 1]
+        apply CX on q[k], q[n + 1]
+        apply RY(-theta / 2) on q[n + 1]
+        apply CX on q[k], q[n + 1]
     }
 
     -- Step 5: uncompute QPE.
