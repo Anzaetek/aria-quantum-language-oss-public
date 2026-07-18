@@ -138,6 +138,12 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
     let (c0, c1) = z_at(STEPS)?;
     let err_half = (h0 - ez0).abs().max((h1 - ez1).abs());
     let err_full = (c0 - ez0).abs().max((c1 - ez1).abs());
+    // Gate the convergence claim, not just print it: doubling the step count must reduce the error.
+    if err_full > err_half {
+        return Err(format!(
+            "Trotter error did not decrease with steps: {err_half:.2e} (steps/2) → {err_full:.2e} (steps)"
+        ));
+    }
 
     println!("  exact ⟨Z0⟩ = ⟨Z1⟩ = {ez0:+.10}");
     println!(
