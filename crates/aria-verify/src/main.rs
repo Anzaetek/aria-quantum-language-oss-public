@@ -39,6 +39,8 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("simon", aria_app_simon::run),
         ("qpe", aria_app_qpe::run),
         ("qsp", aria_app_qsp::run),
+        // Hamiltonian simulation — first-order Trotter vs exact exp(-iHt).
+        ("trotter", aria_app_trotter::run),
         // Encoded (QEC) demos — algorithms run on transversally-encoded logical
         // qubits via the aria-qec crate (Steane [[7,1,3]] + rotated surface code).
         ("qec_grover", aria_app_qec_grover::run),

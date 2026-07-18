@@ -72,6 +72,7 @@ members = [
     "crates/apps/simon",
     "crates/apps/qpe",
     "crates/apps/qsp",
+    "crates/apps/trotter",
     "crates/apps/forward",
     "crates/aria-verify",
     # "crates/aria-backend-tch",# added in Phase 4 (optional)

@@ -305,6 +305,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-app-trotter"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+ "num-complex",
+]
+
+[[package]]
 name = "aria-app-vqe-ansatz"
 version = "0.1.0"
 dependencies = [
@@ -402,6 +410,7 @@ dependencies = [
  "aria-app-superdense",
  "aria-app-swap-test",
  "aria-app-teleport",
+ "aria-app-trotter",
  "aria-app-vqe-ansatz",
  "aria-verify-core",
 ]
