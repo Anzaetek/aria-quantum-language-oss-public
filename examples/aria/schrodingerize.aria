@@ -1,0 +1,51 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- Schrödingerization — solve a linear ODE du/dt = -a·u by lifting to a Hamiltonian (transport)
+-- evolution via the warped phase transformation, then recovering u by integrating over p ≥ 0.
+-- ▶ Application harness + classical cross-check: crates/apps/schrodingerize/src/lib.rs
+--   run: cargo run -p aria-app-schrodingerize   (or: cargo run -p aria-verify -- schrodingerize)
+-- VERIFIED: one transport step (Δp = 0.5, a = 1) reproduces exp(-a·Δp) exactly — the recovery
+--   Σ_{p≥0} w(t,p) / Σ_{p≥0} w(0,p) = e^{-0.5} to machine precision. (Multi-step accuracy improves
+--   with the momentum-grid size; a single step is exact on this symmetric M = 4 grid.)
+--
+-- Warped phase transform: the non-Schrödinger ODE du/dt = -a·u becomes the transport equation
+-- ∂_t w = a·∂_p w on an auxiliary momentum variable p, whose generator P̂ = -i∂_p is Hermitian, so
+-- the evolution e^{i·a·t·P̂} is a (Hamiltonian) translation in p. Discretized on M = 4 grid points
+-- p_j = (j-2)·Δp with warped initial data w(0,p) = e^{-|p|}, one leftward translation step is the
+-- cyclic decrement X(q0)·CX(q0→q1); u(t) is recovered by summing the amplitudes over p ≥ 0
+-- (grid points j ∈ {2,3}). `s` is the number of transport steps.
+
+circuit Schrodingerize(s: int) {
+    qreg q[2]                          -- 2-qubit momentum register, grid index j = 2·q1 + q0
+
+    -- Warped initial amplitudes w(0,p_j) = e^{-|p_j|} on p = (-1, -0.5, 0, 0.5):
+    let e1 = exp(-1.0)                  -- e^{-|−1|}
+    let e5 = exp(-0.5)                  -- e^{-|±0.5|}
+    let n2 = e1 * e1 + e5 * e5 + 1 + e5 * e5
+
+    -- Amplitude loading (real, positive) by a 2-level RY tree.
+    let th1 = 2 * asin(sqrt((1 + e5 * e5) / n2))            -- split on q1: P(q1=1) = (c²+d²)/‖w‖²
+    let ph0 = 2 * asin(sqrt((e5 * e5) / (e1 * e1 + e5 * e5)))  -- q1=0 block: (e1, e5)
+    let ph1 = 2 * asin(sqrt((e5 * e5) / (1 + e5 * e5)))        -- q1=1 block: (1,  e5)
+
+    apply RY(th1) on q[1]
+
+    -- controlled-RY(ph0) on q0, controlled by q1 = 0   (CRY = RY(θ/2)·CX·RY(-θ/2)·CX)
+    apply X on q[1]
+    apply RY(ph0 / 2) on q[0]
+    apply CX on q[1], q[0]
+    apply RY(-ph0 / 2) on q[0]
+    apply CX on q[1], q[0]
+    apply X on q[1]
+
+    -- controlled-RY(ph1) on q0, controlled by q1 = 1
+    apply RY(ph1 / 2) on q[0]
+    apply CX on q[1], q[0]
+    apply RY(-ph1 / 2) on q[0]
+    apply CX on q[1], q[0]
+
+    -- Hamiltonian transport: s leftward translation steps (cyclic decrement: X(q0) then CX(q0→q1)).
+    repeat k from 0 to s - 1 {
+        apply X on q[0]
+        apply CX on q[0], q[1]
+    }
+}

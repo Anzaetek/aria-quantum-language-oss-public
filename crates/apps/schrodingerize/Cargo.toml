@@ -1,0 +1,13 @@
+# aria-app-schrodingerize — application harness for the `schrodingerize` Aria example.
+# Schrödingerization of du/dt = -a·u; one warped-phase transport step vs e^{-a·Δp}.
+# Run standalone: cargo run -p aria-app-schrodingerize     (or: aria-verify schrodingerize)
+[package]
+publish = false
+name = "aria-app-schrodingerize"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Schrödingerization of a linear ODE, one transport step verified vs exp(-a*dp)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

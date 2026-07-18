@@ -75,6 +75,8 @@ members = [
     "crates/apps/trotter",
     "crates/apps/qdrift",
     "crates/apps/taylor-lcu",
+    "crates/apps/shor",
+    "crates/apps/schrodingerize",
     "crates/apps/forward",
     "crates/aria-verify",
     # "crates/aria-backend-tch",# added in Phase 4 (optional)

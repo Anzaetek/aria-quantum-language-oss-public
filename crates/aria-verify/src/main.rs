@@ -43,6 +43,10 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("trotter", aria_app_trotter::run),
         ("qdrift", aria_app_qdrift::run),
         ("taylor_lcu", aria_app_taylor_lcu::run),
+        // Cryptography — Shor factoring of N=15 (compiled, a=11).
+        ("shor", aria_app_shor::run),
+        // PDE / ODE — Schrödingerization (warped phase + Hamiltonian transport).
+        ("schrodingerize", aria_app_schrodingerize::run),
         // Encoded (QEC) demos — algorithms run on transversally-encoded logical
         // qubits via the aria-qec crate (Steane [[7,1,3]] + rotated surface code).
         ("qec_grover", aria_app_qec_grover::run),
