@@ -1468,6 +1468,11 @@ fn eval_call(name: &str, args: &[Expr], scope: &Scope) -> Result<Value, String> 
         ("sin", [x]) => Ok(Value::Float(x.as_f64().sin())),
         ("cos", [x]) => Ok(Value::Float(x.as_f64().cos())),
         ("tan", [x]) => Ok(Value::Float(x.as_f64().tan())),
+        // Inverse trig — kept in sync with the ParamExpr evaluator (ast/expr.rs) so a `let`
+        // binding and a gate-angle expression fold identically (used by LCU PREPARE angles).
+        ("asin", [x]) => Ok(Value::Float(x.as_f64().asin())),
+        ("acos", [x]) => Ok(Value::Float(x.as_f64().acos())),
+        ("atan", [x]) => Ok(Value::Float(x.as_f64().atan())),
         ("exp", [x]) => Ok(Value::Float(x.as_f64().exp())),
         ("log", [x]) => Ok(Value::Float(x.as_f64().ln())),
         ("sqrt", [x]) => Ok(Value::Float(x.as_f64().sqrt())),

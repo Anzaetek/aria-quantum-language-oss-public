@@ -1,0 +1,14 @@
+# aria-app-taylor-lcu — application harness for the `taylor_lcu` Aria example.
+# LCU (Taylor-series) block-encoding of exp(-iXt), verified vs the closed form.
+# Run standalone: cargo run -p aria-app-taylor-lcu     (or: aria-verify taylor_lcu)
+[package]
+publish = false
+name = "aria-app-taylor-lcu"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "LCU/Taylor block-encoding of exp(-iXt) cross-checked against the closed form."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+num-complex = { workspace = true }

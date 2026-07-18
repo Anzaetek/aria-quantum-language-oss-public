@@ -46,6 +46,8 @@ const EXAMPLES: &[(&str, &str, &[(&str, i64)])] = &[
     ("qpe.aria", "QPE", &[("t", 3)]),
     ("qsp.aria", "QSP", &[("d", 4)]),
     ("trotter.aria", "Trotter", &[("steps", 8)]),
+    ("qdrift.aria", "QDrift", &[("N", 8)]),
+    ("taylor_lcu.aria", "TaylorLcu", &[]),
     ("qssl.aria", "QSSLEncoder", &[("N", 2), ("L", 2)]),
     ("qsvd.aria", "QsvdAnsatz", &[]),
     ("qsvt_invert.aria", "QsvtInvert", &[("degree", 4)]),

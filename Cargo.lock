@@ -202,6 +202,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-app-qdrift"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+ "num-complex",
+]
+
+[[package]]
 name = "aria-app-qec-grover"
 version = "0.1.0"
 dependencies = [
@@ -295,6 +303,14 @@ name = "aria-app-swap-test"
 version = "0.1.0"
 dependencies = [
  "aria-verify-core",
+]
+
+[[package]]
+name = "aria-app-taylor-lcu"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+ "num-complex",
 ]
 
 [[package]]
@@ -396,6 +412,7 @@ dependencies = [
  "aria-app-grover3",
  "aria-app-noise",
  "aria-app-qaoa-maxcut",
+ "aria-app-qdrift",
  "aria-app-qec-grover",
  "aria-app-qec-memory",
  "aria-app-qec-qft",
@@ -409,6 +426,7 @@ dependencies = [
  "aria-app-simon",
  "aria-app-superdense",
  "aria-app-swap-test",
+ "aria-app-taylor-lcu",
  "aria-app-teleport",
  "aria-app-trotter",
  "aria-app-vqe-ansatz",

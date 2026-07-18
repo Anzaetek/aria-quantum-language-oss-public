@@ -24,7 +24,7 @@ There are two kinds of run-gate oracle:
   full `⟨Z_q⟩` profile from the same lowered IR; the runtime must match it
   (Δ ≤ 2.2e-16 in practice). This catches lowering / execution regressions.
 
-## Status — 32 / 33 numerically verified, 1 showcase
+## Status — 34 / 35 numerically verified, 1 showcase
 
 | Example | Gate | Oracle | What is checked |
 |---|---|---|---|
@@ -35,6 +35,8 @@ There are two kinds of run-gate oracle:
 | qpe | run | classical | recovered eigenphase φ̂ == 1/8 |
 | qsp | run | classical | zero-phase ⟨Z₀⟩ == cos(d·θ) = T_d (Chebyshev); full phase⇒poly in QSP.lean |
 | trotter | run | classical | circuit ⟨Z_q⟩ after first-order Trotter (t=1) == exact exp(-iHt); error→0 as steps→∞ |
+| qdrift | run | classical | circuit ⟨Z_q⟩ after QDrift (uniform λτ, freq ∝ |c_j|) == exact exp(-iHt); error→0 as N→∞ |
+| taylor_lcu | run | classical | ancilla=|0⟩ block of the LCU == exp(-iXt)|0⟩ (closed form); success prob == 1/λ² |
 | qft | run | classical | output amplitudes == DFT image |
 | qsvd | run | classical | recovered singular values == Jacobi SVD |
 | grover3 | run | classical | marked-state probability after amplification |
