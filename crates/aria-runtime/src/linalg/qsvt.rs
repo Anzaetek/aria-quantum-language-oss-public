@@ -1,123 +1,149 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Quantum Singular Value Transformation (QSVT).
+//! Quantum Singular Value Transformation (QSVT) — circuit construction.
 //!
-//! QSVT applies a polynomial transformation to the singular values
-//! of a block-encoded matrix. It's the foundation for optimal
-//! quantum algorithms for linear algebra, search, and simulation.
+//! QSVT interleaves a block-encoding unitary `W` (the "signal") with QSP phase
+//! rotations `S(φ)` to block-encode a polynomial `P(A)` of the block-encoded
+//! matrix. This module builds the *circuit*; the QSP phase angles that realize a
+//! target polynomial are computed by the numerically-validated angle finder in
+//! [`omega_core::qsp`] (a Wang–Lin/Dong least-squares fit of the exact QSP
+//! response over Chebyshev nodes), which mirrors the `QuantumProofs/QSP.lean`
+//! `qsp` definition gate-for-gate.
 //!
-//! Given a block encoding of A with angles [φ₁, ..., φ_d]:
-//! QSVT circuit = ∏ᵢ (signal_rotation(φᵢ) · signal_processing_unitary)
+//! Conventions (identical to `omega_core::qsp` and `QSP.lean`, the "Wx" family):
+//! * signal   `W(x) = [[x, i·s],[i·s, x]] = e^{i·arccos(x)·X}`  (s = √(1−x²));
+//! * phase    `S(φ) = diag(e^{iφ}, e^{-iφ}) = e^{iφZ}`;
+//! * unitary  `U_Φ = S(φ₀)·W·S(φ₁)·W·…·S(φ_{d-1})·W`   (`d` phases ⇒ degree ≤ d).
 //!
-//! The result block-encodes P(A) where P is a polynomial of degree d.
+//! The ancilla/flag qubit of the block encoding is qubit 0. For a single-ancilla
+//! block encoding the QSVT projector-controlled phase `e^{iφ(2Π−I)}`
+//! (`Π = |0⟩⟨0|` on the ancilla) is exactly `S(φ)` on qubit 0, i.e. `Rz(−2φ)`
+//! with the standard `Rz(θ) = diag(e^{−iθ/2}, e^{iθ/2})`. The
+//! `⟨0|_anc U_Φ |0⟩_anc` block then realizes `P(A)`; with [`inversion_angles`]
+//! that polynomial approximates the (sub-normalized) inverse `≈ 1/x` on
+//! `[1/κ, 1]` — validated against `qsp_response` in the tests below.
 //!
-//! Ported from the gate-model toolkit's `quantum-core/src/circuits/qsvt.rs`
-//! (KEEP-IN-SYNC; only the `crate::ast` → `aria_core::ast` import differs).
+//! (Previously this module emitted a fixed structural template with placeholder
+//! `CX` "signal" steps and `[π/4, 0, …, 0, π/4]` "angles" that implemented no
+//! polynomial at all. It now consumes the real angle finder and a real signal.)
 
-use aria_core::ast::{Circuit, CircuitBuilder};
-use std::f64::consts::PI;
+use aria_core::ast::nodes::{rz, Circuit};
+use omega_core::qsp::qsp_inversion_phases;
+use std::collections::HashMap;
 
-/// Build a QSVT circuit for polynomial transformation.
+/// Build a QSVT circuit that applies the QSP phase sequence `phases` to the
+/// block-encoding unitary `block_encoding` (the signal `W`).
 ///
-/// - `n_system`: system qubits (block encoding uses 1 ancilla + n system)
-/// - `angles`: QSVT phase angles [φ₁, ..., φ_d] defining the polynomial
+/// - `n_system`: system qubits. The circuit spans `1 + n_system` qubits with the
+///   ancilla/flag as qubit 0; `block_encoding` must use the same `q` register /
+///   layout (ancilla first).
+/// - `phases`: QSP phase angles `[φ₀, …, φ_{d-1}]` (e.g. from [`inversion_angles`]).
+/// - `block_encoding`: the signal unitary `W`, a circuit over the same register.
 ///
-/// The ancilla qubit is qubit 0, system qubits are 1..n.
-pub fn qsvt_circuit(n_system: usize, angles: &[f64]) -> Circuit {
-    let n_total = 1 + n_system; // ancilla + system
-    let mut b = CircuitBuilder::new("qsvt", n_total, 0);
-
-    for (i, &phi) in angles.iter().enumerate() {
-        // Signal rotation on ancilla: e^{i*φ*Z}
-        b.rz(0, 2.0 * phi);
-
-        // Signal processing: controlled operation (placeholder)
-        // In practice, this is the block encoding unitary or its complement
-        if i % 2 == 0 {
-            // "Even" step: apply block encoding
-            // For a simple example, use controlled-RY as placeholder
-            b.cx(0, 1);
-        } else {
-            // "Odd" step: apply conjugate block encoding
-            b.cx(0, 1);
-        }
-
-        // Reflection on ancilla
-        if i < angles.len() - 1 {
-            b.h(0);
-            b.z(0);
-            b.h(0);
-        }
+/// Emits `U_Φ = S(φ₀)·W·…·S(φ_{d-1})·W` (Wx convention). The tests verify that
+/// its `⟨0|·|0⟩` statevector amplitude equals `omega_core::qsp::qsp_response`.
+pub fn qsvt_circuit(n_system: usize, phases: &[f64], block_encoding: &Circuit) -> Circuit {
+    let n_total = 1 + n_system;
+    let mut circ = Circuit::new("qsvt");
+    let qubits = circ.qreg("q", n_total);
+    let idmap: HashMap<aria_core::ast::nodes::Qubit, aria_core::ast::nodes::Qubit> = HashMap::new();
+    // Gate (time) order is the matrix product read right-to-left: apply the
+    // signal `W` first, then the phase `S(φ)`, ending with `S(φ₀)` applied last.
+    for &phi in phases.iter().rev() {
+        circ.append_circuit(block_encoding, &idmap, None); // signal W
+        circ.apply(rz(-2.0 * phi), vec![qubits[0].clone()]); // phase S(φ) on the ancilla
     }
-
-    b.build()
+    circ
 }
 
-/// Compute QSVT angles for a simple polynomial.
+/// QSP phase angles implementing the (sub-normalized) matrix inversion
+/// `≈ (1/κ)/x` on `[1/κ, 1]`, for `degree` phases.
 ///
-/// For a degree-d polynomial approximation of sign(x):
-/// angles ≈ [π/4, 0, ..., 0, π/4] (simplified).
-// Index-loop bodies kept byte-identical to the toolkit source; OSS ci.sh
-// runs clippy with `-D warnings`, so the range-loop lint is allowed locally.
-#[allow(clippy::needless_range_loop)]
-pub fn sign_function_angles(degree: usize) -> Vec<f64> {
-    let mut angles = vec![0.0; degree + 1];
-    angles[0] = PI / 4.0;
-    angles[degree] = PI / 4.0;
-    // Interior angles for the Chebyshev approximation
-    for i in 1..degree {
-        angles[i] = PI / (2.0 * degree as f64);
-    }
-    angles
-}
-
-/// Compute QSVT angles for matrix inversion (1/x).
-///
-/// Approximates 1/x on [1/κ, 1] where κ is the condition number.
-#[allow(clippy::needless_range_loop)]
+/// Delegates to the numerically-validated angle finder
+/// [`omega_core::qsp::qsp_inversion_phases`]: a least-squares fit of the exact
+/// QSP response to the target `scale/x` over Chebyshev nodes. Feed the result to
+/// [`qsvt_circuit`]. The `scale = 0.9/κ` keeps the target sub-normalized
+/// (`|P| ≤ 1`), as QSVT requires; the realized block is that scaled inverse.
 pub fn inversion_angles(degree: usize, kappa: f64) -> Vec<f64> {
-    let mut angles = vec![0.0; degree + 1];
-    // Simplified: use uniform angles scaled by 1/κ
-    for i in 0..=degree {
-        angles[i] = PI / (4.0 * kappa) * (if i % 2 == 0 { 1.0 } else { -1.0 });
-    }
-    angles[0] = PI / 4.0;
-    angles
+    let kappa = kappa.max(1.0);
+    // Sub-normalize with a little headroom below 1/κ so the fit is not pinned to
+    // |P| = 1 at the x = 1/κ endpoint (which QSP cannot exceed).
+    let scale = 0.9 / kappa;
+    let iters = (1000 * degree.max(1)).clamp(4000, 20_000);
+    qsp_inversion_phases(degree, kappa, scale, iters)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aria_core::ast::CircuitBuilder;
+    use omega_core::qsp::qsp_response;
 
+    /// Angle layer: the fitted phases implement the scaled inverse `0.9/κ · 1/x`
+    /// on `[1/κ, 1]` — the "validated vs 1/x" numeric anchor.
     #[test]
-    fn test_qsvt_circuit() {
-        let angles = sign_function_angles(3);
-        let circ = qsvt_circuit(1, &angles);
-        assert_eq!(circ.n_qubits(), 2); // 1 ancilla + 1 system
-        assert!(circ.gate_count() > 0);
+    fn inversion_angles_approximate_reciprocal() {
+        let kappa = 2.0_f64;
+        let degree = 8;
+        let phases = inversion_angles(degree, kappa);
+        assert_eq!(phases.len(), degree);
+        let scale = 0.9 / kappa;
+        let lo = 1.0 / kappa;
+        let mut maxerr = 0.0_f64;
+        for i in 0..=20 {
+            let x = lo + (1.0 - lo) * i as f64 / 20.0;
+            let got = qsp_response(&phases, x).re;
+            maxerr = maxerr.max((got - scale / x).abs());
+        }
+        assert!(
+            maxerr < 8e-2,
+            "QSP inversion fit max err on [1/κ,1] = {maxerr}"
+        );
     }
 
+    /// Circuit layer: for a single-qubit signal `W(x) = e^{i·arccos(x)·X}`, the
+    /// emitted QSVT circuit's `⟨0|U|0⟩` amplitude equals the exact QSP response
+    /// `qsp_response(phases, x)` — i.e. the circuit really implements the QSP
+    /// polynomial the phases encode (ties the circuit to the validated angles).
     #[test]
-    fn test_sign_angles() {
-        let angles = sign_function_angles(5);
-        assert_eq!(angles.len(), 6);
-        assert!((angles[0] - PI / 4.0).abs() < 1e-10);
-        assert!((angles[5] - PI / 4.0).abs() < 1e-10);
+    fn qsvt_circuit_realizes_qsp_response() {
+        let phases = [0.3_f64, -1.1, 0.7, 2.0];
+        for &x in &[-0.8_f64, -0.3, 0.0, 0.4, 0.9] {
+            // W(x) = e^{i·θ·X} = Rx(-2θ), θ = arccos(x).
+            let theta = x.acos();
+            let signal = CircuitBuilder::new("w", 1, 0).rx(0, -2.0 * theta).build();
+            let circ = qsvt_circuit(0, &phases, &signal);
+            let sv = crate::run::statevector(
+                &circ,
+                &std::collections::HashMap::new(),
+                crate::run::BackendSel::Sim,
+            )
+            .unwrap();
+            let want = qsp_response(&phases, x);
+            assert!(
+                (sv[0].re - want.re).abs() < 1e-9 && (sv[0].im - want.im).abs() < 1e-9,
+                "x={x}: circuit ⟨0|U|0⟩ = {:?}, qsp_response = {:?}",
+                sv[0],
+                want
+            );
+        }
     }
 
+    /// Structure: `d` phases ⇒ `d` signal blocks + `d` phase rotations, on the
+    /// block encoding's register (`1 + n_system` qubits).
     #[test]
-    fn test_inversion_angles() {
-        let angles = inversion_angles(7, 10.0);
-        assert_eq!(angles.len(), 8);
-    }
-
-    #[test]
-    fn test_qsvt_resources() {
-        // QSVT with degree d uses O(d) gates
-        for d in [3, 7, 15] {
-            let angles = sign_function_angles(d);
-            let circ = qsvt_circuit(1, &angles);
-            // Gate count should scale linearly with degree
-            assert!(circ.gate_count() >= d);
+    fn qsvt_circuit_structure_scales_with_degree() {
+        let n_system = 1;
+        let signal = CircuitBuilder::new("w", 1 + n_system, 0)
+            .h(0)
+            .cx(0, 1)
+            .build();
+        let sig_gates = signal.gate_count();
+        for d in [2usize, 4, 8] {
+            let phases = vec![0.1; d];
+            let circ = qsvt_circuit(n_system, &phases, &signal);
+            assert_eq!(circ.n_qubits(), 1 + n_system);
+            // d signal copies + d phase Rz gates.
+            assert_eq!(circ.gate_count(), d * sig_gates + d);
         }
     }
 }
