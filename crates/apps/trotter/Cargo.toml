@@ -1,0 +1,14 @@
+# aria-app-trotter — application harness for the `trotter` Aria example.
+# First-order Trotter–Suzuki Hamiltonian simulation vs an exact matrix exponential.
+# Run standalone: cargo run -p aria-app-trotter     (or: aria-verify trotter)
+[package]
+publish = false
+name = "aria-app-trotter"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "First-order Trotter Hamiltonian simulation cross-checked against exp(-iHt)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+num-complex = { workspace = true }

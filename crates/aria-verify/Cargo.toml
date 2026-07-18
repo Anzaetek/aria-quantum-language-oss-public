@@ -24,6 +24,7 @@ remote = ["aria-verify-core/remote"]
 [dependencies]
 aria-verify-core = { path = "../aria-verify-core" }
 aria-app-qsvd = { path = "../apps/qsvd" }
+aria-app-trotter = { path = "../apps/trotter" }
 aria-app-qft = { path = "../apps/qft" }
 aria-app-vqe-ansatz = { path = "../apps/vqe-ansatz" }
 aria-app-grover3 = { path = "../apps/grover3" }
