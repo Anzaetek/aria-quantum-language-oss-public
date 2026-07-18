@@ -8,7 +8,9 @@
 //! polynomial approximation of `1/x` to the block-encoded `A/α`.
 //! KEEP-IN-SYNC with the toolkit source.
 
-use crate::linalg::block_encode::{block_encode_dense, DenseBlockEncoding};
+use crate::linalg::block_encode::{
+    block_encode_dense, block_encode_diagonal, DenseBlockEncoding, DiagonalBlockEncoding,
+};
 use crate::linalg::qsvt::{inversion_angles, qsvt_circuit};
 use aria_core::ast::Circuit;
 use ndarray::Array2;
@@ -59,6 +61,54 @@ pub fn quantum_solve_circuit(
     (circuit, dense_be, kappa, degree)
 }
 
+/// A genuine QSVT matrix-inversion circuit for a diagonal Hermitian system.
+#[derive(Clone, Debug)]
+pub struct QuantumInversion {
+    /// The QSVT circuit `U_Φ` over `1 + n_system` qubits (ancilla = qubit 0).
+    /// Its `⟨0|_a U_Φ |0⟩_a` block is the degree-`degree` QSP polynomial of
+    /// `A/α`; its real part `(U_Φ + U_Φ†)/2` block equals `≈ (0.9/κ)·(A/α)⁻¹`,
+    /// i.e. the (sub-normalized) inverse. Prepending `|b⟩` on the system and
+    /// post-selecting the ancilla on `|0⟩` yields `∝ A⁻¹|b⟩` (real part taken
+    /// via the standard `(U+U†)/2` LCU output wrapper).
+    pub circuit: Circuit,
+    /// The real diagonal block encoding the QSVT is built on.
+    pub block_encoding: DiagonalBlockEncoding,
+    /// Condition number `κ = max|λ|/min|λ|` used to set the domain `[1/κ, 1]`.
+    pub kappa: f64,
+    /// QSP polynomial degree used.
+    pub degree: usize,
+}
+
+/// Build a genuine QSVT inversion circuit for a diagonal Hermitian matrix
+/// `A = diag(spectrum)`: block-encode `A/α` exactly ([`block_encode_diagonal`]),
+/// then apply the real QSP inversion polynomial ([`qsvt_circuit`] with
+/// [`inversion_angles`]). Unlike [`quantum_solve_circuit`] (dense A, toy block
+/// encoding, resource-estimation only), this genuinely inverts `A` — verified
+/// end-to-end against the classical solution in the tests.
+pub fn quantum_solve_diagonal(spectrum: &[f64], eps: f64) -> QuantumInversion {
+    let be = block_encode_diagonal(spectrum);
+    // κ from the (scaled) spectrum; degree from the Childs–Kothari–Somma bound
+    // d = O(κ·log(κ/ε)), capped for tractability.
+    let min_abs = spectrum
+        .iter()
+        .map(|l| l.abs())
+        .filter(|&l| l > 1e-12)
+        .fold(f64::INFINITY, f64::min);
+    let kappa = (be.alpha / min_abs).max(1.0);
+    let degree = (kappa * (kappa / eps.max(1e-9)).ln())
+        .max(4.0)
+        .round()
+        .min(40.0) as usize;
+    let phases = inversion_angles(degree, kappa);
+    let circuit = qsvt_circuit(be.n_system, &phases, &be.circuit);
+    QuantumInversion {
+        circuit,
+        block_encoding: be,
+        kappa,
+        degree,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +116,63 @@ mod tests {
 
     fn cmplx(r: f64) -> Complex64 {
         Complex64::new(r, 0.0)
+    }
+
+    #[test]
+    fn quantum_solve_diagonal_matches_classical() {
+        use aria_core::ast::nodes::x;
+        use aria_core::ast::Circuit;
+        use num_complex::Complex64;
+        use std::collections::HashMap;
+
+        // Diagonal QSVT block P(μ_i) = ⟨0,i| U_Φ |0,i⟩, read off the simulated
+        // circuit (system prepared in |i⟩, ancilla=0 amplitude at flat index 2i).
+        fn diag_block(circuit: &Circuit, n_system: usize, i: usize) -> Complex64 {
+            let mut probe = Circuit::new("probe");
+            let qs = probe.qreg("q", 1 + n_system);
+            for j in 0..n_system {
+                if (i >> j) & 1 == 1 {
+                    probe.apply(x(), vec![qs[1 + j].clone()]);
+                }
+            }
+            probe.append_circuit(circuit, &HashMap::new(), None);
+            let sv = crate::run::statevector(&probe, &HashMap::new(), crate::run::BackendSel::Sim)
+                .unwrap();
+            sv[i << 1]
+        }
+
+        // Well-conditioned diagonal systems, n_system = 1 and 2.
+        for spectrum in [vec![1.0, 2.0], vec![2.0, 3.0, 3.0, 4.0]] {
+            let dim = spectrum.len();
+            let inv = quantum_solve_diagonal(&spectrum, 1e-2);
+            // Real inversion operator's diagonal: Re(P)(μ_i) = ⟨(U+U†)/2⟩_ii.
+            let re_p: Vec<f64> = (0..dim)
+                .map(|i| diag_block(&inv.circuit, inv.block_encoding.n_system, i).re)
+                .collect();
+
+            // For several right-hand sides, the post-selected quantum solution
+            // xq_i ∝ Re(P)_i · b_i must match the classical x_i = b_i/λ_i.
+            let rhss = [
+                vec![0.0, 1.0, 0.0, 0.0],
+                vec![1.0, 1.0, 1.0, 1.0],
+                vec![0.3, 0.9, 0.2, 0.7],
+            ];
+            for b in rhss {
+                let b = &b[..dim];
+                let q: Vec<f64> = (0..dim).map(|i| re_p[i] * b[i]).collect();
+                let c: Vec<f64> = (0..dim).map(|i| b[i] / spectrum[i]).collect();
+                let dot: f64 = q.iter().zip(&c).map(|(u, v)| u * v).sum();
+                let nq: f64 = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let nc: f64 = c.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let fidelity = (dot / (nq * nc)).powi(2);
+                assert!(
+                    fidelity > 0.999,
+                    "spectrum {spectrum:?} b {b:?}: solve fidelity {fidelity} (κ={}, d={})",
+                    inv.kappa,
+                    inv.degree
+                );
+            }
+        }
     }
 
     #[test]
