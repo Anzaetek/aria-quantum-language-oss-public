@@ -1,0 +1,33 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- Taylor / LCU — Hamiltonian simulation by a Linear Combination of Unitaries.
+-- ▶ Application harness + classical cross-check: crates/apps/taylor-lcu/src/lib.rs
+--   run: cargo run -p aria-app-taylor-lcu   (or: cargo run -p aria-verify -- taylor_lcu)
+-- VERIFIED: the ancilla = |0⟩ block of the two-qubit state equals exp(-iXt)|0⟩ (t = 0.7) up to the
+--   1/λ block-encoding factor, |Δ| ≤ 1e-9; and the post-selection success probability = 1/λ².
+--
+-- The Taylor series exp(-iXt) = Σₖ (-it)ᵏ Xᵏ / k! resums (X² = I) to the closed form
+-- cos(t)·I + (-i·sin(t))·X — a two-term LCU with positive coefficients a = cos t, b = sin t. The
+-- standard PREPARE / SELECT / PREPARE† block-encoding writes U/λ (λ = a + b) into the ancilla = |0⟩
+-- block: PREPARE spreads the ancilla to √(a/λ)|0⟩+√(b/λ)|1⟩, SELECT applies V₀ = I on the |0⟩ branch
+-- and V₁ = -iX on the |1⟩ branch, PREPARE† un-prepares. q[0] is the system, q[1] the LCU ancilla.
+
+@bound qubits = 2
+
+circuit TaylorLcu() {
+    qreg q[2]                          -- q[0] system, q[1] LCU ancilla
+
+    let t    = 0.7
+    let a    = cos(t)                  -- |coeff of I|      = closed-form Taylor even terms
+    let b    = sin(t)                  -- |coeff of (-iX)|  = closed-form Taylor odd terms
+    let beta = atan(sqrt(b / a))       -- cos β = √(a/λ), sin β = √(b/λ),  λ = a + b
+
+    -- PREPARE: ancilla → √(a/λ)|0⟩ + √(b/λ)|1⟩
+    apply RY(2 * beta) on q[1]
+
+    -- SELECT: |0⟩ → V₀ = I (nothing);  |1⟩ → V₁ = -iX  (X on system, then phase -i on the |1⟩ branch)
+    apply CX on q[1], q[0]
+    apply P(-pi / 2) on q[1]
+
+    -- PREPARE†
+    apply RY(-2 * beta) on q[1]
+}

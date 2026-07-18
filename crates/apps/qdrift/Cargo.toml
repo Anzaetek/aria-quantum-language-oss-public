@@ -1,0 +1,14 @@
+# aria-app-qdrift — application harness for the `qdrift` Aria example.
+# Deterministic realization of QDrift Hamiltonian simulation vs an exact matrix exponential.
+# Run standalone: cargo run -p aria-app-qdrift     (or: aria-verify qdrift)
+[package]
+publish = false
+name = "aria-app-qdrift"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Deterministic QDrift Hamiltonian simulation cross-checked against exp(-iHt)."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+num-complex = { workspace = true }

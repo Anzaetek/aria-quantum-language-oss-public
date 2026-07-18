@@ -1,0 +1,41 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- QDrift — randomized (stochastic) Hamiltonian simulation, deterministic realization.
+-- ▶ Application harness + classical cross-check: crates/apps/qdrift/src/lib.rs
+--   run: cargo run -p aria-app-qdrift   (or: cargo run -p aria-verify -- qdrift)
+-- VERIFIED: circuit ⟨Z_q⟩ after N QDrift micro-steps evolving H = 0.6·Z0Z1 + 0.3·(X0+X1) to
+--   t = 1 vs the exact exp(-iHt); the QDrift error → 0 as N → ∞, |Δ| ≤ 2e-3 at N = 1200.
+--
+-- QDrift's defining feature: every micro-step is a rotation by the SAME angle λτ (λ = Σ|c_j| = 1.2,
+-- τ = t/N) about one Hamiltonian term, and a term is chosen with probability |c_j|/λ — so a term's
+-- coefficient enters through its *frequency*, not its angle. This is a fixed deterministic
+-- realization of that channel: per block of 4 steps the terms appear in proportion 2:1:1
+-- (Z0Z1 : X0 : X1 = 0.6 : 0.3 : 0.3), interleaved, each a uniform λτ rotation. As N → ∞ term j
+-- accumulates generator (N·pⱼ)·(λτ)·Pⱼ = |cⱼ|·t·Pⱼ, recovering exp(-iHt). Z⊗Z is spelled
+-- CX·RZ(λτ)·CX in the universal gate set (`run` does not lower RZZ).
+
+@assert unitary
+@bound qubits = 2
+
+circuit QDrift(N: int) {
+    qreg q[2]
+
+    let t   = 1.0             -- total evolution time
+    let lam = 1.2             -- λ = Σ|c_j| = 0.6 + 0.3 + 0.3
+    let th  = lam * t / N     -- uniform QDrift micro-rotation angle λτ (τ = t/N)
+
+    -- N must be a multiple of 4; per block: Z0Z1, X0, Z0Z1, X1  (frequencies 2:1:1).
+    repeat blk from 0 to N / 4 - 1 {
+        -- Z0Z1 micro-step:  exp(-i·λτ·Z⊗Z) = CX · RZ(2·λτ) · CX
+        apply CX on q[0], q[1]
+        apply RZ(2 * th) on q[1]
+        apply CX on q[0], q[1]
+        -- X0 micro-step
+        apply RX(2 * th) on q[0]
+        -- Z0Z1 micro-step
+        apply CX on q[0], q[1]
+        apply RZ(2 * th) on q[1]
+        apply CX on q[0], q[1]
+        -- X1 micro-step
+        apply RX(2 * th) on q[1]
+    }
+}
