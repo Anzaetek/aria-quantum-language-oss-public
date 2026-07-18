@@ -17,8 +17,11 @@ pub mod block_encode;
 pub mod lcu;
 pub mod qsvt;
 pub mod solver;
+pub mod synth;
 
-pub use block_encode::{block_encode_dense, DenseBlockEncoding};
+pub use block_encode::{
+    block_encode_dense, block_encode_diagonal, DenseBlockEncoding, DiagonalBlockEncoding,
+};
 pub use lcu::{lcu_block_encoding, lcu_one_norm, LcuTerm};
 pub use qsvt::{inversion_angles, qsvt_circuit};
-pub use solver::quantum_solve_circuit;
+pub use solver::{quantum_solve_circuit, quantum_solve_diagonal, quantum_solve_hermitian};
