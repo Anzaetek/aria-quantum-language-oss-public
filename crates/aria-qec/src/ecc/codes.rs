@@ -410,7 +410,10 @@ mod tests {
     #[test]
     fn surface_code_is_valid_css() {
         // X-type and Z-type checks must pairwise commute (even overlap).
-        for d in [3usize, 5] {
+        // d=7 is included so the "PauliProp reaches d ≥ 7" claim (see
+        // `ecc::run::SimBackend::PauliProp`) rests on a code that is actually
+        // asserted to be a valid `[[d²,1,d]]` CSS code, not just constructed.
+        for d in [3usize, 5, 7] {
             let code = SurfaceCode::new(d);
             for xc in code.x_checks() {
                 let xs: std::collections::BTreeSet<usize> = xc.iter().copied().collect();

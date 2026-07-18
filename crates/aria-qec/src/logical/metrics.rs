@@ -88,7 +88,9 @@ pub fn qpe_phase_error(
         .map(|(&k, _)| k)
         .unwrap_or(0);
     let est = best as f64 / (1u64 << n_counting) as f64;
-    let d = (est - true_phase).abs().fract();
+    // Circular distance on the phase circle [0,1): wrap the signed difference
+    // into [0,1) then fold to the nearer arc.
+    let d = (est - true_phase).rem_euclid(1.0);
     d.min(1.0 - d)
 }
 

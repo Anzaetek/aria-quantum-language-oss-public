@@ -78,6 +78,16 @@ pub fn add_error_correction(logical_circuit: &Circuit, code: &dyn QECCode) -> Ci
         let anc_offset = n_physical_total + logical_q * (n_physical_per - 1);
         let clbit_offset = logical_circuit.n_clbits() + logical_q * (n_physical_per - 1);
 
+        // Remap a single-code syndrome-circuit qubit index into this patch's
+        // physical layout: data qubits (index < n_physical_per) sit at the
+        // patch's data offset, ancilla (index >= n_physical_per) after all data.
+        let remap = |qi: usize| {
+            if qi < n_physical_per {
+                data_offset + qi
+            } else {
+                anc_offset + (qi - n_physical_per)
+            }
+        };
         for inst in &syn.instructions {
             if inst.gate.kind == GateKind::Measure {
                 let anc_idx = inst.qubits[0].index;
@@ -85,19 +95,13 @@ pub fn add_error_correction(logical_circuit: &Circuit, code: &dyn QECCode) -> Ci
                     let phys_anc = anc_offset + (anc_idx - n_physical_per);
                     b.measure(phys_anc, clbit_offset + (anc_idx - n_physical_per));
                 }
-            } else if inst.gate.kind == GateKind::CX {
-                let qidxs: Vec<usize> = inst
-                    .qubits
-                    .iter()
-                    .map(|q| {
-                        if q.index < n_physical_per {
-                            data_offset + q.index
-                        } else {
-                            anc_offset + (q.index - n_physical_per)
-                        }
-                    })
-                    .collect();
-                b.cx(qidxs[0], qidxs[1]);
+            } else {
+                // Every other gate (crucially the basis-change Hadamards that
+                // wrap X-type stabilizer measurements — dropping them would read
+                // the X-check syndrome in the wrong basis) is re-emitted on the
+                // remapped physical qubits.
+                let qidxs: Vec<usize> = inst.qubits.iter().map(|q| remap(q.index)).collect();
+                apply_gate_to_builder(&mut b, &inst.gate, &qidxs);
             }
         }
     }
@@ -149,5 +153,32 @@ fn apply_gate_to_builder(b: &mut CircuitBuilder, gate: &GateDef, qubits: &[usize
             b.swap(qubits[0], qubits[1]);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ecc::codes::SteaneCode;
+
+    #[test]
+    fn syndrome_extraction_keeps_ancilla_hadamards() {
+        // Regression: Phase-3 syndrome extraction used to re-emit only Measure/CX,
+        // silently dropping the Hadamards that wrap Steane's X-type stabilizer
+        // measurements — which would read the X-check syndrome in the wrong basis.
+        // A bare 1-logical-qubit circuit must now carry every syndrome Hadamard:
+        // 3 from the Steane encoder (h on qubits 1,2,3) + 6 from the three X-stabs
+        // (an h before and after each ancilla) = 9.
+        let logical = CircuitBuilder::new("id", 1, 0).build();
+        let ecc = add_error_correction(&logical, &SteaneCode);
+        let h_count = ecc
+            .instructions
+            .iter()
+            .filter(|i| i.gate.kind == GateKind::H)
+            .count();
+        assert_eq!(
+            h_count, 9,
+            "encoder (3) + X-stabilizer basis-change Hadamards (6)"
+        );
     }
 }
