@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn surface_geometry_unified() {
-        for d in [3usize, 5] {
+        for d in [3usize, 5, 7] {
             let code = SurfaceCode::new(d);
             assert_checks_commute(&code);
             assert_logical_valid(&code);
