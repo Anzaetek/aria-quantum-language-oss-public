@@ -1,0 +1,41 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- Shor's algorithm — factoring N = 15 with base a = 11 (compiled, order-2 case).
+-- ▶ Application harness + classical cross-check: crates/apps/shor/src/lib.rs
+--   run: cargo run -p aria-app-shor   (or: cargo run -p aria-verify -- shor)
+-- VERIFIED: the counting-register phase distribution peaks at k/2^t ∈ {0, 1/2}, so continued
+--   fractions recover the period r = 2, and gcd(a^{r/2} ± 1, 15) = {3, 5} factors N.
+--
+-- Base a = 11 has multiplicative order 2 mod 15 (11² = 121 ≡ 1). The modular-multiplication
+-- unitary U|y⟩ = |11·y mod 15⟩, restricted to the orbit of the initial state |1⟩ = {1, 11}, is the
+-- bit-permutation XOR 1010 — i.e. X on work qubits 1 and 3 (0001 ↔ 1011). Because U² = I, every
+-- controlled-U^{2^j} for j ≥ 1 is the identity, so period-finding needs only the j = 0 controlled
+-- power, followed by an inverse QFT on the t = 3 counting qubits.
+
+@bound counting_qubits = 3
+
+circuit Shor15() {
+    qreg c[3]                 -- counting register (t = 3)
+    qreg w[4]                 -- work register, value mod 15
+
+    -- initial work state |1> = |0001>
+    apply X on w[0]
+
+    -- counting register into uniform superposition
+    repeat i from 0 to 2 {
+        apply H on c[i]
+    }
+
+    -- controlled-U^{2^0}: controlled multiply-by-11 on the |1>-orbit = C-X on w[1] and w[3].
+    -- (controlled-U^{2^j} = I for j >= 1 since U^2 = I, so nothing else is needed.)
+    apply CX on c[0], w[1]
+    apply CX on c[0], w[3]
+
+    -- inverse QFT on the counting register (little-endian; final SWAP fixes bit order)
+    apply H on c[2]
+    apply CP(-pi / 2) on c[1], c[2]
+    apply H on c[1]
+    apply CP(-pi / 4) on c[0], c[2]
+    apply CP(-pi / 2) on c[0], c[1]
+    apply H on c[0]
+    apply SWAP on c[0], c[2]
+}

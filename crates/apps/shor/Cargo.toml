@@ -1,0 +1,13 @@
+# aria-app-shor — application harness for the `shor` Aria example.
+# Shor's algorithm factors N = 15 (a = 11): period-finding + continued-fraction post-processing.
+# Run standalone: cargo run -p aria-app-shor     (or: aria-verify shor)
+[package]
+publish = false
+name = "aria-app-shor"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Shor's algorithm factors N=15 (a=11), verified against the true factorization."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }

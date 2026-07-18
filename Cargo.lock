@@ -285,6 +285,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-app-schrodingerize"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+]
+
+[[package]]
+name = "aria-app-shor"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+]
+
+[[package]]
 name = "aria-app-simon"
 version = "0.1.0"
 dependencies = [
@@ -423,6 +437,8 @@ dependencies = [
  "aria-app-qpe",
  "aria-app-qsp",
  "aria-app-qsvd",
+ "aria-app-schrodingerize",
+ "aria-app-shor",
  "aria-app-simon",
  "aria-app-superdense",
  "aria-app-swap-test",

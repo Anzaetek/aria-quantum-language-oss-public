@@ -27,6 +27,8 @@ aria-app-qsvd = { path = "../apps/qsvd" }
 aria-app-trotter = { path = "../apps/trotter" }
 aria-app-qdrift = { path = "../apps/qdrift" }
 aria-app-taylor-lcu = { path = "../apps/taylor-lcu" }
+aria-app-shor = { path = "../apps/shor" }
+aria-app-schrodingerize = { path = "../apps/schrodingerize" }
 aria-app-qft = { path = "../apps/qft" }
 aria-app-vqe-ansatz = { path = "../apps/vqe-ansatz" }
 aria-app-grover3 = { path = "../apps/grover3" }
