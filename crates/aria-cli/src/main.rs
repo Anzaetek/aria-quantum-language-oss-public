@@ -403,6 +403,39 @@ fn cmd_train(raw: &[String]) -> Result<(), String> {
     if let Some(v) = a.opt("init-scale") {
         cfg.init_scale = v.parse().map_err(|_| format!("bad --init-scale '{v}'"))?;
     }
+    // Layer-wise training support (arXiv:2606.03517):
+    //   --freeze "theta_0,theta_1"     exclude symbols from updates
+    //   --set "theta_0=0.42"           pin a symbol's initial value
+    //   --opt adam                     Adam instead of plain GD
+    //   --grad parallel                parallel commuting-block shifts
+    for v in a.all("freeze") {
+        cfg.frozen
+            .extend(v.split(',').map(|s| s.trim().to_string()));
+    }
+    for v in a.all("set") {
+        let (k, val) = v
+            .split_once('=')
+            .ok_or_else(|| format!("bad --set '{v}' (want name=value)"))?;
+        let val: f64 = val
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad --set value in '{v}'"))?;
+        cfg.init.insert(k.trim().to_string(), val);
+    }
+    if let Some(v) = a.opt("opt") {
+        cfg.optimizer = match v {
+            "gd" => aria_runtime::Optimizer::Gd,
+            "adam" => aria_runtime::Optimizer::adam(),
+            other => return Err(format!("unknown --opt '{other}' (gd | adam)")),
+        };
+    }
+    if let Some(v) = a.opt("grad") {
+        cfg.grad_method = match v {
+            "shift" => omega_core::gradient::GradMethod::ParameterShift,
+            "parallel" => omega_core::gradient::GradMethod::ParallelParameterShift,
+            other => return Err(format!("unknown --grad '{other}' (shift | parallel)")),
+        };
+    }
 
     let src = read_source(path)?;
     let circuit = instantiate(&src, name, &ints)?;

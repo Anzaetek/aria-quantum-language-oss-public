@@ -22,7 +22,7 @@ pub use run::{
     counts_width, expectation, expectation_noisy, expectation_pauliprop, parse_noise_model,
     run_counts, run_counts_noisy, statevector, BackendSel, PauliPropTruncation,
 };
-pub use train::{train_expectation, TrainConfig, TrainResult};
+pub use train::{train_expectation, Optimizer, TrainConfig, TrainResult};
 
 #[cfg(feature = "remote")]
 pub use remote::{run_counts_remote, Remote};
