@@ -341,6 +341,38 @@ pub struct TrainHistory {
     pub loss_per_epoch: Vec<f64>,
 }
 
+/// Update rule for [`QmlTrainer`] (and re-used by `aria train`).
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Optimizer {
+    /// Plain (full-batch) gradient descent: `θ ← θ − lr·g`.
+    #[default]
+    Gd,
+    /// Adam (adaptive moments, Kingma–Ba) with standard bias correction.
+    Adam {
+        beta1: f64,
+        beta2: f64,
+        epsilon: f64,
+    },
+}
+
+impl Optimizer {
+    /// Adam with the canonical defaults (β₁ = 0.9, β₂ = 0.999, ε = 1e-8).
+    pub fn adam() -> Self {
+        Optimizer::Adam {
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+        }
+    }
+}
+
+/// Per-parameter Adam moments.
+#[derive(Default, Clone, Copy)]
+struct AdamMoments {
+    m: f64,
+    v: f64,
+}
+
 /// MSE-loss SGD trainer for a [`QmlModel`].
 ///
 /// Gradient computation goes through `Backend::adjoint_gradient`, so
@@ -395,6 +427,13 @@ pub struct QmlTrainer<'a> {
     /// surface the OOM as a hard error (useful for benchmark runs
     /// where silent CPU fallback would skew timings).
     cpu_fallback_on_oom: bool,
+    /// When `Some(set)`, only these symbols receive updates — the rest
+    /// stay at their bound values (layer-wise freezing per
+    /// arXiv:2606.03517). Gradients still come from the one adjoint
+    /// pass (no extra cost); freezing is purely an update-time mask.
+    trainable: Option<std::collections::HashSet<SymbolId>>,
+    /// Update rule (default: plain full-batch GD, the legacy behaviour).
+    optimizer: Optimizer,
 }
 
 impl<'a> QmlTrainer<'a> {
@@ -407,7 +446,22 @@ impl<'a> QmlTrainer<'a> {
             optimize: false,
             requested_device: None,
             cpu_fallback_on_oom: true,
+            trainable: None,
+            optimizer: Optimizer::Gd,
         }
+    }
+
+    /// Restrict updates to the given symbols (layer-wise training).
+    /// Symbols outside the set keep their current bound values.
+    pub fn trainable(mut self, symbols: std::collections::HashSet<SymbolId>) -> Self {
+        self.trainable = Some(symbols);
+        self
+    }
+
+    /// Pick the update rule (default [`Optimizer::Gd`]).
+    pub fn optimizer(mut self, opt: Optimizer) -> Self {
+        self.optimizer = opt;
+        self
     }
 
     pub fn epochs(mut self, n: usize) -> Self {
@@ -519,6 +573,7 @@ impl<'a> QmlTrainer<'a> {
         // half-GPU-half-CPU loop would muddy any wall-clock
         // comparison the caller is doing.
         let mut fallback: Option<Box<dyn Backend>> = None;
+        let mut adam: HashMap<SymbolId, AdamMoments> = HashMap::new();
 
         for _epoch in 0..self.epochs {
             let mut epoch_loss = 0.0;
@@ -645,11 +700,33 @@ impl<'a> QmlTrainer<'a> {
                 }
             }
 
-            // SGD step: θ ← θ − lr · (Σ grads) / n_train.
+            // Update step: θ ← θ − lr · step(Σ grads / n_train), skipping
+            // frozen symbols (layer-wise mask).
+            let epoch_t = (history.loss_per_epoch.len() + 1) as f64;
             for (&sym, &grad) in &epoch_grad {
+                if let Some(mask) = &self.trainable {
+                    if !mask.contains(&sym) {
+                        continue;
+                    }
+                }
+                let g = grad / n_train;
+                let update = match self.optimizer {
+                    Optimizer::Gd => self.learning_rate * g,
+                    Optimizer::Adam {
+                        beta1,
+                        beta2,
+                        epsilon,
+                    } => {
+                        let st = adam.entry(sym).or_default();
+                        st.m = beta1 * st.m + (1.0 - beta1) * g;
+                        st.v = beta2 * st.v + (1.0 - beta2) * g * g;
+                        let m_hat = st.m / (1.0 - beta1.powf(epoch_t));
+                        let v_hat = st.v / (1.0 - beta2.powf(epoch_t));
+                        self.learning_rate * m_hat / (v_hat.sqrt() + epsilon)
+                    }
+                };
                 let current = params.resolve(&ParamExpr::Symbol(sym))?;
-                let new = current - self.learning_rate * (grad / n_train);
-                params.bind(sym, new);
+                params.bind(sym, current - update);
             }
 
             history.loss_per_epoch.push(epoch_loss / n_train);
