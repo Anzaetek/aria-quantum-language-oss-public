@@ -11,7 +11,9 @@ use aria_core::ast::parse_aria;
 /// (file, circuit name, instantiation params). Keep alphabetical.
 const EXAMPLES: &[(&str, &str, &[(&str, i64)])] = &[
     ("bell.aria", "Bell", &[]),
+    ("butterfly_qnn.aria", "ButterflyQNN", &[]),
     ("ghz.aria", "GHZ", &[]),
+    ("jl_sketch_digits.aria", "JlSketchDigits", &[("k", 8)]),
     ("circulant.aria", "CyclicShift", &[]),
     ("cqs.aria", "HadamardTestZ", &[]),
     ("qos_oracle.aria", "PhaseOracle", &[("n", 3)]),

@@ -48,6 +48,8 @@ There are two kinds of run-gate oracle:
 | teleport | run | classical | Bob's state == Alice's input |
 | qaoa_maxcut | run | classical | cut value vs brute-force max-cut |
 | qml_classifier | run | classical | accuracy vs ground-truth labels |
+| butterfly_qnn | run | classical | parallel commuting-block gradients (arXiv:2606.03517) == serial 4-term Givens shifts, \|Δ\| ≤ 1e-9; imputation MSE ≤ mean-imputer on UCI heart (open data, 30% MCAR) |
+| jl_sketch_digits | run | differential | forward ⟨Z_q⟩ profile vs independent statevector; optdigits 3-vs-8 accuracy ≥ 0.85 on quantum features (open data) |
 | qos | run | classical | sketch error scales as O(1/N²) |
 | circulant | run | classical | DFT solve == independent Gaussian solve |
 | cqs | run | classical | Hadamard-test ⟨Z⟩ vs Pauli expectation |

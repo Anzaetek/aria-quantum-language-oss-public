@@ -1,0 +1,45 @@
+-- ▶ Application harness + classical cross-check: crates/apps/jl-sketch-digits/src/lib.rs
+--   run: cargo run -p aria-app-jl-sketch-digits   (or: cargo run -p aria-verify -- jl_sketch_digits)
+-- VERIFIED: omega forward ⟨Z_q⟩ profile vs the independent in-tree statevector
+--   oracle on the same lowered IR, |Δ| ≤ 1e-9; digits 3-vs-8 test accuracy on
+--   quantum features ≥ 0.85 (open UCI optdigits, examples/data/; regression
+--   guard, not an advantage claim — see the Fourier-wall note in the harness).
+--
+-- JL-sketch quantum feature map on REAL open data (Babbush sketching track).
+--
+-- The 64-dimensional UCI optdigits images are compressed by a deterministic
+-- Johnson–Lindenstrauss Rademacher projection to k = 12 dims (classical,
+-- outside the circuit — the runnable analogue of "process high-dimensional
+-- classical data with few qubits", cf. Zhao–Babbush–Huang, arXiv:2604.07639;
+-- the fault-tolerant oracle-sketch itself is out of scope). The k-dim sketch
+-- is angle-encoded and entangled twice (data re-uploading), and the per-qubit
+-- ⟨Z_j⟩ profile is the quantum feature vector a linear head classifies.
+--
+-- Layout:
+--   q[0..k-1]   one wire per sketched (standardized, arctan-squashed) dim
+--
+-- Symbols: x[0..k-1] — per-sample sketch angles, bound by the host.
+
+@assert unitary
+@bound depth = 2 * k
+
+circuit JlSketchDigits(k: int) {
+    qreg q[k]
+
+    let x = symbolic[k]
+
+    repeat block from 0 to 1 {
+        repeat j from 0 to k - 1 {
+            apply RY(x[j]) on q[j]
+        }
+        repeat j from 0 to k - 2 {
+            apply CX on q[j], q[j + 1]
+        }
+    }
+}
+
+-- Feature read-out: the per-qubit Z expectations form the quantum feature
+-- vector consumed by the classical linear head.
+observable FeatureZ {
+    1.0 * Z(0)
+}

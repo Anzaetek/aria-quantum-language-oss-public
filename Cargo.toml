@@ -62,6 +62,8 @@ members = [
     "crates/apps/teleport",
     "crates/apps/qaoa-maxcut",
     "crates/apps/qml-classifier",
+    "crates/apps/butterfly-qnn",
+    "crates/apps/jl-sketch-digits",
     "crates/apps/qos",
     "crates/apps/circulant",
     "crates/apps/cqs",
