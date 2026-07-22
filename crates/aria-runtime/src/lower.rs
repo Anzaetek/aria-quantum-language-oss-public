@@ -155,6 +155,7 @@ pub fn lower(circuit: &Circuit) -> Result<Lowered, String> {
                     vec![OExpr::Concrete(0.0), OExpr::Concrete(0.0), lam],
                 )
             }
+            AKind::RBS => (OKind::Rbs, conv_all(p, &mut syms)?),
             AKind::CCX => (OKind::CCX, vec![]),
             AKind::CSWAP => (OKind::CSwap, vec![]),
             AKind::Barrier => (OKind::Barrier, vec![]),

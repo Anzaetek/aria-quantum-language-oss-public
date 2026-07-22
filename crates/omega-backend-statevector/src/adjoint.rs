@@ -234,6 +234,13 @@ fn apply_gate_forward(
             op.qubits[1].0 as usize,
             &gates::cu3(resolved[0], resolved[1], resolved[2]),
         ),
+        GateKind::Rbs => apply_2q(
+            state,
+            n,
+            q0,
+            op.qubits[1].0 as usize,
+            &gates::rbs(resolved[0]),
+        ),
 
         // 3Q gates: decompose (same as main sim)
         GateKind::CCX => {
@@ -336,6 +343,15 @@ fn apply_gate_derivative(
                 &gates::dcu3_dl(resolved[0], resolved[1], resolved[2]),
             );
         }
+        (GateKind::Rbs, 0) => {
+            apply_2q(
+                &mut out,
+                n,
+                q0,
+                op.qubits[1].0 as usize,
+                &gates::drbs(resolved[0]),
+            );
+        }
         _ => {
             return Err(OmegaError::Unsupported(format!(
                 "adjoint: no derivative for {:?} param_idx={}",
@@ -416,6 +432,14 @@ fn apply_adjoint_gate(
             q0,
             op.qubits[1].0 as usize,
             &gates::adjoint_2q(&gates::cu3(resolved[0], resolved[1], resolved[2])),
+        ),
+        // RBS(θ)† = RBS(−θ)
+        GateKind::Rbs => apply_2q(
+            state,
+            n,
+            q0,
+            op.qubits[1].0 as usize,
+            &gates::rbs(-resolved[0]),
         ),
 
         // 3Q gates

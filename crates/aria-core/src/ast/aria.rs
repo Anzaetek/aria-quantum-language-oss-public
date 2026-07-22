@@ -1627,6 +1627,7 @@ fn gate_from_name(name: &str, params: Vec<ParamExpr>) -> Result<GateDef, String>
         "RXX" => GateKind::RXX,
         "RYY" => GateKind::RYY,
         "RZZ" => GateKind::RZZ,
+        "RBS" => GateKind::RBS,
         other => return Err(format!("unknown gate '{other}'")),
     };
     Ok(GateDef::with_exprs(kind, params))
@@ -2367,7 +2368,7 @@ observable B {
         const ONE_Q: &[&str] = &["X", "Y", "Z", "H", "S", "SDG", "T", "TDG", "SX", "I"];
         const ONE_Q_P: &[&str] = &["RX", "RY", "RZ", "P"];
         const TWO_Q: &[&str] = &["CX", "CY", "CZ", "SWAP"];
-        const TWO_Q_P: &[&str] = &["CP", "RXX", "RYY", "RZZ"];
+        const TWO_Q_P: &[&str] = &["CP", "RXX", "RYY", "RZZ", "RBS"];
         const THREE_Q: &[&str] = &["CCX", "CSWAP"];
 
         let mut s = 0xFEED_5EEDu64;

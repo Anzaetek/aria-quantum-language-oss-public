@@ -62,6 +62,12 @@ pub enum GateKind {
     // Two-qubit gates with params
     CRz,
     CU3,
+    /// Reconfigurable Beam Splitter / Givens rotation (1 param):
+    /// `RBS(θ) = exp(−i·θ/2·(Y⊗X − X⊗Y))` — identity on {|00⟩, |11⟩},
+    /// `[[cos θ, −sin θ], [sin θ, cos θ]]` on span{|01⟩, |10⟩}.
+    /// Hamming-weight preserving; the primitive of butterfly / unary QML
+    /// circuits (Kerenidis et al., arXiv:2606.03517).
+    Rbs,
 
     // Three-qubit gates
     CCX,
@@ -112,6 +118,7 @@ impl GateKind {
             | GateKind::Swap
             | GateKind::CRz
             | GateKind::CU3
+            | GateKind::Rbs
             | GateKind::BeamSplitterRx => 2,
 
             GateKind::CCX | GateKind::CSwap => 3,
@@ -124,7 +131,12 @@ impl GateKind {
     /// Number of parameters this gate takes.
     pub fn num_params(&self) -> usize {
         match self {
-            GateKind::Rx | GateKind::Ry | GateKind::Rz | GateKind::U1 | GateKind::CRz => 1,
+            GateKind::Rx
+            | GateKind::Ry
+            | GateKind::Rz
+            | GateKind::U1
+            | GateKind::CRz
+            | GateKind::Rbs => 1,
             GateKind::U2 | GateKind::BeamSplitterRx => 2,
             GateKind::U3 | GateKind::CU3 => 3,
             GateKind::PhaseShifter => 1,

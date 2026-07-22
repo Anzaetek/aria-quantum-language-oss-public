@@ -28,6 +28,7 @@ import QuantumProofs.QPEFaithful
 import QuantumProofs.Noise
 import QuantumProofs.BlockEncoding
 import QuantumProofs.HHL
+import QuantumProofs.Rbs
 import QuantumProofs.QSVT
 import QuantumProofs.QSP
 import QuantumProofs.HadamardLayer

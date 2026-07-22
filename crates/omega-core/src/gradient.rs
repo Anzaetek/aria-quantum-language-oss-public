@@ -188,6 +188,12 @@ pub enum GradMethod {
     Adjoint,
     /// Stochastic parameter-shift: average over many shots to handle mid-circuit measurements.
     StochasticParameterShift { shots: u32 },
+    /// Parallelised parameter-shift (arXiv:2606.03517): symbols confined
+    /// to the trailing commuting block get their gradients from a single
+    /// batched evaluation of commutator observables `i·[G_k, H]`; other
+    /// symbols fall back to the serial per-slot shift rules. See
+    /// [`crate::parallel_shift`].
+    ParallelParameterShift,
     /// Automatic: selects the best method based on circuit properties.
     /// - Circuits with measurements → StochasticParameterShift
     /// - Unitary circuits → Adjoint (falling back to ParameterShift)
@@ -363,6 +369,22 @@ pub fn compute_gradient(
     observable: &Observable,
     method: &GradMethod,
 ) -> Result<Vec<(SymbolId, f64)>> {
+    compute_gradient_for(backend, circuit, params, observable, method, None)
+}
+
+/// Like [`compute_gradient`] but restricted to a subset of symbols.
+/// With `only = Some(set)`, only those symbols' gradients are computed
+/// and returned (frozen/layer-wise training skips the rest — for the
+/// per-symbol shift methods this also skips their circuit evaluations).
+/// With `only = None` this is exactly [`compute_gradient`].
+pub fn compute_gradient_for(
+    backend: &dyn Backend,
+    circuit: &CircuitIR,
+    params: &ParameterBinding,
+    observable: &Observable,
+    method: &GradMethod,
+    only: Option<&std::collections::HashSet<SymbolId>>,
+) -> Result<Vec<(SymbolId, f64)>> {
     let has_measurements = circuit
         .ops
         .iter()
@@ -375,7 +397,7 @@ pub fn compute_gradient(
         } else {
             GradMethod::Adjoint
         };
-        return compute_gradient(backend, circuit, params, observable, &resolved);
+        return compute_gradient_for(backend, circuit, params, observable, &resolved, only);
     }
 
     // Adjoint: reject circuits with measurements, then try batch AD
@@ -388,16 +410,30 @@ pub fn compute_gradient(
             ));
         }
         if let Some(grads) = try_adjoint_gradient(backend, circuit, params, observable)? {
-            return Ok(grads);
+            // Adjoint computes all gradients in one pass; restrict the
+            // *output* to the requested subset.
+            return Ok(match only {
+                Some(set) => grads.into_iter().filter(|(s, _)| set.contains(s)).collect(),
+                None => grads,
+            });
         }
         // Backend doesn't support AD — fall back to parameter-shift
-        return compute_gradient(
+        return compute_gradient_for(
             backend,
             circuit,
             params,
             observable,
             &GradMethod::ParameterShift,
+            only,
         );
+    }
+
+    // Parallel commuting-block path (arXiv:2606.03517).
+    if matches!(method, GradMethod::ParallelParameterShift) {
+        let (grads, _report) = crate::parallel_shift::parallel_parameter_shift_gradient(
+            backend, circuit, params, observable, only,
+        )?;
+        return Ok(grads);
     }
 
     let mut gradients = Vec::new();
@@ -407,6 +443,11 @@ pub fn compute_gradient(
     let active_symbols = find_active_symbols(circuit);
 
     for &sym_id in &symbol_ids {
+        if let Some(set) = only {
+            if !set.contains(&sym_id) {
+                continue;
+            }
+        }
         if !active_symbols.contains(&sym_id) {
             gradients.push((sym_id, 0.0));
             continue;
@@ -422,7 +463,7 @@ pub fn compute_gradient(
             GradMethod::StochasticParameterShift { shots } => stochastic_parameter_shift_gradient(
                 backend, circuit, params, observable, sym_id, *shots,
             )?,
-            GradMethod::Adjoint | GradMethod::Auto => {
+            GradMethod::Adjoint | GradMethod::Auto | GradMethod::ParallelParameterShift => {
                 unreachable!("handled above")
             }
         };
@@ -457,11 +498,19 @@ enum SlotShiftRule {
     /// trig system `Σ_j 2·d_j·sin(ω_k·x_j) = ω_k` for shifts
     /// `x ∈ {π/2, 3π/2}` and frequencies `ω ∈ {1/2, 1}`.
     FourTermBanchiCrooks,
+    /// `f'(θ) = (f(θ+π/4) − f(θ-π/4)) − ((√2-1)/2)·(f(θ+π/2) − f(θ-π/2))`.
+    /// For Givens-type generators with spectrum `{0, 0, ±1}` →
+    /// frequencies `{1, 2}` (RBS: `G = (Y⊗X − X⊗Y)/2`). This is the
+    /// parallelisable rule of Mathur–Kerenidis et al.
+    /// (arXiv:2606.03517, Eq. 6); the naive 2-term ±π/2 rule is
+    /// *wrong* here — it would require `sin(2·π/2) = 2`, false.
+    FourTermGivens,
 }
 
 fn slot_shift_rule(gate: &GateKind) -> SlotShiftRule {
     match gate {
         GateKind::CRz | GateKind::CU3 => SlotShiftRule::FourTermBanchiCrooks,
+        GateKind::Rbs => SlotShiftRule::FourTermGivens,
         _ => SlotShiftRule::TwoTerm,
     }
 }
@@ -557,6 +606,9 @@ fn parameter_shift_gradient(
             SlotShiftRule::FourTermBanchiCrooks => {
                 slot_four_term(backend, circuit, params, observable, slot, v)?
             }
+            SlotShiftRule::FourTermGivens => {
+                slot_four_term_givens(backend, circuit, params, observable, slot, v)?
+            }
         };
         grad += alpha * slot_grad;
     }
@@ -599,6 +651,48 @@ fn slot_four_term(
     let e_p3 = backend.expectation(&c_p3, params, observable)?;
     let e_m3 = backend.expectation(&c_m3, params, observable)?;
     Ok(c1 * (e_p1 - e_m1) + c2 * (e_m3 - e_p3))
+}
+
+/// Givens 4-term rule coefficient `(√2 − 1)/2` for the two-frequency
+/// spectrum `{1, 2}` with shifts `{π/4, π/2}` (arXiv:2606.03517 Eq. 6).
+/// Solves `2d₁·sin(ω·π/4) + 2d₂·sin(ω·π/2)·c = ω` exactly for both
+/// `ω ∈ {1, 2}` with `d₁ = 1`, `d₂ = −(√2−1)/2`.
+fn givens_two_freq_coeff() -> f64 {
+    (std::f64::consts::SQRT_2 - 1.0) / 2.0
+}
+
+fn slot_four_term_givens(
+    backend: &dyn Backend,
+    circuit: &CircuitIR,
+    params: &ParameterBinding,
+    observable: &Observable,
+    slot: SlotRef,
+    v: f64,
+) -> Result<f64> {
+    let pi_4 = std::f64::consts::FRAC_PI_4;
+    let pi_2 = std::f64::consts::FRAC_PI_2;
+    let c2 = givens_two_freq_coeff();
+    let e_p1 = backend.expectation(
+        &shifted_circuit(circuit, slot, v + pi_4),
+        params,
+        observable,
+    )?;
+    let e_m1 = backend.expectation(
+        &shifted_circuit(circuit, slot, v - pi_4),
+        params,
+        observable,
+    )?;
+    let e_p2 = backend.expectation(
+        &shifted_circuit(circuit, slot, v + pi_2),
+        params,
+        observable,
+    )?;
+    let e_m2 = backend.expectation(
+        &shifted_circuit(circuit, slot, v - pi_2),
+        params,
+        observable,
+    )?;
+    Ok((e_p1 - e_m1) - c2 * (e_p2 - e_m2))
 }
 
 /// Compute gradient for a single parameter using finite differences.
@@ -656,6 +750,9 @@ fn stochastic_parameter_shift_gradient(
             SlotShiftRule::FourTermBanchiCrooks => {
                 stochastic_slot_four_term(backend, circuit, params, observable, slot, v, shots)?
             }
+            SlotShiftRule::FourTermGivens => stochastic_slot_four_term_givens(
+                backend, circuit, params, observable, slot, v, shots,
+            )?,
         };
         grad += alpha * slot_grad;
     }
@@ -729,6 +826,50 @@ fn stochastic_slot_four_term(
     let e_p3 = stochastic_expectation_avg(backend, &c_p3, params, observable, shots)?;
     let e_m3 = stochastic_expectation_avg(backend, &c_m3, params, observable, shots)?;
     Ok(c1 * (e_p1 - e_m1) + c2 * (e_m3 - e_p3))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stochastic_slot_four_term_givens(
+    backend: &dyn Backend,
+    circuit: &CircuitIR,
+    params: &ParameterBinding,
+    observable: &Observable,
+    slot: SlotRef,
+    v: f64,
+    shots: u32,
+) -> Result<f64> {
+    let pi_4 = std::f64::consts::FRAC_PI_4;
+    let pi_2 = std::f64::consts::FRAC_PI_2;
+    let c2 = givens_two_freq_coeff();
+    let e_p1 = stochastic_expectation_avg(
+        backend,
+        &shifted_circuit(circuit, slot, v + pi_4),
+        params,
+        observable,
+        shots,
+    )?;
+    let e_m1 = stochastic_expectation_avg(
+        backend,
+        &shifted_circuit(circuit, slot, v - pi_4),
+        params,
+        observable,
+        shots,
+    )?;
+    let e_p2 = stochastic_expectation_avg(
+        backend,
+        &shifted_circuit(circuit, slot, v + pi_2),
+        params,
+        observable,
+        shots,
+    )?;
+    let e_m2 = stochastic_expectation_avg(
+        backend,
+        &shifted_circuit(circuit, slot, v - pi_2),
+        params,
+        observable,
+        shots,
+    )?;
+    Ok((e_p1 - e_m1) - c2 * (e_p2 - e_m2))
 }
 
 /// Compute <ψ|O|ψ> from a statevector and observable (for stochastic gradient use).

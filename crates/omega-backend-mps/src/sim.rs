@@ -607,6 +607,11 @@ fn apply_gate_mps(mps: &mut Mps, op: &GateOp, params: &ParameterBinding) -> Resu
             op.qubits[1].0 as usize,
             &gates::cu3(resolved[0], resolved[1], resolved[2]),
         ),
+        GateKind::Rbs => mps.apply_2q_distant(
+            op.qubits[0].0 as usize,
+            op.qubits[1].0 as usize,
+            &gates::rbs(resolved[0]),
+        ),
 
         // Three-qubit gates: decompose into 1Q + 2Q operations
         GateKind::CCX => {

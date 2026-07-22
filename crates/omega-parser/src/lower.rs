@@ -539,7 +539,14 @@ fn invert_gate_with_params(
         GateKind::Sdg => same(GateKind::S),
         GateKind::T => same(GateKind::Tdg),
         GateKind::Tdg => same(GateKind::T),
-        GateKind::Rx | GateKind::Ry | GateKind::Rz | GateKind::U1 | GateKind::CRz => {
+        // RBS(θ)⁻¹ = RBS(−θ), same negatable-parameter shape as the
+        // rotation gates.
+        GateKind::Rx
+        | GateKind::Ry
+        | GateKind::Rz
+        | GateKind::U1
+        | GateKind::CRz
+        | GateKind::Rbs => {
             let mut out = smallvec::SmallVec::with_capacity(params.len());
             if let Some(p) = params.first() {
                 out.push(negate(p));

@@ -90,6 +90,28 @@ pub fn to_qasm(circuit: &Circuit) -> String {
             GateKind::Reset => {
                 lines.push(format!("reset {};", inst.qubits[0]));
             }
+            GateKind::RBS => {
+                // No RBS primitive in QASM 2.0 / qelib1 — emit the exact
+                // decomposition RBS(θ) = (H⊗H)·CZ·(Ry(−θ)⊗Ry(θ))·CZ·(H⊗H)
+                // (full angle θ, verified against exp(−iθ/2(YX−XY)) in
+                // `omega-backend-statevector` tests).
+                let theta = inst
+                    .gate
+                    .params
+                    .first()
+                    .and_then(|p| p.try_as_f64())
+                    .unwrap_or(0.0);
+                let (a, b) = (&inst.qubits[0], &inst.qubits[1]);
+                lines.push(format!("// rbs({}) {}, {}", format_param(theta), a, b));
+                lines.push(format!("h {a};"));
+                lines.push(format!("h {b};"));
+                lines.push(format!("cz {a}, {b};"));
+                lines.push(format!("ry({}) {a};", format_param(-theta)));
+                lines.push(format!("ry({}) {b};", format_param(theta)));
+                lines.push(format!("cz {a}, {b};"));
+                lines.push(format!("h {a};"));
+                lines.push(format!("h {b};"));
+            }
             _ => {
                 if let Some(qasm_name) = gate_to_qasm(inst.gate.kind) {
                     let params = if inst.gate.params.is_empty() {

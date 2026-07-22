@@ -349,10 +349,7 @@ fn expectation_syndrome(
     let mut bits = Vec::with_capacity(checks.len());
     for support in checks {
         let obs = Observable {
-            terms: vec![(
-                1.0,
-                support.iter().map(|&q| (q as u32, op.clone())).collect(),
-            )],
+            terms: vec![(1.0, support.iter().map(|&q| (q as u32, op)).collect())],
         };
         let ev = be
             .expectation(&ir, &params, &obs)
