@@ -144,6 +144,7 @@ parentheses.
 | `SWAP` | 2 | 0 | swap |
 | `CP` | 2 | 1 | controlled phase `(λ)` — lowers to `CU3(0,0,λ)`, exact |
 | `RXX` `RYY` `RZZ` | 2 | 1 | two-qubit rotations `(θ)` |
+| `RBS` | 2 | 1 | Givens rotation `exp(−iθ/2(Y⊗X−X⊗Y))` — Hamming-weight preserving (butterfly QNNs, arXiv:2606.03517) |
 | `CCX` (`TOFFOLI`) | 3 | 0 | Toffoli |
 | `CSWAP` (`FREDKIN`) | 3 | 0 | controlled-swap |
 

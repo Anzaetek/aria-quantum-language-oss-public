@@ -506,6 +506,13 @@ fn apply_gate(
             op.qubits[1].0 as usize,
             &gates::cu3(resolved[0], resolved[1], resolved[2]),
         ),
+        GateKind::Rbs => apply_2q(
+            state,
+            n,
+            op.qubits[0].0 as usize,
+            op.qubits[1].0 as usize,
+            &gates::rbs(resolved[0]),
+        ),
 
         // Three-qubit: CCX (Toffoli)
         GateKind::CCX => apply_ccx(

@@ -299,6 +299,29 @@ pub fn cu3(theta: f64, phi: f64, lambda: f64) -> Gate2Q {
     ]
 }
 
+/// RBS (Reconfigurable Beam Splitter / Givens rotation):
+/// `RBS(θ) = exp(−i·θ/2·(Y⊗X − X⊗Y))`
+/// = identity on {|00⟩, |11⟩}, `[[cos θ, −sin θ], [sin θ, cos θ]]` on
+/// span{|01⟩, |10⟩} (basis order |00⟩,|01⟩,|10⟩,|11⟩; first qubit = MSB).
+/// Hamming-weight preserving. Generator spectrum {0, 0, ±1} →
+/// frequencies {1, 2} → the 4-term Givens parameter-shift rule
+/// (arXiv:2606.03517 Eq. 6), *not* the 2-term ±π/2 rule.
+///
+/// Matrix-level identity verified in Lean:
+/// `Verification/Adjoint/ParamShiftRbs.lean::rbs_unitary` proves
+/// `RBS(θ)† · RBS(θ) = 1`, and `drbs_eq_neg_i_g_rbs` proves
+/// `dRBS(θ) = -i · G · RBS(θ)` with `G = (Y⊗X − X⊗Y)/2`.
+pub fn rbs(theta: f64) -> Gate2Q {
+    let cv = c(theta.cos(), 0.0);
+    let sv = c(theta.sin(), 0.0);
+    [
+        ONE, ZERO, ZERO, ZERO, // |00> -> |00>
+        ZERO, cv, -sv, ZERO, // |01> -> cos|01> + sin|10>
+        ZERO, sv, cv, ZERO, // |10> -> -sin|01> + cos|10>
+        ZERO, ZERO, ZERO, ONE, // |11> -> |11>
+    ]
+}
+
 // --- 2Q gate derivatives ---
 
 /// dCRz/dθ: only the lower-right 2x2 block changes
@@ -328,6 +351,21 @@ pub fn dcrz(theta: f64) -> Gate2Q {
         ZERO,
         ZERO,
         pos_half_i * ei(theta / 2.0),
+    ]
+}
+
+/// dRBS/dθ: zero on {|00⟩, |11⟩},
+/// `[[-sin θ, -cos θ], [cos θ, -sin θ]]` on span{|01⟩, |10⟩} —
+/// i.e. `dRBS(θ) = -i·G·RBS(θ)` with generator `G = (Y⊗X − X⊗Y)/2`
+/// (see `Verification/Adjoint/ParamShiftRbs.lean::drbs_eq_neg_i_g_rbs`).
+pub fn drbs(theta: f64) -> Gate2Q {
+    let cv = c(theta.cos(), 0.0);
+    let sv = c(theta.sin(), 0.0);
+    [
+        ZERO, ZERO, ZERO, ZERO, //
+        ZERO, -sv, -cv, ZERO, //
+        ZERO, cv, -sv, ZERO, //
+        ZERO, ZERO, ZERO, ZERO,
     ]
 }
 

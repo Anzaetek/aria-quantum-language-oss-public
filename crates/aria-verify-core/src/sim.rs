@@ -179,6 +179,27 @@ pub fn forward_z_expectations(ir: &CircuitIR, params: &[f64]) -> Result<Vec<f64>
                 apply_ctrl_1q(&mut sv, q[0], q[1], u3(p[0], p[1], p[2]));
             }
             GateKind::Swap => swap(&mut sv, q[0], q[1]),
+            GateKind::Rbs => {
+                // Givens rotation on the {|01⟩, |10⟩} pair of qubits
+                // (q[0], q[1]): a01' = cos·a01 − sin·a10,
+                // a10' = sin·a01 + cos·a10, where a01 has q[0]=0, q[1]=1.
+                // Independent textbook realisation (no shared gate table).
+                let t = gate_params(op, &binding)?[0];
+                let (cs, sn) = (t.cos(), t.sin());
+                let (b0, b1) = (1usize << q[0], 1usize << q[1]);
+                let mut i = 0;
+                while i < sv.len() {
+                    // i indexes the |q0=0, q1=1⟩ member of each pair.
+                    if (i & b0 == 0) && (i & b1 != 0) {
+                        let j = (i | b0) & !b1; // q0=1, q1=0
+                        let a01 = sv[i];
+                        let a10 = sv[j];
+                        sv[i] = c(cs, 0.0) * a01 - c(sn, 0.0) * a10;
+                        sv[j] = c(sn, 0.0) * a01 + c(cs, 0.0) * a10;
+                    }
+                    i += 1;
+                }
+            }
             GateKind::CCX => {
                 // Toffoli: X on q[2] when q[0]∧q[1]. Realised directly.
                 let (c0, c1, t) = (1usize << q[0], 1usize << q[1], 1usize << q[2]);

@@ -32,6 +32,11 @@ pub enum GateKind {
     RYY,
     RZZ,
     CP,
+    /// Reconfigurable Beam Splitter / Givens rotation:
+    /// `RBS(θ) = exp(−i·θ/2·(Y⊗X − X⊗Y))`. Hamming-weight preserving;
+    /// the primitive of butterfly / unary QML circuits
+    /// (Kerenidis et al., arXiv:2606.03517).
+    RBS,
     // Three-qubit
     CCX,
     CSWAP,
@@ -58,6 +63,7 @@ impl GateKind {
             | Self::RYY
             | Self::RZZ
             | Self::CP
+            | Self::RBS
             | Self::BeamSplitter => 2,
             Self::CCX | Self::CSWAP => 3,
             _ => 1,
@@ -78,7 +84,15 @@ impl GateKind {
         // same qubit set.
         matches!(
             self,
-            Self::RX | Self::RY | Self::RZ | Self::P | Self::CP | Self::RXX | Self::RYY | Self::RZZ
+            Self::RX
+                | Self::RY
+                | Self::RZ
+                | Self::P
+                | Self::CP
+                | Self::RXX
+                | Self::RYY
+                | Self::RZZ
+                | Self::RBS
         )
     }
 

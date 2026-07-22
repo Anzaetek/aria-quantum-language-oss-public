@@ -118,7 +118,7 @@ impl ExecResult {
 }
 
 /// A Pauli operator for defining observables.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PauliOp {
     I,
     X,

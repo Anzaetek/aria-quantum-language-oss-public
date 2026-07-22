@@ -12,6 +12,7 @@ pub mod gradient;
 pub mod grover;
 pub mod noise;
 pub mod optimize;
+pub mod parallel_shift;
 pub mod params;
 pub mod plugin;
 pub mod qaoa;

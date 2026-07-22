@@ -141,3 +141,17 @@ pub fn cu3(theta: f64, phi: f64, lambda: f64) -> Gate2Q {
         g[3],
     ]
 }
+
+/// RBS (Givens rotation): `exp(−i·θ/2·(Y⊗X − X⊗Y))` — identity on
+/// {|00⟩, |11⟩}, `[[cos θ, −sin θ], [sin θ, cos θ]]` on span{|01⟩, |10⟩}.
+/// Mirrors `omega-backend-statevector/src/gates.rs::rbs`.
+pub fn rbs(theta: f64) -> Gate2Q {
+    let cv = c(theta.cos(), 0.0);
+    let sv = c(theta.sin(), 0.0);
+    [
+        ONE, ZERO, ZERO, ZERO, //
+        ZERO, cv, -sv, ZERO, //
+        ZERO, sv, cv, ZERO, //
+        ZERO, ZERO, ZERO, ONE,
+    ]
+}

@@ -185,6 +185,7 @@ fn flatten_circuit(circuit: &CircuitIR, params: &ParameterBinding) -> Result<Vec
             GateKind::Swap => GATE_SWAP,
             GateKind::CRz => GATE_CRZ,
             GateKind::CU3 => GATE_CU3,
+            GateKind::Rbs => GATE_RBS,
             GateKind::CCX => GATE_CCX,
             GateKind::CSwap => GATE_CSWAP,
             GateKind::PhaseShifter => GATE_PS,

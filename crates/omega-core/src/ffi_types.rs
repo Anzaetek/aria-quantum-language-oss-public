@@ -114,6 +114,7 @@ pub const GATE_CZ: u32 = 22;
 pub const GATE_SWAP: u32 = 23;
 pub const GATE_CRZ: u32 = 24;
 pub const GATE_CU3: u32 = 25;
+pub const GATE_RBS: u32 = 26;
 pub const GATE_CCX: u32 = 30;
 pub const GATE_CSWAP: u32 = 31;
 pub const GATE_PS: u32 = 40;
