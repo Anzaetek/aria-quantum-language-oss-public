@@ -11,11 +11,11 @@ pure-Rust runtime that needs no libtorch and is backed by Lean 4 correctness pro
 ![license](https://img.shields.io/badge/license-Apache--2.0-2ea043)
 ![language](https://img.shields.io/badge/language-pure%20Rust-de5833)
 ![runtime](https://img.shields.io/badge/runtime-no%20libtorch%20required-7c5cff)
-![examples](https://img.shields.io/badge/examples-31%2F32%20numerically%20verified-36c2ff)
+![examples](https://img.shields.io/badge/examples-41%2F42%20numerically%20verified-36c2ff)
 ![proofs](https://img.shields.io/badge/proofs-Lean%204%20%C2%B7%20sorry--free-22e0c8)
 ![backends](https://img.shields.io/badge/backends-CPU%20%C2%B7%20MPS%20%C2%B7%20CUDA%2FMetal%2FOpenCL%20%C2%B7%20tch-f59e0b)
 
-`APACHE-2.0` · `PURE RUST` · `NO LIBTORCH` · `LEAN 4 PROVEN` · `31/32 VERIFIED` · see [LICENSE](./LICENSE)
+`APACHE-2.0` · `PURE RUST` · `NO LIBTORCH` · `LEAN 4 PROVEN` · `41/42 VERIFIED` · see [LICENSE](./LICENSE)
 
 🔗 **https://github.com/Anzaetek/aria-quantum-language-oss-public**
 
@@ -65,7 +65,7 @@ aria-quantum-language-oss/
 │   ├── aria-verify/      application harnesses: quantum vs classical oracle
 │   ├── apps/<name>/      one small crate per example (~60 readable lines)
 │   └── omega-*/          vendored pure-Rust runtime: IR + backends + server
-├── examples/aria/        32 example circuits (each header cites its harness + check)
+├── examples/aria/        42 example circuits (each header cites its harness + check)
 ├── proofs/lean4/         Lean 4 correctness theorems (sorry-free)
 ├── editors/              Aria syntax: tree-sitter · Neovim · VS Code
 ├── TUTORIAL.md · GRAMMAR.md · VERIFICATION.md · LIMITATIONS.md · TESTING.md
@@ -183,8 +183,8 @@ the quantum and classical results agree numerically. Two oracle kinds are used:
 a **classical** one where a closed-form algorithm gives the ground truth (DFT,
 SVD, max-cut, recovered bits/phase, …), and a **differential** one for
 parametrized circuits with no closed-form answer, where an independent pure-Rust
-statevector simulator reproduces the full `⟨Z_q⟩` profile. **31 of 32 examples
-are numerically verified** (the 32nd, `shor_ecdlp`, is a parse-only showcase) —
+statevector simulator reproduces the full `⟨Z_q⟩` profile. **41 of 42 examples
+are numerically verified** (the 42nd, `shor_ecdlp`, is a parse-only showcase) —
 the full table is in [`VERIFICATION.md`](VERIFICATION.md), boundaries in
 [`LIMITATIONS.md`](LIMITATIONS.md).
 

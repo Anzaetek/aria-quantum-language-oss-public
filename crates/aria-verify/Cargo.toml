@@ -38,6 +38,8 @@ aria-app-swap-test = { path = "../apps/swap-test" }
 aria-app-teleport = { path = "../apps/teleport" }
 aria-app-qaoa-maxcut = { path = "../apps/qaoa-maxcut" }
 aria-app-qml-classifier = { path = "../apps/qml-classifier" }
+aria-app-butterfly-qnn = { path = "../apps/butterfly-qnn" }
+aria-app-jl-sketch-digits = { path = "../apps/jl-sketch-digits" }
 aria-app-qos = { path = "../apps/qos" }
 aria-app-circulant = { path = "../apps/circulant" }
 aria-app-cqs = { path = "../apps/cqs" }

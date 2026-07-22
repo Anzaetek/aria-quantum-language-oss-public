@@ -142,6 +142,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-app-butterfly-qnn"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+ "omega-backend-statevector",
+ "omega-core",
+]
+
+[[package]]
 name = "aria-app-circulant"
 version = "0.1.0"
 dependencies = [
@@ -182,6 +191,14 @@ name = "aria-app-grover3"
 version = "0.1.0"
 dependencies = [
  "aria-verify-core",
+]
+
+[[package]]
+name = "aria-app-jl-sketch-digits"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+ "omega-core",
 ]
 
 [[package]]
@@ -418,12 +435,14 @@ version = "0.1.0"
 dependencies = [
  "aria-app-bell",
  "aria-app-bernstein-vazirani",
+ "aria-app-butterfly-qnn",
  "aria-app-circulant",
  "aria-app-cqs",
  "aria-app-deutsch-jozsa",
  "aria-app-forward",
  "aria-app-ghz",
  "aria-app-grover3",
+ "aria-app-jl-sketch-digits",
  "aria-app-noise",
  "aria-app-qaoa-maxcut",
  "aria-app-qdrift",

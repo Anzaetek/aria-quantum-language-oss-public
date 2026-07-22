@@ -1,0 +1,15 @@
+# aria-app-jl-sketch-digits — application harness for the `jl_sketch_digits` Aria example.
+# Babbush sketching track on real open data: JL-project UCI optdigits 64 → 8 dims,
+# quantum feature map on 8 qubits, linear head; verified vs the independent oracle.
+# Run standalone: cargo run -p aria-app-jl-sketch-digits   (or: aria-verify jl_sketch_digits)
+[package]
+publish = false
+name = "aria-app-jl-sketch-digits"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "JL-sketch quantum feature map classifying UCI optdigits 3-vs-8, verified vs an independent statevector oracle."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+omega-core = { path = "../../omega-core" }

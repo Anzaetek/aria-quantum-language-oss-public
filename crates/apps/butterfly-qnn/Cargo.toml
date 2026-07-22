@@ -1,0 +1,16 @@
+# aria-app-butterfly-qnn — application harness for the `butterfly_qnn` Aria example.
+# Butterfly QNN (arXiv:2606.03517): layer-wise training + parallel parameter-shift
+# on the open UCI Cleveland heart dataset (clinical imputation stand-in).
+# Run standalone: cargo run -p aria-app-butterfly-qnn     (or: aria-verify butterfly_qnn)
+[package]
+publish = false
+name = "aria-app-butterfly-qnn"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Butterfly QNN layer-wise training with parallel parameter-shift, verified vs serial gradients and classical imputation baselines."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+omega-core = { path = "../../omega-core" }
+omega-backend-statevector = { path = "../../omega-backend-statevector" }

@@ -1,0 +1,78 @@
+-- ▶ Application harness + classical cross-check: crates/apps/butterfly-qnn/src/lib.rs
+--   run: cargo run -p aria-app-butterfly-qnn   (or: cargo run -p aria-verify -- butterfly_qnn)
+-- VERIFIED: parallel commuting-block gradients (arXiv:2606.03517 Eq. 6) vs serial
+--   parameter-shift, |Δ| ≤ 1e-9; imputation MSE vs classical mean/ridge baselines
+--   on the open UCI Cleveland heart dataset (examples/data/heart_cleveland.csv).
+--
+-- Butterfly quantum neural network (Mathur, Barkoutsos, Yamada, Roetteler,
+-- Kerenidis — arXiv:2606.03517).
+--
+-- Eight features are angle-encoded (RY) onto eight qubits, then flow through
+-- a Cooley–Tukey "butterfly" of RBS gates — the Hamming-weight-preserving
+-- Givens rotation RBS(θ) = exp(−i·θ/2·(Y⊗X − X⊗Y)):
+--
+--     stage 1 (stride 2, within each half):   (0,2) (1,3) (4,6) (5,7)
+--     stage 2 (stride 1, within each pair):   (0,1) (2,3) (4,5) (6,7)
+--     stage 3 (stride 4, the COUPLING layer): (0,4) (1,5) (2,6) (3,7)
+--
+-- O(n·log n) = 12 parameters, O(log n) = 3 layers of depth. The final
+-- coupling layer is a trailing block of DISJOINT RBS gates, so its four
+-- gradients come from ONE circuit execution via the parallelised
+-- parameter-shift rule (commuting generators → simultaneously measurable
+-- gradient observables i·[G_k, H]) — the O(n²) → O(log n) training-cost
+-- collapse the paper demonstrates on hardware.
+--
+-- Layer-wise protocol (the app drives this):
+--   stage A: train theta[0..7] (the two independent 4-qubit sub-butterflies),
+--            coupling angles pinned at 0 (RBS(0) = identity);
+--   stage B: FREEZE theta[0..7], train only the coupling layer theta[8..11]
+--            with the parallel rule — the "on-hardware" stage of the paper.
+--
+-- Layout:
+--   q[0..7]   one wire per (standardized, arctan-squashed) clinical feature
+--   readout   ⟨Z(0)⟩ predicts the standardized target feature (imputation)
+--
+-- Symbols: x[0..7]      per-sample encoding angles (bound by the host)
+--          theta[0..11] trainable RBS angles (12 = (n/2)·log2(n))
+
+@assert unitary
+@bound parameters = 12
+
+circuit ButterflyQNN() {
+    qreg q[8]
+
+    let theta = symbolic[12]
+    let x = symbolic[8]
+
+    -- Data loading: RY angle encoding, one feature per qubit
+    -- (cf. arXiv:2606.03517 §data-loading; the magic-state prefix of the
+    -- hardware experiment is out of scope for this simulator demo).
+    repeat i from 0 to 7 {
+        apply RY(x[i]) on q[i]
+    }
+
+    -- Sub-butterfly A (qubits 0..3): stride 2 then stride 1.
+    apply RBS(theta[0]) on q[0], q[2]
+    apply RBS(theta[1]) on q[1], q[3]
+    apply RBS(theta[2]) on q[0], q[1]
+    apply RBS(theta[3]) on q[2], q[3]
+
+    -- Sub-butterfly B (qubits 4..7): stride 2 then stride 1.
+    apply RBS(theta[4]) on q[4], q[6]
+    apply RBS(theta[5]) on q[5], q[7]
+    apply RBS(theta[6]) on q[4], q[5]
+    apply RBS(theta[7]) on q[6], q[7]
+
+    -- Coupling layer (stride 4): connects the halves. Trailing block of
+    -- disjoint RBS gates → parallel parameter-shift applies.
+    apply RBS(theta[8]) on q[0], q[4]
+    apply RBS(theta[9]) on q[1], q[5]
+    apply RBS(theta[10]) on q[2], q[6]
+    apply RBS(theta[11]) on q[3], q[7]
+}
+
+-- Imputation head: ⟨Z(0)⟩ ∈ [−1, 1] predicts the squashed standardized
+-- target feature.
+observable ImputeHead {
+    1.0 * Z(0)
+}

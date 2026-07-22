@@ -13,6 +13,7 @@
 //! and a 3-line bin that calls [`run_main`].
 
 pub mod banner;
+pub mod data;
 pub mod harness;
 pub mod oracle;
 pub mod sim;
