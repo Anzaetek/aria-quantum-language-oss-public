@@ -97,6 +97,7 @@ fn build(g: &Genome, x: &[f64]) -> (CircuitIR, Vec<u32>) {
 
 /// Train a genome on (train) and return its held-out MSE — the fitness
 /// (lower is better). Fully deterministic from `seed`.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     g: &Genome,
     backend: &dyn Backend,

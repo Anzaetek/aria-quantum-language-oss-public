@@ -37,6 +37,7 @@ pub mod evolve;
 mod gen;
 mod lanes;
 mod qnn;
+pub mod scale;
 
 use aria_verify_core::data::{self, SplitMix64};
 use aria_verify_core::{banner, harness, resolve, sim, Observable, Transport, Verdict};
@@ -955,5 +956,120 @@ pub fn arch_priors(transport_override: Transport) -> Result<Verdict, String> {
         pass: prior_close && improved,
         max_abs_diff: (auc_flat - auc_prior).max(0.0),
         tol: 0.03,
+    })
+}
+
+/// spectra_scaling — the substrate at n = 7 … 13 sites (see `scale.rs`).
+///
+/// CHECK: the |+⟩^⊗n invariant holds (≤ 1e-9) at every size, and the
+/// DMQ-vs-classical AUC gap persists (≥ 0.15) at every gap-checked
+/// size. The cost curve (deterministic work model + measured wall-clock
+/// with fitted exponent and crossover extrapolation) is advisory —
+/// timings never gate the verdict.
+pub fn spectra_scaling(transport_override: Transport) -> Result<Verdict, String> {
+    let guest = "omega_app";
+    let transport = resolve(transport_override, guest);
+    banner::header(
+        "spectra_scaling",
+        "the quantum-generated substrate at 7…13 sites: correctness invariants, \
+         persistent quantum-classical gap, exponential classical-cost curve",
+        &transport.label(guest),
+    );
+    let backend = StatevectorBackend::new();
+    let dt = TOTAL_TIME / TROTTER_STEPS as f64;
+
+    // (n_sites, samples, gap_check, dmq_epochs) — budgets shrink as the
+    // exact simulation cost grows (printed, not silent).
+    let plan = [
+        (7usize, 320usize, true, 20usize),
+        (9, 140, true, 8),
+        (11, 120, true, 8),
+        (13, 80, false, 0),
+    ];
+    let mut reports = Vec::new();
+    for &(n, samples, gap, epochs) in &plan {
+        let rep = scale::run_size(
+            n,
+            TROTTER_STEPS as usize,
+            dt,
+            &backend,
+            SEED,
+            samples,
+            gap,
+            epochs,
+        )?;
+        match rep.gap {
+            Some((dmq, classical)) => println!(
+                "  n = {n:>2}: invariant {:+.1e}, {:.1} ms/sample (work {:.2e}), \
+                 DMQ AUC {dmq:.3} vs classical {classical:.3} (gap {:+.3}) \
+                 [{samples} samples, {epochs} DMQ epochs]",
+                rep.invariant,
+                rep.secs_per_sample * 1e3,
+                rep.work_per_sample,
+                dmq - classical,
+            ),
+            None => println!(
+                "  n = {n:>2}: invariant {:+.1e}, {:.1} ms/sample (work {:.2e}) \
+                 [{samples} samples, generation + invariant only]",
+                rep.invariant,
+                rep.secs_per_sample * 1e3,
+                rep.work_per_sample,
+            ),
+        }
+        reports.push(rep);
+    }
+
+    // Cost-curve fit (advisory): slope of log2(seconds) vs n.
+    let pts: Vec<(f64, f64)> = reports
+        .iter()
+        .map(|r| (r.n_sites as f64, r.secs_per_sample.max(1e-9).log2()))
+        .collect();
+    let n_pts = pts.len() as f64;
+    let (sx, sy): (f64, f64) = (pts.iter().map(|p| p.0).sum(), pts.iter().map(|p| p.1).sum());
+    let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+    let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+    let gamma = (n_pts * sxy - sx * sy) / (n_pts * sxx - sx * sx);
+    let intercept = (sy - gamma * sx) / n_pts;
+    // Paper-style crossover extrapolation: hardware cost per sample is
+    // linear in gate count (~ ops(n) · t_gate); classical exact cost is
+    // 2^{γ·n}·c. Illustrative constants: t_gate = 1 µs, shots = 1000.
+    let ops_13 = reports.last().unwrap().work_per_sample / (1u64 << 13) as f64;
+    let hardware_secs = |n: f64| (ops_13 / 13.0) * n * 1e-6 * 1000.0;
+    let classical_secs = |n: f64| (2f64).powf(gamma * n + intercept);
+    let mut crossover = 30.0;
+    for n10 in 130..300 {
+        let n = n10 as f64 / 10.0;
+        if classical_secs(n) > hardware_secs(n) {
+            crossover = n;
+            break;
+        }
+    }
+    println!(
+        "  cost curve (advisory): seconds/sample ≈ 2^({gamma:.2}·n {intercept:+.1}); \
+         with illustrative hardware constants (1 µs gates × 1000 shots) the \
+         exact-simulation crossover lands near n* ≈ {crossover:.0} sites \
+         (paper's range: 13–19)",
+    );
+
+    let invariants_ok = reports.iter().all(|r| r.invariant.abs() <= 1e-9);
+    if !invariants_ok {
+        println!("  FAIL: |+⟩^⊗n invariant violated at some size");
+    }
+    let gaps_ok = reports
+        .iter()
+        .filter_map(|r| r.gap)
+        .all(|(dmq, classical)| dmq - classical >= 0.15);
+    if !gaps_ok {
+        println!("  FAIL: quantum-classical gap fell below 0.15 at some size");
+    }
+    let max_inv = reports
+        .iter()
+        .map(|r| r.invariant.abs())
+        .fold(0.0f64, f64::max);
+    Ok(Verdict {
+        name: "spectra_scaling".into(),
+        pass: invariants_ok && gaps_ok,
+        max_abs_diff: max_inv,
+        tol: 1e-9,
     })
 }

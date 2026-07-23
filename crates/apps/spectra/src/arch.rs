@@ -68,11 +68,21 @@ pub fn candidates() -> Vec<Candidate> {
 /// per bond XX, YY, ZZ blocks with angle 2·(J_bond·dt), then per-site
 /// field RZ(2·φ_i·dt). Symbols: 0..bonds = J·dt, then N_SITES φ·dt.
 pub fn build_ir(bonds: &[(u32, u32)], steps: usize) -> (CircuitIR, Vec<u32>, Vec<u32>) {
+    build_ir_sized(bonds, steps, N_SITES)
+}
+
+/// `build_ir` for an arbitrary site count (the scaling harness runs the
+/// same chain at n = 7 … 13 sites).
+pub fn build_ir_sized(
+    bonds: &[(u32, u32)],
+    steps: usize,
+    n_sites: usize,
+) -> (CircuitIR, Vec<u32>, Vec<u32>) {
     let jt_ids: Vec<u32> = (0..bonds.len() as u32).collect();
-    let pt_ids: Vec<u32> = (0..N_SITES as u32)
+    let pt_ids: Vec<u32> = (0..n_sites as u32)
         .map(|i| bonds.len() as u32 + i)
         .collect();
-    let mut c = CircuitIR::new(N_SITES as u32, CircuitType::GateBased);
+    let mut c = CircuitIR::new(n_sites as u32, CircuitType::GateBased);
     for &id in jt_ids.iter().chain(pt_ids.iter()) {
         c.symbols.insert(id, format!("s{id}"));
     }
@@ -104,8 +114,8 @@ pub fn build_ir(bonds: &[(u32, u32)], steps: usize) -> (CircuitIR, Vec<u32>, Vec
         )
     };
     let pi_2 = std::f64::consts::FRAC_PI_2;
-    // |+⟩^⊗7
-    for q in 0..N_SITES as u32 {
+    // |+⟩^⊗n
+    for q in 0..n_sites as u32 {
         c.add_op(g1(GateKind::H, q));
     }
     for _ in 0..steps {
@@ -132,7 +142,7 @@ pub fn build_ir(bonds: &[(u32, u32)], steps: usize) -> (CircuitIR, Vec<u32>, Vec
             c.add_op(rot(GateKind::Rz, b, two_sym(jt)));
             c.add_op(cx(a, b));
         }
-        for i in 0..N_SITES as u32 {
+        for i in 0..n_sites as u32 {
             c.add_op(rot(GateKind::Rz, i, two_sym(pt_ids[i as usize])));
         }
     }
