@@ -834,14 +834,27 @@ pub fn arch_evolve(transport_override: Transport) -> Result<Verdict, String> {
          no-entanglement MSE = {none_mse:.5}",
         evolve::genome_name(&evolve::BUTTERFLY_GENOME)
     );
+    // Show the regulariser has teeth: the overlapping chain-full mask
+    // loses the one-execution trailing-block property (engine-measured).
+    let chain_full = [5usize; evolve::LAYERS];
+    let cf_tr = evolve::trainability(&chain_full, &backend, &xs[0])?;
+    println!(
+        "  regulariser reference: [{}] trainability = {cf_tr:.2} \
+         (pays λ·{:.2} = {:.4} in fitness)",
+        evolve::genome_name(&chain_full),
+        1.0 - cf_tr,
+        evolve::TRAINABILITY_LAMBDA * (1.0 - cf_tr),
+    );
 
-    let (winner, fitness, cache) =
+    let (winner, (fitness, winner_tr, _score), cache) =
         evolve::evolve(&backend, &trx, &try_, &tex, &tey, epochs, SEED, pop, gens)?;
     println!(
-        "  EVOLVED: [{}] MSE = {fitness:.5} ({} unique genomes evaluated of {} in the space)",
+        "  EVOLVED: [{}] MSE = {fitness:.5}, trainability = {winner_tr:.2} \
+         ({} unique genomes evaluated of {} in the space; λ = {})",
         evolve::genome_name(&winner),
         cache.len(),
-        evolve::mask_menu().len().pow(evolve::LAYERS as u32)
+        evolve::mask_menu().len().pow(evolve::LAYERS as u32),
+        evolve::TRAINABILITY_LAMBDA,
     );
 
     // (a) determinism.
@@ -859,6 +872,17 @@ pub fn arch_evolve(transport_override: Transport) -> Result<Verdict, String> {
     if !beats_none {
         println!("  FAIL: evolved MSE {fitness:.5} worse than no-entanglement {none_mse:.5}");
     }
+    // Trainability gate: the regulariser must have kept the winner fully
+    // parallel-shift-trainable (every gradient from the one-execution
+    // trailing-block rule) despite the overlapping chain-full mask being
+    // in the menu.
+    let fully_parallel = winner_tr >= 1.0 - 1e-9;
+    if !fully_parallel {
+        println!(
+            "  FAIL: winner trainability {winner_tr:.2} < 1.0 — the regulariser \
+             failed to keep the parallel-shift property"
+        );
+    }
     println!(
         "  verdict inputs: deterministic {deterministic}, expert parity {parity} \
          (Δ = {:+.5}), ≥ ablation {beats_none}",
@@ -867,7 +891,7 @@ pub fn arch_evolve(transport_override: Transport) -> Result<Verdict, String> {
 
     Ok(Verdict {
         name: "arch_evolve".into(),
-        pass: deterministic && parity && beats_none,
+        pass: deterministic && parity && beats_none && fully_parallel,
         max_abs_diff: (fitness - butterfly_mse).max(0.0),
         tol: 0.02,
     })

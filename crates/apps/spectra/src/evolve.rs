@@ -31,7 +31,11 @@ use smallvec::smallvec;
 pub const N_QUBITS: usize = 8;
 pub const LAYERS: usize = 3;
 
-/// The mask menu. Index 0 must stay NONE (the ablation genome).
+/// The mask menu. Index 0 must stay NONE (the ablation genome). The
+/// last entry, `chain-full`, has OVERLAPPING pairs — a layer of it is
+/// NOT a commuting block, so a genome ending in it loses the
+/// one-execution parallel parameter-shift property. The trainability
+/// regularizer prices that in.
 pub fn mask_menu() -> Vec<(&'static str, Vec<(u32, u32)>)> {
     vec![
         ("none", vec![]),
@@ -39,7 +43,39 @@ pub fn mask_menu() -> Vec<(&'static str, Vec<(u32, u32)>)> {
         ("pairs-odd", vec![(1, 2), (3, 4), (5, 6)]),
         ("stride-2", vec![(0, 2), (1, 3), (4, 6), (5, 7)]),
         ("stride-4", vec![(0, 4), (1, 5), (2, 6), (3, 7)]),
+        (
+            "chain-full",
+            vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)],
+        ),
     ]
+}
+
+/// Hardware-trainability score of a genome: the fraction of its
+/// trainable angles whose gradients come from the batched trailing
+/// commuting block — measured by the ENGINE's own block detector
+/// (`omega_core::parallel_shift`), not re-derived here. 1.0 = every
+/// gradient in one execution (the arXiv:2606.03517 property); genomes
+/// ending in overlapping masks score lower and pay a fitness penalty.
+pub fn trainability(g: &Genome, backend: &dyn Backend, probe_x: &[f64]) -> Result<f64, String> {
+    let (c, theta_ids) = build(g, probe_x);
+    if theta_ids.is_empty() {
+        return Ok(1.0); // nothing to train — trivially parallel
+    }
+    let mut b = ParameterBinding::new();
+    for (k, &id) in theta_ids.iter().enumerate() {
+        b.bind(id, 0.1 + 0.01 * k as f64);
+    }
+    let obs = Observable {
+        terms: vec![(1.0, vec![(0, PauliOp::Z)])],
+    };
+    let (_grads, report) =
+        omega_core::parallel_shift::parallel_parameter_shift_gradient(backend, &c, &b, &obs, None)
+            .map_err(|e| e.to_string())?;
+    let total = report.block_symbols + report.fallback_symbols;
+    if total == 0 {
+        return Ok(1.0);
+    }
+    Ok(report.block_symbols as f64 / total as f64)
 }
 
 /// The expert reference: butterfly_qnn.aria's layer structure.
@@ -191,8 +227,14 @@ pub fn evaluate(
     Ok(sq / test_x.len() as f64)
 }
 
-/// Elitist evolutionary loop with memoisation. Returns the ranked
-/// (genome, fitness) list of every evaluation plus the winner.
+/// Fitness-penalty weight for lost hardware trainability: a genome
+/// whose gradients are fully serial pays this much MSE-equivalent.
+pub const TRAINABILITY_LAMBDA: f64 = 0.05;
+
+/// Elitist evolutionary loop with memoisation. Selection uses the
+/// penalised score `mse + λ·(1 − trainability)`; the raw MSE and the
+/// trainability fraction are both reported. Returns the winner and the
+/// evaluation cache.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn evolve(
     backend: &dyn Backend,
@@ -204,7 +246,7 @@ pub fn evolve(
     seed: u64,
     population: usize,
     generations: usize,
-) -> Result<(Genome, f64, HashMap<Genome, f64>), String> {
+) -> Result<(Genome, (f64, f64, f64), HashMap<Genome, (f64, f64, f64)>), String> {
     let menu_len = mask_menu().len();
     let mut rng = SplitMix64(seed);
     let rand_genome = |rng: &mut SplitMix64| -> Genome {
@@ -214,17 +256,21 @@ pub fn evolve(
         }
         g
     };
-    let mut cache: HashMap<Genome, f64> = HashMap::new();
+    // cache: genome → (raw MSE, trainability fraction, penalised score).
+    let mut cache: HashMap<Genome, (f64, f64, f64)> = HashMap::new();
     let mut pop: Vec<Genome> = (0..population).map(|_| rand_genome(&mut rng)).collect();
     for gen in 0..generations {
         for g in &pop {
             if !cache.contains_key(g) {
-                let fit = evaluate(g, backend, train_x, train_y, test_x, test_y, epochs, seed)?;
-                cache.insert(*g, fit);
+                let mse = evaluate(g, backend, train_x, train_y, test_x, test_y, epochs, seed)?;
+                let tr = trainability(g, backend, &train_x[0])?;
+                let score = mse + TRAINABILITY_LAMBDA * (1.0 - tr);
+                cache.insert(*g, (mse, tr, score));
             }
         }
-        let mut ranked: Vec<(Genome, f64)> = pop.iter().map(|g| (*g, cache[g])).collect();
-        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let mut ranked: Vec<(Genome, (f64, f64, f64))> =
+            pop.iter().map(|g| (*g, cache[g])).collect();
+        ranked.sort_by(|a, b| a.1 .2.partial_cmp(&b.1 .2).unwrap());
         ranked.dedup_by_key(|(g, _)| *g);
         let elite: Vec<Genome> = ranked
             .iter()
@@ -232,8 +278,11 @@ pub fn evolve(
             .map(|(g, _)| *g)
             .collect();
         println!(
-            "    gen {gen}: best {:.5} [{}]  (evaluated {} unique genomes so far)",
-            ranked[0].1,
+            "    gen {gen}: best score {:.5} (mse {:.5}, trainability {:.2}) [{}]  \
+             ({} unique genomes so far)",
+            ranked[0].1 .2,
+            ranked[0].1 .0,
+            ranked[0].1 .1,
             genome_name(&ranked[0].0),
             cache.len()
         );
@@ -251,10 +300,10 @@ pub fn evolve(
         }
         pop = next;
     }
-    let (winner, fitness) = cache
+    let (winner, stats) = cache
         .iter()
-        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .min_by(|a, b| a.1 .2.partial_cmp(&b.1 .2).unwrap())
         .map(|(g, f)| (*g, *f))
         .unwrap();
-    Ok((winner, fitness, cache))
+    Ok((winner, stats, cache))
 }
