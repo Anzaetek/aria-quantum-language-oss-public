@@ -58,17 +58,42 @@ pub struct TabularQnn {
     /// symbol ids: 0..d = frequency scalars f_j; then per-block RBS ring
     /// angles.
     freq_ids: Vec<u32>,
+    /// Trainable per-feature phase offsets c_j — RY(f_j·φ_j + c_j).
+    /// Without them the readout only reaches zero-phase cosine
+    /// combinations and a planted cos(Σf·φ + b) with b ≈ ±π/2 is
+    /// invisible no matter how good the frequency prior is.
+    offset_ids: Vec<u32>,
     rbs_ids: Vec<Vec<u32>>,
     params: HashMap<u32, f64>,
     head: Vec<f64>,
+    /// Readout observables. Default: single-qubit ⟨Z_q⟩. With
+    /// `rich_readout()`, all Z-strings up to weight 3 (d ≤ 4 only) —
+    /// the multi-qubit correlators that carry joint-frequency harmonics
+    /// cos(Σ f_j·φ_j) the single-qubit profile cannot express.
+    readout: Vec<Observable>,
 }
 
 impl TabularQnn {
     pub fn new(d: usize, seed: u64, entangle: bool) -> Self {
+        Self::with_freq_prior(d, seed, entangle, None)
+    }
+
+    /// `freq_prior`: per-feature initial values for the trainable
+    /// frequency scalars — how SPECTRA's classical periodogram
+    /// statistics enter the quantum lane (QML_ROADMAP: "Tier-1
+    /// statistics → prior over frequencies"). `None` = flat jittered
+    /// init in the middle of the scan window.
+    pub fn with_freq_prior(
+        d: usize,
+        seed: u64,
+        entangle: bool,
+        freq_prior: Option<&[f64]>,
+    ) -> Self {
         let blocks = 2;
         let mut rng = data::SplitMix64(seed);
         let freq_ids: Vec<u32> = (0..d as u32).collect();
-        let mut next = d as u32;
+        let offset_ids: Vec<u32> = (d as u32..2 * d as u32).collect();
+        let mut next = 2 * d as u32;
         let mut rbs_ids = Vec::new();
         for _ in 0..blocks {
             let ring: Vec<u32> = (0..(d as u32 - 1)).map(|k| next + k).collect();
@@ -76,30 +101,84 @@ impl TabularQnn {
             rbs_ids.push(ring);
         }
         let mut params = HashMap::new();
-        for &id in &freq_ids {
-            // Non-integer init in the middle of the scan window, jittered.
-            params.insert(id, 2.5 + rng.next_f64());
+        for (j, &id) in freq_ids.iter().enumerate() {
+            let flat = 2.5 + rng.next_f64();
+            let v = freq_prior.and_then(|f| f.get(j).copied()).unwrap_or(flat);
+            params.insert(id, v);
+        }
+        for &id in &offset_ids {
+            params.insert(id, 0.0);
         }
         for ring in &rbs_ids {
             for &id in ring {
                 params.insert(id, (rng.next_f64() * 2.0 - 1.0) * 0.2);
             }
         }
+        let readout = (0..d as u32)
+            .map(|q| Observable {
+                terms: vec![(1.0, vec![(q, PauliOp::Z)])],
+            })
+            .collect();
         Self {
             d,
             blocks,
             entangle,
             freq_ids,
+            offset_ids,
             rbs_ids,
             params,
             head: vec![],
+            readout,
         }
+    }
+
+    /// Set the number of re-upload blocks (default 2). One block keeps
+    /// the harmonic coefficients in {0, ±1} — the cleanest structure
+    /// for a frequency prior to act on.
+    pub fn upload_blocks(mut self, blocks: usize) -> Self {
+        self.blocks = blocks;
+        self
+    }
+
+    /// Switch to the rich Z-string readout (all subsets of weight ≤ 3;
+    /// d ≤ 4 to keep the feature count small).
+    pub fn rich_readout(mut self) -> Self {
+        assert!(self.d <= 4, "rich readout is for small d");
+        let mut obs = Vec::new();
+        let d = self.d as u32;
+        for a in 0..d {
+            obs.push(vec![(a, PauliOp::Z)]);
+        }
+        for a in 0..d {
+            for b in (a + 1)..d {
+                obs.push(vec![(a, PauliOp::Z), (b, PauliOp::Z)]);
+            }
+        }
+        for a in 0..d {
+            for b in (a + 1)..d {
+                for c_ in (b + 1)..d {
+                    obs.push(vec![(a, PauliOp::Z), (b, PauliOp::Z), (c_, PauliOp::Z)]);
+                }
+            }
+        }
+        self.readout = obs
+            .into_iter()
+            .map(|terms| Observable {
+                terms: vec![(1.0, terms)],
+            })
+            .collect();
+        self
     }
 
     /// Per-sample circuit: `blocks` × [RY(f_j·φ_j) ⊗ … ; RBS ring].
     fn circuit(&self, phases: &[f64]) -> CircuitIR {
         let mut c = CircuitIR::new(self.d as u32, CircuitType::GateBased);
-        for &id in self.freq_ids.iter().chain(self.rbs_ids.iter().flatten()) {
+        for &id in self
+            .freq_ids
+            .iter()
+            .chain(self.offset_ids.iter())
+            .chain(self.rbs_ids.iter().flatten())
+        {
             c.symbols.insert(id, format!("s{id}"));
         }
         for b in 0..self.blocks {
@@ -107,9 +186,12 @@ impl TabularQnn {
                 c.add_op(GateOp {
                     gate: GateKind::Ry,
                     qubits: smallvec![Qubit(j as u32)],
-                    params: smallvec![ParamExpr::Mul(
-                        Box::new(ParamExpr::Symbol(self.freq_ids[j])),
-                        Box::new(ParamExpr::Concrete(phi)),
+                    params: smallvec![ParamExpr::Add(
+                        Box::new(ParamExpr::Mul(
+                            Box::new(ParamExpr::Symbol(self.freq_ids[j])),
+                            Box::new(ParamExpr::Concrete(phi)),
+                        )),
+                        Box::new(ParamExpr::Symbol(self.offset_ids[j])),
                     )],
                     classical_bit: None,
                     condition: None,
@@ -139,13 +221,8 @@ impl TabularQnn {
     }
 
     fn features(&self, backend: &dyn Backend, phases: &[f64]) -> Result<Vec<f64>, String> {
-        let obs: Vec<Observable> = (0..self.d as u32)
-            .map(|q| Observable {
-                terms: vec![(1.0, vec![(q, PauliOp::Z)])],
-            })
-            .collect();
         backend
-            .expectation_multi(&self.circuit(phases), &self.binding(), &obs)
+            .expectation_multi(&self.circuit(phases), &self.binding(), &self.readout)
             .map_err(|e| e.to_string())
     }
 
@@ -180,8 +257,11 @@ impl TabularQnn {
                 self.head = self.fit_head(backend, x, y)?;
             }
             let hw = Observable {
-                terms: (0..self.d as u32)
-                    .map(|q| (self.head[q as usize], vec![(q, PauliOp::Z)]))
+                terms: self
+                    .readout
+                    .iter()
+                    .enumerate()
+                    .map(|(k, o)| (self.head[k], o.terms[0].1.clone()))
                     .collect(),
             };
             let mut acc: HashMap<u32, f64> = HashMap::new();
