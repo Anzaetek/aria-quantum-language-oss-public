@@ -109,8 +109,34 @@ fn main() -> ExitCode {
 
     let name = args.first().map(|s| s.as_str()).unwrap_or("all");
     let table = registry();
+    // ARIA_QML_QUICK=1: skip the long-running QML search/training
+    // harnesses during `all` (each is minutes of simulator training).
+    // The skips are printed loudly — quick mode is a developer
+    // iteration aid, NEVER the CI default; ci.sh runs the full set.
+    let quick = std::env::var("ARIA_QML_QUICK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    const QUICK_SKIP: &[&str] = &[
+        "butterfly_qnn",
+        "spectra",
+        "arch_search",
+        "arch_evolve",
+        "spectra_scaling",
+    ];
     let selected: Vec<_> = if name == "all" {
-        table
+        if quick {
+            println!(
+                "ARIA_QML_QUICK=1 — SKIPPING the long QML harnesses: {} \
+                 (run `aria-verify all` without the flag, as ci.sh does, for the full set)",
+                QUICK_SKIP.join(", ")
+            );
+            table
+                .into_iter()
+                .filter(|(n, _)| !QUICK_SKIP.contains(n))
+                .collect()
+        } else {
+            table
+        }
     } else {
         table.into_iter().filter(|(n, _)| *n == name).collect()
     };
