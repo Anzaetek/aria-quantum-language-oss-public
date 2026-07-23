@@ -24,6 +24,17 @@ end-to-end implementation, and which deeper features are deferred.
   and `QSVT.lean` (sorry-free, axiom-clean) — and in the pure-Rust kernels
   `omega_core::solver` and `omega_core::chebyshev`.
 
+## Gate set / backends
+
+- **`RBS` (Givens rotation) backend coverage.** The native `RBS` gate runs on
+  the CPU statevector and MPS backends — the engines every trainer and
+  verification harness uses — with analytic adjoint derivatives and the 4-term
+  Givens parameter-shift rule. The GPU backends (metal / cuda / opencl), the
+  Clifford `pauli` backend, and the optional `tch` plugin dispatch it to their
+  wildcard arm and surface a clean *"unsupported gate"* error at runtime; QASM
+  2.0 export decomposes it exactly, so exported circuits run anywhere. GPU
+  kernels are deferred until a GPU-scale QML example needs them.
+
 ## Classical linear-algebra stack (`omega_core`, `aria_runtime::linalg`)
 
 - The QSVT phase angles use a **placeholder heuristic** (`chebyshev::

@@ -307,8 +307,9 @@ pub fn cu3(theta: f64, phi: f64, lambda: f64) -> Gate2Q {
 /// frequencies {1, 2} → the 4-term Givens parameter-shift rule
 /// (arXiv:2606.03517 Eq. 6), *not* the 2-term ±π/2 rule.
 ///
-/// Matrix-level identity verified in Lean:
-/// `Verification/Adjoint/ParamShiftRbs.lean::rbs_unitary` proves
+/// Matrix-level identity verified in Lean (in-tree, unlike the
+/// upstream-repo references above):
+/// `proofs/lean4/QuantumProofs/Rbs.lean::rbs_unitary` proves
 /// `RBS(θ)† · RBS(θ) = 1`, and `drbs_eq_neg_i_g_rbs` proves
 /// `dRBS(θ) = -i · G · RBS(θ)` with `G = (Y⊗X − X⊗Y)/2`.
 pub fn rbs(theta: f64) -> Gate2Q {
@@ -357,7 +358,7 @@ pub fn dcrz(theta: f64) -> Gate2Q {
 /// dRBS/dθ: zero on {|00⟩, |11⟩},
 /// `[[-sin θ, -cos θ], [cos θ, -sin θ]]` on span{|01⟩, |10⟩} —
 /// i.e. `dRBS(θ) = -i·G·RBS(θ)` with generator `G = (Y⊗X − X⊗Y)/2`
-/// (see `Verification/Adjoint/ParamShiftRbs.lean::drbs_eq_neg_i_g_rbs`).
+/// (see `proofs/lean4/QuantumProofs/Rbs.lean::drbs_eq_neg_i_g_rbs`).
 pub fn drbs(theta: f64) -> Gate2Q {
     let cv = c(theta.cos(), 0.0);
     let sv = c(theta.sin(), 0.0);
