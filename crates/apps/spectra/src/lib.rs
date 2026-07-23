@@ -871,3 +871,89 @@ pub fn arch_evolve(transport_override: Transport) -> Result<Verdict, String> {
         tol: 0.02,
     })
 }
+
+/// arch_priors — SPECTRA statistics as search priors (QML_ROADMAP).
+///
+/// The classical supervised joint-periodogram scan (the JOINT lane's
+/// Tier-2 statistic — zero quantum evaluations) discovers the sparse
+/// pocket's interaction triple and its off-grid frequencies. Seeding
+/// the tabular QNN's trainable frequency scalars with those values,
+/// instead of a flat init, is the roadmap's "Tier-1/2 statistics →
+/// prior over frequencies" step.
+///
+/// CHECK: with an identical training budget, the prior-informed QNN's
+/// holdout AUC exceeds the flat-init QNN's by ≥ 0.03 on the pocket,
+/// and the prior itself came from the classical scan (frequencies
+/// within 0.25 of the planted (3.7, 5.1, 6.8) after sorting).
+pub fn arch_priors(transport_override: Transport) -> Result<Verdict, String> {
+    let guest = "omega_app";
+    let transport = resolve(transport_override, guest);
+    banner::header(
+        "arch_priors",
+        "classical periodogram statistics as QNN frequency priors on the sparse pocket",
+        &transport.label(guest),
+    );
+    let backend = StatevectorBackend::new();
+    let pocket = gen::sparse_pocket(N_SYNTH, SEED ^ 2);
+    let (tr, te) = split(&pocket.y, SEED ^ 51);
+    let (trx, try_) = (take(&pocket.phases, &tr), take1(&pocket.y, &tr));
+    let (tex, tey) = (take(&pocket.phases, &te), take1(&pocket.y, &te));
+
+    // The classical prior: supervised joint scan on the TRAIN split.
+    let scan = lanes::joint_basis(&trx, &try_);
+    println!(
+        "  classical joint scan (no quantum evaluations): features {:?}, \
+         f = ({:.2}, {:.2}, {:.2}), power {:.4}",
+        scan.triple, scan.freqs[0], scan.freqs[1], scan.freqs[2], scan.best_triple_power
+    );
+    // Per-feature prior vector: the scan frequency for each feature in
+    // the triple; features outside it (none here, d = 3) keep flat init.
+    let mut prior = vec![0.0f64; 3];
+    for (k, &feat) in scan.triple.iter().enumerate() {
+        prior[feat] = scan.freqs[k];
+    }
+    let mut sorted = scan.freqs;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let planted = [3.7, 5.1, 6.8];
+    let prior_close = sorted
+        .iter()
+        .zip(&planted)
+        .all(|(a, b)| (a - b).abs() <= 0.25);
+    if !prior_close {
+        println!("  FAIL: scan frequencies {sorted:?} not within 0.25 of planted {planted:?}");
+    }
+
+    // Identical training budget, same seed: flat vs prior-informed.
+    // Both lanes get the rich Z-string readout (weight ≤ 3 correlators —
+    // where joint harmonics live); ONLY the init differs.
+    let epochs = 25;
+    let mut flat = qnn::TabularQnn::new(3, SEED ^ 12, true)
+        .rich_readout()
+        .upload_blocks(1);
+    flat.fit(&backend, &trx, &try_, epochs, 0.05)?;
+    let auc_flat = lanes::auc(&flat.scores(&backend, &tex)?, &tey);
+    let mut informed = qnn::TabularQnn::with_freq_prior(3, SEED ^ 12, true, Some(&prior))
+        .rich_readout()
+        .upload_blocks(1);
+    informed.fit(&backend, &trx, &try_, epochs, 0.05)?;
+    let auc_prior = lanes::auc(&informed.scores(&backend, &tex)?, &tey);
+    println!(
+        "  holdout AUC: flat init = {auc_flat:.4}, periodogram-prior init = {auc_prior:.4} \
+         (identical {epochs}-epoch budget, same seed)"
+    );
+    let improved = auc_prior >= auc_flat + 0.03;
+    if !improved {
+        println!("  FAIL: prior init did not improve AUC by ≥ 0.03");
+    }
+    println!(
+        "  (context: the classical JOINT lane itself reaches ~0.90 here — the pocket is \
+         REFUSED territory regardless; this demo is about the *search signal*, not advantage.)"
+    );
+
+    Ok(Verdict {
+        name: "arch_priors".into(),
+        pass: prior_close && improved,
+        max_abs_diff: (auc_flat - auc_prior).max(0.0),
+        tol: 0.03,
+    })
+}

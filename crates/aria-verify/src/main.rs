@@ -34,6 +34,7 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("spectra", aria_app_spectra::run),
         ("arch_search", aria_app_spectra::arch_search),
         ("arch_evolve", aria_app_spectra::arch_evolve),
+        ("arch_priors", aria_app_spectra::arch_priors),
         ("qos", aria_app_qos::run),
         ("circulant", aria_app_circulant::run),
         ("cqs", aria_app_cqs::run),
