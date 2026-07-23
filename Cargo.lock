@@ -323,6 +323,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-app-spectra"
+version = "0.1.0"
+dependencies = [
+ "aria-verify-core",
+ "omega-backend-statevector",
+ "omega-core",
+ "smallvec",
+]
+
+[[package]]
 name = "aria-app-superdense"
 version = "0.1.0"
 dependencies = [
@@ -459,6 +469,7 @@ dependencies = [
  "aria-app-schrodingerize",
  "aria-app-shor",
  "aria-app-simon",
+ "aria-app-spectra",
  "aria-app-superdense",
  "aria-app-swap-test",
  "aria-app-taylor-lcu",

@@ -1,0 +1,83 @@
+-- SPDX-License-Identifier: Apache-2.0
+-- ▶ Application harness + classical cross-check: crates/apps/spectra/src/lib.rs
+--   run: cargo run -p aria-app-spectra   (or: cargo run -p aria-verify -- spectra)
+-- VERIFIED: forward ⟨Z_q⟩ profile vs the independent in-tree statevector oracle
+--   on the same lowered IR, |Δ| ≤ 1e-9; SPECTRA certification demo — refuses
+--   quantum advantage on open tabular data, certifies it on THIS quantum-
+--   generated substrate (Mancilla–Tagliani, arXiv:2607.15815 §6.3).
+--
+-- Disordered Heisenberg chain, first-order Trotter (the "dense-spectrum
+-- quantum substrate" of the Fourier-wall paper):
+--
+--     H(φ) = Σ_{k=1}^{6} J_k·(X_kX_{k+1} + Y_kY_{k+1} + Z_kZ_{k+1})
+--          + Σ_{i=1}^{7} φ_i·Z_i
+--
+-- from |+⟩^⊗7, evolved for T = 2.0 in `steps` first-order Trotter slices.
+-- The SAME circuit is both the dataset generator (J_k ~ U[0.5, 1.5] drawn
+-- once per seed, label = 1[⟨Σ Z_iZ_{i+1}⟩ > median]) and the dynamics-
+-- matched quantum lane (DMQ: J_k become the trainable symbols).
+--
+-- Decompositions (Qiskit convention, cf. trotter.aria):
+--   exp(-i·a·Z⊗Z) = CX · RZ(2a) · CX
+--   exp(-i·a·X⊗X) = (H⊗H) · CX · RZ(2a) · CX · (H⊗H)
+--   exp(-i·a·Y⊗Y) = (RX(π/2)⊗RX(π/2)) · CX · RZ(2a) · CX · (RX(-π/2)⊗RX(-π/2))
+--   exp(-i·φ·Z)   = RZ(2φ)
+-- The host binds jt[k] := J_k·dt and pt[i] := φ_i·dt (dt = T/steps), so every
+-- rotation angle below is 2·(bound symbol) — exact per-slice exponentials.
+--
+-- Layout:
+--   q[0..6]   the 7-site chain; bond k couples q[k], q[k+1]
+--
+-- Symbols: jt[0..5]  per-bond J_k·dt   (trainable in the DMQ lane)
+--          pt[0..6]  per-site φ_i·dt   (data, bound per sample)
+
+@assert unitary
+@bound qubits = 7
+
+circuit SpectraHeisenberg(steps: int) {
+    qreg q[7]
+
+    let jt = symbolic[6]
+    let pt = symbolic[7]
+
+    -- initial state |+⟩^⊗7
+    repeat i from 0 to 6 {
+        apply H on q[i]
+    }
+
+    repeat s from 0 to steps - 1 {
+        -- bond terms: XX, YY, ZZ on (k, k+1), angle 2·J_k·dt each
+        repeat k from 0 to 5 {
+            -- exp(-i·J·dt·X⊗X)
+            apply H on q[k]
+            apply H on q[k + 1]
+            apply CX on q[k], q[k + 1]
+            apply RZ(2 * jt[k]) on q[k + 1]
+            apply CX on q[k], q[k + 1]
+            apply H on q[k]
+            apply H on q[k + 1]
+            -- exp(-i·J·dt·Y⊗Y)
+            apply RX(pi / 2) on q[k]
+            apply RX(pi / 2) on q[k + 1]
+            apply CX on q[k], q[k + 1]
+            apply RZ(2 * jt[k]) on q[k + 1]
+            apply CX on q[k], q[k + 1]
+            apply RX(-pi / 2) on q[k]
+            apply RX(-pi / 2) on q[k + 1]
+            -- exp(-i·J·dt·Z⊗Z)
+            apply CX on q[k], q[k + 1]
+            apply RZ(2 * jt[k]) on q[k + 1]
+            apply CX on q[k], q[k + 1]
+        }
+        -- site fields: exp(-i·φ_i·dt·Z_i)
+        repeat i from 0 to 6 {
+            apply RZ(2 * pt[i]) on q[i]
+        }
+    }
+}
+
+-- Label observable: nearest-neighbour correlator Σ_k Z_k·Z_{k+1};
+-- the dataset label is its sign against the median.
+observable BondCorrelator {
+    1.0 * Z(0) Z(1) + 1.0 * Z(1) Z(2) + 1.0 * Z(2) Z(3) + 1.0 * Z(3) Z(4) + 1.0 * Z(4) Z(5) + 1.0 * Z(5) Z(6)
+}

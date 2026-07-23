@@ -31,6 +31,7 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("qml_classifier", aria_app_qml_classifier::run),
         ("butterfly_qnn", aria_app_butterfly_qnn::run),
         ("jl_sketch_digits", aria_app_jl_sketch_digits::run),
+        ("spectra", aria_app_spectra::run),
         ("qos", aria_app_qos::run),
         ("circulant", aria_app_circulant::run),
         ("cqs", aria_app_cqs::run),
