@@ -102,8 +102,25 @@ graph), recovers the disorder couplings to ≤ 0.2, and emits the
 discovered architecture as Aria source. The programmatic circuit builder
 is cross-checked against the lowered `spectra_heisenberg.aria` (Δ = 0).
 
-Remaining long-term sketch (butterfly-mask spaces, SPECTRA-prior search
-signals, evolutionary loops):
+**Also landed** (the three follow-ups):
+
+- `arch_evolve` — elitist evolutionary loop over layered RBS-mask
+  genomes (125-genome space) on the heart-imputation task; deterministic
+  with memoisation. The evolved [none | stride-4 | stride-2] BEATS the
+  hand-built butterfly (held-out MSE 0.383 vs 0.392) with fewer layers;
+  the no-entanglement ablation sits at 0.778.
+- `arch_priors` — SPECTRA's classical joint-periodogram scan (zero
+  quantum evaluations) recovers the pocket's planted frequencies and,
+  used as the QNN's frequency-prior init (with trainable phase offsets
+  and weight-≤3 Z-string readout), lifts holdout AUC 0.487 → 0.772
+  under an identical budget.
+- `spectra_scaling` — the substrate at 7…13 sites: |+⟩^⊗n invariant
+  exact at every size, DMQ-vs-classical gap persists (+0.19/+0.29/+0.18
+  at 7/9/11), and the measured classical-simulation cost fits
+  2^(1.15·n) — the paper's 2^(1.14·n) — with an illustrative crossover
+  extrapolation near n* ≈ 14 (paper: 13–19).
+
+Original long-term sketch (for reference):
 - **Search space**: layered placements of RBS / Rot / entangler gates with
   a connectivity mask per layer (butterfly = stride masks {n/2, …, 2, 1});
   Hamming-weight-preserving subspaces prunable analytically.
