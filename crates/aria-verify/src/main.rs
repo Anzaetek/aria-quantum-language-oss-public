@@ -33,6 +33,7 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("jl_sketch_digits", aria_app_jl_sketch_digits::run),
         ("spectra", aria_app_spectra::run),
         ("arch_search", aria_app_spectra::arch_search),
+        ("arch_evolve", aria_app_spectra::arch_evolve),
         ("qos", aria_app_qos::run),
         ("circulant", aria_app_circulant::run),
         ("cqs", aria_app_cqs::run),

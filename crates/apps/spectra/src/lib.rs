@@ -33,6 +33,7 @@
 //!   substrate certified.
 
 pub mod arch;
+pub mod evolve;
 mod gen;
 mod lanes;
 mod qnn;
@@ -747,5 +748,126 @@ pub fn arch_search(transport_override: Transport) -> Result<Verdict, String> {
         pass: builder_verdict.pass && chain_won && auc_ok && j_close,
         max_abs_diff: builder_verdict.max_abs_diff,
         tol: builder_verdict.tol,
+    })
+}
+
+/// arch_evolve — evolutionary search over layered RBS masks on the
+/// heart-imputation task (see `evolve.rs`).
+///
+/// CHECK: (a) determinism — re-evaluating the winning genome reproduces
+/// its fitness exactly; (b) expert parity — the evolved architecture's
+/// held-out MSE is within 0.02 of the hand-built butterfly genome
+/// evaluated under the identical protocol; (c) the winner is no worse
+/// than the no-entanglement ablation genome.
+pub fn arch_evolve(transport_override: Transport) -> Result<Verdict, String> {
+    let guest = "omega_app";
+    let transport = resolve(transport_override, guest);
+    banner::header(
+        "arch_evolve",
+        "evolutionary search over layered RBS connectivity masks vs the hand-built \
+         butterfly (UCI heart imputation)",
+        &transport.label(guest),
+    );
+    let backend = StatevectorBackend::new();
+
+    // Heart data, prepared exactly like the butterfly app: 8 features →
+    // standardized → atan angles; target thalach → tanh-squashed.
+    let rows = data::load_csv("heart_cleveland.csv")?;
+    let (means, stds) = data::column_stats(&rows);
+    let cols = [0usize, 1, 2, 3, 4, 6, 8, 9];
+    let target_col = 7;
+    let mut xs = Vec::new();
+    let mut ty = Vec::new();
+    for row in &rows {
+        let feats: Option<Vec<f64>> = cols.iter().map(|&c| row[c]).collect();
+        let (Some(feats), Some(target)) = (feats, row[target_col]) else {
+            continue;
+        };
+        xs.push(
+            cols.iter()
+                .zip(&feats)
+                .map(|(&c, &v)| ((v - means[c]) / stds[c]).atan())
+                .collect::<Vec<f64>>(),
+        );
+        ty.push(((target - means[target_col]) / stds[target_col]).tanh());
+    }
+    let n = xs.len();
+    let mut rng = SplitMix64(SEED ^ 0xE0);
+    let masked: Vec<bool> = (0..n).map(|_| rng.next_f64() < 0.30).collect();
+    let tr: Vec<usize> = (0..n).filter(|&i| !masked[i]).collect();
+    let te: Vec<usize> = (0..n).filter(|&i| masked[i]).collect();
+    let tr = &tr[..160.min(tr.len())]; // search budget cap (printed)
+    let (trx, try_) = (take(&xs, tr), take1(&ty, tr));
+    let (tex, tey) = (take(&xs, &te), take1(&ty, &te));
+    let (epochs, pop, gens) = (8, 8, 4);
+    println!(
+        "  budget: population {pop} × {gens} generations, {epochs} epochs each, \
+         {} train / {} holdout rows (seed {SEED})",
+        trx.len(),
+        tex.len()
+    );
+
+    // References evaluated under the identical protocol, outside the search.
+    let butterfly_mse = evolve::evaluate(
+        &evolve::BUTTERFLY_GENOME,
+        &backend,
+        &trx,
+        &try_,
+        &tex,
+        &tey,
+        epochs,
+        SEED,
+    )?;
+    let none_mse = evolve::evaluate(
+        &evolve::NONE_GENOME,
+        &backend,
+        &trx,
+        &try_,
+        &tex,
+        &tey,
+        epochs,
+        SEED,
+    )?;
+    println!(
+        "  references: hand-built butterfly [{}] MSE = {butterfly_mse:.5}; \
+         no-entanglement MSE = {none_mse:.5}",
+        evolve::genome_name(&evolve::BUTTERFLY_GENOME)
+    );
+
+    let (winner, fitness, cache) =
+        evolve::evolve(&backend, &trx, &try_, &tex, &tey, epochs, SEED, pop, gens)?;
+    println!(
+        "  EVOLVED: [{}] MSE = {fitness:.5} ({} unique genomes evaluated of {} in the space)",
+        evolve::genome_name(&winner),
+        cache.len(),
+        evolve::mask_menu().len().pow(evolve::LAYERS as u32)
+    );
+
+    // (a) determinism.
+    let re_eval = evolve::evaluate(&winner, &backend, &trx, &try_, &tex, &tey, epochs, SEED)?;
+    let deterministic = re_eval == fitness;
+    if !deterministic {
+        println!("  FAIL: winner re-evaluation {re_eval} ≠ cached {fitness}");
+    }
+    // (b) expert parity, (c) entanglement sanity.
+    let parity = fitness <= butterfly_mse + 0.02;
+    if !parity {
+        println!("  FAIL: evolved MSE {fitness:.5} worse than butterfly {butterfly_mse:.5} + 0.02");
+    }
+    let beats_none = fitness <= none_mse + 1e-9;
+    if !beats_none {
+        println!("  FAIL: evolved MSE {fitness:.5} worse than no-entanglement {none_mse:.5}");
+    }
+    println!(
+        "  verdict inputs: deterministic {deterministic}, expert parity {parity} \
+         (Δ = {:+.5}), ≥ ablation {beats_none}",
+        fitness - butterfly_mse
+    );
+
+    Ok(Verdict {
+        name: "arch_evolve".into(),
+        pass: deterministic && parity && beats_none,
+        max_abs_diff: (fitness - butterfly_mse).max(0.0),
+        tol: 0.02,
     })
 }
