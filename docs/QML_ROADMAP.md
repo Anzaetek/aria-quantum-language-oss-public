@@ -86,12 +86,24 @@ Original plan (for reference):
    repo an honest, reproducible "where advantage lives" example with the
    butterfly QNN as the quantum lane.
 
-## Long-term follow-up: quantum architecture search
+## Quantum architecture search — first increment landed
 
-Idea (user-proposed): given a dataset, *discover* circuit patterns like the
-butterfly independently instead of hand-picking them.
+Idea (user-proposed): given a dataset, *discover* circuit patterns
+independently instead of hand-picking them.
 
-Sketch:
+**Landed** (`aria_app_spectra::arch_search`, run:
+`cargo run -p aria-verify -- arch_search`): exhaustive search over five
+coupling graphs on 7 sites (chain / ring / star / stride-2 / disconnected
+pairs), each trained identically (per-bond couplings, adjoint + Adam,
+affine head) and scored on a holdout split with a parsimony penalty.
+Given ONLY the labelled Heisenberg-substrate data, the search selects the
+generator's CHAIN graph (holdout AUC 0.98 vs ≤ 0.65 for every wrong
+graph), recovers the disorder couplings to ≤ 0.2, and emits the
+discovered architecture as Aria source. The programmatic circuit builder
+is cross-checked against the lowered `spectra_heisenberg.aria` (Δ = 0).
+
+Remaining long-term sketch (butterfly-mask spaces, SPECTRA-prior search
+signals, evolutionary loops):
 - **Search space**: layered placements of RBS / Rot / entangler gates with
   a connectivity mask per layer (butterfly = stride masks {n/2, …, 2, 1});
   Hamming-weight-preserving subspaces prunable analytically.
