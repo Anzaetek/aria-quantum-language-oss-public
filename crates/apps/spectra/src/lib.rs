@@ -112,6 +112,28 @@ fn tier1_screen(ds: &Dataset, seed: u64) -> Option<String> {
         }
     }
     let rho_off = 1.0 - integer / total.max(1e-12);
+    // C3 advisory (near-independence): max |off-diagonal Pearson
+    // correlation| among the phase columns. The paper PCA-whitens the
+    // encoded block; we report the measured residual correlation so a
+    // correlated tabular set (heart) is visibly different from the
+    // independent synthetics.
+    let mut max_corr = 0.0f64;
+    for a in 0..d {
+        for b_ in (a + 1)..d {
+            let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            let m = ds.phases.len() as f64;
+            for p in &ds.phases {
+                sa += p[a] / m;
+                sb += p[b_] / m;
+                saa += p[a] * p[a] / m;
+                sbb += p[b_] * p[b_] / m;
+                sab += p[a] * p[b_] / m;
+            }
+            let cov = sab - sa * sb;
+            let den = ((saa - sa * sa) * (sbb - sb * sb)).sqrt().max(1e-12);
+            max_corr = max_corr.max((cov / den).abs());
+        }
+    }
     // g2: Fourier-GAM classifier vs chance on a held-out half.
     let (tr, te) = split(&ds.y, seed);
     let (trx, try_) = (take(&ds.phases, &tr), take1(&ds.y, &tr));
@@ -128,7 +150,7 @@ fn tier1_screen(ds: &Dataset, seed: u64) -> Option<String> {
     let gam_auc = auc(&scores, &tey);
     println!(
         "    tier-1[{}]: ρ_off = {rho_off:.3} (gate > 0.3), Fourier-GAM holdout AUC = \
-         {gam_auc:.3} (advisory), d = {d}",
+         {gam_auc:.3} (advisory), C3 max |corr| = {max_corr:.3} (advisory), d = {d}",
         ds.name
     );
     if rho_off <= 0.3 {
@@ -210,6 +232,15 @@ fn tier2_certify(
         joint_scan.freqs[1],
         joint_scan.freqs[2],
         joint_scan.best_triple_power
+    );
+    // C4 advisory (tree-breaking frequency): the joint coordinate
+    // u = Σ f_i·φ_i completes Σ|f_i| cycles across the phase cube, so an
+    // axis-aligned partitioner needs ≥ 2·Σ|f_i| cells PER FEATURE to
+    // tile it — compare with the stump budget actually granted below.
+    let joint_cycles: f64 = joint_scan.freqs.iter().map(|f| f.abs()).sum();
+    println!(
+        "    tier-2[{name}]: C4 advisory — joint coordinate oscillates ~{joint_cycles:.1} \
+         cycles vs a 150-stump axis-aligned budget",
     );
     let joint_w = logreg_fit(
         &train_x
@@ -422,7 +453,22 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
             let mut q = qnn::TabularQnn::new(trx[0].len(), SEED ^ 11, true);
             q.fit(&backend, &trx, &try_, 25, 0.05)?;
             let qs = q.scores(&backend, &tex)?;
-            let out = tier2_certify("heart", &trx, &try_, &tex, &tey, &qs, None, SEED ^ 21)?;
+            // ON−OFF ablation lane (entanglers removed, same budget) —
+            // the paper's mechanism gate applies to every certification
+            // decision, refusals included.
+            let mut q_off = qnn::TabularQnn::new(trx[0].len(), SEED ^ 11, false);
+            q_off.fit(&backend, &trx, &try_, 25, 0.05)?;
+            let offs = q_off.scores(&backend, &tex)?;
+            let out = tier2_certify(
+                "heart",
+                &trx,
+                &try_,
+                &tex,
+                &tey,
+                &qs,
+                Some(&offs),
+                SEED ^ 21,
+            )?;
             println!(
                 "    → {} at tier 2: {}",
                 if out.certified {
@@ -451,7 +497,19 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
             let mut q = qnn::TabularQnn::new(3, SEED ^ 12, true);
             q.fit(&backend, &trx, &try_, 25, 0.05)?;
             let qs = q.scores(&backend, &tex)?;
-            let out = tier2_certify("pocket", &trx, &try_, &tex, &tey, &qs, None, SEED ^ 22)?;
+            let mut q_off = qnn::TabularQnn::new(3, SEED ^ 12, false);
+            q_off.fit(&backend, &trx, &try_, 25, 0.05)?;
+            let offs = q_off.scores(&backend, &tex)?;
+            let out = tier2_certify(
+                "pocket",
+                &trx,
+                &try_,
+                &tex,
+                &tey,
+                &qs,
+                Some(&offs),
+                SEED ^ 22,
+            )?;
             println!(
                 "    → {} at tier 2: {}",
                 if out.certified {
