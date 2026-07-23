@@ -68,6 +68,9 @@ fi
 step "8/9  Application harnesses: quantum vs classical (aria-verify all)"
 # Runs every shipped example through the omega WASM runtime (in-process) and
 # asserts each matches its pure-Rust classical oracle within tolerance.
+# (For local iteration only: `ARIA_QML_QUICK=1 ./ci.sh` skips the minutes-long
+# QML search/training harnesses with a printed notice. CI runs the full set —
+# do not export the flag in automation.)
 cargo run -q -p aria-verify -- all
 
 step "9/9  Socket transport (omega-server over HTTP) — best effort"
