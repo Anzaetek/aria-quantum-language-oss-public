@@ -32,6 +32,7 @@
 //! CHECK: oracle Δ ≤ 1e-9 AND heart refused AND pocket refused AND
 //!   substrate certified.
 
+pub mod arch;
 mod gen;
 mod lanes;
 mod qnn;
@@ -551,5 +552,200 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
         pass,
         max_abs_diff: forward_verdict.max_abs_diff,
         tol: forward_verdict.tol,
+    })
+}
+
+/// arch_search — coupling-graph architecture search on the Heisenberg
+/// substrate (see `arch.rs` for the space and training).
+///
+/// CHECK: (a) the programmatic circuit builder reproduces the lowered
+/// spectra_heisenberg.aria on a probe row (|Δ| ≤ 1e-9); (b) the search,
+/// given only the labelled data, selects the generator's CHAIN graph
+/// under a parsimony-penalised score; (c) the winner's learned couplings
+/// approximate the true disorder draw (max |ΔJ| ≤ 0.2) and its holdout
+/// AUC ≥ 0.85.
+pub fn arch_search(transport_override: Transport) -> Result<Verdict, String> {
+    let guest = "omega_app";
+    let transport = resolve(transport_override, guest);
+    banner::header(
+        "arch_search",
+        "architecture search over coupling graphs: rediscover the Heisenberg chain \
+         from labelled data alone",
+        &transport.label(guest),
+    );
+    let backend = StatevectorBackend::new();
+    let lowered = harness::load_lowered(
+        "spectra_heisenberg.aria",
+        "SpectraHeisenberg",
+        &[("steps", TROTTER_STEPS)],
+    )?;
+    let jt_ids: Vec<u32> = (0..6)
+        .map(|k| {
+            lowered
+                .symbol_ids
+                .get(&format!("jt_{k}"))
+                .copied()
+                .ok_or(format!("missing jt_{k}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let pt_ids: Vec<u32> = (0..7)
+        .map(|i| {
+            lowered
+                .symbol_ids
+                .get(&format!("pt_{i}"))
+                .copied()
+                .ok_or(format!("missing pt_{i}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let dt = TOTAL_TIME / TROTTER_STEPS as f64;
+    let correlator =
+        Observable::parse("1.0*Z0Z1 + 1.0*Z1Z2 + 1.0*Z2Z3 + 1.0*Z3Z4 + 1.0*Z4Z5 + 1.0*Z5Z6")?;
+    let couplings = gen::heisenberg_couplings(SEED);
+
+    // (a) builder ≡ shipped example on a probe row.
+    let mut rng = SplitMix64(SEED ^ 0xA5C);
+    let probe: Vec<f64> = (0..7)
+        .map(|_| (rng.next_f64() * 2.0 - 1.0) * std::f64::consts::PI)
+        .collect();
+    let aria_val = gen::heisenberg_correlator(
+        &backend,
+        &lowered.ir,
+        &jt_ids,
+        &pt_ids,
+        &couplings,
+        dt,
+        &probe,
+        &correlator,
+    )?;
+    let chain = &arch::candidates()[0];
+    let (built_ir, bjt, bpt) = arch::build_ir(&chain.bonds, TROTTER_STEPS as usize);
+    let built_val = gen::heisenberg_correlator(
+        &backend,
+        &built_ir,
+        &bjt,
+        &bpt,
+        &couplings,
+        dt,
+        &probe,
+        &correlator,
+    )?;
+    let builder_verdict = banner::report_values(
+        "arch_search/builder",
+        "programmatic coupling-graph builder (chain)",
+        &[built_val],
+        "lowered spectra_heisenberg.aria",
+        &[aria_val],
+        1e-9,
+    );
+
+    // Dataset: the SAME substrate the spectra certificate uses.
+    let dense = gen::heisenberg(
+        N_SYNTH,
+        SEED ^ 4,
+        &backend,
+        &lowered.ir,
+        &jt_ids,
+        &pt_ids,
+        &couplings,
+        dt,
+        &correlator,
+    )?;
+    let (tr, te) = split(&dense.y, SEED ^ 41);
+    // Cheap-evaluation budget: 200 train rows, 10 epochs per candidate
+    // (printed — no silent caps).
+    let tr = &tr[..200.min(tr.len())];
+    let (trx, try_) = (take(&dense.phases, tr), take1(&dense.y, tr));
+    let (tex, tey) = (take(&dense.phases, &te), take1(&dense.y, &te));
+    println!(
+        "  search budget: {} candidates × 10 epochs on {} train rows; holdout {} rows",
+        arch::candidates().len(),
+        trx.len(),
+        tex.len()
+    );
+
+    // (b) exhaustive search with a parsimony penalty (0.005·bonds):
+    // a strict superset graph (ring ⊃ chain) can always match the chain
+    // by zeroing its extra bond, so ties break toward fewer parameters.
+    let mut results = Vec::new();
+    for cand in arch::candidates() {
+        let trained = arch::train_candidate(
+            &cand,
+            &backend,
+            TROTTER_STEPS as usize,
+            dt,
+            &correlator,
+            &trx,
+            &try_,
+            &tex,
+            &tey,
+            10,
+        )?;
+        println!(
+            "  candidate {:>8}: holdout AUC = {:.4}  (bonds: {}, penalised score {:.4})",
+            trained.name,
+            trained.auc,
+            trained.bonds.len(),
+            trained.auc - 0.005 * trained.bonds.len() as f64,
+        );
+        results.push(trained);
+    }
+    results.sort_by(|a, b| {
+        let sa = a.auc - 0.005 * a.bonds.len() as f64;
+        let sb = b.auc - 0.005 * b.bonds.len() as f64;
+        sb.partial_cmp(&sa).unwrap()
+    });
+    let winner = &results[0];
+    println!(
+        "  WINNER: '{}' — holdout AUC {:.4}, learned J = [{}] (true chain J = [{}])",
+        winner.name,
+        winner.auc,
+        winner
+            .couplings
+            .iter()
+            .map(|j| format!("{j:.3}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        couplings
+            .iter()
+            .map(|j| format!("{j:.3}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // (c) ground-truth checks.
+    let chain_won = winner.name == "chain";
+    let auc_ok = winner.auc >= 0.85;
+    let j_close = chain_won
+        && winner
+            .couplings
+            .iter()
+            .zip(&couplings)
+            .all(|(a, b)| (a - b).abs() <= 0.2);
+    if !chain_won {
+        println!(
+            "  FAIL: search selected '{}', not the generator's chain",
+            winner.name
+        );
+    }
+    if !auc_ok {
+        println!("  FAIL: winner AUC {:.4} < 0.85", winner.auc);
+    }
+    if chain_won && !j_close {
+        println!("  FAIL: learned couplings deviate > 0.2 from the true draw");
+    }
+
+    // The deliverable: the discovered architecture as Aria source.
+    let src = arch::to_aria_source(winner, TROTTER_STEPS as usize);
+    println!("\n  discovered architecture (Aria source, first lines):");
+    for line in src.lines().take(8) {
+        println!("    {line}");
+    }
+    println!("    … ({} lines total)", src.lines().count());
+
+    Ok(Verdict {
+        name: "arch_search".into(),
+        pass: builder_verdict.pass && chain_won && auc_ok && j_close,
+        max_abs_diff: builder_verdict.max_abs_diff,
+        tol: builder_verdict.tol,
     })
 }
