@@ -192,3 +192,92 @@ fn test_gradmethod_variant_routes_to_parallel() {
         assert!((via_enum[i].1 - ser[i].1).abs() < 1e-9);
     }
 }
+
+/// A Clifford readout layer after the trained block must NOT break the
+/// one-execution property: generators are conjugated through the
+/// suffix (i·[B·G_k·B†, H]) and the gradients still match serial
+/// parameter-shift exactly.
+#[test]
+fn test_parallel_conjugates_through_clifford_suffix() {
+    let backend = StatevectorBackend::new();
+    // Exercise every supported suffix gate, including the phase-carrying
+    // S/Sdg and the two-qubit entanglers.
+    let suffixes: Vec<Vec<GateOp>> = vec![
+        vec![gate(GateKind::H, &[0], &[]), gate(GateKind::H, &[2], &[])],
+        vec![gate(GateKind::S, &[1], &[]), gate(GateKind::Sdg, &[3], &[])],
+        vec![
+            gate(GateKind::CX, &[0, 3], &[]),
+            gate(GateKind::CZ, &[1, 2], &[]),
+        ],
+        vec![
+            gate(GateKind::Swap, &[0, 2], &[]),
+            gate(GateKind::Y, &[1], &[]),
+            gate(GateKind::S, &[2], &[]),
+            gate(GateKind::CX, &[2, 1], &[]),
+            gate(GateKind::H, &[3], &[]),
+        ],
+    ];
+    let obs = observable();
+    let params = bind();
+    for (case, suffix) in suffixes.into_iter().enumerate() {
+        let mut circuit = butterfly_circuit();
+        let n_suffix = suffix.len();
+        for op in suffix {
+            circuit.add_op(op);
+        }
+        let (par, report) =
+            parallel_parameter_shift_gradient(&backend, &circuit, &params, &obs, None).unwrap();
+        let ser = compute_gradient(
+            &backend,
+            &circuit,
+            &params,
+            &obs,
+            &GradMethod::ParameterShift,
+        )
+        .unwrap();
+        for i in 0..2 {
+            assert!(
+                (par[i].1 - ser[i].1).abs() < 1e-9,
+                "case {case}: parallel {} vs serial {} for symbol {}",
+                par[i].1,
+                ser[i].1,
+                par[i].0
+            );
+        }
+        assert_eq!(report.block_symbols, 2, "case {case}");
+        assert_eq!(
+            report.circuit_executions, 1,
+            "case {case}: still ONE execution"
+        );
+        assert_eq!(report.clifford_suffix_gates, n_suffix, "case {case}");
+    }
+}
+
+/// A non-Clifford trailing gate (T) ends the suffix scan — the block
+/// detection must fall back cleanly rather than mis-conjugate.
+#[test]
+fn test_non_clifford_suffix_falls_back() {
+    let backend = StatevectorBackend::new();
+    let mut circuit = butterfly_circuit();
+    circuit.add_op(gate(GateKind::T, &[0], &[]));
+    let obs = observable();
+    let params = bind();
+    let (par, report) =
+        parallel_parameter_shift_gradient(&backend, &circuit, &params, &obs, None).unwrap();
+    let ser = compute_gradient(
+        &backend,
+        &circuit,
+        &params,
+        &obs,
+        &GradMethod::ParameterShift,
+    )
+    .unwrap();
+    for i in 0..2 {
+        assert!((par[i].1 - ser[i].1).abs() < 1e-9);
+    }
+    // T is not a supported suffix gate: the symbols escape the block and
+    // take the serial path — correct, just not batched.
+    assert_eq!(report.block_symbols, 0);
+    assert_eq!(report.fallback_symbols, 2);
+    assert_eq!(report.clifford_suffix_gates, 0);
+}

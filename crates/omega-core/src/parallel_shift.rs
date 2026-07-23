@@ -161,16 +161,46 @@ struct BlockSlot {
     generator: Vec<(f64, PauliString)>,
 }
 
-/// Find the maximal trailing commuting block: scanning ops from the
-/// end, keep gates that (a) have a known Pauli-sum generator or are
-/// `Barrier`, and (b) act on qubits disjoint from every gate already
-/// in the block. The first op that violates either rule ends the scan.
-fn trailing_commuting_block(circuit: &CircuitIR) -> Vec<usize> {
-    let mut used_qubits: HashSet<u32> = HashSet::new();
+/// Is this gate a phase-tracked Clifford the suffix conjugation
+/// supports? (Non-parametric only; T and CCX end the scan.)
+fn is_suffix_clifford(gate: &GateKind) -> bool {
+    matches!(
+        gate,
+        GateKind::H
+            | GateKind::X
+            | GateKind::Y
+            | GateKind::Z
+            | GateKind::S
+            | GateKind::Sdg
+            | GateKind::CX
+            | GateKind::CZ
+            | GateKind::Swap
+    )
+}
+
+/// Find the maximal trailing structure `block ++ suffix`: an optional
+/// run of non-parametric Clifford gates at the very end (the readout /
+/// basis-change layer), preceded by the commuting block — parametric
+/// gates with known Pauli-sum generators and pairwise-disjoint
+/// supports. Returns `(block_indices, suffix_indices)`, both in
+/// circuit order. Gradients of block gates stay one-execution: the
+/// gradient observable is `i·[B·G_k·B†, H]` with the generator pushed
+/// forward through the Clifford suffix `B` to the measurement frame.
+fn trailing_commuting_block(circuit: &CircuitIR) -> (Vec<usize>, Vec<usize>) {
+    let mut suffix = Vec::new();
     let mut block = Vec::new();
+    let mut used_qubits: HashSet<u32> = HashSet::new();
+    let mut in_suffix = true;
     for (idx, op) in circuit.ops.iter().enumerate().rev() {
         if matches!(op.gate, GateKind::Barrier) {
             continue;
+        }
+        if in_suffix {
+            if is_suffix_clifford(&op.gate) {
+                suffix.push(idx);
+                continue;
+            }
+            in_suffix = false;
         }
         let qubits: Vec<u32> = op.qubits.iter().map(|q| q.0).collect();
         let has_generator = gate_generator(&op.gate, &qubits).is_some();
@@ -183,7 +213,142 @@ fn trailing_commuting_block(circuit: &CircuitIR) -> Vec<usize> {
         }
     }
     block.reverse();
-    block
+    suffix.reverse();
+    (block, suffix)
+}
+
+/// Image of a single X or Z factor on `q` under conjugation by one
+/// Clifford gate: `U · P_q · U†` as `(i-power, PauliString)`. Every
+/// entry is a textbook stabilizer-tableau rule; Y factors never appear
+/// here because callers decompose `Y = i·X·Z` first.
+fn factor_image(gate: &GateKind, qs: &[u32], q: u32, is_x: bool) -> (u8, PauliString) {
+    use PauliOp::*;
+    let touched = qs.contains(&q);
+    if !touched {
+        return (0, vec![(q, if is_x { X } else { Z })]);
+    }
+    match gate {
+        GateKind::H => (0, vec![(q, if is_x { Z } else { X })]),
+        // S: X → Y (exactly), Z → Z. Sdg: X → −Y, Z → Z.
+        GateKind::S if is_x => (0, vec![(q, Y)]),
+        GateKind::Sdg if is_x => (2, vec![(q, Y)]),
+        GateKind::S | GateKind::Sdg => (0, vec![(q, Z)]),
+        // Paulis flip anticommuting factors.
+        GateKind::X => (
+            if is_x { 0 } else { 2 },
+            vec![(q, if is_x { X } else { Z })],
+        ),
+        GateKind::Z => (
+            if is_x { 2 } else { 0 },
+            vec![(q, if is_x { X } else { Z })],
+        ),
+        GateKind::Y => (2, vec![(q, if is_x { X } else { Z })]),
+        GateKind::CX => {
+            let (c, t) = (qs[0], qs[1]);
+            match (q == c, is_x) {
+                (true, true) => (0, vec![(c, X), (t, X)]), // X_c → X_c X_t
+                (true, false) => (0, vec![(c, Z)]),        // Z_c → Z_c
+                (false, true) => (0, vec![(t, X)]),        // X_t → X_t
+                (false, false) => (0, vec![(c, Z), (t, Z)]), // Z_t → Z_c Z_t
+            }
+        }
+        GateKind::CZ => {
+            let (a, b) = (qs[0], qs[1]);
+            let other = if q == a { b } else { a };
+            if is_x {
+                // X_q → X_q Z_other
+                let mut s = vec![(q, X), (other, Z)];
+                s.sort_by_key(|&(qq, _)| qq);
+                (0, s)
+            } else {
+                (0, vec![(q, Z)])
+            }
+        }
+        GateKind::Swap => {
+            let (a, b) = (qs[0], qs[1]);
+            let dest = if q == a { b } else { a };
+            (0, vec![(dest, if is_x { X } else { Z })])
+        }
+        other => unreachable!("factor_image on non-suffix gate {other:?}"),
+    }
+}
+
+/// Conjugate a Pauli string through ONE Clifford gate: decompose each
+/// site into X/Z factors (`Y = i·X·Z`), map every factor, and multiply
+/// the images back together with the phase-exact [`pauli_mul`].
+/// Returns `(i-power, string)`; the i-power is even iff the input
+/// phase was even (Hermiticity is preserved), which the caller asserts.
+fn conjugate_through_gate(
+    phase: u8,
+    string: &PauliString,
+    gate: &GateKind,
+    qs: &[u32],
+) -> (u8, PauliString) {
+    let mut k = phase;
+    let mut acc: PauliString = Vec::new();
+    for &(q, p) in string {
+        let factors: Vec<(u8, PauliString)> = match p {
+            PauliOp::I => continue,
+            PauliOp::X => vec![factor_image(gate, qs, q, true)],
+            PauliOp::Z => vec![factor_image(gate, qs, q, false)],
+            PauliOp::Y => {
+                // Y = i·X·Z
+                k = (k + 1) % 4;
+                vec![
+                    factor_image(gate, qs, q, true),
+                    factor_image(gate, qs, q, false),
+                ]
+            }
+        };
+        for (fk, fs) in factors {
+            k = (k + fk) % 4;
+            let (mk, ms) = pauli_mul(&acc, &fs);
+            k = (k + mk) % 4;
+            acc = ms;
+        }
+    }
+    // Fold Y = i·X·Z back out: pauli_mul already emits Y with its phase
+    // absorbed, so `acc` is a plain Pauli string and `k` the residue.
+    (k, acc)
+}
+
+/// Conjugate a weighted Pauli-sum generator into the measurement frame:
+/// `G̃ = B·G·B†` for the suffix unitary `B = U_n···U_1` (circuit order) —
+/// the Schrödinger pushforward `∂f/∂θ = i·⟨ψ|[B·G·B†, H]|ψ⟩` at the
+/// full final state `|ψ⟩ = B·L·A|0⟩`. Conjugate by `U_1` (the first
+/// suffix gate) first. Direction pinned by a 1-qubit closed form
+/// (Ry(θ) + S suffix, H = Z: BGB† = −X/2 gives f' = −sin θ) AND by the
+/// parallel_shift_integration suffix tests against serial/FD — note the
+/// direction can only be tested against a Y-sign-correct backend; the
+/// odd-Y expectation bug this work uncovered made the opposite
+/// direction look right at first (see tests/pauli_y_expectation.rs).
+/// Phases must come back real (i^0 → +1, i^2 → −1); an odd residue
+/// would break Hermiticity and panics.
+fn conjugate_generator(
+    generator: &[(f64, PauliString)],
+    circuit: &CircuitIR,
+    suffix: &[usize],
+) -> Vec<(f64, PauliString)> {
+    generator
+        .iter()
+        .map(|(w, s)| {
+            let mut k: u8 = 0;
+            let mut string = s.clone();
+            for &idx in suffix {
+                let op = &circuit.ops[idx];
+                let qs: Vec<u32> = op.qubits.iter().map(|q| q.0).collect();
+                let (nk, ns) = conjugate_through_gate(k, &string, &op.gate, &qs);
+                k = nk;
+                string = ns;
+            }
+            let sign = match k {
+                0 => 1.0,
+                2 => -1.0,
+                _ => unreachable!("Clifford conjugation broke Hermiticity (i^{k})"),
+            };
+            (w * sign, string)
+        })
+        .collect()
 }
 
 /// What the parallel path did — for honest execution-count reporting.
@@ -200,6 +365,9 @@ pub struct ParallelShiftReport {
     pub circuit_executions: usize,
     /// Number of gates in the detected trailing commuting block.
     pub block_gates: usize,
+    /// Non-parametric Clifford gates after the block (the readout /
+    /// basis-change layer the generators were conjugated through).
+    pub clifford_suffix_gates: usize,
 }
 
 /// Gradient of `⟨H⟩` w.r.t. the given symbols (all free symbols when
@@ -224,17 +392,20 @@ pub fn parallel_parameter_shift_gradient(
         ));
     }
 
-    let block_indices = trailing_commuting_block(circuit);
+    let (block_indices, suffix_indices) = trailing_commuting_block(circuit);
     let block_set: HashSet<usize> = block_indices.iter().copied().collect();
 
     // Slots per block op (a block gate may have several params in
-    // principle; Rx/Ry/Rz/Rbs all have exactly one).
+    // principle; Rx/Ry/Rz/Rbs all have exactly one). Generators are
+    // conjugated through the trailing Clifford suffix so the gradient
+    // observables live at the measurement frame.
     let mut block_slots: Vec<BlockSlot> = Vec::new();
     for &op_idx in &block_indices {
         let op = &circuit.ops[op_idx];
         let qubits: Vec<u32> = op.qubits.iter().map(|q| q.0).collect();
         let generator =
             gate_generator(&op.gate, &qubits).expect("block membership implies a known generator");
+        let generator = conjugate_generator(&generator, circuit, &suffix_indices);
         for param_idx in 0..op.params.len() {
             block_slots.push(BlockSlot {
                 op_idx,
@@ -328,6 +499,7 @@ pub fn parallel_parameter_shift_gradient(
         fallback_symbols: fallback_syms.len(),
         circuit_executions: executions,
         block_gates: block_indices.len(),
+        clifford_suffix_gates: suffix_indices.len(),
     };
 
     let mut out: Vec<(SymbolId, f64)> = symbol_ids
@@ -414,8 +586,9 @@ mod tests {
         c.add_op(cx);
         c.add_op(op(GateKind::Rbs, &[0, 1]));
         c.add_op(op(GateKind::Rbs, &[2, 3]));
-        let block = trailing_commuting_block(&c);
+        let (block, suffix) = trailing_commuting_block(&c);
         assert_eq!(block, vec![2, 3]);
+        assert!(suffix.is_empty());
     }
 
     #[test]
@@ -430,7 +603,8 @@ mod tests {
         };
         c.add_op(op(GateKind::Rbs, &[0, 1]));
         c.add_op(op(GateKind::Rbs, &[1, 2])); // overlaps qubit 1
-        let block = trailing_commuting_block(&c);
+        let (block, suffix) = trailing_commuting_block(&c);
         assert_eq!(block, vec![1], "only the last gate fits the block");
+        assert!(suffix.is_empty());
     }
 }

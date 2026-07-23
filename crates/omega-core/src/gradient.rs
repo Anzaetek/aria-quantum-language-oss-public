@@ -913,7 +913,11 @@ fn expectation_from_sv(
                     }
                 }
             }
-            result += sv[i].conj() * c * sv[j];
+            // P|i> = c'·|j> with c' built from |i>'s bits: accumulate
+            // conj(sv[j])·c'·sv[i] (see the statevector backend's
+            // expectation_pauli — the flipped pairing negates odd-Y
+            // Pauli strings).
+            result += sv[j].conj() * c * sv[i];
         }
         total += coeff * result.re;
     }

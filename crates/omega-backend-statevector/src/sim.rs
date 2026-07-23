@@ -804,8 +804,15 @@ fn expectation_pauli(sv: &[Complex64], num_qubits: u32, pauli_string: &[(u32, Pa
             }
         }
 
-        // <i|P|i> contribution = conj(sv[i]) * coeff * sv[j]
-        result += sv[i].conj() * coeff * sv[j];
+        // P|i> = coeff * |j>, so the contribution to <psi|P|psi> is
+        // conj(sv[j]) * coeff * sv[i]. (Pairing the coefficient with
+        // conj(sv[i])·sv[j] instead silently NEGATES every Pauli string
+        // with an odd number of Y factors — Y's two matrix elements
+        // have opposite signs, so the i-based coefficient belongs to
+        // the bra side only after conjugation. Caught by the
+        // Clifford-suffix parallel-shift tests; pinned in
+        // tests/pauli_y_expectation.rs.)
+        result += sv[j].conj() * coeff * sv[i];
     }
 
     result.re
