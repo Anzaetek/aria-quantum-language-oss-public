@@ -736,7 +736,7 @@ fn expectation_pauli(sv: &[Complex64], num_qubits: u32, paulis: &[(u32, PauliOp)
     let i_unit = Complex64::new(0.0, 1.0);
 
     for basis in 0..dim {
-        let mut coeff = sv[basis].conj();
+        let mut phase = Complex64::new(1.0, 0.0);
         let mut target_basis = basis;
 
         for (q, op) in paulis {
@@ -751,20 +751,25 @@ fn expectation_pauli(sv: &[Complex64], num_qubits: u32, paulis: &[(u32, PauliOp)
                     target_basis ^= 1 << q;
                     // Y|0> = i|1>, Y|1> = -i|0>
                     if bit == 0 {
-                        coeff *= i_unit;
+                        phase *= i_unit;
                     } else {
-                        coeff *= -i_unit;
+                        phase *= -i_unit;
                     }
                 }
                 PauliOp::Z => {
                     if bit == 1 {
-                        coeff *= Complex64::new(-1.0, 0.0);
+                        phase *= Complex64::new(-1.0, 0.0);
                     }
                 }
             }
         }
 
-        result += coeff * sv[target_basis];
+        // P|basis> = phase * |target>, so the contribution to
+        // <psi|P|psi> is conj(sv[target]) * phase * sv[basis].
+        // (Pairing the basis-derived phase with conj(sv[basis]) instead
+        // negates every odd-Y Pauli string — mirrors the statevector
+        // backend's fix; pinned by tests below.)
+        result += sv[target_basis].conj() * phase * sv[basis];
     }
 
     result.re
