@@ -24,7 +24,13 @@ There are two kinds of run-gate oracle:
   full `⟨Z_q⟩` profile from the same lowered IR; the runtime must match it
   (Δ ≤ 2.2e-16 in practice). This catches lowering / execution regressions.
 
-## Status — 39 / 40 numerically verified, 1 showcase
+## Status — 48 harnesses numerically verified, 1 parse-only showcase
+
+One row per `aria-verify` harness (`cargo run -p aria-verify -- all` asserts
+every PASS); the four `arch_*`/`spectra_scaling` rows are search/scaling
+harnesses that reuse `spectra_heisenberg.aria` rather than shipping their own
+`.aria` file. Of the 43 `.aria` example files, 42 are run-verified and
+`shor_ecdlp` is the parse-only showcase.
 
 | Example | Gate | Oracle | What is checked |
 |---|---|---|---|
@@ -41,6 +47,7 @@ There are two kinds of run-gate oracle:
 | schrodingerize | run | classical | one warped-phase transport step: recovery Σ_{p≥0} w == e^{-a·Δp} (exact) |
 | qft | run | classical | output amplitudes == DFT image |
 | qsvd | run | classical | recovered singular values == Jacobi SVD |
+| vqe_ansatz | run | classical | hardware-efficient ansatz minimizes ⟨H₂⟩ to the exact ground energy E₀ |
 | grover3 | run | classical | marked-state probability after amplification |
 | bernstein_vazirani | run | classical | recovered hidden string == planted a |
 | deutsch_jozsa | run | classical | constant-vs-balanced verdict |
@@ -55,6 +62,14 @@ There are two kinds of run-gate oracle:
 | circulant | run | classical | DFT solve == independent Gaussian solve |
 | cqs | run | classical | Hadamard-test ⟨Z⟩ vs Pauli expectation |
 | noise | run | classical | channel fidelity floor vs analytic CPTP value |
+| qec_grover | run | classical | encoded 2-qubit Grover on Steane [[7,1,3]] finds the marked state exactly |
+| qec_qft | run | classical | logical-channel QFT satisfies the defining amplitude identities |
+| qec_qpe | run | classical | logical-channel QPE recovers the planted eigenphase exactly |
+| qec_memory | run | classical | surface-code memory Monte-Carlo matches seeded code-capacity statistics |
+| arch_search | run | classical | coupling-graph search selects the generator's chain; builder ≡ lowered spectra_heisenberg.aria; learned J within 0.2 of the true draw |
+| arch_evolve | run | classical | evolved RBS-mask genome ≤ hand-built butterfly MSE + 0.02, ≥ no-entanglement ablation; bit-exact re-evaluation |
+| arch_priors | run | classical | classical periodogram prior within 0.25 of the planted frequencies; prior-init QNN ≥ flat-init + 0.03 AUC |
+| spectra_scaling | run | classical | \|+⟩^⊗n invariant ≤ 1e-9 at n = 7…13; DMQ-vs-classical AUC gap ≥ 0.15 at every gap-checked size |
 | iqp_born | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
 | quantum_kernel | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
 | qcnn | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
