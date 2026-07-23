@@ -24,7 +24,7 @@ There are two kinds of run-gate oracle:
   full `⟨Z_q⟩` profile from the same lowered IR; the runtime must match it
   (Δ ≤ 2.2e-16 in practice). This catches lowering / execution regressions.
 
-## Status — 36 / 37 numerically verified, 1 showcase
+## Status — 39 / 40 numerically verified, 1 showcase
 
 | Example | Gate | Oracle | What is checked |
 |---|---|---|---|
@@ -50,6 +50,7 @@ There are two kinds of run-gate oracle:
 | qml_classifier | run | classical | accuracy vs ground-truth labels |
 | butterfly_qnn | run | classical | parallel commuting-block gradients (arXiv:2606.03517) == serial 4-term Givens shifts, \|Δ\| ≤ 1e-9; imputation MSE ≤ mean-imputer on UCI heart (open data, 30% MCAR) |
 | jl_sketch_digits | run | differential | forward ⟨Z_q⟩ profile vs independent statevector; optdigits 3-vs-8 accuracy ≥ 0.85 on quantum features (open data) |
+| spectra | run | classical | SPECTRA certificate (arXiv:2607.15815): heart + planted-term pocket REFUSED (order-matched classical panel wins), quantum-generated Heisenberg substrate CERTIFIED (bootstrap CI_lo > 0 + ablation gate); probe ⟨Z_q⟩ vs independent oracle ≤ 1e-9 |
 | qos | run | classical | sketch error scales as O(1/N²) |
 | circulant | run | classical | DFT solve == independent Gaussian solve |
 | cqs | run | classical | Hadamard-test ⟨Z⟩ vs Pauli expectation |

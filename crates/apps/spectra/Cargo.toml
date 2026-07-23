@@ -1,0 +1,18 @@
+# aria-app-spectra — application harness for the `spectra_heisenberg` Aria example.
+# SPECTRA two-tier quantum-advantage certification (Mancilla–Tagliani,
+# arXiv:2607.15815): refuses advantage on open tabular data, certifies it on the
+# quantum-generated disordered-Heisenberg substrate.
+# Run standalone: cargo run -p aria-app-spectra     (or: aria-verify spectra)
+[package]
+publish = false
+name = "aria-app-spectra"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SPECTRA certification: Fourier-wall screen + classical lane panel vs quantum lanes, refusing advantage on open data and certifying it on a quantum-generated substrate."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+omega-core = { path = "../../omega-core" }
+omega-backend-statevector = { path = "../../omega-backend-statevector" }
+smallvec = { workspace = true }

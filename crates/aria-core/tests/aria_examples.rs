@@ -60,6 +60,11 @@ const EXAMPLES: &[(&str, &str, &[(&str, i64)])] = &[
     ("simon.aria", "Simon", &[("n", 3)]),
     ("sketch_qml.aria", "SketchQml", &[("k", 4)]),
     (
+        "spectra_heisenberg.aria",
+        "SpectraHeisenberg",
+        &[("steps", 3)],
+    ),
+    (
         "strongly_entangling.aria",
         "StronglyEntangling",
         &[("n", 3), ("L", 2)],

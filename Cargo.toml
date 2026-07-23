@@ -64,6 +64,7 @@ members = [
     "crates/apps/qml-classifier",
     "crates/apps/butterfly-qnn",
     "crates/apps/jl-sketch-digits",
+    "crates/apps/spectra",
     "crates/apps/qos",
     "crates/apps/circulant",
     "crates/apps/cqs",

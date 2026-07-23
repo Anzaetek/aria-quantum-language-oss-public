@@ -28,7 +28,7 @@ Both dataset apps deliberately report classical baselines that match or beat
 the quantum lane. That is the expected outcome on open tabular/image data —
 see below.
 
-## Planned: Fourier-wall certification track (arXiv:2607.15815, Mancilla–Tagliani)
+## Landed: Fourier-wall certification track (arXiv:2607.15815, Mancilla–Tagliani)
 
 *Why quantum models don't beat classical baselines on public tabular data,
 and a certified recipe for where they can.* Angle-encoded QNNs are partial
@@ -37,7 +37,27 @@ Fourier series; genuine advantage needs the target to be simultaneously
 and non-enumerable** — the "Fourier wall". Neither UCI set above passes,
 which is exactly what our two apps observe empirically.
 
-Implementation plan (SPECTRA, two tiers):
+Implemented in `crates/apps/spectra` + `examples/aria/spectra_heisenberg.aria`
+(run: `cargo run -p aria-verify -- spectra`):
+
+- **Generators**: the §6.2 controlled sparse pocket (planted 3-way term at
+  f = (3.7, 5.1, 6.8)) and the §6.3 disordered-Heisenberg substrate — the
+  shipped Trotter circuit generates the labels AND doubles as the
+  dynamics-matched quantum lane (DMQ) with trainable couplings.
+- **Tier 1**: ρ_off off-grid ratio (> 0.3), advisory Fourier-GAM holdout
+  AUC, d ≤ 14 feasibility.
+- **Tier 2**: five classical lanes (LogReg, trained-frequency GAM, GA2M,
+  boosted stumps, order-matched JOINT with a two-stage supervised
+  periodogram scan) vs the quantum lane; certify iff paired-bootstrap
+  CI_lo(Δ AUC) > 0 AND the entanglement ON−OFF ablation gate passes.
+- **Verified outcomes** (the app's CHECK): UCI heart REFUSED (stumps
+  0.86 ≫ QNN 0.54), sparse pocket REFUSED (JOINT recovers the planted
+  frequencies and scores 0.90 while the QNN sits at 0.46 — the panel-
+  completeness calibration), Heisenberg substrate CERTIFIED (DMQ learns
+  the disorder couplings to ~0.05 and scores 0.99 vs 0.58 best
+  classical; CI_lo(Δ) = +0.34, ablation +0.48).
+
+Original plan (for reference):
 
 1. **Synthetic generators first** (highest value / effort ratio):
    - *Controlled sparse pocket* (paper §6.2): 3 whitened phases,
