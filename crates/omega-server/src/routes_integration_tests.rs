@@ -817,6 +817,59 @@ async fn quantum_execute_auto_picks_stabilizer_for_clifford_only() {
 }
 
 // --------------------------------------------------------------------
+// /v1/quantum/expectation — Pauli expectation over bound circuits
+// --------------------------------------------------------------------
+
+#[tokio::test]
+async fn quantum_expectation_batch_of_bound_circuits() {
+    // Two bound Ry(theta) circuits (a "batch of rows"); ⟨Z0⟩ = cos(theta).
+    // Confirms the HTTP path returns scalars, not a statevector.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let ry = |theta: f64| {
+        serde_json::json!({
+            "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "Ry", "qubits": [0], "params": [theta], "classical_bit": null, "condition": null}]
+        })
+    };
+    let body = serde_json::json!({
+        "circuits": [ry(0.0), ry(1.3)],
+        "observable": "Z0"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_body_json(resp.into_body()).await;
+    assert_eq!(v["backend"], "statevector");
+    let vals = v["values"].as_array().unwrap();
+    assert_eq!(vals.len(), 2);
+    assert!((vals[0].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert!((vals[1].as_f64().unwrap() - (1.3_f64).cos()).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn quantum_expectation_rejects_bad_observable() {
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+        },
+        "observable": "not a pauli"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// --------------------------------------------------------------------
 // /v1/lambdas/:id/invoke — full HTTP → registry → wasm-runtime path
 // --------------------------------------------------------------------
 

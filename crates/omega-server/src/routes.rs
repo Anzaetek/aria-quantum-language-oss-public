@@ -102,6 +102,12 @@ pub fn create_router(state: SharedState, ws_state: Option<WsSharedState>) -> Rou
             "/v1/quantum/execute",
             post(quantum_bridge::execute_quantum_route),
         )
+        // Expectation of a Pauli observable on one or many bound circuits —
+        // returns scalars so a remote client needn't pull the full statevector.
+        .route(
+            "/v1/quantum/expectation",
+            post(quantum_bridge::expectation_quantum_route),
+        )
         // MBQC one-way measurement patterns (C1.3): execute an OmegaPatternIR
         // on the photonic graph-state backend.
         .route(

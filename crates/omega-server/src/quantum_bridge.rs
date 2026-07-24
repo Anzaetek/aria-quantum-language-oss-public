@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, ParamExpr, Qubit};
-use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode};
+use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode, Observable};
 use omega_core::params::ParameterBinding;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -250,6 +250,39 @@ pub fn execute_quantum_ir(
     Ok((result, resolved))
 }
 
+/// Compute `⟨ψ|O|ψ⟩` of a Pauli observable on an `OmegaCircuitIR`, on the
+/// backend its `backend` field selects. Returns `(value, resolved_backend)`.
+/// This is the remote counterpart of a local `Backend::expectation` — it lets
+/// a client get a scalar back instead of pulling the full statevector and
+/// reducing it client-side. The photonic backend has no Pauli-expectation
+/// contract, so it is rejected with a clear error.
+pub fn expectation_quantum_ir(
+    ir: &OmegaCircuitIR,
+    observable: &Observable,
+) -> omega_core::error::Result<(f64, OmegaBackendSel)> {
+    let core = translate_to_core_ir(ir);
+    let binding = ParameterBinding::new();
+    let resolved = resolve_backend(ir);
+    let value = match &resolved {
+        OmegaBackendSel::Auto => unreachable!("resolve_backend never returns Auto"),
+        OmegaBackendSel::Statevector => omega_backend_statevector::StatevectorBackend::new()
+            .expectation(&core, &binding, observable)?,
+        OmegaBackendSel::Mps { max_bond_dim } => {
+            omega_backend_mps::MpsBackend::new(*max_bond_dim as usize)
+                .expectation(&core, &binding, observable)?
+        }
+        OmegaBackendSel::Stabilizer => {
+            omega_backend_pauli::PauliBackend::new().expectation(&core, &binding, observable)?
+        }
+        OmegaBackendSel::Photonic => {
+            return Err(omega_core::error::OmegaError::Unsupported(
+                "expectation is not defined on the photonic backend".into(),
+            ))
+        }
+    };
+    Ok((value, resolved))
+}
+
 /// Execute a Statevector circuit, routing to the OpenCL device when the
 /// server is built `--features opencl` AND `OMEGA_DEVICE=opencl` resolves
 /// to a usable OpenCL device. Falls back to the CPU statevector backend
@@ -445,6 +478,78 @@ pub async fn execute_pattern_route(
         .into_response()
 }
 
+#[derive(Deserialize)]
+pub struct QuantumExpectationReq {
+    /// A single bound circuit (its gate params are concrete).
+    #[serde(default)]
+    pub circuit: Option<OmegaCircuitIR>,
+    /// A batch of bound circuits — e.g. one per data row, each with its
+    /// features baked into the gate parameters. One value is returned per
+    /// circuit, in order.
+    #[serde(default)]
+    pub circuits: Option<Vec<OmegaCircuitIR>>,
+    /// Pauli-sum observable, e.g. `"Z0"` or `"0.5*X0 + Z1 Z2"`.
+    pub observable: String,
+}
+
+/// `POST /v1/quantum/expectation` — compute `⟨O⟩` of a Pauli observable on one
+/// bound circuit (`circuit`) or a batch of them (`circuits`, one value each).
+/// Returns scalars, so a remote QML client never has to pull the full
+/// statevector and reduce it locally. Requires the `EXECUTE` right.
+pub async fn expectation_quantum_route(
+    Extension(claims): Extension<TokenClaims>,
+    State(_state): State<SharedState>,
+    Json(req): Json<QuantumExpectationReq>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_rights(&claims, rights::EXECUTE) {
+        return resp;
+    }
+    let bad = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+
+    // Exactly one of `circuit` / `circuits`.
+    let circuits: Vec<OmegaCircuitIR> = match (req.circuit, req.circuits) {
+        (Some(c), None) => vec![c],
+        (None, Some(cs)) => cs,
+        (Some(_), Some(_)) => return bad("provide either `circuit` or `circuits`, not both".into()),
+        (None, None) => return bad("provide `circuit` or `circuits`".into()),
+    };
+    if circuits.is_empty() {
+        return bad("`circuits` is empty".into());
+    }
+    let observable = match Observable::parse(&req.observable) {
+        Ok(o) => o,
+        Err(e) => return bad(format!("bad observable '{}': {e}", req.observable)),
+    };
+
+    let mut values = Vec::with_capacity(circuits.len());
+    let mut backend: Option<String> = None;
+    for (i, ir) in circuits.iter().enumerate() {
+        match expectation_quantum_ir(ir, &observable) {
+            Ok((v, resolved)) => {
+                if backend.is_none() {
+                    backend = Some(backend_name(&resolved));
+                }
+                values.push(v);
+            }
+            Err(e) => return bad(format!("circuit[{i}]: {e}")),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "backend": backend.unwrap_or_else(|| "statevector".to_string()),
+            "values": values,
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +580,24 @@ mod tests {
         }
     }
 
+    /// Single-qubit `Ry(theta)` circuit (params baked in — the wire form).
+    fn ry_ir(theta: f64, backend: OmegaBackendSel) -> OmegaCircuitIR {
+        OmegaCircuitIR {
+            num_qubits: 1,
+            num_classical_bits: 0,
+            is_photonic: false,
+            mid_circuit_mode: OmegaMidCircuitMode::Skip,
+            backend,
+            ops: vec![OmegaGateOp {
+                gate: OmegaGateKind::Ry,
+                qubits: vec![0],
+                params: vec![theta],
+                classical_bit: None,
+                condition: None,
+            }],
+        }
+    }
+
     #[test]
     fn translate_preserves_shape() {
         let ir = bell_ir(OmegaBackendSel::Statevector);
@@ -482,6 +605,49 @@ mod tests {
         assert_eq!(core.num_qubits, 2);
         assert_eq!(core.ops.len(), 2);
         assert!(matches!(core.circuit_type, CircuitType::GateBased));
+    }
+
+    #[test]
+    fn expectation_bell_zz_is_one() {
+        let ir = bell_ir(OmegaBackendSel::Statevector);
+        let obs = Observable::parse("Z0 Z1").unwrap();
+        let (v, sel) = expectation_quantum_ir(&ir, &obs).unwrap();
+        assert!((v - 1.0).abs() < 1e-12, "⟨Z0 Z1⟩ on Bell = {v}");
+        assert_eq!(sel, OmegaBackendSel::Statevector);
+    }
+
+    #[test]
+    fn expectation_ry_batch_matches_cos() {
+        // Each "row" is a bound Ry(theta) circuit; ⟨Z0⟩ = cos(theta). This is
+        // the batch shape a remote QML client sends (one circuit per row).
+        let obs = Observable::parse("Z0").unwrap();
+        for theta in [0.0, 0.5, 1.3, std::f64::consts::PI] {
+            let (v, _) =
+                expectation_quantum_ir(&ry_ir(theta, OmegaBackendSel::Statevector), &obs).unwrap();
+            assert!((v - theta.cos()).abs() < 1e-12, "θ={theta}: {v} != cos");
+        }
+    }
+
+    #[test]
+    fn expectation_matches_across_backends() {
+        // MPS (χ high enough) and statevector agree on the same circuit.
+        let obs = Observable::parse("Z0").unwrap();
+        let sv = expectation_quantum_ir(&ry_ir(0.9, OmegaBackendSel::Statevector), &obs)
+            .unwrap()
+            .0;
+        let mps =
+            expectation_quantum_ir(&ry_ir(0.9, OmegaBackendSel::Mps { max_bond_dim: 8 }), &obs)
+                .unwrap()
+                .0;
+        assert!((sv - mps).abs() < 1e-12, "sv {sv} vs mps {mps}");
+    }
+
+    #[test]
+    fn expectation_photonic_is_rejected() {
+        let obs = Observable::parse("Z0").unwrap();
+        let mut ir = ry_ir(0.5, OmegaBackendSel::Photonic);
+        ir.is_photonic = true;
+        assert!(expectation_quantum_ir(&ir, &obs).is_err());
     }
 
     #[test]
