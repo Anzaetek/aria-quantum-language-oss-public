@@ -167,11 +167,25 @@ by hand. Two batch reads amortise work across a whole dataset:
 - Or embed the source and go through `parse_aria` directly, as in the top
   snippet (`include_str!("my_circuit.aria")`).
 
-## Exporting a trained model
+## Saving and reloading a trained model
 
-`aria_core::ast::qasm::to_qasm(&circuit)` returns OPENQASM 2.0 for a circuit
-with concrete parameters — bind your trained weights back into the AST and
-export, and "the trained model is a circuit you can read" holds literally.
+`aria_runtime::TrainedModel` is a self-contained JSON artefact: it embeds the
+`.aria` source, circuit name, template params, feature-prefix/readout/loss
+convention, the weight names paired with their trained values, and the affine
+head. `TrainedModel::from_result(..)` builds one from a `SupervisedResult`;
+`save(path)` / `load(path)` persist it; `predict(&x, backend)` re-lowers the
+embedded circuit, validates the saved weights against its symbols, and scores a
+feature matrix — reproducing the training-time scores to f64-JSON precision with
+no external file needed. From the CLI:
+
+```console
+$ aria train model.aria --circuit C --data X.csv --labels y.csv --loss bce --save-model m.json
+$ aria predict m.json --data X.csv --out scores.csv
+```
+
+`aria_core::ast::qasm::to_qasm(&circuit)` additionally returns OPENQASM 2.0 for a
+circuit with concrete parameters — bind your trained weights back into the AST
+and export, and "the trained model is a circuit you can read" holds literally.
 
 ## See also
 

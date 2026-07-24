@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         "parse" => cmd_parse(rest),
         "run" => cmd_run(rest),
         "train" => cmd_train(rest),
+        "predict" => cmd_predict(rest),
         "export" => cmd_export(rest),
         "-h" | "--help" | "help" | "" => {
             usage();
@@ -56,7 +57,8 @@ fn usage() {
          [--url URL --token TOK   (for --backend remote)]\n  \
          aria train  <file.aria> --circuit NAME --observable OBS [--int k=v]...\n              \
          [--steps N] [--lr R] [--seed S] [--init-scale S] [--opt gd|adam] [--freeze a,b] [--grad adjoint|shift|parallel]\n              \
-         (supervised: --data X.csv [--labels y.csv] [--loss mse|bce] [--feature-prefix x]  → fit a labelled dataset)\n  \
+         (supervised: --data X.csv [--labels y.csv] [--loss mse|bce] [--feature-prefix x] [--save-model m.json]  → fit a labelled dataset)\n  \
+         aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]\n  \
          aria export <file.aria> --circuit NAME (--qasm | --json | --lean | --gate-model) [--int k=v]...\n"
     );
 }
@@ -630,6 +632,55 @@ fn cmd_train_supervised(
     println!("trained weights:");
     for (k, v) in weights {
         println!("  {k} = {v:.6}");
+    }
+
+    // Optionally save a self-contained trained-model JSON.
+    if let Some(model_path) = a.opt("save-model") {
+        let model = aria_runtime::TrainedModel::from_result(
+            src,
+            name.to_string(),
+            ints.to_vec(),
+            cfg.feature_prefix.clone(),
+            obs.to_string(),
+            cfg.loss,
+            &result,
+            cfg.seed,
+            cfg.steps,
+        );
+        model.save(model_path)?;
+        println!("saved model : {model_path}");
+    }
+    Ok(())
+}
+
+/// `aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]` —
+/// score a feature matrix with a saved trained model.
+fn cmd_predict(raw: &[String]) -> Result<(), String> {
+    let a = parse_args(raw, &[])?;
+    let model_path = a.first_positional("<model.json>")?;
+    let data_path = a
+        .opt("data")
+        .ok_or("predict requires --data X.csv (the feature matrix)")?;
+    let sel = BackendSel::parse(a.opt("backend").unwrap_or("sim"))?;
+
+    let model = aria_runtime::TrainedModel::load(model_path)?;
+    let x = read_numeric_csv(data_path)?;
+    let scores = model.predict(&x, sel)?;
+
+    match a.opt("out") {
+        Some(out) => {
+            let mut s = String::from("score\n");
+            for v in &scores {
+                s.push_str(&format!("{v:.10}\n"));
+            }
+            std::fs::write(out, s).map_err(|e| format!("write {out}: {e}"))?;
+            println!("wrote {} scores to {out}", scores.len());
+        }
+        None => {
+            for v in &scores {
+                println!("{v:.10}");
+            }
+        }
     }
     Ok(())
 }
