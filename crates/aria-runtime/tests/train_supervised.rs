@@ -239,10 +239,19 @@ fn heart_dataset_smoke_reaches_reasonable_auc() {
         optimizer: Optimizer::adam(),
         ..Default::default()
     };
+    let t0 = std::time::Instant::now();
     let r = train_supervised(&heart_model(), &x, &y, "Z0", &cfg, BackendSel::Sim).unwrap();
+    let secs = t0.elapsed().as_secs_f64();
+    // Throughput = rows × steps adjoint passes over the wall-clock — the
+    // row-parallel batch path is what keeps this in a few seconds.
+    let row_passes = (x.len() * cfg.steps) as f64;
     println!(
-        "  heart smoke: final BCE loss {:.4}, train AUC {:.3}",
-        r.final_loss, r.final_auc
+        "  heart smoke: final BCE loss {:.4}, train AUC {:.3}, {:.0} row-gradient passes in \
+         {secs:.2}s ({:.0}/s, row-batched)",
+        r.final_loss,
+        r.final_auc,
+        row_passes,
+        row_passes / secs,
     );
     assert!(
         r.final_auc >= 0.80,

@@ -211,6 +211,39 @@ impl Backend for StatevectorBackend {
             circuit, params, observable,
         )?))
     }
+
+    /// Row-parallel expectation over bindings. Each row is an independent
+    /// forward sweep with no shared mutable state, so we `par_iter` and
+    /// `collect` — rayon's collect is index-preserving, so the result is
+    /// identical (bit-for-bit) to the sequential default regardless of the
+    /// thread count.
+    fn expectation_batch(
+        &self,
+        circuit: &CircuitIR,
+        bindings: &[&ParameterBinding],
+        observable: &Observable,
+    ) -> Result<Vec<f64>> {
+        use rayon::prelude::*;
+        bindings
+            .par_iter()
+            .map(|b| self.expectation(circuit, b, observable))
+            .collect()
+    }
+
+    /// Row-parallel adjoint gradients over bindings — the throughput lever for
+    /// supervised training (one adjoint pass per data row). Index-preserving.
+    fn adjoint_gradient_batch(
+        &self,
+        circuit: &CircuitIR,
+        bindings: &[&ParameterBinding],
+        observable: &Observable,
+    ) -> Result<Vec<AdjointGradient>> {
+        use rayon::prelude::*;
+        bindings
+            .par_iter()
+            .map(|b| self.adjoint_gradient(circuit, b, observable))
+            .collect()
+    }
 }
 
 impl NoisyStatevectorBackend {
