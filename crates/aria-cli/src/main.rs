@@ -55,7 +55,8 @@ fn usage() {
           [--truncate C] [--max-weight W] [--max-freq F])\n              \
          [--url URL --token TOK   (for --backend remote)]\n  \
          aria train  <file.aria> --circuit NAME --observable OBS [--int k=v]...\n              \
-         [--steps N] [--lr R] [--seed S] [--init-scale S]\n  \
+         [--steps N] [--lr R] [--seed S] [--init-scale S] [--opt gd|adam] [--freeze a,b] [--grad adjoint|shift|parallel]\n              \
+         (supervised: --data X.csv [--labels y.csv] [--loss mse|bce] [--feature-prefix x]  → fit a labelled dataset)\n  \
          aria export <file.aria> --circuit NAME (--qasm | --json | --lean | --gate-model) [--int k=v]...\n"
     );
 }
@@ -380,15 +381,52 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Read a headered-or-not numeric CSV into rows of f64. A leading line whose
+/// first cell is non-numeric is treated as a header and skipped.
+fn read_numeric_csv(path: &str) -> Result<Vec<Vec<f64>>, String> {
+    let text = read_source(path)?;
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let cells: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
+        // Skip a header row (first line, first cell not a number).
+        if lineno == 0 && cells[0].parse::<f64>().is_err() {
+            continue;
+        }
+        let row: Vec<f64> = cells
+            .iter()
+            .map(|c| {
+                c.parse::<f64>()
+                    .map_err(|_| format!("{path}:{}: '{c}' is not a number", lineno + 1))
+            })
+            .collect::<Result<_, _>>()?;
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return Err(format!("{path}: no numeric rows"));
+    }
+    Ok(rows)
+}
+
 fn cmd_train(raw: &[String]) -> Result<(), String> {
     let a = parse_args(raw, &[])?;
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("train requires --circuit NAME")?;
+    let ints = parse_kv_i64(a.all("int").into_iter())?;
+    let sel = BackendSel::parse(a.opt("backend").unwrap_or("sim"))?;
+
+    // Supervised dataset training: `aria train f.aria --circuit C --data X.csv
+    // --labels y.csv --observable Z0 [--loss bce] [--feature-prefix x]`.
+    if a.opt("data").is_some() {
+        return cmd_train_supervised(&a, path, name, &ints, sel);
+    }
+
     let obs = a
         .opt("observable")
         .ok_or("train requires --observable OBS (e.g. \"Z0\" or a Pauli sum)")?;
-    let ints = parse_kv_i64(a.all("int").into_iter())?;
-    let sel = BackendSel::parse(a.opt("backend").unwrap_or("sim"))?;
 
     let mut cfg = TrainConfig::default();
     if let Some(v) = a.opt("steps") {
@@ -459,6 +497,138 @@ fn cmd_train(raw: &[String]) -> Result<(), String> {
     params.sort_by(|x, y| x.0.cmp(y.0));
     println!("trained parameters:");
     for (k, v) in params {
+        println!("  {k} = {v:.6}");
+    }
+    Ok(())
+}
+
+/// Supervised dataset-training path (`aria train --data`). Reads a feature
+/// matrix and a labels column, fits the circuit's weights with the chosen
+/// loss, and prints loss/AUC plus the trained weights.
+fn cmd_train_supervised(
+    a: &Args,
+    path: &str,
+    name: &str,
+    ints: &[(String, i64)],
+    sel: BackendSel,
+) -> Result<(), String> {
+    use aria_runtime::{train_supervised, Loss, Optimizer, SupervisedConfig};
+
+    let data_path = a.opt("data").expect("checked by caller");
+    let obs = a
+        .opt("observable")
+        .ok_or("supervised train requires --observable OBS (the readout, e.g. \"Z0\")")?;
+
+    let train_x = read_numeric_csv(data_path)?;
+    // Labels: a separate --labels file (column 0), else the LAST column of
+    // --data. Both are common; be explicit about which was used.
+    let (train_x, train_y): (Vec<Vec<f64>>, Vec<f64>) = match a.opt("labels") {
+        Some(lp) => {
+            let ly = read_numeric_csv(lp)?;
+            if ly.len() != train_x.len() {
+                return Err(format!(
+                    "--data has {} rows but --labels has {}",
+                    train_x.len(),
+                    ly.len()
+                ));
+            }
+            let y = ly.iter().map(|r| r[0]).collect();
+            (train_x, y)
+        }
+        None => {
+            let mut xs = train_x;
+            let mut ys = Vec::with_capacity(xs.len());
+            for row in &mut xs {
+                ys.push(row.pop().ok_or("empty --data row")?);
+            }
+            eprintln!("note: no --labels file; using the last column of --data as the label");
+            (xs, ys)
+        }
+    };
+
+    let mut cfg = SupervisedConfig {
+        loss: match a.opt("loss") {
+            Some(s) => Loss::parse(s)?,
+            None => Loss::Mse,
+        },
+        ..Default::default()
+    };
+    if let Some(v) = a.opt("feature-prefix") {
+        cfg.feature_prefix = v.to_string();
+    }
+    if let Some(v) = a.opt("steps") {
+        cfg.steps = v.parse().map_err(|_| format!("bad --steps '{v}'"))?;
+    }
+    if let Some(v) = a.opt("lr") {
+        cfg.lr = v.parse().map_err(|_| format!("bad --lr '{v}'"))?;
+    }
+    if let Some(v) = a.opt("seed") {
+        cfg.seed = v.parse().map_err(|_| format!("bad --seed '{v}'"))?;
+    }
+    if let Some(v) = a.opt("init-scale") {
+        cfg.init_scale = v.parse().map_err(|_| format!("bad --init-scale '{v}'"))?;
+    }
+    for v in a.all("freeze") {
+        cfg.frozen
+            .extend(v.split(',').map(|s| s.trim().to_string()));
+    }
+    if let Some(v) = a.opt("opt") {
+        cfg.optimizer = match v {
+            "gd" => Optimizer::Gd,
+            "adam" => Optimizer::adam(),
+            other => return Err(format!("unknown --opt '{other}' (gd | adam)")),
+        };
+    }
+    if let Some(v) = a.opt("grad") {
+        cfg.grad_method = match v {
+            "adjoint" => omega_core::gradient::GradMethod::Adjoint,
+            "shift" => omega_core::gradient::GradMethod::ParameterShift,
+            "parallel" => omega_core::gradient::GradMethod::ParallelParameterShift,
+            other => {
+                return Err(format!(
+                    "unknown --grad '{other}' (adjoint | shift | parallel)"
+                ))
+            }
+        };
+    }
+
+    let src = read_source(path)?;
+    let circuit = instantiate(&src, name, ints)?;
+    let result = train_supervised(&circuit, &train_x, &train_y, obs, &cfg, sel)?;
+
+    let loss_name = match cfg.loss {
+        Loss::Mse => "mse",
+        Loss::Bce => "bce",
+    };
+    println!(
+        "dataset    : {} rows × {} features",
+        train_x.len(),
+        train_x[0].len()
+    );
+    println!(
+        "readout    : {obs}   loss: {loss_name}   backend: {}",
+        sel.name()
+    );
+    println!(
+        "steps      : {}  (lr {}, seed {}, feature-prefix '{}')",
+        cfg.steps, cfg.lr, cfg.seed, cfg.feature_prefix
+    );
+    let initial = result
+        .loss_history
+        .first()
+        .copied()
+        .unwrap_or(result.final_loss);
+    println!("initial loss: {initial:.6}");
+    println!("final   loss: {:.6}", result.final_loss);
+    println!("train AUC   : {:.4}", result.final_auc);
+    println!(
+        "affine head : (s = {:.4}, b = {:.4})",
+        result.head.0, result.head.1
+    );
+    let mut weights: Vec<(&String, &f64)> = result.weights.iter().collect();
+    weights.sort_by(|x, y| x.0.cmp(y.0));
+    println!("trained weights:");
+    for (k, v) in weights {
         println!("  {k} = {v:.6}");
     }
     Ok(())

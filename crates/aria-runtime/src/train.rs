@@ -77,10 +77,11 @@ pub struct TrainResult {
     pub final_value: f64,
 }
 
-/// Deterministic SplitMix64 → uniform f64 in `[-scale, scale]`.
-struct SplitMix64(u64);
+/// Deterministic SplitMix64 → uniform f64 in `[0, 1)`. Shared with the
+/// supervised trainer so seeded runs are reproducible across both.
+pub(crate) struct SplitMix64(pub(crate) u64);
 impl SplitMix64 {
-    fn next_f64(&mut self) -> f64 {
+    pub(crate) fn next_f64(&mut self) -> f64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
