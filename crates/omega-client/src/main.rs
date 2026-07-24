@@ -178,6 +178,10 @@ fn print_usage() {
     eprintln!("  lambdas delete ID");
     eprintln!("  lambdas invoke ID [--input JSON | --input-file PATH]");
     eprintln!("  invocation get ID                     GET /v1/invocations/:id");
+    eprintln!(
+        "  quantum execute FILE                  POST /v1/quantum/execute (FILE = JSON body)"
+    );
+    eprintln!("  quantum expectation FILE              POST /v1/quantum/expectation (⟨O⟩ scalars)");
     eprintln!("  raw METHOD PATH [--data JSON]         escape hatch");
     eprintln!();
     eprintln!("ENV:");
@@ -203,6 +207,7 @@ fn dispatch(opts: &Opts, cmd: &[String]) -> Result<(), String> {
         "functions" => cmd_functions(opts, tail),
         "lambdas" => cmd_lambdas(opts, tail),
         "invocation" => cmd_invocation(opts, tail),
+        "quantum" => cmd_quantum(opts, tail),
         "raw" => cmd_raw(opts, tail),
         other => Err(format!("unknown command: {}", other)),
     }
@@ -338,6 +343,35 @@ fn cmd_lambdas(opts: &Opts, args: &[String]) -> Result<(), String> {
             run_request(opts, "POST", &format!("/v1/lambdas/{}/invoke", id), body)
         }
         _ => Err("lambdas: expected register|list|get|delete|invoke".to_string()),
+    }
+}
+
+/// `quantum execute|expectation FILE` — POST a quantum-core wire-IR request
+/// body (JSON in FILE) to the matching endpoint. `execute` returns counts /
+/// statevector; `expectation` returns scalar `⟨O⟩` values (one per bound
+/// circuit) — so a remote client gets numbers back, not a full statevector.
+fn cmd_quantum(opts: &Opts, args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let read_body = |what: &str| -> Result<String, String> {
+        let file = args
+            .get(1)
+            .ok_or_else(|| format!("quantum {what}: missing FILE (JSON request body)"))?;
+        std::fs::read_to_string(file).map_err(|e| format!("read {}: {}", file, e))
+    };
+    match sub {
+        "execute" => run_request(
+            opts,
+            "POST",
+            "/v1/quantum/execute",
+            Some(read_body("execute")?),
+        ),
+        "expectation" => run_request(
+            opts,
+            "POST",
+            "/v1/quantum/expectation",
+            Some(read_body("expectation")?),
+        ),
+        _ => Err("quantum: expected execute|expectation".to_string()),
     }
 }
 
@@ -546,6 +580,36 @@ fn print_response(status: u16, body: &[u8], raw: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- quantum subcommand (offline: only the pre-request error branches) ----
+
+    fn test_opts() -> Opts {
+        Opts {
+            server: DEFAULT_SERVER.to_string(),
+            token: None,
+            raw: false,
+            show_help: false,
+            command: None,
+        }
+    }
+
+    #[test]
+    fn quantum_unknown_subcommand_errors() {
+        let err = cmd_quantum(&test_opts(), &["bogus".to_string()]).unwrap_err();
+        assert!(err.contains("expected execute|expectation"), "{err}");
+    }
+
+    #[test]
+    fn quantum_expectation_missing_file_errors() {
+        let err = cmd_quantum(&test_opts(), &["expectation".to_string()]).unwrap_err();
+        assert!(err.contains("missing FILE"), "{err}");
+    }
+
+    #[test]
+    fn quantum_execute_missing_file_errors() {
+        let err = cmd_quantum(&test_opts(), &["execute".to_string()]).unwrap_err();
+        assert!(err.contains("missing FILE"), "{err}");
+    }
 
     // ---- parse_server ----
 
