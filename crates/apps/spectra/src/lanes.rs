@@ -446,6 +446,34 @@ mod tests {
         assert!(auc(&scores, &y) > 0.99);
     }
 
+    // The certify/refuse decision itself: CI_lo(Δ) > 0 is the gate. Pin the
+    // three regimes so a regression in the bootstrap can't silently flip a
+    // verdict.
+    #[test]
+    fn bootstrap_ci_lo_is_positive_only_when_a_truly_dominates() {
+        // 20 pos, 20 neg; a ranks them perfectly, b ranks them inverted.
+        let y: Vec<f64> = (0..40).map(|i| if i < 20 { 1.0 } else { -1.0 }).collect();
+        let perfect: Vec<f64> = (0..40).map(|i| if i < 20 { 1.0 } else { 0.0 }).collect();
+        let inverted: Vec<f64> = perfect.iter().map(|&s| 1.0 - s).collect();
+
+        // a dominates b in EVERY stratified resample → the whole Δ
+        // distribution sits at +1, so the 2.5th percentile is > 0 (certify).
+        let ci_win = bootstrap_delta_ci_lo(&perfect, &inverted, &y, 200, 1);
+        assert!(ci_win > 0.0, "dominant lane must certify, got {ci_win}");
+
+        // Identical scores → Δ ≡ 0 in every resample → CI_lo = 0, which does
+        // NOT clear the strict `> 0` gate (refuse). This is the tie guard.
+        let ci_tie = bootstrap_delta_ci_lo(&perfect, &perfect, &y, 200, 1);
+        assert!(
+            ci_tie.abs() < 1e-12,
+            "a tie must give exactly 0 (no certification), got {ci_tie}"
+        );
+
+        // b dominates a → the lower bound is negative (refuse).
+        let ci_lose = bootstrap_delta_ci_lo(&inverted, &perfect, &y, 200, 1);
+        assert!(ci_lose < 0.0, "dominated lane must refuse, got {ci_lose}");
+    }
+
     #[test]
     fn periodogram_peaks_at_the_generating_frequency() {
         let mut rng = SplitMix64(7);
