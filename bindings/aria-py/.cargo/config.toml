@@ -1,0 +1,10 @@
+# pyo3 `extension-module` leaves the CPython symbols undefined (they resolve at
+# import time inside the host interpreter). On macOS a bare `cargo build` must
+# be told to allow that, or linking fails with "Undefined symbols: _PyXxx".
+# maturin sets this automatically; this makes plain `cargo build` / `cargo test`
+# work too. See https://pyo3.rs (Building and distribution → macOS).
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
