@@ -1,0 +1,25 @@
+# aria-py — Python bindings for the Aria runtime (pyo3, opt-in).
+#
+# EXCLUDED from the default workspace (like the wasm guests): the pure-Rust
+# `cargo build` / `ci.sh` never touch this. Build the wheel with maturin:
+#   source bindings/aria-py/.venv/bin/activate
+#   maturin develop -m bindings/aria-py/Cargo.toml
+[package]
+name = "aria-py"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Python bindings for the Aria Quantum Language runtime."
+publish = false
+
+[lib]
+name = "aria_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+aria-core = { path = "../../crates/aria-core" }
+aria-runtime = { path = "../../crates/aria-runtime" }
+omega-core = { path = "../../crates/omega-core" }
+omega-backend-statevector = { path = "../../crates/omega-backend-statevector" }
+omega-backend-mps = { path = "../../crates/omega-backend-mps" }

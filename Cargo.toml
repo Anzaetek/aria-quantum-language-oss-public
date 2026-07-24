@@ -16,6 +16,9 @@ exclude = [
     # Optional libtorch backend — excluded so the default build stays
     # libtorch-free; built only via `aria-runtime --features tch`.
     "crates/aria-backend-tch",
+    # Optional Python bindings (pyo3) — built with maturin, not cargo. Excluded
+    # so the pure-Rust workspace build / ci.sh never touch it.
+    "bindings/aria-py",
 ]
 members = [
     # --- omega-functions runtime (vendored) ---
