@@ -1303,7 +1303,10 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
         );
         let mut points = Vec::new();
         for &r in rates {
-            let qs = if r == 0.0 && matches!(channel, noise::Channel::Depolarizing) {
+            // rate 0 is noiseless for EVERY channel, so reuse the one full-term
+            // PauliProp(0) evaluation (the slowest call — nonzero rates shrink
+            // coefficients and prune faster) instead of recomputing it per channel.
+            let qs = if r == 0.0 {
                 pp0_scores.clone()
             } else {
                 dmq.scores_par(&noise::channel_backend(channel, r), &tex)?
