@@ -1171,10 +1171,15 @@ pub fn spectra_scaling(transport_override: Transport) -> Result<Verdict, String>
 /// CI_lo(Δ AUC) > 0 flips CERTIFIED → REFUSED at a crossover rate — the
 /// reported robustness margin.
 ///
+/// A final sweep adds finite-shot (measurement/sampling) noise: the correlator
+/// is estimated from a shrinking number of Z-basis shots, giving the minimum
+/// shot budget the advantage needs.
+///
 /// CHECK: (a) at zero noise PauliProp reproduces the statevector quantum scores
 /// (|Δ| ≤ 1e-6); (b) for EACH channel the substrate CERTIFIES at zero noise and
-/// the advantage is destroyed (REFUSED) at the largest swept rate — a crossover
-/// exists.
+/// the advantage is destroyed (REFUSED) at the largest swept rate; (c) the shot
+/// sweep CERTIFIES at the largest budget and is REFUSED at the smallest — every
+/// axis exhibits a crossover.
 pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
     let guest = "omega_app";
     let transport = resolve(transport_override, guest);
@@ -1342,13 +1347,48 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
         }
         all_channels_ok &= cert_at_zero && refused_at_max;
     }
+
+    // --- finite-shot (measurement/sampling) noise ---
+    // The channel sweeps use exact expectations (infinite shots). Real hardware
+    // also has sampling noise: the correlator is estimated from a finite number
+    // of Z-basis measurements. Sweep the shot budget (descending, good → bad) to
+    // find how many shots/row the advantage needs.
+    println!("  finite-shot sweep (Z-basis sampling of the exact-trained lane; certify needs CI_lo(Δ) > 0):");
+    let shot_grid = [16384u32, 1024, 256, 64, 16, 4];
+    let mut shot_points = Vec::new();
+    for &s in &shot_grid {
+        let qs = dmq.scores_shots(&backend, &tex, s, SEED ^ 0x5407)?;
+        let pt = noise::certify_point(s as f64, &qs, &classical, &tey, BOOT_REPS, SEED ^ 0x51);
+        println!(
+            "    {:>5} shots: quantum AUC {:.4}, CI_lo(Δ vs {}) = {:+.4}  → {}",
+            s,
+            pt.auc_q,
+            classical.name,
+            pt.ci_lo,
+            if pt.certified { "CERTIFIED" } else { "REFUSED" }
+        );
+        shot_points.push(pt);
+    }
+    // Descending grid, so crossover_rate finds the CERTIFIED→REFUSED edge and
+    // interpolates the minimum shot budget that still certifies.
+    if let Some(min_shots) = noise::crossover_rate(&shot_points) {
+        println!("  → shot margin: advantage needs ≳ {min_shots:.0} shots/row to certify");
+    }
+    let shots_ok = shot_points[0].certified && !shot_points.last().unwrap().certified;
+    if !shot_points[0].certified {
+        println!("  FAIL: did not certify even at the largest shot budget");
+    }
+    if shot_points.last().unwrap().certified {
+        println!("  FAIL: still certified at the smallest shot budget — lower the floor");
+    }
+
     let sanity_ok = max_diff <= 1e-6;
     if !sanity_ok {
         println!("  FAIL: PauliProp diverged from statevector at zero noise (Δ {max_diff:.2e})");
     }
     Ok(Verdict {
         name: "spectra_noise".into(),
-        pass: sanity_ok && all_channels_ok,
+        pass: sanity_ok && all_channels_ok && shots_ok,
         max_abs_diff: max_diff,
         tol: 1e-6,
     })

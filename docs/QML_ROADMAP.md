@@ -98,9 +98,10 @@ Original plan (for reference):
   which folds each channel's Heisenberg adjoint into the expectation
   *exactly* (no trajectory sampling) and reproduces the statevector
   correlator to ~1e-7 at zero noise. The classical panel is scored on the
-  same rows, so the paired bootstrap stays valid. **Three channels** are swept
-  — per-gate depolarizing, amplitude damping (T1), phase damping (T2) — so the
-  margin is not an artifact of one noise model.
+  same rows, so the paired bootstrap stays valid. **Three decoherence channels**
+  are swept — per-gate depolarizing, amplitude damping (T1), phase damping
+  (T2) — plus a finite-shot sampling axis, so the margin is not an artifact of
+  one noise model.
 - **Verified sweep** (7-site substrate, 96-row balanced eval): quantum AUC and
   the certification gate `CI_lo(Δ AUC) > 0` degrade monotonically with the
   error rate. The **crossover rate** is where `CI_lo(Δ)` linearly interpolates
@@ -117,9 +118,16 @@ Original plan (for reference):
   sits at chance, ~0.51, throughout, since the substrate is non-enumerable).
   The ordering is physical: phase damping touches only X/Y and leaves Z, so a
   Z-basis correlator tolerates ~2× more of it than of depolarizing, which also
-  shrinks Z. CHECK: PauliProp reproduces the statevector scores at zero noise
-  (|Δ| ≤ 1e-6), and for EACH channel the substrate CERTIFIES at zero noise with
-  a crossover to REFUSED inside the sweep.
+  shrinks Z.
+- **Finite-shot (sampling) axis**: the channel sweeps use exact expectations
+  (∞ shots); a final sweep estimates the correlator from a shrinking Z-basis
+  shot budget. AUC 0.990 (16384 shots) → 0.954 (256) → 0.806 (64) → 0.630 (16),
+  with the certification crossover interpolated at **≈ 31 shots/row** — a
+  modest, hardware-friendly budget (real experiments take thousands).
+- CHECK: PauliProp reproduces the statevector scores at zero noise (|Δ| ≤ 1e-6);
+  for EACH decoherence channel the substrate CERTIFIES at zero noise with a
+  crossover to REFUSED inside the sweep; and the shot sweep certifies at the
+  largest budget, refuses at the smallest.
 
 ## Quantum architecture search — first increment landed
 
