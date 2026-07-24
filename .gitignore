@@ -23,3 +23,7 @@ fixes/
 
 # libtorch env file written by tools/setup-libtorch.sh
 tch-env.sh
+
+# Compiled Python extension modules (built by maturin)
+**/*.so
+**/*.pyd
