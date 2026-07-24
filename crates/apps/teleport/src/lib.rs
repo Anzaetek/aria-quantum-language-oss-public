@@ -36,7 +36,15 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
             harness::AppMode::ClassicalBits { seed: seed as i64 },
             &[],
         )?;
-        let bob = *payload.get(2).unwrap_or(&0.0) as u64;
+        // Bob's qubit is classical bit 2. A missing bit means the harness
+        // failed structurally — surface it, don't default to 0, which would
+        // silently count as a delivered |0⟩ and inflate the pass fraction.
+        let bob = *payload.get(2).ok_or_else(|| {
+            format!(
+                "teleport: run produced no classical bit 2 (got {} bits)",
+                payload.len()
+            )
+        })? as u64;
         if bob == input_bit {
             matched += 1;
         }

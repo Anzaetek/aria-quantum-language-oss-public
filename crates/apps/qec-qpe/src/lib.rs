@@ -25,7 +25,7 @@ pub fn run(_transport: Transport) -> Result<Verdict, String> {
         let dist = qpe_distribution(m, phase);
         let (best, peak) = dist
             .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(&k, &p)| (k, p))
             .unwrap_or((0, 0.0));
         let est = best as f64 / (1u64 << m) as f64;

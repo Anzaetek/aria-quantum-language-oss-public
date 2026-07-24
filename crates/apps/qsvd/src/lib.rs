@@ -80,7 +80,9 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
     let lambda_max = -min_val;
     let lambda_min = (trace_g - lambda_max).max(0.0);
     let mut quantum_sv = vec![lambda_max.max(0.0).sqrt(), lambda_min.sqrt()];
-    quantum_sv.sort_by(|x, y| y.partial_cmp(x).unwrap());
+    // total_cmp gives a total order (no panic if a σ came back NaN from a
+    // numeric blow-up); a NaN then fails the downstream tolerance check cleanly.
+    quantum_sv.sort_by(|x, y| y.total_cmp(x));
 
     Ok(banner::report_values(
         "qsvd",

@@ -31,7 +31,7 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
     let input_index = prep_sv
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.norm().partial_cmp(&b.1.norm()).unwrap())
+        .max_by(|a, b| a.1.norm().total_cmp(&b.1.norm()))
         .map(|(i, _)| i as u64)
         .unwrap_or(0);
 
