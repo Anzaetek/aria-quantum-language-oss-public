@@ -45,7 +45,7 @@ fn readout_flip_moves_distribution_on_sampling_backends() {
     let c = damp_circuit();
     let binds = HashMap::new();
     let model = parse_noise_model(r#"{"readout_flip":0.5}"#).unwrap();
-    for sel in [BackendSel::Sim, BackendSel::Mps] {
+    for sel in [BackendSel::Sim, BackendSel::Mps { chi: 64 }] {
         let res = run_counts_noisy(&c, &binds, 20000, Some(1), sel, &model).unwrap();
         let got = p1(&res, 20000);
         assert!(
@@ -62,7 +62,7 @@ fn amplitude_damping_matches_analytic_on_sampling_backends() {
     let c = damp_circuit();
     let binds = HashMap::new();
     let model = parse_noise_model(r#"{"amplitude_damping":0.5}"#).unwrap();
-    for sel in [BackendSel::Sim, BackendSel::Mps] {
+    for sel in [BackendSel::Sim, BackendSel::Mps { chi: 64 }] {
         let res = run_counts_noisy(&c, &binds, 20000, Some(2), sel, &model).unwrap();
         let got = p1(&res, 20000);
         assert!(

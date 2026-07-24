@@ -69,8 +69,8 @@ fn fuzz_statevector_vs_mps_agree() {
             for axis in ["Z", "X"] {
                 let obs = format!("{axis}{q}");
                 let sv = expectation(&circ, &obs, &binds, BackendSel::Sim).expect("sv expectation");
-                let mps =
-                    expectation(&circ, &obs, &binds, BackendSel::Mps).expect("mps expectation");
+                let mps = expectation(&circ, &obs, &binds, BackendSel::Mps { chi: 64 })
+                    .expect("mps expectation");
                 assert!(sv.abs() <= 1.0 + 1e-9, "‖ψ‖ violated: ⟨{obs}⟩={sv}");
                 assert!(
                     (sv - mps).abs() < 1e-6,

@@ -5,7 +5,7 @@
 //! - `aria list   <file.aria>`                         — list circuit templates
 //! - `aria parse  <file.aria> [--circuit NAME] [--int k=v]...`
 //! - `aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...
-//!   [--shots N] [--seed S] [--backend sim|mps|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]`
+//!   [--shots N] [--seed S] [--backend sim|mps[:chi]|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]`
 //! - `aria export <file.aria> --circuit NAME (--qasm|--json|--lean|--gate-model) [--int k=v]...`
 
 use std::collections::HashMap;
@@ -49,7 +49,7 @@ fn usage() {
          aria list   <file.aria>\n  \
          aria parse  <file.aria> [--circuit NAME] [--int k=v]...\n  \
          aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...\n              \
-         [--shots N] [--seed S] [--backend sim|mps|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]\n              \
+         [--shots N] [--seed S] [--backend sim|mps[:chi]|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]\n              \
          [--noise JSON  (sampled counts on --backend sim, e.g. '{{\"readout_flip\":0.02,\"amplitude_damping\":5e-4}}')]\n              \
          (pauliprop computes --expectation only; truncate deep circuits with\n              \
           [--truncate C] [--max-weight W] [--max-freq F])\n              \
