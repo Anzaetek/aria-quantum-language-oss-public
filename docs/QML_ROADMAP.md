@@ -95,28 +95,29 @@ Original plan (for reference):
 
 - The dynamics-matched quantum lane is trained ONCE on the ideal simulator
   (the deployed model), then re-scored through the **PauliProp backend**,
-  which folds a per-gate depolarizing channel into the Heisenberg-adjoint
-  expectation *exactly* (no trajectory sampling) and reproduces the
-  statevector correlator to ~1e-7 at zero noise. The classical panel is
-  scored on the same rows, so the paired bootstrap stays valid.
+  which folds each channel's Heisenberg adjoint into the expectation
+  *exactly* (no trajectory sampling) and reproduces the statevector
+  correlator to ~1e-7 at zero noise. The classical panel is scored on the
+  same rows, so the paired bootstrap stays valid. Two channels are swept —
+  per-gate depolarizing and amplitude damping (T1) — so the margin is not an
+  artifact of one noise model.
 - **Verified sweep** (7-site substrate, 96-row balanced eval): quantum AUC
   and the certification gate `CI_lo(Δ AUC) > 0` degrade monotonically with
-  the per-gate depolarizing rate —
+  the error rate —
 
-  | depol rate | quantum AUC | CI_lo(Δ vs best classical) | verdict |
-  |---|---|---|---|
-  | 0.0000 | 0.993 | +0.377 | CERTIFIED |
-  | 0.0050 | 0.968 | +0.352 | CERTIFIED |
-  | 0.0100 | 0.885 | +0.262 | CERTIFIED |
-  | 0.0200 | 0.739 | +0.093 | CERTIFIED |
-  | 0.0400 | 0.645 | −0.007 | REFUSED |
+  | rate | depolarizing AUC / verdict | amp-damping AUC / verdict |
+  |---|---|---|
+  | 0.000 | 0.993 CERTIFIED | 0.993 CERTIFIED |
+  | 0.010 | 0.885 CERTIFIED | 0.921 CERTIFIED |
+  | 0.020 | 0.739 CERTIFIED | 0.691 CERTIFIED |
+  | 0.040 | 0.645 REFUSED   | 0.542 REFUSED   |
 
-  The advantage survives up to a **per-gate depolarizing rate ≈ 0.02** and is
-  destroyed by 0.04 — an honest robustness margin (best classical sits at
-  chance, ~0.51, throughout, since the substrate is non-enumerable). CHECK:
-  PauliProp reproduces the statevector scores at zero noise (|Δ| ≤ 1e-6),
-  the substrate CERTIFIES at zero noise, and a crossover to REFUSED exists
-  within the sweep.
+  Under **both** channels the advantage survives up to a per-gate rate ≈ 0.02
+  and is destroyed by 0.04 — an honest, channel-independent robustness margin
+  (best classical sits at chance, ~0.51, throughout, since the substrate is
+  non-enumerable). CHECK: PauliProp reproduces the statevector scores at zero
+  noise (|Δ| ≤ 1e-6), and for each channel the substrate CERTIFIES at zero
+  noise with a crossover to REFUSED inside the sweep.
 
 ## Quantum architecture search — first increment landed
 

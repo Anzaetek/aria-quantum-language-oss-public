@@ -1163,23 +1163,25 @@ pub fn spectra_scaling(transport_override: Transport) -> Result<Verdict, String>
 /// an ideal simulator. This asks the follow-up every advantage claim owes:
 /// does it survive noise? The dynamics-matched quantum lane is trained once on
 /// the ideal simulator (the deployed model), then re-scored through the
-/// PauliProp backend — which folds a per-gate depolarizing channel into the
-/// Heisenberg-adjoint expectation *exactly* — across a sweep of error rates.
-/// Depolarizing shrinks every Pauli expectation toward zero, so the quantum
-/// score's discriminating power decays while the classical lanes (scored on the
-/// same rows) hold; the gate CI_lo(Δ AUC) > 0 flips CERTIFIED → REFUSED at a
-/// crossover rate — the reported robustness margin.
+/// PauliProp backend — which folds each channel's Heisenberg adjoint into the
+/// expectation *exactly* — across a sweep of error rates, for two channels
+/// (per-gate depolarizing and amplitude damping). Both shrink the Pauli
+/// expectations toward zero, so the quantum score's discriminating power decays
+/// while the classical lanes (scored on the same rows) hold; the gate
+/// CI_lo(Δ AUC) > 0 flips CERTIFIED → REFUSED at a crossover rate — the
+/// reported robustness margin.
 ///
 /// CHECK: (a) at zero noise PauliProp reproduces the statevector quantum scores
-/// (|Δ| ≤ 1e-6) and the substrate still CERTIFIES; (b) at the largest swept
-/// rate the advantage is destroyed (REFUSED) — a crossover exists.
+/// (|Δ| ≤ 1e-6); (b) for EACH channel the substrate CERTIFIES at zero noise and
+/// the advantage is destroyed (REFUSED) at the largest swept rate — a crossover
+/// exists.
 pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
     let guest = "omega_app";
     let transport = resolve(transport_override, guest);
     banner::header(
         "spectra_noise",
-        "does the certified Heisenberg-substrate advantage survive per-gate depolarizing noise, \
-         and at what rate does it vanish?",
+        "does the certified Heisenberg-substrate advantage survive per-gate noise (depolarizing \
+         and amplitude damping), and at what rate does it vanish?",
         &transport.label(guest),
     );
     let backend = StatevectorBackend::new();
@@ -1261,8 +1263,10 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
     // --- zero-noise sanity: PauliProp reproduces the statevector scores ---
     let sv_scores = dmq.scores(&backend, &tex)?;
     let auc_sv = auc(&sv_scores, &tey);
-    let pp0 = noise::depolarizing_backend(0.0);
-    let pp0_scores = dmq.scores_par(&pp0, &tex)?;
+    let pp0_scores = dmq.scores_par(
+        &noise::channel_backend(noise::Channel::Depolarizing, 0.0),
+        &tex,
+    )?;
     let max_diff = sv_scores
         .iter()
         .zip(&pp0_scores)
@@ -1272,58 +1276,75 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
         "  noiseless quantum AUC {auc_sv:.4}; PauliProp(0) − statevector max score Δ = {max_diff:.2e}"
     );
 
-    // --- the depolarizing sweep ---
-    let rates = [0.0, 0.0025, 0.005, 0.01, 0.02, 0.04];
-    println!(
-        "  per-gate depolarizing sweep ({BOOT_REPS} bootstrap reps; certify needs CI_lo(Δ) > 0):"
-    );
-    let mut points = Vec::new();
-    for &r in &rates {
-        let qs = if r == 0.0 {
-            pp0_scores.clone()
-        } else {
-            dmq.scores_par(&noise::depolarizing_backend(r), &tex)?
-        };
-        let pt = noise::certify_point(r, &qs, &classical, &tey, BOOT_REPS, SEED ^ 0x51);
+    // --- sweep each channel; report its crossover and gate the verdict ---
+    // One decoherence model can flatter or punish a lane; running both shows the
+    // margin isn't an artifact of the channel choice.
+    let channels = [
+        (
+            noise::Channel::Depolarizing,
+            &[0.0, 0.0025, 0.005, 0.01, 0.02, 0.04][..],
+        ),
+        (
+            noise::Channel::AmplitudeDamping,
+            &[0.0, 0.005, 0.01, 0.02, 0.04, 0.08][..],
+        ),
+    ];
+    let mut all_channels_ok = true;
+    for (channel, rates) in channels {
         println!(
-            "    depol {:.4}: quantum AUC {:.4}, CI_lo(Δ vs {}) = {:+.4}  → {}",
-            pt.rate,
-            pt.auc_q,
-            classical.name,
-            pt.ci_lo,
-            if pt.certified { "CERTIFIED" } else { "REFUSED" }
+            "  {} sweep ({BOOT_REPS} bootstrap reps; certify needs CI_lo(Δ) > 0):",
+            channel.label()
         );
-        points.push(pt);
-    }
-
-    // --- verdict ---
-    let cert_at_zero = points[0].certified;
-    let refused_at_max = !points.last().unwrap().certified;
-    let crossover = points
-        .iter()
-        .filter(|p| p.certified)
-        .map(|p| p.rate)
-        .fold(f64::NEG_INFINITY, f64::max);
-    if crossover.is_finite() {
-        println!(
-            "  robustness margin: the advantage survives up to a per-gate depolarizing rate \
-             ≈ {crossover:.4} and is destroyed by {:.4}",
-            points.last().unwrap().rate
-        );
+        let mut points = Vec::new();
+        for &r in rates {
+            let qs = if r == 0.0 && matches!(channel, noise::Channel::Depolarizing) {
+                pp0_scores.clone()
+            } else {
+                dmq.scores_par(&noise::channel_backend(channel, r), &tex)?
+            };
+            let pt = noise::certify_point(r, &qs, &classical, &tey, BOOT_REPS, SEED ^ 0x51);
+            println!(
+                "    rate {:.4}: quantum AUC {:.4}, CI_lo(Δ vs {}) = {:+.4}  → {}",
+                pt.rate,
+                pt.auc_q,
+                classical.name,
+                pt.ci_lo,
+                if pt.certified { "CERTIFIED" } else { "REFUSED" }
+            );
+            points.push(pt);
+        }
+        let cert_at_zero = points[0].certified;
+        let refused_at_max = !points.last().unwrap().certified;
+        let crossover = points
+            .iter()
+            .filter(|p| p.certified)
+            .map(|p| p.rate)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if crossover.is_finite() && refused_at_max {
+            println!(
+                "  → margin: advantage survives to a {} rate ≈ {crossover:.4}, destroyed by {:.4}",
+                channel.label(),
+                points.last().unwrap().rate
+            );
+        }
+        if !cert_at_zero {
+            println!("  FAIL[{}]: did not certify at zero noise", channel.label());
+        }
+        if !refused_at_max {
+            println!(
+                "  FAIL[{}]: still certified at the largest swept rate — widen the sweep",
+                channel.label()
+            );
+        }
+        all_channels_ok &= cert_at_zero && refused_at_max;
     }
     let sanity_ok = max_diff <= 1e-6;
     if !sanity_ok {
         println!("  FAIL: PauliProp diverged from statevector at zero noise (Δ {max_diff:.2e})");
     }
-    if !cert_at_zero {
-        println!("  FAIL: the substrate did not certify at zero noise");
-    }
-    if !refused_at_max {
-        println!("  FAIL: still certified at the largest swept rate — widen the sweep");
-    }
     Ok(Verdict {
         name: "spectra_noise".into(),
-        pass: sanity_ok && cert_at_zero && refused_at_max,
+        pass: sanity_ok && all_channels_ok,
         max_abs_diff: max_diff,
         tol: 1e-6,
     })

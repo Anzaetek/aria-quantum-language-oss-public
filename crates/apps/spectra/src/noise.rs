@@ -19,9 +19,44 @@
 //! crossover rate — that rate is the reported robustness margin.
 
 use omega_backend_pauliprop::PauliPropBackend;
-use omega_core::noise::{Depolarizing, NoiseModel};
+use omega_core::noise::{Depolarizing, NoiseModel, Rate};
 
 use crate::lanes::{self, auc, bootstrap_delta_ci_lo, logreg_fit, logreg_score};
+
+/// A decoherence channel to sweep. PauliProp folds each one's Heisenberg
+/// adjoint into the expectation exactly, so the robustness margin can be
+/// reported for more than one noise model — showing the crossover is not an
+/// artifact of a single channel choice.
+#[derive(Clone, Copy)]
+pub enum Channel {
+    /// Depolarizing after every gate (arity-aware): the standard worst-case
+    /// per-gate error. Rate = per-gate depolarizing probability.
+    Depolarizing,
+    /// Amplitude damping (T1 relaxation, |1⟩ → |0⟩) after every gate. Rate = γ.
+    AmplitudeDamping,
+}
+
+impl Channel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Channel::Depolarizing => "per-gate depolarizing",
+            Channel::AmplitudeDamping => "per-gate amplitude damping (T1)",
+        }
+    }
+
+    fn model(self, rate: f64) -> NoiseModel {
+        match self {
+            Channel::Depolarizing => NoiseModel {
+                depolarizing: Depolarizing::uniform(rate),
+                ..Default::default()
+            },
+            Channel::AmplitudeDamping => NoiseModel {
+                amplitude_damping: Rate::Uniform(rate),
+                ..Default::default()
+            },
+        }
+    }
+}
 
 /// The best-scoring classical lane on a given split — the baseline the quantum
 /// lane must beat. Fits the same five competitors as the main certification
@@ -90,17 +125,14 @@ pub fn classical_best(
     best
 }
 
-/// A per-gate uniform depolarizing model at rate `p`.
-pub fn depolarizing_backend(p: f64) -> PauliPropBackend {
+/// A PauliProp backend carrying `channel` at strength `rate`.
+pub fn channel_backend(channel: Channel, rate: f64) -> PauliPropBackend {
     // coeff_min 1e-8 prunes only negligible Pauli terms, keeping the raw
     // correlator within ~1e-8 of the statevector value at zero noise (the
     // affine head then keeps the score within ~1e-6); noise is applied via its
     // exact Heisenberg adjoint. Nonzero rates shrink coefficients, so fewer
     // terms survive truncation and the sweep speeds up.
-    PauliPropBackend::with_truncation(1e-8, None).with_noise(NoiseModel {
-        depolarizing: Depolarizing::uniform(p),
-        ..Default::default()
-    })
+    PauliPropBackend::with_truncation(1e-8, None).with_noise(channel.model(rate))
 }
 
 /// One point of the noise sweep.
