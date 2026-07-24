@@ -79,13 +79,29 @@ pub fn load_circuit(
     prog.instantiate(circuit, int_params)
 }
 
-/// Parse + instantiate + lower a shipped `.aria` file to the omega IR.
+/// Parse + instantiate + lower a shipped `.aria` file (resolved under
+/// `examples/aria/`) to the omega IR. For an `.aria` file anywhere else —
+/// e.g. an external integration shipping its own circuits — use
+/// [`load_lowered_path`] with an absolute or working-directory-relative path.
 pub fn load_lowered(
     file: &str,
     circuit: &str,
     int_params: &[(&str, i64)],
 ) -> Result<Lowered, String> {
-    let src = std::fs::read_to_string(aria_path(file)).map_err(|e| format!("read {file}: {e}"))?;
+    load_lowered_path(&aria_path(file), circuit, int_params)
+}
+
+/// Parse + instantiate + lower an `.aria` file at an arbitrary path to the
+/// omega IR. Unlike [`load_lowered`], the path is not resolved against the
+/// repo's `examples/aria/` directory — pass an absolute path or one relative
+/// to the current working directory, so callers outside this repository can
+/// use the loading helpers on their own circuits.
+pub fn load_lowered_path(
+    path: &std::path::Path,
+    circuit: &str,
+    int_params: &[(&str, i64)],
+) -> Result<Lowered, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let prog = parse_aria(&src)?;
     let circ = prog.instantiate(circuit, int_params)?;
     lower(&circ)

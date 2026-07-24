@@ -20,8 +20,10 @@ use omega_core::params::ParameterBinding;
 
 use crate::lower::{lower, Lowered};
 
-/// Default MPS bond dimension when the MPS backend is selected.
-const MPS_BOND: usize = 64;
+/// Default MPS bond dimension (χ) when `--backend mps` is selected without an
+/// explicit `mps:<chi>`. Ample for the small examples; raise it for circuits
+/// whose entanglement exceeds it (χ = 2^(n/2) is exact for n qubits).
+pub const DEFAULT_MPS_CHI: usize = 64;
 
 /// Which execution backend to dispatch to. Every variant is an implementation
 /// of `omega_core::executor::Backend` — the Aria plugin contract. New backends
@@ -30,9 +32,11 @@ const MPS_BOND: usize = 64;
 pub enum BackendSel {
     /// Pure-Rust CPU statevector (`omega-backend-statevector`). Exact, ≤~24 qubits.
     Sim,
-    /// Pure-Rust matrix-product-state (`omega-backend-mps`). Scales to many
-    /// qubits when entanglement is bounded.
-    Mps,
+    /// Pure-Rust matrix-product-state (`omega-backend-mps`) with bond
+    /// dimension `chi`. Scales to many qubits when entanglement is bounded;
+    /// `chi = 2^(n/2)` reproduces the dense statevector exactly. Selected as
+    /// `--backend mps` (χ = [`DEFAULT_MPS_CHI`]) or `--backend mps:<chi>`.
+    Mps { chi: usize },
     /// GPU statevector (Metal / CUDA / OpenCL, whichever feature is compiled in).
     /// Falls back to [`BackendSel::Sim`] if the device is unavailable at runtime.
     Gpu,
@@ -49,20 +53,35 @@ impl BackendSel {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "sim" | "statevector" => Ok(Self::Sim),
-            "mps" => Ok(Self::Mps),
+            "mps" => Ok(Self::Mps {
+                chi: DEFAULT_MPS_CHI,
+            }),
             "gpu" => Ok(Self::Gpu),
             "tch" => Ok(Self::Tch),
             "pauliprop" => Ok(Self::PauliProp),
-            other => Err(format!(
-                "unknown backend '{other}' (available: sim, mps, gpu, tch, pauliprop; remote via --url)"
-            )),
+            other => {
+                // `mps:<chi>` — explicit bond dimension.
+                if let Some(chi_str) = other.strip_prefix("mps:") {
+                    let chi: usize = chi_str.parse().map_err(|_| {
+                        format!("bad MPS bond dimension in '{other}' (want mps:<int>)")
+                    })?;
+                    if chi == 0 {
+                        return Err("MPS bond dimension must be ≥ 1".into());
+                    }
+                    return Ok(Self::Mps { chi });
+                }
+                Err(format!(
+                    "unknown backend '{other}' (available: sim, mps, mps:<chi>, gpu, tch, \
+                     pauliprop; remote via --url)"
+                ))
+            }
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Sim => "sim",
-            Self::Mps => "mps",
+            Self::Mps { .. } => "mps",
             Self::Gpu => "gpu",
             Self::Tch => "tch",
             Self::PauliProp => "pauliprop",
@@ -75,7 +94,7 @@ impl BackendSel {
 pub(crate) fn make_backend(sel: BackendSel) -> Result<Box<dyn Backend>, String> {
     Ok(match sel {
         BackendSel::Sim => Box::new(StatevectorBackend::new()),
-        BackendSel::Mps => Box::new(make_mps()),
+        BackendSel::Mps { chi } => Box::new(make_mps(chi)),
         BackendSel::Gpu => make_gpu()?,
         BackendSel::Tch => make_tch()?,
         // Exact engine (no truncation: coeff_min = 0, max_weight = None), with
@@ -126,8 +145,8 @@ fn make_tch() -> Result<Box<dyn Backend>, String> {
 /// two-site θ-contraction is routed to the GPU instead (SVD stays on CPU —
 /// Apple has no native f64, so on-GPU Jacobi SVD is deferred; see
 /// GPU_BACKEND_PLAN.md), engaging only above the bond-dim threshold.
-fn make_mps() -> MpsBackend {
-    let backend = MpsBackend::new(MPS_BOND);
+fn make_mps(chi: usize) -> MpsBackend {
+    let backend = MpsBackend::new(chi);
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
     // Metal arm: the two-site θ-contraction runs on the GPU (SVD stays on CPU —
@@ -343,7 +362,7 @@ pub fn run_counts_noisy(
     // SVD) — the channels are CPU-side, the heavy contraction stays on device.
     let backend: Box<dyn Backend> = match sel {
         BackendSel::Sim => Box::new(NoisyStatevectorBackend::with_model(model.clone(), seed)),
-        BackendSel::Mps => Box::new(make_noisy_mps(model.clone())),
+        BackendSel::Mps { chi } => Box::new(make_noisy_mps(chi, model.clone())),
         other => {
             return Err(format!(
                 "--noise sampling is supported on --backend sim or mps; backend '{}' cannot \
@@ -370,8 +389,8 @@ pub fn run_counts_noisy(
 /// [`make_mps`], but — unlike the Metal arm, which is exercised on macOS in this
 /// repo's tests — it is not executed on the CI host (no NVIDIA device). Its
 /// composition with noise is code-identical to the verified Metal path.
-fn make_noisy_mps(model: NoiseModel) -> NoisyMpsBackend {
-    let backend = NoisyMpsBackend::with_model(MPS_BOND, model);
+fn make_noisy_mps(chi: usize, model: NoiseModel) -> NoisyMpsBackend {
+    let backend = NoisyMpsBackend::with_model(chi, model);
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
     #[cfg(all(feature = "metal", not(feature = "cuda")))]

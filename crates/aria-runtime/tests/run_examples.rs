@@ -114,7 +114,7 @@ fn mps_backend_agrees_with_sim_on_bell() {
     // Same Bell circuit through a different pluggable backend (MPS) must yield
     // the same physics: only |00>/|11>, balanced — no |01>/|10>.
     let c = example("bell.aria", "Bell", &[]);
-    let res = run_counts(&c, &no_binds(), 8192, Some(2), BackendSel::Mps).unwrap();
+    let res = run_counts(&c, &no_binds(), 8192, Some(2), BackendSel::Mps { chi: 64 }).unwrap();
     if let omega_core::executor::ExecResult::Counts(map) = res {
         let n00 = *map.get(&0b00).unwrap_or(&0) as f64;
         let n11 = *map.get(&0b11).unwrap_or(&0) as f64;
@@ -134,7 +134,7 @@ fn partial_measurement_counts_are_keyed_over_creg() {
     let src = "circuit Partial() {\n  qreg q[2]\n  creg c[1]\n  apply RY(0.927295218) on q[0]\n  apply H on q[1]\n  measure q[0] -> c[0]\n}\n";
     let c = inline(src, "Partial");
     assert_eq!(aria_runtime::counts_width(&c, &no_binds()), 1);
-    for sel in [BackendSel::Sim, BackendSel::Mps] {
+    for sel in [BackendSel::Sim, BackendSel::Mps { chi: 64 }] {
         let res = run_counts(&c, &no_binds(), 8192, Some(5), sel).unwrap();
         if let omega_core::executor::ExecResult::Counts(map) = res {
             let total: u64 = map.values().map(|&v| v as u64).sum();
@@ -297,7 +297,7 @@ fn gpu_mps_cuda_agrees_with_sim() {
     // fully entangling, so the SVD path is genuinely exercised (bond dim > 1).
     let c = example("qft.aria", "QFT", &[("n", 5)]);
     let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
-    let mps = statevector(&c, &no_binds(), BackendSel::Mps).unwrap();
+    let mps = statevector(&c, &no_binds(), BackendSel::Mps { chi: 64 }).unwrap();
     assert_eq!(cpu.len(), mps.len());
     for (i, (a, b)) in cpu.iter().zip(mps.iter()).enumerate() {
         // Native-f64 gesvdj → the 1e-10 forward tolerance is reachable.
@@ -347,7 +347,7 @@ fn gpu_mps_metal_agrees_with_sim() {
     let c = inline(&src, "BW");
     let before = omega_backend_mps_metal::metal_contraction_count();
     let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
-    let mps = statevector(&c, &no_binds(), BackendSel::Mps).unwrap();
+    let mps = statevector(&c, &no_binds(), BackendSel::Mps { chi: 64 }).unwrap();
     let ran = omega_backend_mps_metal::metal_contraction_count() - before;
     if ran == 0 {
         eprintln!("skipping assertion: no Metal device (GPU contraction never ran)");
