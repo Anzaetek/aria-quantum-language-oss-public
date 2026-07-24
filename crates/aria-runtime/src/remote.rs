@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Remote execution backend: delegate an Aria circuit to a running
-//! `omega-server` over HTTP (`POST /v1/quantum/execute`).
+//! `omega-server` over HTTP.
 //!
-//! The circuit is bound to concrete parameters, lowered to the omega JSON wire
-//! IR ([`aria_core::backends::omega::to_omega_ir`]), wrapped as
-//! `{ circuit, shots, seed }`, and POSTed with an optional bearer token. The
-//! `{ result: { counts } }` response is decoded back into an
-//! [`ExecResult::Counts`].
+//! The circuit is bound to concrete parameters and lowered to the omega JSON
+//! wire IR ([`aria_core::backends::omega::to_omega_ir`]), then either:
+//! - [`run_counts_remote`] POSTs `{ circuit, shots, seed }` to
+//!   `/v1/quantum/execute` and decodes `{ result: { counts } }` into an
+//!   [`ExecResult::Counts`]; or
+//! - [`expectation_remote`] POSTs `{ circuit, observable }` to
+//!   `/v1/quantum/expectation` and returns the scalar `⟨O⟩` from `{ values }`,
+//!   so a client gets a number back instead of the full statevector.
 
 use std::collections::HashMap;
 
@@ -21,6 +24,62 @@ use crate::run::{measure_pairs, project_counts_onto_creg};
 pub struct Remote {
     pub url: String,
     pub token: Option<String>,
+}
+
+/// POST `body` as JSON to `remote.url + path` (with the optional bearer token)
+/// and return the decoded JSON response. Shared by the counts and expectation
+/// remote paths.
+fn post_json(
+    remote: &Remote,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let endpoint = format!("{}{path}", remote.url.trim_end_matches('/'));
+    let mut req = ureq::post(&endpoint).set("Content-Type", "application/json");
+    if let Some(tok) = &remote.token {
+        req = req.set("Authorization", &format!("Bearer {tok}"));
+    }
+    req.send_json(body)
+        .map_err(|e| format!("omega-server request to {endpoint} failed: {e}"))?
+        .into_json()
+        .map_err(|e| format!("bad response JSON from omega-server: {e}"))
+}
+
+/// Extract the `values` array from a `/v1/quantum/expectation` response.
+fn parse_expectation_values(v: &serde_json::Value) -> Result<Vec<f64>, String> {
+    v.get("values")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| format!("unexpected expectation response: {v}"))?
+        .iter()
+        .map(|x| {
+            x.as_f64()
+                .ok_or_else(|| "expectation value not a number".to_string())
+        })
+        .collect()
+}
+
+/// Compute `⟨O⟩` of a Pauli observable on a remote omega-server
+/// (`POST /v1/quantum/expectation`). The circuit is bound to concrete
+/// parameters and lowered to the wire IR; the scalar comes back directly, so
+/// the client never pulls the full statevector to reduce it locally.
+pub fn expectation_remote(
+    circuit: &Circuit,
+    observable: &str,
+    bindings: &HashMap<String, f64>,
+    remote: &Remote,
+) -> Result<f64, String> {
+    let mut full = bindings.clone();
+    for s in circuit.free_symbols() {
+        full.entry(s).or_insert(0.0);
+    }
+    let bound = circuit.bind_params(&full)?;
+    let ir = to_omega_ir(&bound);
+    let body = serde_json::json!({ "circuit": ir, "observable": observable });
+    let v = post_json(remote, "/v1/quantum/expectation", body)?;
+    parse_expectation_values(&v)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "omega-server returned no expectation value".to_string())
 }
 
 /// Execute `circuit` on a remote omega-server and return measurement counts.
@@ -40,18 +99,7 @@ pub fn run_counts_remote(
     let ir = to_omega_ir(&bound);
 
     let body = serde_json::json!({ "circuit": ir, "shots": shots, "seed": seed });
-    let endpoint = format!("{}/v1/quantum/execute", remote.url.trim_end_matches('/'));
-
-    let mut req = ureq::post(&endpoint).set("Content-Type", "application/json");
-    if let Some(tok) = &remote.token {
-        req = req.set("Authorization", &format!("Bearer {tok}"));
-    }
-    let resp = req
-        .send_json(body)
-        .map_err(|e| format!("omega-server request to {endpoint} failed: {e}"))?;
-    let v: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("bad response JSON from omega-server: {e}"))?;
+    let v = post_json(remote, "/v1/quantum/execute", body)?;
 
     let counts = v
         .get("result")
@@ -109,5 +157,17 @@ mod tests {
         } else {
             panic!("expected counts");
         }
+    }
+
+    #[test]
+    fn parse_expectation_values_reads_the_array() {
+        let v = serde_json::json!({ "backend": "statevector", "values": [1.0, -0.5, 0.0] });
+        assert_eq!(parse_expectation_values(&v).unwrap(), vec![1.0, -0.5, 0.0]);
+    }
+
+    #[test]
+    fn parse_expectation_values_rejects_malformed() {
+        assert!(parse_expectation_values(&serde_json::json!({ "error": "x" })).is_err());
+        assert!(parse_expectation_values(&serde_json::json!({ "values": ["nan"] })).is_err());
     }
 }

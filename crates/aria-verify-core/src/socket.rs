@@ -5,13 +5,15 @@
 //! wire IR) is sent over the wire, executed remotely, and the returned counts
 //! are cross-checked against the SAME pure-Rust classical oracle.
 //!
-//! Only the counts-based examples are offered here (omega-server's execute
-//! endpoint returns measurement counts); amplitude / expectation / variational
-//! examples keep using the in-process transport, which is the canonical path.
+//! Counts-based examples use `/v1/quantum/execute`; a parametric expectation
+//! example uses `/v1/quantum/expectation` (scalar ⟨O⟩ over the wire, no
+//! statevector round-trip). Amplitude / variational examples keep using the
+//! in-process transport, which is the canonical path.
 
 use std::collections::HashMap;
 
-use aria_runtime::remote::{run_counts_remote, Remote};
+use aria_core::ast::parse_aria;
+use aria_runtime::remote::{expectation_remote, run_counts_remote, Remote};
 use omega_core::executor::ExecResult;
 
 use crate::banner::{self, Verdict};
@@ -64,7 +66,40 @@ pub fn run(url: &str, token: Option<String>) -> bool {
             ok = false;
         }
     }
+    match ry_expectation_remote(&remote) {
+        Ok(v) => ok &= v.ok(),
+        Err(e) => {
+            eprintln!("ry_expectation (socket): ERROR — {e}");
+            ok = false;
+        }
+    }
     ok
+}
+
+/// Remote expectation via `/v1/quantum/expectation`: ⟨Z0⟩ of RY(θ)|0⟩ is
+/// cos(θ) exactly, so the scalar returned by the server is cross-checked
+/// against the closed-form value — the expectation-endpoint counterpart of the
+/// counts examples above.
+fn ry_expectation_remote(remote: &Remote) -> Result<Verdict, String> {
+    banner::header(
+        "ry_expectation",
+        "⟨Z0⟩ of RY(theta)|0⟩ over the wire == cos(theta)",
+        TRANSPORT,
+    );
+    let src =
+        "circuit RyExp() {\n  qreg q[1]\n  let t = symbolic[1]\n  apply RY(t[0]) on q[0]\n}\n";
+    let circuit = parse_aria(src)?.instantiate("RyExp", &[])?;
+    let theta = 0.9_f64;
+    let binds = HashMap::from([("t_0".to_string(), theta)]);
+    let z = expectation_remote(&circuit, "Z0", &binds, remote)?;
+    Ok(banner::report_scalar(
+        "ry_expectation",
+        "server ⟨Z0⟩ (remote)",
+        z,
+        "cos(theta)",
+        theta.cos(),
+        1e-9,
+    ))
 }
 
 fn grover3_remote(remote: &Remote) -> Result<Verdict, String> {
