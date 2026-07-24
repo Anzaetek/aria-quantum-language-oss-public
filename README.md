@@ -111,6 +111,24 @@ $ aria train examples/aria/vqe_ansatz.aria --circuit VQEAnsatz --int n_layers=2 
   structure, statements, expressions, the gate set, observables, annotations,
   and an EBNF grammar).
 
+## Use it as a library
+
+Beyond the CLI, the runtime is a set of Rust crates you can call directly —
+lower a circuit once, then evaluate expectations, take exact adjoint gradients,
+and train parameters over a dataset:
+
+- **[`docs/LIBRARY.md`](docs/LIBRARY.md)** — the "embed Aria in Rust" guide:
+  lower-once/bind-many, gradient-method selection, the `SymbolId` binding
+  contract, a training loop, and backend selection (every snippet compiled/tested).
+- **[`llms.txt`](llms.txt)** — a one-line index of every crate's public entry
+  points, for humans and agents.
+- **`aria train … --data X.csv --loss bce`** fits a labelled dataset;
+  **`aria predict model.json --data X.csv`** scores one — see
+  [`aria train --data`](docs/LIBRARY.md#saving-and-reloading-a-trained-model).
+- **[`bindings/aria-py`](bindings/aria-py)** — opt-in Python bindings (pyo3):
+  numpy expectations/gradients plus a PyTorch `AriaLayer` (`nn.Module`) and
+  `autograd.Function`. Built with maturin; the default build stays pure Rust.
+
 ## Architecture
 
 | Crate | Role |
