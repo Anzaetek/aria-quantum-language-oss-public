@@ -7,6 +7,16 @@ and needs none of this (`cargo build`, `cargo test`, and `./ci.sh` all pass with
 no libtorch installed). Install libtorch only if you want to exercise
 `--backend tch`.
 
+## Quick start (macOS arm64)
+
+```console
+$ tools/setup-libtorch.sh          # download libtorch, build, and verify the tch backend
+$ source ./tch-env.sh              # in later shells, before `cargo ... --features tch`
+```
+
+The script is idempotent, applies the clang workaround below automatically, and
+writes `tch-env.sh` for reuse. The rest of this file is the manual walkthrough.
+
 ## Required version
 
 | Component | Version |
@@ -22,18 +32,20 @@ ABI-incompatible symbols.
 
 Download the prebuilt C++ distribution from <https://pytorch.org/get-started/locally/>
 (pick "LibTorch", your OS, and the **CPU** compute platform), then unzip it. You
-want the directory that contains `lib/`, `include/`, and `share/`.
+want the directory that contains `lib/`, `include/`, and `share/`. Use the
+**prebuilt** distribution — do not build libtorch from source.
+
+Apple Silicon (arm64) direct link:
 
 ```console
-$ ls /path/to/libtorch
+$ curl -fL -o /tmp/libtorch.zip \
+    https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.7.0.zip
+$ unzip -q /tmp/libtorch.zip -d ~/work/            # → ~/work/libtorch
+$ ls ~/work/libtorch
 build-version  include  lib  share
-$ cat /path/to/libtorch/build-version
+$ cat ~/work/libtorch/build-version
 2.7.0
 ```
-
-> On this mac dev box a matching build already lives at
-> `…/work/quantum/libtorch` (libtorch 2.7.0, arm64) and can be reused directly —
-> point `LIBTORCH` at it.
 
 ## 2. Point the toolchain at it
 
@@ -45,6 +57,19 @@ $ export LD_LIBRARY_PATH=$LIBTORCH/lib:$LD_LIBRARY_PATH       # Linux
 
 ### Gotchas
 
+- **Recent clang / libc++ (Apple clang ≥ 21):** `torch-sys` fails to compile
+  with `error: 'is_arithmetic' cannot be specialized [-Winvalid-specialization]`
+  — libtorch 2.7's vendored `c10/util/strong_type.h` specializes
+  `std::is_arithmetic`, which newer libc++ marks `[[no_specializations]]`. Demote
+  that diagnostic when building:
+
+  ```console
+  $ export CXXFLAGS="-std=gnu++17 -Wno-invalid-specialization"
+  ```
+
+  This is a header-compat issue, not a missing include — `-include type_traits`
+  does **not** fix it. If a future clang removes the flag, bump the tch/libtorch
+  pin to a release whose `strong_type` no longer specializes `is_arithmetic`.
 - **Do _not_ set `LIBTORCH_USE_PYTORCH`.** The `torch-sys` build script treats
   *any* value (including `0`) as "discover libtorch through an installed pip
   `torch`". If you have no pip `torch`, the build fails with

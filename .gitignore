@@ -20,3 +20,6 @@ proofs/lean4/.lake/
 **/*.olean
 fixes/
 .codegraph
+
+# libtorch env file written by tools/setup-libtorch.sh
+tch-env.sh
