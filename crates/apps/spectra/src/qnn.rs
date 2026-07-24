@@ -419,6 +419,21 @@ impl<'a> DmqLane<'a> {
             .collect()
     }
 
+    /// Same as [`scores`](Self::scores) but evaluates the per-row correlator
+    /// across rayon threads — for the noisy PauliProp backend, whose exact
+    /// Heisenberg-adjoint expectation is orders of magnitude slower than the
+    /// statevector path. Order-preserving, so it's a drop-in for `scores`.
+    pub fn scores_par(
+        &self,
+        backend: &(dyn Backend + Sync),
+        x: &[Vec<f64>],
+    ) -> Result<Vec<f64>, String> {
+        use rayon::prelude::*;
+        x.par_iter()
+            .map(|p| Ok(data::ridge_predict(&self.head, &[self.raw(backend, p)?])))
+            .collect()
+    }
+
     /// The ablation lane (certification's ON−OFF gate): couplings pinned
     /// to zero — no entanglement, product-state dynamics only. The head
     /// still refits, so the comparison is fair.
