@@ -52,6 +52,7 @@ pub mod linalg;
 pub mod lower;
 pub mod run;
 pub mod train;
+pub mod train_supervised;
 
 #[cfg(feature = "remote")]
 pub mod remote;
@@ -62,6 +63,7 @@ pub use run::{
     run_counts, run_counts_noisy, statevector, BackendSel, PauliPropTruncation,
 };
 pub use train::{train_expectation, Optimizer, TrainConfig, TrainResult};
+pub use train_supervised::{train_supervised, Loss, SupervisedConfig, SupervisedResult};
 
 #[cfg(feature = "remote")]
 pub use remote::{run_counts_remote, Remote};
