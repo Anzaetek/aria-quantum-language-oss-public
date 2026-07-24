@@ -36,6 +36,7 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("arch_evolve", aria_app_spectra::arch_evolve),
         ("arch_priors", aria_app_spectra::arch_priors),
         ("spectra_scaling", aria_app_spectra::spectra_scaling),
+        ("spectra_noise", aria_app_spectra::spectra_noise),
         ("qos", aria_app_qos::run),
         ("circulant", aria_app_circulant::run),
         ("cqs", aria_app_cqs::run),
@@ -122,6 +123,7 @@ fn main() -> ExitCode {
         "arch_search",
         "arch_evolve",
         "spectra_scaling",
+        "spectra_noise",
     ];
     let selected: Vec<_> = if name == "all" {
         if quick {

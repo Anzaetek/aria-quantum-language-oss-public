@@ -86,6 +86,38 @@ Original plan (for reference):
    repo an honest, reproducible "where advantage lives" example with the
    butterfly QNN as the quantum lane.
 
+## Landed: noise-robustness of the certification
+
+*Does the certified advantage survive noise, and at what rate does it vanish?*
+— the follow-up every advantage claim owes. Implemented in
+`crates/apps/spectra/src/noise.rs` + `spectra_noise` (run:
+`cargo run -p aria-verify -- spectra_noise`):
+
+- The dynamics-matched quantum lane is trained ONCE on the ideal simulator
+  (the deployed model), then re-scored through the **PauliProp backend**,
+  which folds a per-gate depolarizing channel into the Heisenberg-adjoint
+  expectation *exactly* (no trajectory sampling) and reproduces the
+  statevector correlator to ~1e-7 at zero noise. The classical panel is
+  scored on the same rows, so the paired bootstrap stays valid.
+- **Verified sweep** (7-site substrate, 96-row balanced eval): quantum AUC
+  and the certification gate `CI_lo(Δ AUC) > 0` degrade monotonically with
+  the per-gate depolarizing rate —
+
+  | depol rate | quantum AUC | CI_lo(Δ vs best classical) | verdict |
+  |---|---|---|---|
+  | 0.0000 | 0.993 | +0.377 | CERTIFIED |
+  | 0.0050 | 0.968 | +0.352 | CERTIFIED |
+  | 0.0100 | 0.885 | +0.262 | CERTIFIED |
+  | 0.0200 | 0.739 | +0.093 | CERTIFIED |
+  | 0.0400 | 0.645 | −0.007 | REFUSED |
+
+  The advantage survives up to a **per-gate depolarizing rate ≈ 0.02** and is
+  destroyed by 0.04 — an honest robustness margin (best classical sits at
+  chance, ~0.51, throughout, since the substrate is non-enumerable). CHECK:
+  PauliProp reproduces the statevector scores at zero noise (|Δ| ≤ 1e-6),
+  the substrate CERTIFIES at zero noise, and a crossover to REFUSED exists
+  within the sweep.
+
 ## Quantum architecture search — first increment landed
 
 Idea (user-proposed): given a dataset, *discover* circuit patterns

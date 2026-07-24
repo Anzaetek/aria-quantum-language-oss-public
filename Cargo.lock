@@ -329,8 +329,10 @@ name = "aria-app-spectra"
 version = "0.1.0"
 dependencies = [
  "aria-verify-core",
+ "omega-backend-pauliprop",
  "omega-backend-statevector",
  "omega-core",
+ "rayon",
  "smallvec",
 ]
 

@@ -15,4 +15,6 @@ description = "SPECTRA certification: Fourier-wall screen + classical lane panel
 aria-verify-core = { path = "../../aria-verify-core" }
 omega-core = { path = "../../omega-core" }
 omega-backend-statevector = { path = "../../omega-backend-statevector" }
+omega-backend-pauliprop = { path = "../../omega-backend-pauliprop" }
 smallvec = { workspace = true }
+rayon = { workspace = true }
