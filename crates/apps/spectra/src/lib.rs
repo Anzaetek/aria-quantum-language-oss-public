@@ -1164,9 +1164,9 @@ pub fn spectra_scaling(transport_override: Transport) -> Result<Verdict, String>
 /// does it survive noise? The dynamics-matched quantum lane is trained once on
 /// the ideal simulator (the deployed model), then re-scored through the
 /// PauliProp backend — which folds each channel's Heisenberg adjoint into the
-/// expectation *exactly* — across a sweep of error rates, for two channels
-/// (per-gate depolarizing and amplitude damping). Both shrink the Pauli
-/// expectations toward zero, so the quantum score's discriminating power decays
+/// expectation *exactly* — across a sweep of error rates, for three channels
+/// (per-gate depolarizing, amplitude damping, phase damping). All shrink the
+/// Pauli expectations toward zero, so the quantum score's discriminating power decays
 /// while the classical lanes (scored on the same rows) hold; the gate
 /// CI_lo(Δ AUC) > 0 flips CERTIFIED → REFUSED at a crossover rate — the
 /// reported robustness margin.
@@ -1180,8 +1180,8 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
     let transport = resolve(transport_override, guest);
     banner::header(
         "spectra_noise",
-        "does the certified Heisenberg-substrate advantage survive per-gate noise (depolarizing \
-         and amplitude damping), and at what rate does it vanish?",
+        "does the certified Heisenberg-substrate advantage survive per-gate noise (depolarizing, \
+         amplitude damping, phase damping), and at what rate does it vanish?",
         &transport.label(guest),
     );
     let backend = StatevectorBackend::new();
@@ -1277,8 +1277,8 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
     );
 
     // --- sweep each channel; report its crossover and gate the verdict ---
-    // One decoherence model can flatter or punish a lane; running both shows the
-    // margin isn't an artifact of the channel choice.
+    // One decoherence model can flatter or punish a lane; running several shows
+    // the margin isn't an artifact of the channel choice.
     let channels = [
         (
             noise::Channel::Depolarizing,
@@ -1287,6 +1287,12 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
         (
             noise::Channel::AmplitudeDamping,
             &[0.0, 0.005, 0.01, 0.02, 0.04, 0.08][..],
+        ),
+        // Phase damping hits only X/Y (Z untouched), so it degrades a Z-basis
+        // correlator more slowly — a wider grid to reach the crossover.
+        (
+            noise::Channel::PhaseDamping,
+            &[0.0, 0.02, 0.05, 0.1, 0.2, 0.4][..],
         ),
     ];
     let mut all_channels_ok = true;
@@ -1315,16 +1321,11 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
         }
         let cert_at_zero = points[0].certified;
         let refused_at_max = !points.last().unwrap().certified;
-        let crossover = points
-            .iter()
-            .filter(|p| p.certified)
-            .map(|p| p.rate)
-            .fold(f64::NEG_INFINITY, f64::max);
-        if crossover.is_finite() && refused_at_max {
+        if let Some(crossover) = noise::crossover_rate(&points) {
             println!(
-                "  → margin: advantage survives to a {} rate ≈ {crossover:.4}, destroyed by {:.4}",
-                channel.label(),
-                points.last().unwrap().rate
+                "  → margin: advantage certified up to a {} rate ≈ {crossover:.4} \
+                 (CI_lo(Δ) crosses 0, linearly interpolated)",
+                channel.label()
             );
         }
         if !cert_at_zero {

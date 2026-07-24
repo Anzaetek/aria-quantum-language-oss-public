@@ -34,6 +34,9 @@ pub enum Channel {
     Depolarizing,
     /// Amplitude damping (T1 relaxation, |1⟩ → |0⟩) after every gate. Rate = γ.
     AmplitudeDamping,
+    /// Phase damping (T2 dephasing, loss of X/Y coherence, Z untouched) after
+    /// every gate. Rate = λ.
+    PhaseDamping,
 }
 
 impl Channel {
@@ -41,6 +44,7 @@ impl Channel {
         match self {
             Channel::Depolarizing => "per-gate depolarizing",
             Channel::AmplitudeDamping => "per-gate amplitude damping (T1)",
+            Channel::PhaseDamping => "per-gate phase damping (T2)",
         }
     }
 
@@ -52,6 +56,10 @@ impl Channel {
             },
             Channel::AmplitudeDamping => NoiseModel {
                 amplitude_damping: Rate::Uniform(rate),
+                ..Default::default()
+            },
+            Channel::PhaseDamping => NoiseModel {
+                phase_damping: Rate::Uniform(rate),
                 ..Default::default()
             },
         }
@@ -143,6 +151,23 @@ pub struct NoisePoint {
     pub certified: bool,
 }
 
+/// The interpolated crossover rate: where the certification statistic
+/// `CI_lo(Δ)` crosses zero — the CERTIFIED ↔ REFUSED boundary — between the
+/// last certified point and the first refused one. Linear in `CI_lo` vs rate,
+/// which is far tighter than "largest certified grid rate". Returns `None` if
+/// the sweep never crosses (still certified at the top).
+pub fn crossover_rate(points: &[NoisePoint]) -> Option<f64> {
+    for w in points.windows(2) {
+        let (a, b) = (&w[0], &w[1]);
+        if a.certified && !b.certified {
+            // a.ci_lo > 0 ≥ b.ci_lo, so the fraction lands in [0, 1).
+            let t = a.ci_lo / (a.ci_lo - b.ci_lo);
+            return Some(a.rate + t * (b.rate - a.rate));
+        }
+    }
+    None
+}
+
 /// Bootstrap the quantum-vs-best-classical certification gate at one rate.
 pub fn certify_point(
     rate: f64,
@@ -159,5 +184,42 @@ pub fn certify_point(
         auc_q,
         ci_lo,
         certified: ci_lo > 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(rate: f64, ci_lo: f64) -> NoisePoint {
+        NoisePoint {
+            rate,
+            auc_q: 0.0,
+            ci_lo,
+            certified: ci_lo > 0.0,
+        }
+    }
+
+    #[test]
+    fn crossover_interpolates_the_ci_zero() {
+        // CI_lo goes +0.1 (rate 0.02) → −0.1 (rate 0.04); the zero sits halfway.
+        let points = [pt(0.0, 0.4), pt(0.02, 0.1), pt(0.04, -0.1)];
+        let x = crossover_rate(&points).unwrap();
+        assert!((x - 0.03).abs() < 1e-12, "expected 0.03, got {x}");
+    }
+
+    #[test]
+    fn crossover_takes_the_first_transition() {
+        // Only the first CERTIFIED→REFUSED edge counts, even if noise re-crosses.
+        let points = [pt(0.0, 0.2), pt(0.1, -0.05), pt(0.2, 0.01), pt(0.3, -0.2)];
+        let x = crossover_rate(&points).unwrap();
+        // between 0.0 (+0.2) and 0.1 (−0.05): 0.2/(0.2+0.05)=0.8 → 0.08
+        assert!((x - 0.08).abs() < 1e-12, "expected 0.08, got {x}");
+    }
+
+    #[test]
+    fn no_crossover_when_always_certified() {
+        let points = [pt(0.0, 0.4), pt(0.02, 0.3), pt(0.04, 0.2)];
+        assert!(crossover_rate(&points).is_none());
     }
 }

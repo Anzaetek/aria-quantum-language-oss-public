@@ -98,26 +98,28 @@ Original plan (for reference):
   which folds each channel's Heisenberg adjoint into the expectation
   *exactly* (no trajectory sampling) and reproduces the statevector
   correlator to ~1e-7 at zero noise. The classical panel is scored on the
-  same rows, so the paired bootstrap stays valid. Two channels are swept —
-  per-gate depolarizing and amplitude damping (T1) — so the margin is not an
-  artifact of one noise model.
-- **Verified sweep** (7-site substrate, 96-row balanced eval): quantum AUC
-  and the certification gate `CI_lo(Δ AUC) > 0` degrade monotonically with
-  the error rate —
+  same rows, so the paired bootstrap stays valid. **Three channels** are swept
+  — per-gate depolarizing, amplitude damping (T1), phase damping (T2) — so the
+  margin is not an artifact of one noise model.
+- **Verified sweep** (7-site substrate, 96-row balanced eval): quantum AUC and
+  the certification gate `CI_lo(Δ AUC) > 0` degrade monotonically with the
+  error rate. The **crossover rate** is where `CI_lo(Δ)` linearly interpolates
+  to 0 — the CERTIFIED ↔ REFUSED boundary:
 
-  | rate | depolarizing AUC / verdict | amp-damping AUC / verdict |
+  | channel | crossover rate | AUC at 0 → at destruction |
   |---|---|---|
-  | 0.000 | 0.993 CERTIFIED | 0.993 CERTIFIED |
-  | 0.010 | 0.885 CERTIFIED | 0.921 CERTIFIED |
-  | 0.020 | 0.739 CERTIFIED | 0.691 CERTIFIED |
-  | 0.040 | 0.645 REFUSED   | 0.542 REFUSED   |
+  | depolarizing        | ≈ 0.039 | 0.993 → 0.645 |
+  | amplitude damping T1 | ≈ 0.027 | 0.993 → 0.542 |
+  | phase damping T2     | ≈ 0.082 | 0.993 → 0.500 |
 
-  Under **both** channels the advantage survives up to a per-gate rate ≈ 0.02
-  and is destroyed by 0.04 — an honest, channel-independent robustness margin
-  (best classical sits at chance, ~0.51, throughout, since the substrate is
-  non-enumerable). CHECK: PauliProp reproduces the statevector scores at zero
-  noise (|Δ| ≤ 1e-6), and for each channel the substrate CERTIFIES at zero
-  noise with a crossover to REFUSED inside the sweep.
+  Across all three channels the advantage survives to a per-gate rate of a few
+  percent — an honest, channel-independent robustness margin (best classical
+  sits at chance, ~0.51, throughout, since the substrate is non-enumerable).
+  The ordering is physical: phase damping touches only X/Y and leaves Z, so a
+  Z-basis correlator tolerates ~2× more of it than of depolarizing, which also
+  shrinks Z. CHECK: PauliProp reproduces the statevector scores at zero noise
+  (|Δ| ≤ 1e-6), and for EACH channel the substrate CERTIFIES at zero noise with
+  a crossover to REFUSED inside the sweep.
 
 ## Quantum architecture search — first increment landed
 
