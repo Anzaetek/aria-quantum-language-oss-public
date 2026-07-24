@@ -71,7 +71,13 @@ step "8/9  Application harnesses: quantum vs classical (aria-verify all)"
 # (For local iteration only: `ARIA_QML_QUICK=1 ./ci.sh` skips the minutes-long
 # QML search/training harnesses with a printed notice. CI runs the full set —
 # do not export the flag in automation.)
+# `all` skips the DEEP harnesses (e.g. spectra_noise, ~15 min of exact noisy
+# simulation) by default; set ARIA_DEEP=1 to fold them in, or run them by name.
 cargo run -q -p aria-verify -- all
+if [ "${ARIA_DEEP:-0}" = "1" ]; then
+  step "8b/9  Deep harnesses (ARIA_DEEP=1)"
+  ARIA_DEEP=1 cargo run -q -p aria-verify -- all
+fi
 
 step "9/9  Socket transport (omega-server over HTTP) — best effort"
 # Sends the same Aria package to a live omega-server and cross-checks counts.

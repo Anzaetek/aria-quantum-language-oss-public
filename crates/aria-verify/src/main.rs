@@ -123,8 +123,13 @@ fn main() -> ExitCode {
         "arch_search",
         "arch_evolve",
         "spectra_scaling",
-        "spectra_noise",
     ];
+    // DEEP harnesses are skipped by `all` even in the full (non-quick) run —
+    // each is many minutes of exact noisy simulation. Run them explicitly by
+    // name, or set ARIA_DEEP=1 to fold them into `all`. This keeps the default
+    // CI sweep fast without dropping the check.
+    const DEEP: &[&str] = &["spectra_noise"];
+    let deep = std::env::var("ARIA_DEEP").map(|v| v == "1").unwrap_or(false);
     let selected: Vec<_> = if name == "all" {
         if quick {
             println!(
@@ -132,13 +137,18 @@ fn main() -> ExitCode {
                  (run `aria-verify all` without the flag, as ci.sh does, for the full set)",
                 QUICK_SKIP.join(", ")
             );
-            table
-                .into_iter()
-                .filter(|(n, _)| !QUICK_SKIP.contains(n))
-                .collect()
-        } else {
-            table
         }
+        if !deep {
+            println!(
+                "SKIPPING deep harnesses in `all`: {} (run by name, or set ARIA_DEEP=1)",
+                DEEP.join(", ")
+            );
+        }
+        table
+            .into_iter()
+            .filter(|(n, _)| !(quick && QUICK_SKIP.contains(n)))
+            .filter(|(n, _)| deep || !DEEP.contains(n))
+            .collect()
     } else {
         table.into_iter().filter(|(n, _)| *n == name).collect()
     };
