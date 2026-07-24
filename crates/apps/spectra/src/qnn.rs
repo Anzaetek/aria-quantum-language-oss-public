@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use aria_verify_core::data;
 use aria_verify_core::Observable;
 use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, ParamExpr, Qubit, SymbolId};
-use omega_core::executor::{Backend, PauliOp};
+use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode, PauliOp};
 use omega_core::gradient::{compute_gradient_for, GradMethod};
 use omega_core::params::ParameterBinding;
 use smallvec::smallvec;
@@ -432,6 +432,81 @@ impl<'a> DmqLane<'a> {
         x.par_iter()
             .map(|p| Ok(data::ridge_predict(&self.head, &[self.raw(backend, p)?])))
             .collect()
+    }
+
+    /// Per-row scores from a FINITE number of measurement shots — the
+    /// sampling-noise axis of hardware realism, on top of the exact/decoherence
+    /// paths. The correlator ⟨Σ Z_k Z_{k+1}⟩ is estimated by sampling the
+    /// evolved state in the computational (Z) basis `shots` times and averaging
+    /// Σ_k z_k z_{k+1} per shot (an UNBIASED estimator: variance ∝ 1/shots, no
+    /// bias), then run through the fixed exact-trained head. Deterministic given
+    /// `seed` (each row is sampled with a distinct sub-seed).
+    pub fn scores_shots(
+        &self,
+        backend: &dyn Backend,
+        x: &[Vec<f64>],
+        shots: u32,
+        seed: u64,
+    ) -> Result<Vec<f64>, String> {
+        x.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let raw = self.shot_correlator(
+                    backend,
+                    p,
+                    shots,
+                    seed ^ (i as u64).wrapping_mul(0x9E37),
+                )?;
+                Ok(data::ridge_predict(&self.head, &[raw]))
+            })
+            .collect()
+    }
+
+    /// Sample ⟨Σ Z_k Z_{k+1}⟩ from `shots` Z-basis measurements of the evolved
+    /// state for one phase row.
+    fn shot_correlator(
+        &self,
+        backend: &dyn Backend,
+        phases: &[f64],
+        shots: u32,
+        seed: u64,
+    ) -> Result<f64, String> {
+        let mut b = ParameterBinding::new();
+        for (&id, &j) in self.jt_ids.iter().zip(&self.couplings) {
+            b.bind(id, j * self.dt);
+        }
+        for (&id, &ph) in self.pt_ids.iter().zip(phases) {
+            b.bind(id, ph * self.dt);
+        }
+        let cfg = ExecConfig {
+            shots: Some(shots),
+            seed: Some(seed),
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let counts = match backend
+            .execute(self.ir, &b, &cfg)
+            .map_err(|e| e.to_string())?
+        {
+            ExecResult::Counts(m) => m,
+            other => return Err(format!("expected sampled counts, got {other:?}")),
+        };
+        // z_q = 1 − 2·bit_q (qubit q is bit q, LSB-first); correlator per shot
+        // is Σ_{k=0}^{5} z_k z_{k+1}, averaged over the sampled bitstrings.
+        let total: u64 = counts.values().map(|&c| c as u64).sum();
+        if total == 0 {
+            return Ok(0.0);
+        }
+        let mut acc = 0.0;
+        for (state, &c) in &counts {
+            let mut corr = 0.0;
+            for k in 0..6u32 {
+                let zk = 1 - 2 * ((state >> k) & 1) as i64;
+                let zk1 = 1 - 2 * ((state >> (k + 1)) & 1) as i64;
+                corr += (zk * zk1) as f64;
+            }
+            acc += corr * c as f64;
+        }
+        Ok(acc / total as f64)
     }
 
     /// The ablation lane (certification's ON−OFF gate): couplings pinned
