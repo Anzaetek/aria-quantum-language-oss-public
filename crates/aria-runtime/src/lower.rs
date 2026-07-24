@@ -28,9 +28,21 @@ use omega_core::circuit::{
 
 /// A lowered circuit plus the symbol table linking Aria parameter names to the
 /// omega `SymbolId`s used inside [`CircuitIR::symbols`].
+///
+/// # Binding-order contract (stable)
+///
+/// `SymbolId`s are assigned in **first-appearance order** as the lowering
+/// walks the circuit, so they form a contiguous `0..symbol_ids.len()` range.
+/// Consumers that pass parameters as a flat slice (the wasm transport, the
+/// verify-core oracle) MUST order that slice by **ascending `SymbolId`** —
+/// `params[id]` is the value bound to the symbol with that id. `symbol_ids`
+/// is the authoritative name → id map; never assume a name's id from source
+/// order, always look it up. This ordering is a tested guarantee
+/// (`aria-runtime/tests/symbol_order.rs`), not an incidental behaviour.
 pub struct Lowered {
     pub ir: CircuitIR,
-    /// Aria symbol name → omega `SymbolId`.
+    /// Aria symbol name → omega `SymbolId` (ids are dense, `0..len`, in
+    /// first-appearance order — see the type-level binding-order contract).
     pub symbol_ids: HashMap<String, SymbolId>,
     /// True when a non-meta gate follows a measurement (projective
     /// mid-circuit semantics required at execution time).

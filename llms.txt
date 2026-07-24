@@ -1,0 +1,60 @@
+# Aria Quantum Language — API index
+
+A small, readable DSL for quantum circuits on a pluggable pure-Rust runtime
+(the vendored `omega-functions` engine). One source parses to a backend-agnostic
+IR and then runs, trains (parameter-shift / adjoint gradients, no libtorch),
+and exports to OPENQASM 2.0 / JSON / Lean 4. This file indexes the public Rust
+entry points for embedding Aria as a library. Prose guide: docs/LIBRARY.md.
+The default build needs no libtorch and no GPU.
+
+## Start here
+- docs/LIBRARY.md — "using Aria as a library": lower-once/bind-many, gradients, training (compiled snippets).
+- crates/apps/qml-classifier — smallest end-to-end trained example (adjoint gradients through the Backend trait).
+- TUTORIAL.md / GRAMMAR.md — the .aria language and CLI.
+- README.md — overview; VERIFICATION.md — what each example proves.
+
+## The core flow (3 crates)
+- aria-core :: `ast::parse_aria(src) -> Program`; `Program::instantiate(name, &[(k,i64)]) -> Circuit`.
+  `ast::qasm::to_qasm(&Circuit) -> String` (OPENQASM 2.0 export). `ast::GateKind` (incl. `RBS`).
+- aria-runtime :: `lower::lower(&Circuit) -> Lowered { ir: CircuitIR, symbol_ids: HashMap<String,SymbolId>, .. }`.
+  Binding-order contract on `Lowered`: SymbolIds are dense 0..N in first-appearance order (tested).
+  `run::{expectation, statevector, run_counts}` — one-shot CLI-style wrappers (re-lower each call; not for loops).
+  `run::BackendSel::{Sim, Mps{chi}, Gpu, Tch, PauliProp}` + `BackendSel::parse("mps:128")`.
+  `train::{train_expectation, TrainConfig, Optimizer::{Gd,Adam}}` — single-observable variational trainer (VQE-shaped).
+- omega-core :: the runtime types every backend and gradient path share.
+  `executor::Backend` (trait): `expectation`, `expectation_multi`, `adjoint_gradient`, `execute`.
+  `executor::Observable::parse("0.5*X0 + Z1 Z2")`; `executor::PauliOp`.
+  `circuit::{CircuitIR, GateOp, GateKind, ParamExpr, SymbolId=u32, Qubit}`.
+  `params::ParameterBinding` — `new()`, `bind(SymbolId, f64)`; the typed parameter vector.
+  `gradient::compute_gradient_for(backend, ir, binding, obs, &GradMethod, only: Option<&HashSet<SymbolId>>)`.
+  `gradient::GradMethod::{Adjoint, ParameterShift, ParallelParameterShift, FiniteDifference}`.
+  `parallel_shift::parallel_parameter_shift_gradient` — one-execution gradients for a trailing commuting block (arXiv:2606.03517).
+  `qml::{QmlModel, QmlTrainer, Encoding, Optimizer}` — batched encode-then-ansatz trainer (MSE SGD/Adam).
+
+## Backends (all impl omega_core::executor::Backend)
+- omega-backend-statevector :: `StatevectorBackend::new()` — pure-Rust dense, exact, ≲24 qubits. Implements `adjoint_gradient`.
+- omega-backend-mps :: `MpsBackend::new(chi)` — matrix-product-state, bond dim `chi` (2^(n/2) = exact).
+- omega-backend-pauliprop :: `PauliPropBackend` — Heisenberg-picture Pauli propagation; expectations only, width-unbounded on Clifford.
+- omega-backend-pauli :: stabilizer tableau (Clifford).
+- omega-backend-photonics :: Fock/optical modes (BeamSplitterRx, PhaseShifter).
+- GPU (feature-gated): omega-backend-{statevector,mps,pauliprop}-{metal,cuda,opencl}.
+- aria-backend-tch :: libtorch `tch::Tensor` statevector (feature `tch`, workspace-EXCLUDED; see INSTALL_LIBTORCH.md).
+
+## Verification / apps
+- aria-verify-core :: `harness::load_lowered(file, circuit, ints)` (repo examples/aria/), `harness::load_lowered_path(path, ..)` (arbitrary path).
+  `harness::execute_report` (run through the wasm/native transport), `sim::forward_z_expectations(ir, params)` (independent oracle),
+  `banner::*` (PASS/FAIL reporting), `data::{load_csv, ridge_regression, SplitMix64}` (vendored-dataset helpers).
+- aria-verify :: `cargo run -p aria-verify -- all` runs every example harness vs its classical oracle (this is what CI asserts).
+- crates/apps/<name> :: one crate per shipped example; each `pub fn run(Transport) -> Result<Verdict,String>`.
+
+## CLI (crates/aria-cli, the `aria` binary)
+- `aria run <f.aria> --circuit C [--int k=v] [--bind s=v] [--shots N] [--backend sim|mps[:chi]|gpu|tch|pauliprop] [--statevector] [--expectation OBS]`
+- `aria train <f.aria> --circuit C --observable OBS [--steps N --lr R --opt adam --freeze a,b --set a=0.5 --grad parallel]`
+- `aria export <f.aria> --circuit C (--qasm|--json|--lean|--gate-model)`
+- `aria list|parse <f.aria>`
+
+## Server / remote (optional)
+- omega-server :: HTTP execution service (`POST /v1/quantum/execute`; PQC bearer auth). omega-client :: Rust client.
+
+## Proofs
+- proofs/lean4/QuantumProofs/*.lean :: sorry-free correctness theorems (Bell, QFT, QPE, Grover, HHL, QSVT, RBS gate).
