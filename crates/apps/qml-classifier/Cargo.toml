@@ -11,3 +11,5 @@ description = "data-reuploading classifier confusion matrix vs labels."
 
 [dependencies]
 aria-verify-core = { path = "../../aria-verify-core" }
+omega-core = { path = "../../omega-core" }
+omega-backend-statevector = { path = "../../omega-backend-statevector" }

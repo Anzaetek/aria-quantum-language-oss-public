@@ -270,6 +270,8 @@ name = "aria-app-qml-classifier"
 version = "0.1.0"
 dependencies = [
  "aria-verify-core",
+ "omega-backend-statevector",
+ "omega-core",
 ]
 
 [[package]]

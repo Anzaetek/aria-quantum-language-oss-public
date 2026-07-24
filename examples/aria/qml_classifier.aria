@@ -1,6 +1,9 @@
 -- ▶ Application harness + classical cross-check: crates/apps/qml-classifier/src/lib.rs
 --   run: cargo run -p aria-app-qml-classifier   (or: cargo run -p aria-verify -- qml_classifier)
 -- VERIFIED: test-set predictions sign(⟨Z⟩) (inference through wasm) vs ground-truth labels y=sign(x); accuracy ≥ 0.9.
+-- The weights are trained with EXACT adjoint gradients through the public
+-- omega Backend trait (StatevectorBackend::adjoint_gradient) — see the app
+-- harness and docs/LIBRARY.md for the "train an Aria circuit from Rust" pattern.
 --
 -- Data-reuploading binary classifier (Perez-Salinas et al. 2020).
 --
