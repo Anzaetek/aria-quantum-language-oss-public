@@ -382,6 +382,26 @@ pub trait Backend {
             .collect()
     }
 
+    /// Expectation of ONE observable across MANY parameter bindings (one per
+    /// row), against the same circuit. This is the row-batch counterpart of
+    /// [`Backend::expectation_multi`] (which batches observables): scoring N
+    /// data rows is N independent forward sweeps, so a backend can run them in
+    /// parallel. The default loops [`Backend::expectation`] sequentially;
+    /// backends override with a data-parallel implementation. The returned
+    /// vector is in the SAME order as `bindings` (index-preserving), so seeded
+    /// training runs stay bit-stable regardless of parallelism.
+    fn expectation_batch(
+        &self,
+        circuit: &CircuitIR,
+        bindings: &[&ParameterBinding],
+        observable: &Observable,
+    ) -> Result<Vec<f64>> {
+        bindings
+            .iter()
+            .map(|b| self.expectation(circuit, b, observable))
+            .collect()
+    }
+
     /// Compute all gradients via adjoint differentiation in a single forward+backward pass.
     /// Returns `Ok(None)` if the backend doesn't support AD (triggers fallback to parameter-shift).
     fn adjoint_gradient(
@@ -392,6 +412,26 @@ pub trait Backend {
     ) -> Result<Option<Vec<(SymbolId, f64)>>> {
         let _ = (circuit, params, observable);
         Ok(None)
+    }
+
+    /// Adjoint gradients across MANY parameter bindings (one per row), against
+    /// the same circuit and observable — the row-batch counterpart of
+    /// [`Backend::adjoint_gradient`]. This is where a supervised training
+    /// loop spends most of its time (one adjoint pass per data row per step),
+    /// so parallelising over rows is the main throughput lever. The default
+    /// loops sequentially; the returned vector is index-aligned with
+    /// `bindings`, and each element carries the same `Ok(None)` /
+    /// `Ok(Some(..))` contract as [`Backend::adjoint_gradient`].
+    fn adjoint_gradient_batch(
+        &self,
+        circuit: &CircuitIR,
+        bindings: &[&ParameterBinding],
+        observable: &Observable,
+    ) -> Result<Vec<AdjointGradient>> {
+        bindings
+            .iter()
+            .map(|b| self.adjoint_gradient(circuit, b, observable))
+            .collect()
     }
 
     /// Compute per-observable expectations *and* a gradient against a
@@ -427,6 +467,12 @@ pub trait Backend {
         Ok((predictions, gradient))
     }
 }
+
+/// One binding's adjoint gradient: `Some(per-symbol gradients)`, or `None`
+/// when the backend can't run adjoint AD on the circuit (same contract as
+/// [`Backend::adjoint_gradient`]). The element type of
+/// [`Backend::adjoint_gradient_batch`].
+pub type AdjointGradient = Option<Vec<(SymbolId, f64)>>;
 
 /// Closure shape for [`Backend::expectation_multi_then_gradient`] —
 /// builds the gradient `Observable` from the just-computed

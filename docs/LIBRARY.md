@@ -148,9 +148,15 @@ backend-agnostic — swap the constructor:
 
 `Observable::parse("0.5*X0 + Z1 Z2")` builds a weighted Pauli sum;
 `Observable { terms: vec![(coeff, vec![(qubit, PauliOp::Z)]) , ..] }` builds one
-by hand. `backend.expectation_multi(ir, binding, &[obs0, obs1, ..])` evaluates
-several observables against **one** forward sweep — use it when reading ⟨Z_q⟩
-on many qubits per point (it saves N−1 simulator runs).
+by hand. Two batch reads amortise work across a whole dataset:
+
+- `backend.expectation_multi(ir, binding, &[obs0, obs1, ..])` — several
+  observables against **one** forward sweep (⟨Z_q⟩ on many qubits per point).
+- `backend.expectation_batch(ir, &[&binding0, &binding1, ..], obs)` — one
+  observable against **many bindings** (one per data row), run in parallel on
+  the statevector backend. `adjoint_gradient_batch` is the gradient
+  counterpart — the throughput lever a training loop leans on. Both are
+  index-preserving, so seeded runs stay bit-identical to the sequential loop.
 
 ## Loading circuits
 

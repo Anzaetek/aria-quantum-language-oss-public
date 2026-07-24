@@ -299,15 +299,15 @@ pub fn train_supervised(
         }
         b
     };
+    // Row-batched readout: build one binding per row and evaluate them in a
+    // single (backend-parallel) call. Index-preserving, so results are
+    // identical to a sequential loop.
     let readout = |w: &[f64]| -> Result<Vec<f64>, String> {
-        train_x
-            .iter()
-            .map(|x| {
-                backend
-                    .expectation(&low.ir, &binding(w, x), &obs)
-                    .map_err(|e| e.to_string())
-            })
-            .collect()
+        let bnds: Vec<ParameterBinding> = train_x.iter().map(|x| binding(w, x)).collect();
+        let refs: Vec<&ParameterBinding> = bnds.iter().collect();
+        backend
+            .expectation_batch(&low.ir, &refs, &obs)
+            .map_err(|e| e.to_string())
     };
 
     let n = train_x.len() as f64;
@@ -347,22 +347,47 @@ pub fn train_supervised(
 
         // Accumulate weight gradients: Σ_row dL/dz · ∂z/∂θ.
         let mut grad: HashMap<SymbolId, f64> = HashMap::new();
-        for (i, x) in train_x.iter().enumerate() {
-            if dl_dz[i] == 0.0 {
-                continue;
+        if matches!(cfg.grad_method, GradMethod::Adjoint) {
+            // Fast path: one backend-parallel batch of adjoint passes over all
+            // rows (the loop's dominant cost), then a deterministic reduction.
+            let bnds: Vec<ParameterBinding> = train_x.iter().map(|x| binding(&w, x)).collect();
+            let refs: Vec<&ParameterBinding> = bnds.iter().collect();
+            let per_row = backend
+                .adjoint_gradient_batch(&low.ir, &refs, &obs)
+                .map_err(|e| e.to_string())?;
+            for (i, row) in per_row.into_iter().enumerate() {
+                if dl_dz[i] == 0.0 {
+                    continue;
+                }
+                let row = row.ok_or("backend returned no adjoint gradient")?;
+                for (sym, g) in row {
+                    // adjoint returns every symbol; keep only trainable weights
+                    // (this is where freezing is applied on the batch path).
+                    if trainable.contains(&sym) {
+                        *grad.entry(sym).or_insert(0.0) += dl_dz[i] * g / n;
+                    }
+                }
             }
-            let bnd = binding(&w, x);
-            let grads = compute_gradient_for(
-                backend.as_ref(),
-                &low.ir,
-                &bnd,
-                &obs,
-                &cfg.grad_method,
-                Some(&trainable),
-            )
-            .map_err(|e| e.to_string())?;
-            for (sym, g) in grads {
-                *grad.entry(sym).or_insert(0.0) += dl_dz[i] * g / n;
+        } else {
+            // Parameter-shift / parallel-shift: per-row, with the `only` filter
+            // doing the freezing.
+            for (i, x) in train_x.iter().enumerate() {
+                if dl_dz[i] == 0.0 {
+                    continue;
+                }
+                let bnd = binding(&w, x);
+                let grads = compute_gradient_for(
+                    backend.as_ref(),
+                    &low.ir,
+                    &bnd,
+                    &obs,
+                    &cfg.grad_method,
+                    Some(&trainable),
+                )
+                .map_err(|e| e.to_string())?;
+                for (sym, g) in grads {
+                    *grad.entry(sym).or_insert(0.0) += dl_dz[i] * g / n;
+                }
             }
         }
 
