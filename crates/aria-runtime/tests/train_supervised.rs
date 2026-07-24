@@ -153,6 +153,50 @@ fn feature_count_mismatch_is_reported() {
     assert!(err.contains("missing feature symbol 'x_1'"), "err: {err}");
 }
 
+/// A structurally-degenerate model: the feature `x_0` drives q[1] but the
+/// readout is Z0 on q[0], which only ever sees trainable rotations. ⟨Z0⟩ is
+/// therefore identical across every row, so the affine head is degenerate
+/// (variance ≈ 0, slope ≈ 0) and dL/d⟨O⟩ is zero on every step. Training must
+/// not panic or divide-by-zero — the stall escape keeps the loop advancing and
+/// the run returns finite, honest metrics (AUC ≈ 0.5, no better than chance).
+fn degenerate_model() -> Circuit {
+    let src = "circuit Deg() {\n  qreg q[2]\n  let theta = symbolic[2]\n  let x = symbolic[1]\n  \
+               apply RY(x[0]) on q[1]\n  apply RY(theta[0]) on q[0]\n  apply RZ(theta[1]) on q[0]\n}\n";
+    parse_aria(src).unwrap().instantiate("Deg", &[]).unwrap()
+}
+
+#[test]
+fn degenerate_head_does_not_panic_and_stays_finite() {
+    let c = degenerate_model();
+    let (x, y) = synthetic();
+    let cfg = SupervisedConfig {
+        steps: 20,
+        lr: 0.2,
+        seed: 11,
+        loss: Loss::Bce,
+        optimizer: Optimizer::adam(),
+        ..Default::default()
+    };
+    let r = train_supervised(&c, &x, &y, "Z0", &cfg, BackendSel::Sim).unwrap();
+    assert!(
+        r.final_loss.is_finite(),
+        "loss went non-finite: {}",
+        r.final_loss
+    );
+    assert!(
+        r.final_auc.is_finite() && (0.0..=1.0).contains(&r.final_auc),
+        "AUC out of range: {}",
+        r.final_auc
+    );
+    // A model that structurally cannot correlate the readout with the feature
+    // should not appear to have learned anything.
+    assert!(
+        r.final_auc < 0.7,
+        "degenerate model reported AUC {:.3} — suspiciously high",
+        r.final_auc
+    );
+}
+
 // ---- Smoke test on the vendored open UCI Cleveland heart dataset. ----
 
 /// Minimal CSV reader for the vendored numeric file (no external crate; the

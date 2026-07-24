@@ -230,6 +230,9 @@ mod tests {
         fn qsvt_block(circuit: &Circuit, n_system: usize) -> Vec<Vec<Complex64>> {
             let dim = 1usize << n_system;
             let mut block = vec![vec![Complex64::new(0.0, 0.0); dim]; dim];
+            // `i` is a basis-state bit pattern (used as `i >> j`) and the column
+            // it fills, not a plain row cursor — a range loop is the honest form.
+            #[allow(clippy::needless_range_loop)]
             for i in 0..dim {
                 let mut probe = Circuit::new("probe");
                 let qs = probe.qreg("q", 1 + n_system);
