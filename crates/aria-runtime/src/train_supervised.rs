@@ -315,7 +315,13 @@ pub fn train_supervised(
     let mut loss_history = Vec::with_capacity(cfg.steps);
 
     for step in 0..cfg.steps {
-        let z = readout(&w)?;
+        // Build the per-row bindings ONCE and reuse them for both the readout
+        // and the gradient pass (they only depend on the current weights).
+        let bnds: Vec<ParameterBinding> = train_x.iter().map(|x| binding(&w, x)).collect();
+        let refs: Vec<&ParameterBinding> = bnds.iter().collect();
+        let z = backend
+            .expectation_batch(&low.ir, &refs, &obs)
+            .map_err(|e| e.to_string())?;
         // Refit the affine head to the current ⟨O⟩ profile.
         let head = match cfg.loss {
             Loss::Mse => fit_head_mse(&z, train_y),
@@ -349,9 +355,8 @@ pub fn train_supervised(
         let mut grad: HashMap<SymbolId, f64> = HashMap::new();
         if matches!(cfg.grad_method, GradMethod::Adjoint) {
             // Fast path: one backend-parallel batch of adjoint passes over all
-            // rows (the loop's dominant cost), then a deterministic reduction.
-            let bnds: Vec<ParameterBinding> = train_x.iter().map(|x| binding(&w, x)).collect();
-            let refs: Vec<&ParameterBinding> = bnds.iter().collect();
+            // rows (the loop's dominant cost), reusing the readout bindings,
+            // then a deterministic reduction.
             let per_row = backend
                 .adjoint_gradient_batch(&low.ir, &refs, &obs)
                 .map_err(|e| e.to_string())?;
@@ -371,15 +376,14 @@ pub fn train_supervised(
         } else {
             // Parameter-shift / parallel-shift: per-row, with the `only` filter
             // doing the freezing.
-            for (i, x) in train_x.iter().enumerate() {
+            for (i, bnd) in bnds.iter().enumerate() {
                 if dl_dz[i] == 0.0 {
                     continue;
                 }
-                let bnd = binding(&w, x);
                 let grads = compute_gradient_for(
                     backend.as_ref(),
                     &low.ir,
-                    &bnd,
+                    bnd,
                     &obs,
                     &cfg.grad_method,
                     Some(&trainable),
@@ -389,6 +393,21 @@ pub fn train_supervised(
                     *grad.entry(sym).or_insert(0.0) += dl_dz[i] * g / n;
                 }
             }
+        }
+
+        // Stall escape: a flat readout (degenerate affine head, s ≈ 0) makes
+        // every dL/d⟨O⟩ zero, so there is no gradient. Rather than silently
+        // freezing, nudge the trainable weights deterministically to break the
+        // plateau and try the step again next iteration.
+        let grad_norm: f64 = grad.values().map(|g| g * g).sum::<f64>().sqrt();
+        if grad_norm < 1e-12 && step + 1 < cfg.steps {
+            let mut rng = SplitMix64(cfg.seed ^ 0x5715_2AE1 ^ (step as u64 + 1));
+            for (k, &id) in weight_ids.iter().enumerate() {
+                if trainable.contains(&id) {
+                    w[k] += (rng.next_f64() * 2.0 - 1.0) * 1e-2;
+                }
+            }
+            continue;
         }
 
         // Optimizer update over trainable weights.
