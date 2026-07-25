@@ -541,3 +541,65 @@ impl<'a> DmqLane<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omega_backend_statevector::StatevectorBackend;
+
+    fn gate(kind: GateKind, q: u32) -> GateOp {
+        GateOp {
+            gate: kind,
+            qubits: smallvec![Qubit(q)],
+            params: smallvec![],
+            classical_bit: None,
+            condition: None,
+        }
+    }
+
+    fn zz_correlator() -> Observable {
+        Observable::parse("1.0*Z0Z1 + 1.0*Z1Z2 + 1.0*Z2Z3 + 1.0*Z3Z4 + 1.0*Z4Z5 + 1.0*Z5Z6")
+            .unwrap()
+    }
+
+    // A DmqLane with no trainable symbols over a hand-built 7-qubit circuit, so
+    // shot_correlator samples that fixed circuit directly (couplings/phases bind
+    // nothing). This pins the estimator's bit convention and 6-bond averaging
+    // without the substrate .aria or any training.
+    #[test]
+    fn shot_correlator_exact_on_a_product_state() {
+        // X on qubits {0,2,4} → basis state with bits 0,2,4 set;
+        // z = [-1,+1,-1,+1,-1,+1,+1]; Σ_k z_k z_{k+1} = -5 + 1 = -4, deterministic.
+        let mut ir = CircuitIR::new(7, CircuitType::GateBased);
+        for q in [0u32, 2, 4] {
+            ir.add_op(gate(GateKind::X, q));
+        }
+        let corr = zz_correlator();
+        let (jt, pt): (Vec<u32>, Vec<u32>) = (vec![], vec![]);
+        let dmq = DmqLane::new(&ir, &jt, &pt, 1.0, &corr);
+        let est = dmq
+            .shot_correlator(&StatevectorBackend::new(), &[], 1000, 7)
+            .unwrap();
+        assert!(
+            (est - (-4.0)).abs() < 1e-9,
+            "product-state ΣZZ estimate {est}, want -4"
+        );
+    }
+
+    #[test]
+    fn shot_correlator_converges_on_a_superposition() {
+        // H on every qubit → |+>^7: each ⟨Z_k Z_{k+1}⟩ = 0, so ΣZZ = 0. The
+        // sampled mean must converge there (unbiasedness + correct averaging).
+        let mut ir = CircuitIR::new(7, CircuitType::GateBased);
+        for q in 0..7 {
+            ir.add_op(gate(GateKind::H, q));
+        }
+        let corr = zz_correlator();
+        let (jt, pt): (Vec<u32>, Vec<u32>) = (vec![], vec![]);
+        let dmq = DmqLane::new(&ir, &jt, &pt, 1.0, &corr);
+        let est = dmq
+            .shot_correlator(&StatevectorBackend::new(), &[], 100_000, 42)
+            .unwrap();
+        assert!(est.abs() < 0.1, "|+>^7 ΣZZ estimate {est}, want ~0");
+    }
+}
