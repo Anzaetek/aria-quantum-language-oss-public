@@ -129,7 +129,9 @@ fn main() -> ExitCode {
     // name, or set ARIA_DEEP=1 to fold them into `all`. This keeps the default
     // CI sweep fast without dropping the check.
     const DEEP: &[&str] = &["spectra_noise"];
-    let deep = std::env::var("ARIA_DEEP").map(|v| v == "1").unwrap_or(false);
+    let deep = std::env::var("ARIA_DEEP")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let selected: Vec<_> = if name == "all" {
         if quick {
             println!(
