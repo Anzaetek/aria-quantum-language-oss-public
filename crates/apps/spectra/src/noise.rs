@@ -222,4 +222,39 @@ mod tests {
         let points = [pt(0.0, 0.4), pt(0.02, 0.3), pt(0.04, 0.2)];
         assert!(crossover_rate(&points).is_none());
     }
+
+    // classical_best is the baseline the whole certification is measured
+    // against — pin that it (a) finds a separable signal and (b) returns
+    // per-row scores aligned to the test set.
+    #[test]
+    fn classical_best_recovers_a_separable_signal() {
+        use aria_verify_core::data::SplitMix64;
+        // Two phase features; the label is sign(phi_0). A linear lane separates
+        // it, so the best lane must score near-perfect AUC.
+        let mut rng = SplitMix64(9);
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for _ in 0..80 {
+            let p0 = (rng.next_f64() * 2.0 - 1.0) * std::f64::consts::PI;
+            let p1 = (rng.next_f64() * 2.0 - 1.0) * std::f64::consts::PI;
+            x.push(vec![p0, p1]);
+            y.push(if p0 > 0.0 { 1.0 } else { -1.0 });
+        }
+        let (tr_x, te_x) = x.split_at(56);
+        let (tr_y, te_y) = y.split_at(56);
+        let best = classical_best(tr_x, tr_y, te_x, te_y);
+        assert_eq!(
+            best.scores.len(),
+            te_x.len(),
+            "scores must align to test rows"
+        );
+        assert!(
+            best.auc > 0.9,
+            "best classical lane {} only reached AUC {:.3} on a separable set",
+            best.name,
+            best.auc
+        );
+        // Consistency: the reported AUC is the AUC of the reported scores.
+        assert!((auc(&best.scores, te_y) - best.auc).abs() < 1e-12);
+    }
 }
