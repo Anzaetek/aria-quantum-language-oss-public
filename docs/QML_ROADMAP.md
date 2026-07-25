@@ -121,9 +121,17 @@ Original plan (for reference):
   shrinks Z.
 - **Finite-shot (sampling) axis**: the channel sweeps use exact expectations
   (∞ shots); a final sweep estimates the correlator from a shrinking Z-basis
-  shot budget. AUC 0.990 (16384 shots) → 0.954 (256) → 0.806 (64) → 0.630 (16),
-  with the certification crossover interpolated at **≈ 31 shots/row** — a
-  modest, hardware-friendly budget (real experiments take thousands).
+  shot budget (an unbiased per-shot Σ_k z_k z_{k+1} average). AUC 0.990 (16384
+  shots) → 0.954 (256) → 0.806 (64) → 0.630 (16), with the certification
+  crossover interpolated at **≈ 31 shots/row** — a modest, hardware-friendly
+  budget (real experiments take thousands).
+- **Zero-noise-extrapolation probe (advisory, honest negative)**: Richardson
+  extrapolation over depolarizing scales {1,2,3}×base gives *negligible*
+  recovery (best CI_lo change ≈ +0.001, no verdict flips). This is expected and
+  reported as such — on this deep Trotter circuit the correlator is a
+  high-degree polynomial in the noise rate, which a 3-point extrapolation cannot
+  invert; low-order ZNE is a poor fit here. The reported margin stays the raw
+  crossover, never a mitigated one. (Never gates the verdict.)
 - CHECK: PauliProp reproduces the statevector scores at zero noise (|Δ| ≤ 1e-6);
   for EACH decoherence channel the substrate CERTIFIES at zero noise with a
   crossover to REFUSED inside the sweep; and the shot sweep certifies at the
