@@ -37,6 +37,10 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("arch_priors", aria_app_spectra::arch_priors),
         ("spectra_scaling", aria_app_spectra::spectra_scaling),
         ("spectra_noise", aria_app_spectra::spectra_noise),
+        (
+            "spectra_scaling_noise",
+            aria_app_spectra::spectra_scaling_noise,
+        ),
         ("qos", aria_app_qos::run),
         ("circulant", aria_app_circulant::run),
         ("cqs", aria_app_cqs::run),
@@ -128,7 +132,7 @@ fn main() -> ExitCode {
     // each is many minutes of exact noisy simulation. Run them explicitly by
     // name, or set ARIA_DEEP=1 to fold them into `all`. This keeps the default
     // CI sweep fast without dropping the check.
-    const DEEP: &[&str] = &["spectra_noise"];
+    const DEEP: &[&str] = &["spectra_noise", "spectra_scaling_noise"];
     let deep = std::env::var("ARIA_DEEP")
         .map(|v| v == "1")
         .unwrap_or(false);
