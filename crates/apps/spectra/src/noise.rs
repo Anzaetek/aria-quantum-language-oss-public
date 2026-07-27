@@ -140,7 +140,19 @@ pub fn channel_backend(channel: Channel, rate: f64) -> PauliPropBackend {
     // affine head then keeps the score within ~1e-6); noise is applied via its
     // exact Heisenberg adjoint. Nonzero rates shrink coefficients, so fewer
     // terms survive truncation and the sweep speeds up.
-    PauliPropBackend::with_truncation(1e-8, None).with_noise(channel.model(rate))
+    channel_backend_trunc(channel, rate, 1e-8)
+}
+
+/// [`channel_backend`] with an explicit Pauli-coefficient truncation floor.
+///
+/// The n=7 substrate is exact at `coeff_min = 1e-8`. At larger sizes the
+/// number of surviving Pauli strings (and thus the cost) grows steeply toward
+/// zero noise, so the scaling×noise harness uses a looser floor (1e-5) for the
+/// *nonzero-rate* points — where noise already prunes aggressively and the
+/// resulting correlator matches the 1e-8 value to well under 1% (measured) —
+/// while taking the noiseless reference from the statevector, never PauliProp.
+pub fn channel_backend_trunc(channel: Channel, rate: f64, coeff_min: f64) -> PauliPropBackend {
+    PauliPropBackend::with_truncation(coeff_min, None).with_noise(channel.model(rate))
 }
 
 /// One point of the noise sweep.

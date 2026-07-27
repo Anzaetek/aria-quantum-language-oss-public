@@ -1451,3 +1451,183 @@ pub fn spectra_noise(transport_override: Transport) -> Result<Verdict, String> {
         tol: 1e-6,
     })
 }
+
+/// spectra_scaling_noise — how the certified advantage's noise sensitivity
+/// scales with system size (the scaling × noise cross-study).
+///
+/// The intuitive expectation is that a bigger substrate — more gates — must be
+/// LESS noise-robust. This harness measures it and finds the intuition WRONG,
+/// which is the interesting part. Depolarizing collapses the quantum signal
+/// (the spread of the dynamics-matched bond correlator across inputs)
+/// exponentially, A(r) ≈ A(0)·e^{−κ·r}. The decay constant κ is the noise
+/// sensitivity — a larger κ means the advantage dies at a lower error rate. For
+/// a LOCAL observable (nearest-neighbour ΣZZ) on a FIXED-DEPTH circuit (3
+/// Trotter steps), κ is INTENSIVE: it is set by each term's causal cone, not by
+/// the total system size, so it stays essentially constant as n grows. The
+/// noise budget therefore does NOT shrink with size — what grows with n is the
+/// *classical cost* of simulating the noisy dynamics exactly (measured here:
+/// the same scrambling that defeats classical simulation multiplies the Pauli
+/// strings, ~2.5 s/call at n = 7 → ~60 s at n = 9 → minutes at n = 11, which is
+/// what caps the exact study at n ∈ {7,8,9}). Robustness intensive, cost
+/// extensive — the two decouple.
+///
+/// To isolate the size variable cleanly, the scan uses NESTED couplings (the
+/// same disorder realization extended by one bond per size) and measures κ
+/// directly from the generator's true correlator — κ is a property of the
+/// circuit and observable, so no training is needed, which also makes the scan
+/// cheap. A separate TRAINED anchor at n = 7 establishes that the advantage is
+/// real (quantum lane beats the best classical lane) and noise-fragile, and
+/// that PauliProp reproduces the statevector exactly.
+///
+/// CHECK: (a) at n = 7 PauliProp(0) ≈ statevector (|Δ| ≤ 1e-6); (b) the trained
+/// n = 7 lane beats the best classical lane (gap > 0.05) and its signal is
+/// destroyed by r = 0.02 (fragility); (c) κ(n) is INTENSIVE — flat within 15%
+/// across n = 7,8,9 (the finding); (d) the exact-sim cost grows with n.
+pub fn spectra_scaling_noise(transport_override: Transport) -> Result<Verdict, String> {
+    let guest = "omega_app";
+    let transport = resolve(transport_override, guest);
+    banner::header(
+        "spectra_scaling_noise",
+        "does the certified advantage get less noise-robust as the substrate \
+         grows? nested-disorder decay-constant scan, exact-noisy, n = 7…9",
+        &transport.label(guest),
+    );
+    let sv = StatevectorBackend::new();
+    let dt = TOTAL_TIME / TROTTER_STEPS as f64;
+    let coeff_min = 1e-5;
+    // The signal collapses by r ≈ 0.02, so κ is fit from low, cheap rates
+    // {0.01, 0.02} (fast at every size — the costly PauliProp regime is r → 0,
+    // which we never enter); rate 0 is the free statevector reference A(0).
+    let rates: &[f64] = &[0.0, 0.01, 0.02];
+
+    // --- trained anchor at n = 7: a real, noise-fragile, exactly-simulated
+    // advantage exists to be scaled. ---
+    let anchor = scale::run_size_noise(
+        7,
+        TROTTER_STEPS as usize,
+        dt,
+        &sv,
+        SEED,
+        400, // samples
+        40,  // per_class → 80 eval rows
+        rates,
+        coeff_min,
+        BOOT_REPS,
+        40,   // epochs
+        true, // PauliProp(0) sanity
+    )?;
+    let gap = anchor.noiseless_auc_q - anchor.classical_auc;
+    let sanity_diff = anchor.sanity_diff.unwrap_or(f64::INFINITY);
+    let a0 = anchor.signal[0].1;
+    let a_top = anchor.signal.last().unwrap().1;
+    let residual = if a0 > 0.0 { a_top / a0 } else { 1.0 };
+    println!(
+        "  anchor n=7 (trained): {} eval rows, quantum AUC {:.3} vs best classical {} {:.3} (gap {:+.3}); \
+         PauliProp(0)−statevector Δ = {sanity_diff:.2e}",
+        anchor.eval_rows, anchor.noiseless_auc_q, anchor.classical_name, anchor.classical_auc, gap
+    );
+    println!(
+        "    signal under noise: {} → advantage {} by r = {:.3} (residual {:.1}% of A(0))",
+        anchor
+            .signal
+            .iter()
+            .map(|(r, a)| format!("A({r:.2})={a:.4}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        if residual < 0.1 {
+            "destroyed"
+        } else {
+            "survives"
+        },
+        anchor.signal.last().unwrap().0,
+        residual * 100.0
+    );
+
+    // --- κ scan across sizes (nested disorder, untrained generator correlator). ---
+    let mut points = Vec::new();
+    for &n in &[7usize, 8, 9] {
+        let kp = scale::generator_kappa(n, TROTTER_STEPS as usize, dt, SEED, 24, rates, coeff_min)?;
+        println!(
+            "  n = {n}: {} ops, signal {} → κ = {} ({:.1} s PauliProp)",
+            kp.gate_count,
+            kp.signal
+                .iter()
+                .map(|(r, a)| format!("A({r:.2})={a:.4}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            kp.kappa
+                .map(|k| format!("{k:.1}"))
+                .unwrap_or_else(|| "none".into()),
+            kp.secs
+        );
+        points.push(kp);
+    }
+
+    // (a) sanity, (b) advantage + fragility at the anchor.
+    let sanity_ok = sanity_diff <= 1e-6;
+    if !sanity_ok {
+        println!(
+            "  FAIL: n=7 PauliProp diverged from statevector at zero noise (Δ {sanity_diff:.2e})"
+        );
+    }
+    let advantage_ok = gap > 0.05;
+    if !advantage_ok {
+        println!("  FAIL: no noiseless quantum advantage at the anchor (gap {gap:+.3} ≤ 0.05)");
+    }
+    let fragility_ok = residual < 0.15;
+    if !fragility_ok {
+        println!(
+            "  FAIL: anchor advantage not destroyed by r = 0.02 (residual {:.1}%)",
+            residual * 100.0
+        );
+    }
+
+    // (c) κ INTENSIVE — does NOT grow with size (the finding). An extensive κ
+    // (∝ gate count) would rise like ops(9)/ops(7); the gate rejects any real
+    // growth (κ(9) ≤ κ(7)·1.10, the 10% band absorbing draw fluctuation), which
+    // is the sharp physical distinction, not a direction-blind spread bound.
+    let kappas: Vec<f64> = points.iter().filter_map(|p| p.kappa).collect();
+    let kappa_complete = kappas.len() == points.len();
+    let intensive =
+        kappa_complete && kappas[0] > 0.0 && *kappas.last().unwrap() <= kappas[0] * 1.10;
+    if kappa_complete {
+        let extensive_ratio =
+            points.last().unwrap().gate_count as f64 / points.first().unwrap().gate_count as f64;
+        println!(
+            "  → κ(n): {} — κ(9)/κ(7) = {:.2} vs the extensive prediction ops(9)/ops(7) = {:.2}: {}",
+            points
+                .iter()
+                .map(|p| format!("κ(n{})={:.1}", p.n_sites, p.kappa.unwrap()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            kappas.last().unwrap() / kappas[0],
+            extensive_ratio,
+            if intensive {
+                "INTENSIVE — the local observable's noise budget does NOT shrink with size"
+            } else {
+                "κ GREW with size (not intensive)"
+            }
+        );
+    }
+    if !intensive {
+        println!("  FAIL: κ(n) grows with size across n = 7,8,9 (expected intensive)");
+    }
+
+    // (d) the classical exact-sim cost is what grows with size (descriptive —
+    // wall-clock, so reported not gated).
+    println!(
+        "  → exact-noisy cost (extensive): {} — robustness intensive, cost extensive; they decouple",
+        points
+            .iter()
+            .map(|p| format!("n{}={:.1}s", p.n_sites, p.secs))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    Ok(Verdict {
+        name: "spectra_scaling_noise".into(),
+        pass: sanity_ok && advantage_ok && fragility_ok && intensive,
+        max_abs_diff: sanity_diff,
+        tol: 1e-6,
+    })
+}

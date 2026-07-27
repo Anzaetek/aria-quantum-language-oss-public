@@ -220,3 +220,328 @@ pub fn run_size(
         gap,
     })
 }
+
+/// The depolarizing crossover of the certification at ONE system size — the
+/// scaling×noise data point. Trains the dynamics-matched lane noiselessly
+/// (statevector), then re-scores it through the exact-noisy PauliProp backend
+/// over a depolarizing-rate grid and interpolates where the certification gate
+/// `CI_lo(Δ AUC) > 0` crosses zero.
+pub struct SizeCrossover {
+    pub n_sites: usize,
+    pub eval_rows: usize,
+    pub noiseless_auc_q: f64,
+    pub classical_name: &'static str,
+    pub classical_auc: f64,
+    /// `max |statevector − PauliProp(0)|` over the eval scores, when the
+    /// rate-0 PauliProp sanity was run at this size (only the smallest size,
+    /// to keep the sweep affordable — the noiseless reference is otherwise the
+    /// statevector directly).
+    pub sanity_diff: Option<f64>,
+    pub points: Vec<crate::noise::NoisePoint>,
+    pub crossover: Option<f64>,
+    /// Circuit gate count (ops in the lowered IR) — the physical driver of the
+    /// noise-decay constant: each gate applies one depolarizing multiplier.
+    pub gate_count: usize,
+    /// (rate, signal amplitude) where amplitude = std of the quantum scores
+    /// across eval rows. Depolarizing collapses this exponentially,
+    /// A(r) ≈ A(0)·exp(−κ·r); κ (fit by the caller) is the draw-robust noise
+    /// sensitivity, governed by gate count rather than the starting margin.
+    pub signal: Vec<(f64, f64)>,
+    /// Wall-clock of the nonzero-rate PauliProp sweep (illustrates the cost
+    /// wall that caps the exact method's reach).
+    pub noisy_secs: f64,
+}
+
+/// Population std of a score vector — the "signal amplitude" that decoherence
+/// collapses toward zero.
+fn amplitude(scores: &[f64]) -> f64 {
+    let n = scores.len() as f64;
+    if n == 0.0 {
+        return 0.0;
+    }
+    let mean = scores.iter().sum::<f64>() / n;
+    (scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n).sqrt()
+}
+
+/// Build the labelled substrate dataset at `n_sites`: fixed disorder draw, then
+/// median-thresholded sign of the bond correlator (identical recipe to
+/// [`run_size`], factored so the noise harness shares it).
+#[allow(clippy::type_complexity)]
+fn sized_dataset(
+    n_sites: usize,
+    steps: usize,
+    dt: f64,
+    backend: &dyn Backend,
+    seed: u64,
+    n_samples: usize,
+) -> Result<
+    (
+        omega_core::circuit::CircuitIR,
+        Vec<u32>,
+        Vec<u32>,
+        Observable,
+        Vec<Vec<f64>>,
+        Vec<f64>,
+    ),
+    String,
+> {
+    let bonds = chain_bonds(n_sites);
+    let (ir, jt_ids, pt_ids) = arch::build_ir_sized(&bonds, steps, n_sites);
+    let obs = correlator(n_sites);
+    let couplings = nested_couplings(bonds.len(), seed);
+    let mut rng = SplitMix64(seed ^ 0xDA7A);
+    let eval = |phases: &[f64]| -> Result<f64, String> {
+        let mut b = ParameterBinding::new();
+        for (&id, &j) in jt_ids.iter().zip(&couplings) {
+            b.bind(id, j * dt);
+        }
+        for (&id, &p) in pt_ids.iter().zip(phases) {
+            b.bind(id, p * dt);
+        }
+        backend
+            .expectation(&ir, &b, &obs)
+            .map_err(|e| e.to_string())
+    };
+    let phases: Vec<Vec<f64>> = (0..n_samples)
+        .map(|_| (0..n_sites).map(|_| uniform_phase(&mut rng)).collect())
+        .collect();
+    let z: Vec<f64> = phases.iter().map(|p| eval(p)).collect::<Result<_, _>>()?;
+    let mut sorted = z.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let tau = sorted[sorted.len() / 2];
+    let y: Vec<f64> = z
+        .iter()
+        .map(|&v| if v > tau { 1.0 } else { -1.0 })
+        .collect();
+    Ok((ir, jt_ids, pt_ids, obs, phases, y))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_size_noise(
+    n_sites: usize,
+    steps: usize,
+    dt: f64,
+    sv: &(dyn Backend + Sync),
+    seed: u64,
+    n_samples: usize,
+    per_class: usize,
+    rates: &[f64],
+    coeff_min: f64,
+    boot_reps: usize,
+    epochs: usize,
+    sanity: bool,
+) -> Result<SizeCrossover, String> {
+    use crate::noise::{self, Channel};
+    use crate::qnn::DmqLane;
+    assert_eq!(rates.first(), Some(&0.0), "rate grid must start at 0.0");
+
+    let (ir, jt_ids, pt_ids, obs, phases, y) =
+        sized_dataset(n_sites, steps, dt, sv, seed, n_samples)?;
+
+    // Class-balanced train / eval split: eval takes the last `per_class` rows
+    // of each class (a paired bootstrap needs both classes present); train is
+    // everything before. Deterministic — the dataset order is seed-fixed.
+    let mut rng = SplitMix64(seed ^ 0xE7A1 ^ n_sites as u64);
+    let mut by_class = |want: f64| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..y.len()).filter(|&i| y[i] == want).collect();
+        for k in (1..idx.len()).rev() {
+            let j = (rng.next_f64() * (k + 1) as f64) as usize % (k + 1);
+            idx.swap(k, j);
+        }
+        idx
+    };
+    let (pos, neg) = (by_class(1.0), by_class(-1.0));
+    if pos.len() <= per_class || neg.len() <= per_class {
+        return Err(format!(
+            "n={n_sites}: too few samples per class ({} / {}) for {per_class} eval rows",
+            pos.len(),
+            neg.len()
+        ));
+    }
+    let take = |src: &[Vec<f64>], idx: &[usize]| -> Vec<Vec<f64>> {
+        idx.iter().map(|&i| src[i].clone()).collect()
+    };
+    let take1 = |src: &[f64], idx: &[usize]| -> Vec<f64> { idx.iter().map(|&i| src[i]).collect() };
+    let tr_idx: Vec<usize> = pos[..pos.len() - per_class]
+        .iter()
+        .chain(&neg[..neg.len() - per_class])
+        .copied()
+        .collect();
+    let ev_idx: Vec<usize> = pos[pos.len() - per_class..]
+        .iter()
+        .chain(&neg[neg.len() - per_class..])
+        .copied()
+        .collect();
+    let (trx, try_) = (take(&phases, &tr_idx), take1(&y, &tr_idx));
+    let (tex, tey) = (take(&phases, &ev_idx), take1(&y, &ev_idx));
+
+    // Train the deployed model on the ideal simulator, pick its classical rival.
+    let mut dmq = DmqLane::new(&ir, &jt_ids, &pt_ids, dt, &obs);
+    dmq.fit(sv, &trx, &try_, epochs, 0.05)?;
+    let classical = noise::classical_best(&trx, &try_, &tex, &tey);
+    let sv_scores = dmq.scores(sv, &tex)?;
+    let noiseless_auc_q = crate::lanes::auc(&sv_scores, &tey);
+
+    // Optional PauliProp(0) ≈ statevector sanity (only the cheapest size).
+    let sanity_diff = if sanity {
+        let pp0 = dmq.scores_par(&noise::channel_backend(Channel::Depolarizing, 0.0), &tex)?;
+        Some(
+            sv_scores
+                .iter()
+                .zip(&pp0)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f64, f64::max),
+        )
+    } else {
+        None
+    };
+
+    // Sweep: rate 0 reuses the exact statevector scores; nonzero rates run the
+    // exact-noisy PauliProp adjoint at the looser (still <1% accurate) floor.
+    let t0 = Instant::now();
+    let mut points = Vec::new();
+    let mut signal = Vec::new();
+    for &r in rates {
+        let qs = if r == 0.0 {
+            sv_scores.clone()
+        } else {
+            dmq.scores_par(
+                &noise::channel_backend_trunc(Channel::Depolarizing, r, coeff_min),
+                &tex,
+            )?
+        };
+        signal.push((r, amplitude(&qs)));
+        points.push(noise::certify_point(
+            r,
+            &qs,
+            &classical,
+            &tey,
+            boot_reps,
+            seed ^ 0x51,
+        ));
+    }
+    let noisy_secs = t0.elapsed().as_secs_f64();
+    let crossover = noise::crossover_rate(&points);
+
+    Ok(SizeCrossover {
+        n_sites,
+        eval_rows: tex.len(),
+        noiseless_auc_q,
+        classical_name: classical.name,
+        classical_auc: classical.auc,
+        sanity_diff,
+        points,
+        crossover,
+        gate_count: ir.ops.len(),
+        signal,
+        noisy_secs,
+    })
+}
+
+/// Least-squares decay constant κ of the signal amplitude: slope of
+/// −ln A(r) vs r over the points with A above a small floor (the collapse can
+/// take A below where a log is meaningful). Returns `None` if fewer than two
+/// usable points remain. Draw-robust: κ is a *relative* decay, independent of
+/// the rate-0 amplitude A(0).
+pub fn decay_constant(signal: &[(f64, f64)]) -> Option<f64> {
+    let floor = 1e-4;
+    let pts: Vec<(f64, f64)> = signal
+        .iter()
+        .filter(|&&(_, a)| a > floor)
+        .map(|&(r, a)| (r, -a.ln()))
+        .collect();
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let (sx, sy): (f64, f64) = (pts.iter().map(|p| p.0).sum(), pts.iter().map(|p| p.1).sum());
+    let sxx: f64 = pts.iter().map(|p| p.0 * p.0).sum();
+    let sxy: f64 = pts.iter().map(|p| p.0 * p.1).sum();
+    let denom = n * sxx - sx * sx;
+    (denom.abs() > 1e-18).then_some((n * sxy - sx * sy) / denom)
+}
+
+/// Nested disorder: the SAME realization extended by one bond per size, so the
+/// only variable across sizes is the added gates. Seeded independently of n, so
+/// the first (n−1) couplings match for every n — a controlled scaling
+/// experiment, not a fresh draw at each size.
+fn nested_couplings(n_bonds: usize, seed: u64) -> Vec<f64> {
+    let mut rng = SplitMix64(seed ^ 0xC0DE);
+    (0..n_bonds).map(|_| 0.5 + rng.next_f64()).collect()
+}
+
+/// One point of the κ-scaling scan: the depolarizing decay constant of the
+/// substrate's bond-correlator signal at `n_sites`, measured directly from the
+/// generator's true (nested) couplings — no training needed, since κ is a
+/// property of the circuit and the observable, and the trained lane recovers
+/// the true couplings anyway. Cheap: only the nonzero rates call PauliProp,
+/// and only over `n_rows` inputs.
+pub struct KappaPoint {
+    pub n_sites: usize,
+    pub gate_count: usize,
+    pub signal: Vec<(f64, f64)>,
+    pub kappa: Option<f64>,
+    pub secs: f64,
+}
+
+pub fn generator_kappa(
+    n_sites: usize,
+    steps: usize,
+    dt: f64,
+    seed: u64,
+    n_rows: usize,
+    rates: &[f64],
+    coeff_min: f64,
+) -> Result<KappaPoint, String> {
+    use rayon::prelude::*;
+    let bonds = chain_bonds(n_sites);
+    let (ir, jt_ids, pt_ids) = arch::build_ir_sized(&bonds, steps, n_sites);
+    let obs = correlator(n_sites);
+    let couplings = nested_couplings(bonds.len(), seed);
+    // Fixed input rows (n-dependent dimension, deterministic seed).
+    let mut prng = SplitMix64(seed ^ 0xA11CE ^ n_sites as u64);
+    let rows: Vec<Vec<f64>> = (0..n_rows)
+        .map(|_| (0..n_sites).map(|_| uniform_phase(&mut prng)).collect())
+        .collect();
+    let corr = |backend: &(dyn Backend + Sync), phases: &[f64]| -> Result<f64, String> {
+        let mut b = ParameterBinding::new();
+        for (&id, &j) in jt_ids.iter().zip(&couplings) {
+            b.bind(id, j * dt);
+        }
+        for (&id, &p) in pt_ids.iter().zip(phases) {
+            b.bind(id, p * dt);
+        }
+        backend
+            .expectation(&ir, &b, &obs)
+            .map_err(|e| e.to_string())
+    };
+    let t0 = Instant::now();
+    let mut signal = Vec::new();
+    for &r in rates {
+        let vals: Vec<f64> = if r == 0.0 {
+            let sv = omega_backend_statevector::StatevectorBackend::new();
+            rows.iter()
+                .map(|p| corr(&sv, p))
+                .collect::<Result<_, _>>()?
+        } else {
+            let bk = crate::noise::channel_backend_trunc(
+                crate::noise::Channel::Depolarizing,
+                r,
+                coeff_min,
+            );
+            rows.par_iter()
+                .map(|p| corr(&bk, p))
+                .collect::<Result<_, _>>()?
+        };
+        signal.push((r, amplitude(&vals)));
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let kappa = decay_constant(&signal);
+    Ok(KappaPoint {
+        n_sites,
+        gate_count: ir.ops.len(),
+        signal,
+        kappa,
+        secs,
+    })
+}
