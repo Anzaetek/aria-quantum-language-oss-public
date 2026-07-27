@@ -125,17 +125,57 @@ Original plan (for reference):
   shots) → 0.954 (256) → 0.806 (64) → 0.630 (16), with the certification
   crossover interpolated at **≈ 31 shots/row** — a modest, hardware-friendly
   budget (real experiments take thousands).
-- **Zero-noise-extrapolation probe (advisory, honest negative)**: Richardson
-  extrapolation over depolarizing scales {1,2,3}×base gives *negligible*
-  recovery (best CI_lo change ≈ +0.001, no verdict flips). This is expected and
-  reported as such — on this deep Trotter circuit the correlator is a
-  high-degree polynomial in the noise rate, which a 3-point extrapolation cannot
-  invert; low-order ZNE is a poor fit here. The reported margin stays the raw
-  crossover, never a mitigated one. (Never gates the verdict.)
+- **Error-mitigation probe (advisory, honest negative)** — `src/mitigation.rs`,
+  unit-tested. Two standard mitigators, shown NOT to rescue the deep circuit:
+  - **Zero-noise extrapolation** over depolarizing scales {1..5}×base, in three
+    models — 3-point Richardson (the usual `3E1−3E2+E3`), 5-point Richardson,
+    and a 3-point *exponential* fit — scored by mean |recovered − noiseless|
+    per row against the exact statevector scores. In the mild-noise regime it
+    genuinely recovers the noiseless correlator (measured raw ≈ 0.26 → exp3
+    ≈ 0.04, Richardson-5 ≈ 0.06 < Richardson-3 ≈ 0.12): the exponential fit is
+    best, and higher-order Richardson *helps* here because the EXACT decay curve
+    is smooth. Two honest caveats keep the reported margin the raw crossover:
+    (a) no leverage where it is needed — past the crossover the signal has
+    collapsed to ~0, nothing to extrapolate; (b) the 5-point Lagrange one-norm
+    ‖w‖₁ = 31 amplifies *statistical* error, so this exact-expectation gain does
+    NOT survive finite shots.
+  - **Probabilistic error cancellation (PEC)**: unbiased in expectation, but the
+    sampling overhead is `γ^(2·#channels)` with the exact depolarizing one-norm
+    `γ = (1+2p/3)/(1−4p/3)` per channel — exponential in the gate count, hence
+    EXTENSIVE in n. At the crossover rate it already needs astronomically many
+    shots, so it cannot cheaply restore the advantage either.
+  - Neither ever gates the verdict; the reported margin stays the raw crossover.
 - CHECK: PauliProp reproduces the statevector scores at zero noise (|Δ| ≤ 1e-6);
   for EACH decoherence channel the substrate CERTIFIES at zero noise with a
   crossover to REFUSED inside the sweep; and the shot sweep certifies at the
   largest budget, refuses at the smallest.
+
+### Landed: scaling × noise — robustness intensive, cost extensive
+
+*Does the certified advantage get LESS noise-robust as the substrate grows?*
+`spectra_scaling_noise` (a DEEP harness, run by name or `ARIA_DEEP=1`) answers
+with a counter-intuitive **no**. Depolarizing collapses the quantum signal (the
+spread of the bond correlator across inputs) exponentially, `A(r) ≈ A(0)·e^{−κ·r}`;
+κ is the noise sensitivity. Measured across n = 7,8,9 with NESTED disorder (the
+same realization extended one bond per size, isolating the size variable):
+
+| n | ops | κ (decay constant) | exact-noisy PauliProp cost |
+|---|---|---|---|
+| 7 | 334 | 194.6 | 11 s |
+| 8 | 389 | 177.8 | 33 s |
+| 9 | 444 | 172.1 | 101 s |
+
+κ is **INTENSIVE**: κ(9)/κ(7) = 0.88, versus the *extensive* prediction
+ops(9)/ops(7) = 1.33. For a LOCAL observable on a FIXED-DEPTH circuit κ is set
+by each term's causal cone, not the total system size, so the per-gate noise
+budget does NOT shrink with n. What IS extensive is the *classical cost* of
+simulating the noisy dynamics exactly (11 → 33 → 101 s — the same scrambling
+that defeats classical simulation multiplies the surviving Pauli strings), which
+caps the exact study at n ≤ 9. Robustness intensive, cost extensive — they
+decouple. A trained n = 7 anchor confirms a real, exactly-simulated,
+noise-fragile advantage (AUC 1.00 vs 0.63, destroyed by r = 0.02). Gates:
+PauliProp(0) ≈ statevector (≤ 1e-6), anchor gap > 0.05, anchor signal destroyed
+by r = 0.02, and κ non-growing (κ(9) ≤ κ(7)·1.10).
 
 ## Quantum architecture search — first increment landed
 
