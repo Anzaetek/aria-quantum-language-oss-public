@@ -55,8 +55,11 @@ pub type SvdFlatFn = fn(&[Complex64], usize, usize, usize, usize, f64) -> SvdRes
 /// Metal arm's injection point (contraction on GPU, SVD on CPU — see
 /// `omega-backend-mps-metal`); the CUDA arm instead swaps the SVD via
 /// [`SvdFlatFn`]. A plain `fn` pointer so [`Mps`] stays `Clone`.
+/// Returns the two new site tensors and the *relative* discarded singular-value
+/// weight of the split (Σσ²_dropped / Σσ²_total, 0.0 when nothing truncated), so
+/// an accelerated path feeds the same truncation certificate as the CPU path.
 pub type Contract2qFn =
-    fn(&MpsTensor, &MpsTensor, &[Complex64; 16], usize, f64) -> Option<(MpsTensor, MpsTensor)>;
+    fn(&MpsTensor, &MpsTensor, &[Complex64; 16], usize, f64) -> Option<(MpsTensor, MpsTensor, f64)>;
 
 /// Matrix Product State for n qubits.
 #[derive(Clone)]
@@ -64,6 +67,21 @@ pub struct Mps {
     pub tensors: Vec<MpsTensor>,
     pub n: usize,
     pub max_bond_dim: usize,
+    /// Accumulated relative truncation error across every two-site split in the
+    /// run so far: Σ over splits of (dropped Σσ² / total Σσ²). 0.0 means every
+    /// split was exact (e.g. χ ≥ 2^(n/2)); a growing value is the honest signal
+    /// that the bond dimension is under-provisioned. The standard MPS fidelity
+    /// proxy — read via [`MpsBackend::last_run_stats`].
+    pub discarded_weight: f64,
+    /// The largest right-bond dimension reached after truncation across the run
+    /// — how close the state came to saturating `max_bond_dim`.
+    pub max_bond_reached: usize,
+    /// Adaptive truncation: when `Some(ε)`, a split keeps only the singular
+    /// values above `ε · σ_max` (relative threshold) rather than always filling
+    /// `max_bond_dim`, so the bond grows with the actual entanglement and stays
+    /// small when the state is nearly product — with `max_bond_dim` as the hard
+    /// ceiling. `None` = fixed-rank truncation at `max_bond_dim` (the default).
+    pub adaptive_eps: Option<f64>,
     /// Bond-compression SVD. Every two-qubit gate (including the SWAP network
     /// behind `apply_2q_distant`) routes its truncation through this, so
     /// swapping in a GPU SVD accelerates the whole circuit. Defaults to CPU.
@@ -88,9 +106,18 @@ impl Mps {
             tensors,
             n,
             max_bond_dim,
+            discarded_weight: 0.0,
+            max_bond_reached: 1,
+            adaptive_eps: None,
             svd_fn: truncated_svd_flat,
             contract_fn: None,
         }
+    }
+
+    /// Enable adaptive truncation with relative singular-value threshold `eps`
+    /// (see [`Mps::adaptive_eps`]). `max_bond_dim` stays the hard ceiling.
+    pub fn set_adaptive_eps(&mut self, eps: f64) {
+        self.adaptive_eps = Some(eps);
     }
 
     /// Route bond-compression SVDs through `f` (e.g. a GPU `gesvdj`). Applies to
@@ -136,13 +163,15 @@ impl Mps {
         // falls through to the built-in path below, so the result is identical
         // whether or not the hook is installed.
         if let Some(cf) = self.contract_fn {
-            if let Some((nl, nr)) = cf(
+            if let Some((nl, nr, rel_discarded)) = cf(
                 &self.tensors[q],
                 &self.tensors[q + 1],
                 gate,
                 self.max_bond_dim,
                 1e-14,
             ) {
+                self.max_bond_reached = self.max_bond_reached.max(nl.bond_right);
+                self.discarded_weight += rel_discarded;
                 self.tensors[q] = nl;
                 self.tensors[q + 1] = nr;
                 return;
@@ -232,10 +261,68 @@ impl Mps {
         }
         drop(theta);
 
-        // Step 3: SVD and truncate (CPU or GPU via the injected fn).
+        // Step 3: SVD and truncate (CPU or GPU via the injected fn). The
+        // total two-site weight is Σσ²_kept + discarded_weight — with the
+        // orthonormal-by-construction kernel that also equals ‖Θ'‖²_F, the
+        // pre-SVD Frobenius norm.
         let rows = bl * 2;
-        let svd = svd_fn(&matrix_flat, rows, cols, cols, self.max_bond_dim, 1e-14);
+        let total: f64 = matrix_flat.iter().map(|z| z.norm_sqr()).sum();
+        let mut svd = svd_fn(&matrix_flat, rows, cols, cols, self.max_bond_dim, 1e-14);
+        // Adaptive truncation: the kernel returns the kept σ sorted descending
+        // (capped at the ceiling max_bond_dim). Drop the tail below ε·σ_max so
+        // the bond tracks the actual entanglement, folding the extra-dropped
+        // weight into the certificate and repacking the k-strided U / Vt buffers
+        // to the new column count. `u` is rows×k row-major (element (i,m) at
+        // `u[i*k+m]`); `vt` is k×cols row-major (first `keep` rows survive).
+        if let Some(eps) = self.adaptive_eps {
+            let old_k = svd.s.len();
+            let smax = svd.s.first().copied().unwrap_or(0.0);
+            let keep = svd
+                .s
+                .iter()
+                .take_while(|&&sv| sv > eps * smax)
+                .count()
+                .max(1);
+            if keep < old_k {
+                let extra: f64 = svd.s[keep..].iter().map(|&sv| sv * sv).sum();
+                svd.discarded_weight += extra;
+                let mut u2 = vec![Complex64::new(0.0, 0.0); rows * keep];
+                for i in 0..rows {
+                    for m in 0..keep {
+                        u2[i * keep + m] = svd.u[i * old_k + m];
+                    }
+                }
+                svd.u = u2;
+                svd.vt.truncate(keep * cols);
+                svd.s.truncate(keep);
+            }
+        }
         let new_bm = svd.s.len();
+        let kept: f64 = svd.s.iter().map(|&sv| sv * sv).sum();
+        // Free unitarity certificate: with orthonormal U/V the kept + dropped
+        // weight must equal the input norm. A drift here is exactly the
+        // non-unitary-split bug the kernel rewrite fixes.
+        debug_assert!(
+            (kept + svd.discarded_weight - total).abs() <= 1e-9 * total.max(1e-300),
+            "MPS split not norm-preserving: kept {kept} + dropped {} vs ‖Θ'‖² {total}",
+            svd.discarded_weight
+        );
+
+        // Truncation certificate — the discarded weight relative to the block
+        // norm, accumulated across the run. We deliberately do NOT rescale the
+        // kept singular values here: this MPS is not held in canonical form, so
+        // a per-split "local" renormalization does not restore the GLOBAL state
+        // norm (it can drift it far from 1). Instead the readout paths
+        // (`to_statevector`, expectation, sampling) divide by the true ‖ψ‖,
+        // which is exact and gauge-independent. Under truncation the raw state
+        // norm is < 1 by exactly the lost weight — the honest signal.
+        let rel_discarded = if total > 1e-300 {
+            svd.discarded_weight / total
+        } else {
+            0.0
+        };
+        self.discarded_weight += rel_discarded;
+        self.max_bond_reached = self.max_bond_reached.max(new_bm);
 
         // Step 4: Build new tensors directly from flat U / Vt buffers.
         // A[l, s0, m] = U[(l*2+s0) * new_bm + m] * sqrt(S[m])
@@ -337,6 +424,20 @@ impl Mps {
             }
 
             sv[basis] = left_vec[0];
+        }
+
+        // Readout normalization. Truncating splits are unitary but drop weight,
+        // so the raw contracted state has ‖ψ‖ ≤ 1 (exactly 1 when no truncation
+        // occurred). Divide by the true norm here — gauge-independent and exact
+        // — rather than rescaling per split, which would not restore the global
+        // norm on this non-canonical MPS. `discarded_weight` remains the
+        // separate honest signal of how much was lost.
+        let norm_sq: f64 = sv.iter().map(|z| z.norm_sqr()).sum();
+        if norm_sq > 1e-300 {
+            let inv = 1.0 / norm_sq.sqrt();
+            for z in &mut sv {
+                *z *= inv;
+            }
         }
 
         sv
@@ -667,7 +768,7 @@ mod tests {
         let shots = 20000usize;
         let mut rng = StdRng::seed_from_u64(7);
         let envs = mps.right_environments();
-        let mut freq = vec![0.0f64; 16];
+        let mut freq = [0.0f64; 16];
         for _ in 0..shots {
             freq[mps.sample_with_envs(&envs, &mut rng) as usize] += 1.0 / shots as f64;
         }
@@ -718,7 +819,7 @@ mod tests {
 
         let trials = 20000usize;
         let mut rng = StdRng::seed_from_u64(11);
-        let mut freq = vec![0.0f64; 16];
+        let mut freq = [0.0f64; 16];
         for _ in 0..trials {
             let mut state = mps.clone();
             let mut outcome = 0usize;

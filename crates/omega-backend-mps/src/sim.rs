@@ -4,6 +4,7 @@
 //! simulate circuits with limited entanglement (low bond dimension).
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use num_complex::Complex64;
 use rand::rngs::StdRng;
@@ -19,6 +20,20 @@ use crate::gates;
 use crate::mps::Mps;
 use crate::svd::truncated_svd_flat;
 use crate::{Contract2qFn, SvdFlatFn};
+
+/// Truncation certificate for the most recent run through an [`MpsBackend`].
+///
+/// `discarded_weight` is the accumulated relative singular-value weight thrown
+/// away across every two-site split (0.0 = exact, e.g. χ ≥ 2^(n/2)); a growing
+/// value is the honest signal the bond dimension is under-provisioned — the
+/// standard MPS fidelity proxy. `max_bond_reached` is the largest post-
+/// truncation bond dimension seen, i.e. how close the run came to saturating
+/// `max_bond_dim`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MpsRunStats {
+    pub discarded_weight: f64,
+    pub max_bond_reached: usize,
+}
 
 /// MPS-based quantum circuit simulator.
 ///
@@ -38,6 +53,16 @@ pub struct MpsBackend {
     /// the built-in contract+SVD path. Transparent CPU fall-through, so wiring
     /// it under a `metal` build never changes results below the GPU threshold.
     contract_fn: Option<Contract2qFn>,
+    /// Adaptive truncation threshold ε: when `Some`, each split keeps the
+    /// singular values above `ε · σ_max` up to `max_bond_dim` (the ceiling),
+    /// so the bond grows with entanglement instead of always filling the cap.
+    /// `None` = fixed-rank truncation at `max_bond_dim`.
+    adaptive_eps: Option<f64>,
+    /// Truncation certificate of the most recent `execute`/`expectation`.
+    /// Interior-mutable because the `Backend` trait methods take `&self`;
+    /// under batch parallelism it reflects one (arbitrary) row's run. Read via
+    /// [`Self::last_run_stats`]. Never printed (library crates stay silent).
+    stats: Mutex<MpsRunStats>,
 }
 
 impl MpsBackend {
@@ -46,7 +71,34 @@ impl MpsBackend {
             max_bond_dim,
             svd_fn: truncated_svd_flat,
             contract_fn: None,
+            adaptive_eps: None,
+            stats: Mutex::new(MpsRunStats::default()),
         }
+    }
+
+    /// Enable adaptive bond truncation with relative singular-value threshold
+    /// `eps` — the bond grows with the actual entanglement up to `max_bond_dim`
+    /// (the hard ceiling), instead of always filling it. This is what
+    /// `--backend mps:auto` selects.
+    pub fn with_adaptive(mut self, eps: f64) -> Self {
+        self.adaptive_eps = Some(eps);
+        self
+    }
+
+    /// The truncation certificate of the most recent run — the discarded
+    /// singular-value weight (fidelity proxy) and the peak bond dimension. Lets
+    /// an embedder holding a concrete `MpsBackend` tell "χ was plenty" from
+    /// "χ threw away half the state" without any CLI or trait change.
+    pub fn last_run_stats(&self) -> MpsRunStats {
+        *self.stats.lock().unwrap()
+    }
+
+    /// Record a finished run's truncation stats (last-writer-wins).
+    fn record_stats(&self, mps: &Mps) {
+        *self.stats.lock().unwrap() = MpsRunStats {
+            discarded_weight: mps.discarded_weight,
+            max_bond_reached: mps.max_bond_reached,
+        };
     }
 
     /// Route this backend's bond-compression SVDs through `f` (e.g. the CUDA
@@ -90,6 +142,9 @@ impl Backend for MpsBackend {
         if let Some(cf) = self.contract_fn {
             mps.set_contract_fn(cf);
         }
+        if let Some(eps) = self.adaptive_eps {
+            mps.set_adaptive_eps(eps);
+        }
         let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -119,6 +174,7 @@ impl Backend for MpsBackend {
                 }
             }
         }
+        self.record_stats(&mps);
 
         match config.shots {
             None => {
@@ -778,7 +834,7 @@ fn expectation_pauli(sv: &[Complex64], num_qubits: u32, paulis: &[(u32, PauliOp)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, Qubit};
+    use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, ParamExpr, Qubit};
     use omega_core::params::ParameterBinding;
     use smallvec::smallvec;
 
@@ -1195,5 +1251,270 @@ mod tests {
             .expectation_multi(&circuit, &ParameterBinding::new(), &[])
             .unwrap();
         assert!(out.is_empty());
+    }
+
+    // --- deep-circuit unitarity + truncation-certificate regression ---
+    //
+    // The normal-equations SVD kernel produced non-unitary splits on deep
+    // circuits (state norm → 21.7 at χ=64 where truncation is impossible). All
+    // pre-existing MPS tests are shallow, so nothing caught it. These exercise
+    // the truncation-free regime (χ = 2^(n/2) ⇒ exact) and the truncating one.
+
+    /// SplitMix64 → deterministic angles with no rng dependency.
+    fn brick_angle(state: &mut u64) -> f64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let z = z ^ (z >> 31);
+        (z as f64) / (u64::MAX as f64) * std::f64::consts::TAU
+    }
+
+    /// Random-angle brickwork: `layers` of (RY on every qubit, then a CX ladder
+    /// on alternating even/odd bonds) — RY + adjacent CX only, exactly the
+    /// report's stress circuit. Deterministic in `seed`.
+    fn brickwork(n: u32, layers: usize, seed: u64) -> CircuitIR {
+        let mut c = empty_circuit(n);
+        let mut st = seed;
+        for layer in 0..layers {
+            for q in 0..n {
+                let mut op = make_op(GateKind::Ry, &[q]);
+                op.params = smallvec![ParamExpr::Concrete(brick_angle(&mut st))];
+                c.ops.push(op);
+            }
+            let start = (layer % 2) as u32;
+            let mut q = start;
+            while q + 1 < n {
+                c.ops.push(make_op(GateKind::CX, &[q, q + 1]));
+                q += 2;
+            }
+        }
+        c
+    }
+
+    fn statevector_of(circuit: &CircuitIR, chi: usize) -> Vec<Complex64> {
+        let backend = MpsBackend::new(chi);
+        let result = backend
+            .execute(
+                circuit,
+                &ParameterBinding::new(),
+                &ExecConfig {
+                    shots: None,
+                    seed: None,
+                    mid_circuit_mode: MidCircuitMode::Skip,
+                },
+            )
+            .unwrap();
+        result.statevector().to_vec()
+    }
+
+    #[test]
+    fn deep_brickwork_is_unitary_at_exact_bond_dimension() {
+        // n=8, χ=16=2^(n/2): every Schmidt rank fits, so truncation is
+        // impossible and the state MUST stay exactly normalized through depth.
+        // Before the kernel fix this norm collapsed (8q/60L was ~0.996 and
+        // fell off a cliff by n=10). 60 layers ≈ 900 ops.
+        let circuit = brickwork(8, 60, 0xBEEF);
+        let sv = statevector_of(&circuit, 16);
+        let norm_sq: f64 = sv.iter().map(|z| z.norm_sqr()).sum();
+        assert!(
+            (norm_sq - 1.0).abs() < 1e-10,
+            "‖ψ‖² = {norm_sq} (expected 1 at exact χ)"
+        );
+    }
+
+    /// Independent dense reference simulator (RY + CX only) — deliberately not
+    /// another MPS, so the parity check has a genuinely separate ground truth.
+    /// Qubit q is bit q, LSB-first (matches `to_statevector`).
+    fn dense_reference(circuit: &CircuitIR) -> Vec<Complex64> {
+        let n = circuit.num_qubits as usize;
+        let dim = 1usize << n;
+        let mut sv = vec![Complex64::new(0.0, 0.0); dim];
+        sv[0] = Complex64::new(1.0, 0.0);
+        for op in &circuit.ops {
+            match &op.gate {
+                GateKind::Ry => {
+                    let theta = match &op.params[0] {
+                        ParamExpr::Concrete(v) => *v,
+                        _ => panic!("reference expects concrete angles"),
+                    };
+                    let (c, s) = ((theta / 2.0).cos(), (theta / 2.0).sin());
+                    let q = op.qubits[0].0 as usize;
+                    let bit = 1usize << q;
+                    let mut out = sv.clone();
+                    for i in 0..dim {
+                        if i & bit == 0 {
+                            let a = sv[i];
+                            let b = sv[i | bit];
+                            out[i] = c * a - s * b;
+                            out[i | bit] = s * a + c * b;
+                        }
+                    }
+                    sv = out;
+                }
+                GateKind::CX => {
+                    let (ctrl, tgt) = (op.qubits[0].0 as usize, op.qubits[1].0 as usize);
+                    let (cb, tb) = (1usize << ctrl, 1usize << tgt);
+                    let mut out = sv.clone();
+                    for i in 0..dim {
+                        if i & cb != 0 {
+                            out[i] = sv[i ^ tb];
+                        }
+                    }
+                    sv = out;
+                }
+                _ => panic!("reference only implements RY + CX"),
+            }
+        }
+        sv
+    }
+
+    #[test]
+    fn deep_brickwork_matches_dense_reference_at_exact_bond_dimension() {
+        // χ=8=2^(6/2) is exact for n=6, so mps must match an INDEPENDENT dense
+        // simulator to ~1e-9 across 80 layers.
+        let circuit = brickwork(6, 80, 0x1234);
+        let reference = dense_reference(&circuit);
+        let got = statevector_of(&circuit, 8);
+        assert_eq!(got.len(), reference.len());
+        let worst = got
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f64, f64::max);
+        assert!(worst < 1e-9, "max amplitude Δ vs dense reference = {worst}");
+    }
+
+    #[test]
+    fn under_provisioned_bond_reports_discarded_weight() {
+        // Same deep circuit, χ=2 forces heavy truncation: discarded_weight must
+        // be clearly positive, and readout normalization keeps the returned
+        // statevector at ‖ψ‖² = 1 even though the raw truncated state is lossy.
+        let circuit = brickwork(8, 60, 0xBEEF);
+        let backend = MpsBackend::new(2);
+        let result = backend
+            .execute(
+                &circuit,
+                &ParameterBinding::new(),
+                &ExecConfig {
+                    shots: None,
+                    seed: None,
+                    mid_circuit_mode: MidCircuitMode::Skip,
+                },
+            )
+            .unwrap();
+        let sv = result.statevector();
+        let stats = backend.last_run_stats();
+        assert!(
+            stats.discarded_weight > 1e-3,
+            "expected real truncation at χ=2, got discarded_weight {}",
+            stats.discarded_weight
+        );
+        assert!(stats.max_bond_reached <= 2);
+        let norm_sq: f64 = sv.iter().map(|z| z.norm_sqr()).sum();
+        assert!(
+            (norm_sq - 1.0).abs() < 1e-9,
+            "readout normalization should keep ‖ψ‖² = 1, got {norm_sq}"
+        );
+    }
+
+    #[test]
+    fn exact_bond_reports_negligible_discarded_weight() {
+        let circuit = brickwork(8, 60, 0xBEEF);
+        let backend = MpsBackend::new(16); // 2^(8/2), exact
+        backend
+            .execute(
+                &circuit,
+                &ParameterBinding::new(),
+                &ExecConfig {
+                    shots: None,
+                    seed: None,
+                    mid_circuit_mode: MidCircuitMode::Skip,
+                },
+            )
+            .unwrap();
+        let stats = backend.last_run_stats();
+        assert!(
+            stats.discarded_weight < 1e-12,
+            "exact χ must not truncate, got {}",
+            stats.discarded_weight
+        );
+    }
+
+    #[test]
+    fn adaptive_bond_matches_exact_within_its_tolerance_and_uses_smaller_bond() {
+        // A tight adaptive tolerance under a generous ceiling must reproduce the
+        // exact statevector to ~its own ε, while keeping the bond at or below the
+        // exact requirement — i.e. it grows only as far as the entanglement needs.
+        let circuit = brickwork(8, 60, 0xBEEF);
+        let exact = statevector_of(&circuit, 16); // 2^(8/2), exact reference
+        let backend = MpsBackend::new(16).with_adaptive(1e-8);
+        let cfg = ExecConfig {
+            shots: None,
+            seed: None,
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let result = backend
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .unwrap();
+        let got = result.statevector();
+        let worst = got
+            .iter()
+            .zip(&exact)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f64, f64::max);
+        assert!(worst < 1e-6, "adaptive vs exact max Δ = {worst}");
+        let stats = backend.last_run_stats();
+        assert!(stats.max_bond_reached <= 16, "must respect the ceiling");
+        // Coarsening ε discards at least as much weight (monotonic) — this deep
+        // brickwork scrambles to a near-flat Schmidt spectrum, so even a coarse
+        // ε may still fill the bond; the honest invariant is monotone discard.
+        let coarse = MpsBackend::new(16).with_adaptive(1e-1);
+        coarse
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .unwrap();
+        let coarse_stats = coarse.last_run_stats();
+        assert!(coarse_stats.max_bond_reached <= 16, "ceiling respected");
+        assert!(
+            coarse_stats.discarded_weight >= stats.discarded_weight,
+            "coarser ε must discard ≥ finer ε ({} vs {})",
+            coarse_stats.discarded_weight,
+            stats.discarded_weight
+        );
+    }
+
+    #[test]
+    fn adaptive_keeps_a_small_bond_on_low_entanglement() {
+        // A shallow circuit generates little entanglement, so adaptive mode
+        // under a generous ceiling must keep the bond far below it — the point
+        // of "grow only as the state needs".
+        let circuit = brickwork(8, 3, 0x77);
+        let cfg = ExecConfig {
+            shots: None,
+            seed: None,
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let adaptive = MpsBackend::new(64).with_adaptive(1e-8);
+        adaptive
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .unwrap();
+        let stats = adaptive.last_run_stats();
+        assert!(
+            stats.max_bond_reached < 64,
+            "adaptive should not fill the ceiling on a shallow circuit (bond {})",
+            stats.max_bond_reached
+        );
+        // And it stays accurate: matches the fixed-χ=64 (exact) statevector.
+        let exact = statevector_of(&circuit, 64);
+        let result = adaptive
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .unwrap();
+        let got = result.statevector();
+        let worst = got
+            .iter()
+            .zip(&exact)
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f64, f64::max);
+        assert!(worst < 1e-6, "adaptive shallow vs exact Δ = {worst}");
     }
 }
