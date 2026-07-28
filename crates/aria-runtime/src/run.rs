@@ -6,17 +6,22 @@
 //! (MPS, GPU, libtorch, remote) are added as features in later phases and
 //! selected through [`BackendSel`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aria_core::ast::Circuit;
 use num_complex::Complex64;
-use omega_backend_mps::{MpsBackend, NoisyMpsBackend};
+use omega_backend_mps::{MpsBackend, MpsRunStats, NoisyMpsBackend};
 use omega_backend_pauliprop::PauliPropBackend;
 use omega_backend_statevector::{NoisyStatevectorBackend, StatevectorBackend};
-use omega_core::circuit::GateKind as OGateKind;
+use omega_core::circuit::{GateKind as OGateKind, SymbolId};
 use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode, Observable};
+use omega_core::gradient::compute_gradient_for;
 use omega_core::noise::NoiseModel;
 use omega_core::params::ParameterBinding;
+
+// Re-exported so callers of [`expectation_with_gradient`] can name the gradient
+// method without a direct `omega_core` dependency (matches the rest of `run`).
+pub use omega_core::gradient::GradMethod;
 
 use crate::lower::{lower, Lowered};
 
@@ -24,6 +29,17 @@ use crate::lower::{lower, Lowered};
 /// explicit `mps:<chi>`. Ample for the small examples; raise it for circuits
 /// whose entanglement exceeds it (χ = 2^(n/2) is exact for n qubits).
 pub const DEFAULT_MPS_CHI: usize = 64;
+
+/// Ceiling (χ budget) for `--backend mps:auto` when no explicit
+/// `mps:auto:<ceiling>` is given — the bond grows adaptively only as far as the
+/// entanglement needs, never past this.
+pub const DEFAULT_MPS_AUTO_CEILING: usize = 1024;
+
+/// Relative singular-value tolerance for adaptive (`mps:auto`) truncation: a
+/// split keeps the singular values above `ε · σ_max`. Small enough to be
+/// effectively lossless on low-entanglement states while letting the bond stay
+/// far below the ceiling when it can.
+pub const MPS_AUTO_EPS: f64 = 1e-10;
 
 /// Which execution backend to dispatch to. Every variant is an implementation
 /// of `omega_core::executor::Backend` — the Aria plugin contract. New backends
@@ -37,6 +53,11 @@ pub enum BackendSel {
     /// `chi = 2^(n/2)` reproduces the dense statevector exactly. Selected as
     /// `--backend mps` (χ = [`DEFAULT_MPS_CHI`]) or `--backend mps:<chi>`.
     Mps { chi: usize },
+    /// Adaptive-bond MPS: the bond grows with the actual entanglement (relative
+    /// singular-value tolerance [`MPS_AUTO_EPS`]) up to the `max_chi` ceiling,
+    /// instead of always filling a fixed χ. Selected as `--backend mps:auto`
+    /// (ceiling [`DEFAULT_MPS_AUTO_CEILING`]) or `--backend mps:auto:<ceiling>`.
+    MpsAuto { max_chi: usize },
     /// GPU statevector (Metal / CUDA / OpenCL, whichever feature is compiled in).
     /// Falls back to [`BackendSel::Sim`] if the device is unavailable at runtime.
     Gpu,
@@ -59,8 +80,21 @@ impl BackendSel {
             "gpu" => Ok(Self::Gpu),
             "tch" => Ok(Self::Tch),
             "pauliprop" => Ok(Self::PauliProp),
+            "mps:auto" => Ok(Self::MpsAuto {
+                max_chi: DEFAULT_MPS_AUTO_CEILING,
+            }),
             other => {
-                // `mps:<chi>` — explicit bond dimension.
+                // `mps:auto:<ceiling>` — adaptive bond with an explicit ceiling.
+                if let Some(cap_str) = other.strip_prefix("mps:auto:") {
+                    let max_chi: usize = cap_str.parse().map_err(|_| {
+                        format!("bad MPS ceiling in '{other}' (want mps:auto:<int>)")
+                    })?;
+                    if max_chi == 0 {
+                        return Err("MPS bond ceiling must be ≥ 1".into());
+                    }
+                    return Ok(Self::MpsAuto { max_chi });
+                }
+                // `mps:<chi>` — explicit fixed bond dimension.
                 if let Some(chi_str) = other.strip_prefix("mps:") {
                     let chi: usize = chi_str.parse().map_err(|_| {
                         format!("bad MPS bond dimension in '{other}' (want mps:<int>)")
@@ -71,8 +105,8 @@ impl BackendSel {
                     return Ok(Self::Mps { chi });
                 }
                 Err(format!(
-                    "unknown backend '{other}' (available: sim, mps, mps:<chi>, gpu, tch, \
-                     pauliprop; remote via --url)"
+                    "unknown backend '{other}' (available: sim, mps, mps:<chi>, mps:auto, \
+                     mps:auto:<ceiling>, gpu, tch, pauliprop; remote via --url)"
                 ))
             }
         }
@@ -82,6 +116,7 @@ impl BackendSel {
         match self {
             Self::Sim => "sim",
             Self::Mps { .. } => "mps",
+            Self::MpsAuto { .. } => "mps:auto",
             Self::Gpu => "gpu",
             Self::Tch => "tch",
             Self::PauliProp => "pauliprop",
@@ -95,12 +130,59 @@ pub(crate) fn make_backend(sel: BackendSel) -> Result<Box<dyn Backend>, String> 
     Ok(match sel {
         BackendSel::Sim => Box::new(StatevectorBackend::new()),
         BackendSel::Mps { chi } => Box::new(make_mps(chi)),
+        BackendSel::MpsAuto { max_chi } => Box::new(make_mps(max_chi).with_adaptive(MPS_AUTO_EPS)),
         BackendSel::Gpu => make_gpu()?,
         BackendSel::Tch => make_tch()?,
         // Exact engine (no truncation: coeff_min = 0, max_weight = None), with
         // the GPU branch accelerator wired under a cuda build.
         BackendSel::PauliProp => Box::new(make_pauliprop(0.0, None, None)),
     })
+}
+
+std::thread_local! {
+    /// Truncation certificate of the most recent MPS run through the `run::*`
+    /// wrappers on this thread — a side channel that keeps the wrappers'
+    /// signatures unchanged (the binding-order / API contract) while letting a
+    /// front end report it. `None` after a non-MPS run. Read (and cleared) with
+    /// [`take_last_mps_stats`].
+    static LAST_MPS_STATS: std::cell::Cell<Option<MpsRunStats>> = const { std::cell::Cell::new(None) };
+}
+
+/// Take (and clear) the MPS truncation certificate of the most recent `run::*`
+/// call on this thread; `None` if that run did not use an MPS backend. Used by
+/// the CLIs to report discarded weight without changing any run signature.
+pub fn take_last_mps_stats() -> Option<MpsRunStats> {
+    LAST_MPS_STATS.with(|c| c.take())
+}
+
+/// Run `f` against the selected backend, recording the MPS truncation
+/// certificate into the thread-local side channel when the backend is MPS (so
+/// [`take_last_mps_stats`] can surface it) and clearing it otherwise. Holds the
+/// concrete `MpsBackend` for the MPS arms — stats live on the concrete type,
+/// never the `Backend` trait.
+fn with_backend_stats<T>(
+    sel: BackendSel,
+    f: impl FnOnce(&dyn Backend) -> Result<T, String>,
+) -> Result<T, String> {
+    match sel {
+        BackendSel::Mps { chi } => {
+            let b = make_mps(chi);
+            let out = f(&b);
+            LAST_MPS_STATS.with(|c| c.set(Some(b.last_run_stats())));
+            out
+        }
+        BackendSel::MpsAuto { max_chi } => {
+            let b = make_mps(max_chi).with_adaptive(MPS_AUTO_EPS);
+            let out = f(&b);
+            LAST_MPS_STATS.with(|c| c.set(Some(b.last_run_stats())));
+            out
+        }
+        other => {
+            let b = make_backend(other)?;
+            LAST_MPS_STATS.with(|c| c.set(None));
+            f(b.as_ref())
+        }
+    }
 }
 
 /// Construct the Pauli-propagation backend with the given truncation, installing
@@ -314,9 +396,10 @@ pub fn run_counts(
             MidCircuitMode::Skip
         },
     };
-    let res = make_backend(sel)?
-        .execute(&low.ir, &ParameterBinding::new(), &cfg)
-        .map_err(|e| e.to_string())?;
+    let res = with_backend_stats(sel, |b| {
+        b.execute(&low.ir, &ParameterBinding::new(), &cfg)
+            .map_err(|e| e.to_string())
+    })?;
     if low.needs_collapse {
         return Ok(res);
     }
@@ -437,10 +520,11 @@ pub fn statevector(
         seed: None,
         mid_circuit_mode: MidCircuitMode::Skip,
     };
-    match make_backend(sel)?
-        .execute(&low.ir, &ParameterBinding::new(), &cfg)
-        .map_err(|e| e.to_string())?
-    {
+    let res = with_backend_stats(sel, |b| {
+        b.execute(&low.ir, &ParameterBinding::new(), &cfg)
+            .map_err(|e| e.to_string())
+    })?;
+    match res {
         ExecResult::Statevector(sv) => Ok(sv),
         other => Err(format!(
             "backend returned non-statevector result: {other:?}"
@@ -458,9 +542,109 @@ pub fn expectation(
 ) -> Result<f64, String> {
     let low = concrete_ir(circuit, bindings)?;
     let obs = Observable::parse(observable)?;
-    make_backend(sel)?
-        .expectation(&low.ir, &ParameterBinding::new(), &obs)
-        .map_err(|e| e.to_string())
+    with_backend_stats(sel, |b| {
+        b.expectation(&low.ir, &ParameterBinding::new(), &obs)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// One-shot expectation **and** gradient of `observable` for `circuit` at the
+/// given parameter values — the name-keyed front end for
+/// `omega_core::gradient::compute_gradient_for`, so a caller never has to lower
+/// by hand or touch `SymbolId`.
+///
+/// `bindings` maps Aria symbol names to values; any free symbol the map omits
+/// defaults to `0.0` (as elsewhere in `run::*`). `only`, when `Some`, restricts
+/// the returned gradient to those symbol names (frozen/layer-wise training) —
+/// and for the per-symbol shift methods also skips the other symbols'
+/// evaluations; `None` returns the gradient for every symbol. The result is
+/// `(expectation, name → ∂⟨O⟩/∂name)`.
+///
+/// Like its `run::*` siblings this **re-lowers per call** — it is the one-shot
+/// entry point, not a training inner loop (use `train_supervised` /
+/// `train_expectation`, which lower once, for that).
+pub fn expectation_with_gradient(
+    circuit: &Circuit,
+    observable: &str,
+    bindings: &HashMap<String, f64>,
+    sel: BackendSel,
+    method: GradMethod,
+    only: Option<&[&str]>,
+) -> Result<(f64, HashMap<String, f64>), String> {
+    // Lower WITHOUT folding the bindings into the IR: gradients differentiate
+    // w.r.t. the live symbols, so they must survive lowering (unlike
+    // `expectation`, which uses `concrete_ir`).
+    let low = lower(circuit)?;
+    let obs = Observable::parse(observable)?;
+
+    let known = || {
+        let mut names: Vec<&String> = low.symbol_ids.keys().collect();
+        names.sort();
+        names
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Validate every provided name up front (bindings and `only`), same error
+    // shape as the trainer, so a typo is a clear message not a silent no-op.
+    for name in bindings.keys() {
+        if !low.symbol_ids.contains_key(name) {
+            return Err(format!(
+                "unknown symbol '{name}' in bindings (circuit has: {})",
+                known()
+            ));
+        }
+    }
+    if let Some(sel_names) = only {
+        for name in sel_names {
+            if !low.symbol_ids.contains_key(*name) {
+                return Err(format!(
+                    "unknown symbol '{name}' in `only` (circuit has: {})",
+                    known()
+                ));
+            }
+        }
+    }
+
+    // Bind every symbol: provided value, else 0.0 (matching `concrete_ir`).
+    let mut binding = ParameterBinding::new();
+    for (name, &id) in &low.symbol_ids {
+        binding.bind(id, bindings.get(name).copied().unwrap_or(0.0));
+    }
+
+    let backend = make_backend(sel)?;
+    let value = backend
+        .expectation(&low.ir, &binding, &obs)
+        .map_err(|e| e.to_string())?;
+
+    // Restrict to the named subset, if any (names already validated above).
+    let only_ids: Option<HashSet<SymbolId>> = only.map(|names| {
+        names
+            .iter()
+            .map(|n| low.symbol_ids[*n])
+            .collect::<HashSet<_>>()
+    });
+    let grads = compute_gradient_for(
+        backend.as_ref(),
+        &low.ir,
+        &binding,
+        &obs,
+        &method,
+        only_ids.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Map SymbolIds back to names — SymbolId never crosses the API boundary.
+    let id_to_name: HashMap<SymbolId, &String> =
+        low.symbol_ids.iter().map(|(n, &i)| (i, n)).collect();
+    let mut out = HashMap::with_capacity(grads.len());
+    for (id, g) in grads {
+        if let Some(name) = id_to_name.get(&id) {
+            out.insert((*name).clone(), g);
+        }
+    }
+    Ok((value, out))
 }
 
 /// Truncation knobs for the Pauli-propagation backend (PauliPropagation.jl's
@@ -491,4 +675,39 @@ pub fn expectation_pauliprop(
     make_pauliprop(trunc.coeff_min, trunc.max_weight, trunc.max_freq)
         .expectation_with_budget(&low.ir, &ParameterBinding::new(), &obs)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_parse_covers_mps_fixed_and_adaptive() {
+        assert_eq!(
+            BackendSel::parse("mps").unwrap(),
+            BackendSel::Mps {
+                chi: DEFAULT_MPS_CHI
+            }
+        );
+        assert_eq!(
+            BackendSel::parse("mps:128").unwrap(),
+            BackendSel::Mps { chi: 128 }
+        );
+        assert_eq!(
+            BackendSel::parse("mps:auto").unwrap(),
+            BackendSel::MpsAuto {
+                max_chi: DEFAULT_MPS_AUTO_CEILING
+            }
+        );
+        assert_eq!(
+            BackendSel::parse("mps:auto:512").unwrap(),
+            BackendSel::MpsAuto { max_chi: 512 }
+        );
+        assert_eq!(BackendSel::MpsAuto { max_chi: 512 }.name(), "mps:auto");
+        // Malformed / zero are loud errors, not silent fallbacks.
+        assert!(BackendSel::parse("mps:0").is_err());
+        assert!(BackendSel::parse("mps:auto:0").is_err());
+        assert!(BackendSel::parse("mps:auto:xyz").is_err());
+        assert!(BackendSel::parse("wat").is_err());
+    }
 }
