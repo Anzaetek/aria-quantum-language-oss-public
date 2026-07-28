@@ -1308,18 +1308,45 @@ mod tests {
         result.statevector().to_vec()
     }
 
+    /// Apply a RY+CX brickwork IR to a fresh Mps and return it — so the test
+    /// can inspect the RAW (un-normalized) state, unlike execute→to_statevector.
+    fn brickwork_mps(circuit: &CircuitIR, chi: usize) -> crate::mps::Mps {
+        let mut mps = crate::mps::Mps::zero_state(circuit.num_qubits as usize, chi);
+        for op in &circuit.ops {
+            match &op.gate {
+                GateKind::Ry => {
+                    let theta = match &op.params[0] {
+                        ParamExpr::Concrete(v) => *v,
+                        _ => panic!("expected concrete angle"),
+                    };
+                    mps.apply_1q(op.qubits[0].0 as usize, &crate::gates::ry(theta));
+                }
+                GateKind::CX => {
+                    mps.apply_2q_distant(
+                        op.qubits[0].0 as usize,
+                        op.qubits[1].0 as usize,
+                        &crate::gates::cx(),
+                    );
+                }
+                _ => panic!("brickwork_mps only handles RY + CX"),
+            }
+        }
+        mps
+    }
+
     #[test]
     fn deep_brickwork_is_unitary_at_exact_bond_dimension() {
         // n=8, χ=16=2^(n/2): every Schmidt rank fits, so truncation is
         // impossible and the state MUST stay exactly normalized through depth.
-        // Before the kernel fix this norm collapsed (8q/60L was ~0.996 and
-        // fell off a cliff by n=10). 60 layers ≈ 900 ops.
+        // Check the RAW norm ⟨ψ|ψ⟩ from the tensors — NOT to_statevector, which
+        // divides by ‖ψ‖ and so reads 1 even for the old non-unitary kernel
+        // (norm 21.7 → 21.7/21.7 = 1). The raw norm is what the bug corrupted.
+        // 60 layers ≈ 900 ops.
         let circuit = brickwork(8, 60, 0xBEEF);
-        let sv = statevector_of(&circuit, 16);
-        let norm_sq: f64 = sv.iter().map(|z| z.norm_sqr()).sum();
+        let raw_norm_sq = brickwork_mps(&circuit, 16).norm_sqr();
         assert!(
-            (norm_sq - 1.0).abs() < 1e-10,
-            "‖ψ‖² = {norm_sq} (expected 1 at exact χ)"
+            (raw_norm_sq - 1.0).abs() < 1e-10,
+            "raw ‖ψ‖² = {raw_norm_sq} (expected exactly 1 at exact χ; a non-unitary split drifts it)"
         );
     }
 

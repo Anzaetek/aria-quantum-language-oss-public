@@ -43,6 +43,11 @@ impl MpsTensor {
 /// GPU contexts live behind the pointer (e.g. a thread-local cuSOLVER handle in
 /// `omega-backend-mps-cuda`). Default is the CPU Jacobi SVD
 /// [`truncated_svd_flat`]; the CUDA backend injects its `gesvdj` path here.
+///
+/// CONTRACT: the returned `s` MUST be sorted DESCENDING (largest first). The
+/// adaptive-truncation path reads `s[0]` as σ_max and `take_while(> ε·σ_max)`,
+/// so an unsorted provider would silently mis-truncate. The CPU kernel sorts;
+/// cuSOLVER returns descending order.
 pub type SvdFlatFn = fn(&[Complex64], usize, usize, usize, usize, f64) -> SvdResultFlat;
 
 /// A two-site-gate accelerator in the calling convention of [`Mps::apply_2q`]:
@@ -161,20 +166,25 @@ impl Mps {
         // Offer the whole contract-gate-SVD to an accelerator first (e.g. Metal
         // θ-contraction). It returns `Some` only when it actually ran; `None`
         // falls through to the built-in path below, so the result is identical
-        // whether or not the hook is installed.
-        if let Some(cf) = self.contract_fn {
-            if let Some((nl, nr, rel_discarded)) = cf(
-                &self.tensors[q],
-                &self.tensors[q + 1],
-                gate,
-                self.max_bond_dim,
-                1e-14,
-            ) {
-                self.max_bond_reached = self.max_bond_reached.max(nl.bond_right);
-                self.discarded_weight += rel_discarded;
-                self.tensors[q] = nl;
-                self.tensors[q + 1] = nr;
-                return;
+        // whether or not the hook is installed. The accelerator truncates at a
+        // FIXED rank and knows nothing about `adaptive_eps`, so skip it in
+        // adaptive mode — otherwise `mps:auto` would silently fill the bond to
+        // the ceiling on a GPU build. Correctness over GPU speed for auto mode.
+        if self.adaptive_eps.is_none() {
+            if let Some(cf) = self.contract_fn {
+                if let Some((nl, nr, rel_discarded)) = cf(
+                    &self.tensors[q],
+                    &self.tensors[q + 1],
+                    gate,
+                    self.max_bond_dim,
+                    1e-14,
+                ) {
+                    self.max_bond_reached = self.max_bond_reached.max(nl.bond_right);
+                    self.discarded_weight += rel_discarded;
+                    self.tensors[q] = nl;
+                    self.tensors[q + 1] = nr;
+                    return;
+                }
             }
         }
 
@@ -301,9 +311,13 @@ impl Mps {
         let kept: f64 = svd.s.iter().map(|&sv| sv * sv).sum();
         // Free unitarity certificate: with orthonormal U/V the kept + dropped
         // weight must equal the input norm. A drift here is exactly the
-        // non-unitary-split bug the kernel rewrite fixes.
+        // non-unitary-split bug the kernel rewrite fixes (which drove the norm
+        // ~20× off — vastly outside this bound). The 1e-7 tolerance leaves ample
+        // headroom over the naive-summation error of `total`/`kept` even at the
+        // mps:auto ceiling (χ=1024 ⇒ ~4M-term sums), so it never spuriously
+        // fires while still catching any real non-unitarity.
         debug_assert!(
-            (kept + svd.discarded_weight - total).abs() <= 1e-9 * total.max(1e-300),
+            (kept + svd.discarded_weight - total).abs() <= 1e-7 * total.max(1e-300),
             "MPS split not norm-preserving: kept {kept} + dropped {} vs ‖Θ'‖² {total}",
             svd.discarded_weight
         );
@@ -441,6 +455,17 @@ impl Mps {
         }
 
         sv
+    }
+
+    /// The RAW state norm ⟨ψ|ψ⟩, contracted directly from the tensors WITHOUT
+    /// the readout normalization `to_statevector` applies. Exactly 1 when no
+    /// split truncated; below 1 by the accumulated truncation loss otherwise.
+    /// This is the quantity a non-unitary split corrupts — the honest unitarity
+    /// probe (`to_statevector`'s output is always normalized, so it cannot see
+    /// the drift). Uses the right-environment contraction: `envs[0]` is the 1×1
+    /// ⟨ψ|ψ⟩ (bond_left(0) = 1).
+    pub fn norm_sqr(&self) -> f64 {
+        self.right_environments()[0][0].re
     }
 
     /// Right-environment matrices for exact sequential sampling.
