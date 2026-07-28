@@ -276,6 +276,7 @@ fn apply_op_dagger(
         | GateKind::Measure
         | GateKind::PhaseShifter
         | GateKind::BeamSplitterRx
+        | GateKind::Rbs
         | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "cuda adjoint dagger: unsupported gate {:?}",

@@ -1105,7 +1105,10 @@ pub(crate) fn apply_op(
             )));
         }
 
-        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
+        GateKind::PhaseShifter
+        | GateKind::BeamSplitterRx
+        | GateKind::Rbs
+        | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "cuda-statevector: gate {:?} is not supported on this backend",
                 op.gate

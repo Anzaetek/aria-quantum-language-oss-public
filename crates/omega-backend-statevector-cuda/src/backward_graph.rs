@@ -1399,6 +1399,7 @@ fn build_plan(circuit: &CircuitIR, gradient_obs_template: &Observable) -> OmegaR
             | GateKind::CSwap
             | GateKind::PhaseShifter
             | GateKind::BeamSplitterRx
+            | GateKind::Rbs
             | GateKind::Custom(_) => {
                 return Err(OmegaError::Unsupported(format!(
                     "TrainStepGraph: gate {:?} not supported in this slice",

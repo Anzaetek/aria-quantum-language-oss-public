@@ -1257,8 +1257,12 @@ pub(crate) fn apply_op(
             )));
         }
 
-        // Photonic / custom — out of scope for the statevector backend.
-        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
+        // Photonic / RBS / custom — no native Metal kernel; the CPU
+        // statevector backend handles these (RBS decomposes to H·CZ·Ry·CZ·H).
+        GateKind::PhaseShifter
+        | GateKind::BeamSplitterRx
+        | GateKind::Rbs
+        | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "metal-statevector: gate {:?} is not supported on this backend",
                 op.gate
