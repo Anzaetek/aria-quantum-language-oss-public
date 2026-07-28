@@ -5,7 +5,8 @@
 //! - `aria list   <file.aria>`                         — list circuit templates
 //! - `aria parse  <file.aria> [--circuit NAME] [--int k=v]...`
 //! - `aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...
-//!   [--shots N] [--seed S] [--backend sim|mps[:chi]|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]`
+//!   [--shots N] [--seed S] [--backend sim|mps[:chi]|mps:auto[:ceiling]|gpu|tch|pauliprop|remote]
+//!   [--statevector] [--expectation OBS] [--strict-truncation EPS]`
 //! - `aria export <file.aria> --circuit NAME (--qasm|--json|--lean|--gate-model) [--int k=v]...`
 
 use std::collections::HashMap;
@@ -50,7 +51,8 @@ fn usage() {
          aria list   <file.aria>\n  \
          aria parse  <file.aria> [--circuit NAME] [--int k=v]...\n  \
          aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...\n              \
-         [--shots N] [--seed S] [--backend sim|mps[:chi]|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]\n              \
+         [--shots N] [--seed S] [--backend sim|mps[:chi]|mps:auto[:ceiling]|gpu|tch|pauliprop|remote] [--statevector] [--expectation OBS]\n              \
+         [--strict-truncation EPS  (fail if an MPS run's discarded weight exceeds EPS)]\n              \
          [--noise JSON  (sampled counts on --backend sim, e.g. '{{\"readout_flip\":0.02,\"amplitude_damping\":5e-4}}')]\n              \
          (pauliprop computes --expectation only; truncate deep circuits with\n              \
           [--truncate C] [--max-weight W] [--max-freq F])\n              \
@@ -258,6 +260,16 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
         .opt("seed")
         .map(|s| s.parse().map_err(|_| format!("bad --seed '{s}'")))
         .transpose()?;
+    // Opt-in fail-loud: exit non-zero when an MPS run's accumulated discarded
+    // weight exceeds this. Default (absent) preserves exit-code semantics for
+    // every existing backend/flag combination.
+    let strict_truncation: Option<f64> = a
+        .opt("strict-truncation")
+        .map(|s| {
+            s.parse::<f64>()
+                .map_err(|_| format!("bad --strict-truncation '{s}'"))
+        })
+        .transpose()?;
 
     // Per-gate noise model (trajectory simulation). Parsed here so a bad spec
     // or a channel that can't be applied fails loudly — `--noise` must never be
@@ -349,7 +361,7 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
         }
         let val = expectation(&circuit, obs, &binds, sel)?;
         println!("<{obs}> = {val:.12}");
-        return Ok(());
+        return report_mps_truncation(strict_truncation);
     }
 
     if a.has("statevector") {
@@ -372,7 +384,7 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
                 );
             }
         }
-        return Ok(());
+        return report_mps_truncation(strict_truncation);
     }
 
     let res = match &noise {
@@ -380,6 +392,33 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
         None => run_counts(&circuit, &binds, shots, seed, sel)?,
     };
     print_counts(res, counts_width(&circuit, &binds));
+    report_mps_truncation(strict_truncation)
+}
+
+/// Report the MPS truncation certificate of the just-completed run to stderr
+/// (only when it actually truncated), and fail loudly under
+/// `--strict-truncation <eps>`. A no-op for non-MPS backends (no stats were
+/// captured). stderr-only + opt-in, so stdout and default exit codes are
+/// unchanged for every existing invocation.
+fn report_mps_truncation(strict: Option<f64>) -> Result<(), String> {
+    let Some(stats) = aria_runtime::take_last_mps_stats() else {
+        return Ok(());
+    };
+    if stats.discarded_weight > 0.0 {
+        eprintln!(
+            "mps: discarded_weight={:.3e} max_bond_reached={}",
+            stats.discarded_weight, stats.max_bond_reached
+        );
+    }
+    if let Some(eps) = strict {
+        if stats.discarded_weight > eps {
+            return Err(format!(
+                "MPS discarded weight {:.3e} exceeds --strict-truncation {eps:.3e}; \
+                 raise --backend mps:<chi> / mps:auto:<ceiling> or loosen the bound",
+                stats.discarded_weight
+            ));
+        }
+    }
     Ok(())
 }
 

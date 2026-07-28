@@ -60,9 +60,11 @@ pub mod remote;
 
 pub use lower::{lower, Lowered};
 pub use model::{ModelMetadata, TrainedModel};
+pub use omega_backend_mps::MpsRunStats;
 pub use run::{
-    counts_width, expectation, expectation_noisy, expectation_pauliprop, parse_noise_model,
-    run_counts, run_counts_noisy, statevector, BackendSel, PauliPropTruncation,
+    counts_width, expectation, expectation_noisy, expectation_pauliprop, expectation_with_gradient,
+    parse_noise_model, run_counts, run_counts_noisy, statevector, take_last_mps_stats, BackendSel,
+    GradMethod, PauliPropTruncation,
 };
 pub use train::{train_expectation, Optimizer, TrainConfig, TrainResult};
 pub use train_supervised::{train_supervised, Loss, SupervisedConfig, SupervisedResult};

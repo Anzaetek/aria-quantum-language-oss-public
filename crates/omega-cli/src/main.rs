@@ -1066,7 +1066,18 @@ fn main() {
                     omega_backend_mps::NoisyMpsBackend::with_model(64, model.clone())
                         .execute(&circuit, &params, &config)
                 } else {
-                    MpsBackend::new(64).execute(&circuit, &params, &config)
+                    // Hold the concrete backend so its truncation certificate
+                    // can be reported to stderr (stdout/exit unchanged — K14).
+                    let backend = MpsBackend::new(64);
+                    let r = backend.execute(&circuit, &params, &config);
+                    let stats = backend.last_run_stats();
+                    if stats.discarded_weight > 0.0 {
+                        eprintln!(
+                            "mps: discarded_weight={:.3e} max_bond_reached={}",
+                            stats.discarded_weight, stats.max_bond_reached
+                        );
+                    }
+                    r
                 }
             }
             "pauli" | "stabilizer" => PauliBackend::new().execute(&circuit, &params, &config),

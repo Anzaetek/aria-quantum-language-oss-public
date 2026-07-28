@@ -408,6 +408,53 @@ fn gpu_pauliprop_metal_agrees_with_sim() {
     );
 }
 
+#[test]
+fn expectation_with_gradient_matches_analytic_derivative() {
+    use aria_runtime::{expectation_with_gradient, GradMethod};
+
+    // RY(t_0) RY(t_1) on |0>, observable Z0. Only t_0 acts on q0, and
+    // ⟨Z0⟩ = cos(t_0), so ∂⟨Z0⟩/∂t_0 = −sin(t_0) and ∂/∂t_1 = 0 exactly.
+    let src = "circuit G() {\n  qreg q[1]\n  let t = symbolic[2]\n  apply RY(t[0]) on q[0]\n  \
+         apply RY(t[1]) on q[0]\n}\n";
+    let c = inline(src, "G");
+    // Combined angle is t_0 + t_1; ⟨Z0⟩ = cos(t_0 + t_1), so both partials are
+    // −sin(t_0 + t_1). Pick values whose sum is a clean angle.
+    let binds: HashMap<String, f64> = [("t_0".to_string(), 0.7), ("t_1".to_string(), 0.5)].into();
+    let sum = 1.2_f64;
+
+    // Adjoint and parameter-shift must both hit the analytic value/gradient.
+    for method in [GradMethod::Adjoint, GradMethod::ParameterShift] {
+        let (value, grad) = expectation_with_gradient(&c, "Z0", &binds, SIM, method, None).unwrap();
+        assert!(
+            (value - sum.cos()).abs() < 1e-9,
+            "value {value} vs cos {}",
+            sum.cos()
+        );
+        assert_eq!(grad.len(), 2, "both symbols returned");
+        for name in ["t_0", "t_1"] {
+            assert!(
+                (grad[name] + sum.sin()).abs() < 1e-7,
+                "∂/∂{name} = {} vs analytic {}",
+                grad[name],
+                -sum.sin()
+            );
+        }
+    }
+
+    // `only` restricts the returned gradient to the named subset.
+    let (_, only_grad) =
+        expectation_with_gradient(&c, "Z0", &binds, SIM, GradMethod::Adjoint, Some(&["t_1"]))
+            .unwrap();
+    assert_eq!(only_grad.len(), 1, "only t_1 requested");
+    assert!(only_grad.contains_key("t_1") && !only_grad.contains_key("t_0"));
+
+    // An unknown binding name is a clear error, not a silent no-op.
+    let bad: HashMap<String, f64> = [("nope".to_string(), 1.0)].into();
+    let err =
+        expectation_with_gradient(&c, "Z0", &bad, SIM, GradMethod::Adjoint, None).unwrap_err();
+    assert!(err.contains("unknown symbol 'nope'"), "got: {err}");
+}
+
 #[cfg(feature = "tch")]
 #[test]
 fn tch_backend_agrees_with_sim_on_qft() {
