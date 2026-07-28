@@ -17,6 +17,34 @@
 //! falls back to the CPU Jacobi SVD — no separate `Zgesvdj` fallback
 //! on-device is wired up.
 //!
+//! # Truncation certificate (`discarded_weight`)
+//!
+//! `SvdResultFlat` now carries `discarded_weight` = Σσ² over the singular
+//! values dropped by truncation (the MPS fidelity proxy). This device path
+//! sets it from the full spectrum cuSOLVER returns, mirroring the CPU kernel.
+//! Because CUDA only swaps the *SVD* (via `MpsBackend::with_svd_fn`) and leaves
+//! the split/accumulation in `Mps::apply_2q_with_svd_flat`, the per-run
+//! accumulation onto `Mps::discarded_weight` works automatically once this
+//! field is correct — there is NO CUDA analogue of the Metal
+//! `mps_apply_2q_metal` bypass to patch.
+//!
+//! ## TODO — validate on CUDA hardware (RTX 6000 Pro machine)
+//!
+//! These changes compile on the CPU-fallback path but the device numbers are
+//! unverified here. On a CUDA box, run and confirm:
+//!   1. `cargo test -p omega-backend-mps-cuda --features cuda` (existing SVD
+//!      parity tests — must still pass; U/V from `Zgesvda`/`Zgesvdj` stay the
+//!      returned orthonormal factors, so no kernel-correctness change).
+//!   2. Add/run a device parity check that `discarded_weight` from the CUDA
+//!      `truncated_svd_flat` matches the CPU `omega_backend_mps::svd::
+//!      truncated_svd_flat` to ~1e-9 on the same truncating matrix (e.g. the
+//!      128×96 / diagonal-spectrum cases from the CPU unit tests).
+//!   3. `ci.sh` gates CUDA behind `ARIA_CUDA=1` — run `ARIA_CUDA=1 ./ci.sh`
+//!      there so `gpu_cuda_agrees_with_sim` / `gpu_mps_cuda_agrees` exercise the
+//!      new field end to end.
+//! The one-sided-Jacobi CPU rewrite does not touch this file's device kernels,
+//! so only the `discarded_weight` plumbing (2 construction sites) is new here.
+//!
 //! # Matrix layout
 //!
 //! cuSOLVER is column-major (LAPACK convention). The host-side input
@@ -224,6 +252,7 @@ impl CudaSvdContext {
                 vt: vec![],
                 m: m_host,
                 n: n_host,
+                discarded_weight: 0.0,
             });
         }
         debug_assert!(stride >= n_host);
@@ -350,6 +379,9 @@ impl CudaSvdContext {
             .max(1);
 
         let s_out: Vec<f64> = s_host[..kept].to_vec();
+        // Truncation certificate: Σσ² over the singular values the solver
+        // returned but truncation dropped (mirrors the CPU kernel exactly).
+        let discarded_weight: f64 = s_host[kept..].iter().map(|&sv| sv * sv).sum();
 
         // Build U (m_host × kept) and Vt (kept × n_host) in row-major
         // flat. When we transposed:
@@ -389,6 +421,7 @@ impl CudaSvdContext {
             vt: vt_out,
             m: m_host,
             n: n_host,
+            discarded_weight,
         })
     }
 

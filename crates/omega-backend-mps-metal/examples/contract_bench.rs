@@ -68,7 +68,7 @@ fn run_brickwall_cpu(mps: &mut Mps, depth: usize) {
             // via the same `cpu_path` the Metal entry uses for its
             // SVD/split tail.
             let max_bm = mps.max_bond_dim;
-            let (nl, nr) = cpu_path(&mps.tensors[q], &mps.tensors[q + 1], &gate, max_bm, 1e-14);
+            let (nl, nr, _w) = cpu_path(&mps.tensors[q], &mps.tensors[q + 1], &gate, max_bm, 1e-14);
             mps.tensors[q] = nl;
             mps.tensors[q + 1] = nr;
         }
@@ -81,7 +81,7 @@ fn run_brickwall_metal(mps: &mut Mps, depth: usize) -> usize {
     for d in 0..depth {
         let offset = d & 1;
         for q in (offset..mps.n - 1).step_by(2) {
-            let (nl, nr, used) = apply_two_site_gate_metal(
+            let (nl, nr, _w, used) = apply_two_site_gate_metal(
                 &mps.tensors[q],
                 &mps.tensors[q + 1],
                 &gate,

@@ -40,6 +40,10 @@ cargo build "${ARIA_CRATES[@]}"
 
 step "5/9  Test Aria crates (numeric gates)"
 cargo test "${ARIA_CRATES[@]}"
+# The pure-Rust omega backends carry their own numeric gates (e.g. the MPS
+# SVD-unitarity + deep-circuit norm/truncation regressions). Step 3 only builds
+# them, so run their tests here or those gates never execute in CI.
+cargo test "${OMEGA_CORE[@]}"
 
 step "6/9  Numeric smoke against the built 'aria' binary"
 ARIA=$(cargo build -p aria-cli --message-format=json 2>/dev/null \

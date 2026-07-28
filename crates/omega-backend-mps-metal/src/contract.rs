@@ -13,7 +13,7 @@
 use num_complex::Complex64;
 
 use omega_backend_mps::mps::{Mps, MpsTensor};
-use omega_backend_mps::svd::truncated_svd;
+use omega_backend_mps::svd::truncated_svd_flat;
 
 /// Below this contracted bond dimension the GPU dispatch overhead
 /// (~100 µs per kernel call on Apple) exceeds the CPU contraction
@@ -46,7 +46,7 @@ pub fn apply_two_site_gate_metal(
     gate: &[Complex64; 16],
     max_bond_dim: usize,
     threshold: f64,
-) -> (MpsTensor, MpsTensor, bool) {
+) -> (MpsTensor, MpsTensor, f64, bool) {
     assert_eq!(
         left.bond_right, right.bond_left,
         "left.bond_right must match right.bond_left",
@@ -55,15 +55,15 @@ pub fn apply_two_site_gate_metal(
     #[cfg(all(target_os = "macos", feature = "metal"))]
     {
         if left.bond_right >= min_bond_dim_for_metal() {
-            if let Some((nl, nr)) = metal_path(left, right, gate, max_bond_dim, threshold) {
-                return (nl, nr, true);
+            if let Some((nl, nr, w)) = metal_path(left, right, gate, max_bond_dim, threshold) {
+                return (nl, nr, w, true);
             }
         }
     }
 
     // CPU fallback — mirrors `Mps::apply_2q` Steps 1..5 verbatim.
-    let (nl, nr) = cpu_path(left, right, gate, max_bond_dim, threshold);
-    (nl, nr, false)
+    let (nl, nr, w) = cpu_path(left, right, gate, max_bond_dim, threshold);
+    (nl, nr, w, false)
 }
 
 /// Drop-in replacement for `Mps::apply_2q` that routes through
@@ -78,13 +78,18 @@ pub fn apply_two_site_gate_metal(
 /// build graph.
 pub fn mps_apply_2q_metal(mps: &mut Mps, q: usize, gate: &[Complex64; 16]) -> bool {
     assert!(q + 1 < mps.n, "q+1 out of range");
-    let (new_left, new_right, used_metal) = apply_two_site_gate_metal(
+    let (new_left, new_right, rel_discarded, used_metal) = apply_two_site_gate_metal(
         &mps.tensors[q],
         &mps.tensors[q + 1],
         gate,
         mps.max_bond_dim,
         1e-14,
     );
+    // Bypasses `Mps::apply_2q`, so accumulate the truncation certificate here
+    // exactly as that path does — otherwise a GPU-driven run would report zero
+    // discarded weight regardless of truncation.
+    mps.discarded_weight += rel_discarded;
+    mps.max_bond_reached = mps.max_bond_reached.max(new_right.bond_left);
     mps.tensors[q] = new_left;
     mps.tensors[q + 1] = new_right;
     used_metal
@@ -93,14 +98,14 @@ pub fn mps_apply_2q_metal(mps: &mut Mps, q: usize, gate: &[Complex64; 16]) -> bo
 /// Pure-CPU two-site gate apply (extracted from `Mps::apply_2q`). Used
 /// both as the fallback path and as the reference for GPU-vs-CPU
 /// equivalence tests. Returns the post-truncation `(left, right)`
-/// tensors.
+/// tensors and the relative discarded singular-value weight.
 pub fn cpu_path(
     left: &MpsTensor,
     right: &MpsTensor,
     gate: &[Complex64; 16],
     max_bond_dim: usize,
     threshold: f64,
-) -> (MpsTensor, MpsTensor) {
+) -> (MpsTensor, MpsTensor, f64) {
     let bl = left.bond_left;
     let bm = left.bond_right;
     let br = right.bond_right;
@@ -139,29 +144,32 @@ pub fn cpu_path(
     finalize_svd(&theta_prime, bl, br, max_bond_dim, threshold)
 }
 
-/// CPU SVD + split shared by both code paths.
+/// CPU SVD + split shared by both code paths. Returns the two site tensors and
+/// the *relative* discarded singular-value weight of the split (0.0 when nothing
+/// truncated) — the same truncation certificate the built-in path accumulates.
+///
+/// `theta_prime` is already in the `(bl*2) × (2*br)` row-major matrix layout the
+/// SVD consumes (`theta_prime[l*4*br + (s0*2+s1)*br + r]` equals
+/// `matrix_flat[(l*2+s0)*(2*br) + s1*br + r]`), so it feeds `truncated_svd_flat`
+/// directly — no nested-Vec repack, and it gets the discarded weight the old
+/// nested `truncated_svd` dropped.
 fn finalize_svd(
     theta_prime: &[Complex64],
     bl: usize,
     br: usize,
     max_bond_dim: usize,
     threshold: f64,
-) -> (MpsTensor, MpsTensor) {
+) -> (MpsTensor, MpsTensor, f64) {
     let rows = bl * 2;
     let cols = 2 * br;
-    let mut matrix = vec![vec![Complex64::new(0.0, 0.0); cols]; rows];
-    for l in 0..bl {
-        for s0 in 0..2 {
-            for s1 in 0..2 {
-                for r in 0..br {
-                    let ss = s0 * 2 + s1;
-                    matrix[l * 2 + s0][s1 * br + r] = theta_prime[l * 4 * br + ss * br + r];
-                }
-            }
-        }
-    }
-    let svd = truncated_svd(&matrix, max_bond_dim, threshold);
+    let total: f64 = theta_prime.iter().map(|z| z.norm_sqr()).sum();
+    let svd = truncated_svd_flat(theta_prime, rows, cols, cols, max_bond_dim, threshold);
     let new_bm = svd.s.len();
+    let rel_discarded = if total > 1e-300 {
+        svd.discarded_weight / total
+    } else {
+        0.0
+    };
 
     let mut new_left = MpsTensor::new(bl, new_bm);
     let mut new_right = MpsTensor::new(new_bm, br);
@@ -169,7 +177,7 @@ fn finalize_svd(
         for s0 in 0..2 {
             for m in 0..new_bm {
                 let sqrt_s = svd.s[m].sqrt();
-                new_left.set(l, s0, m, svd.u[l * 2 + s0][m] * sqrt_s);
+                new_left.set(l, s0, m, svd.u[(l * 2 + s0) * new_bm + m] * sqrt_s);
             }
         }
     }
@@ -177,11 +185,11 @@ fn finalize_svd(
         let sqrt_s = svd.s[m].sqrt();
         for s1 in 0..2 {
             for r in 0..br {
-                new_right.set(m, s1, r, sqrt_s * svd.vt[m][s1 * br + r]);
+                new_right.set(m, s1, r, sqrt_s * svd.vt[m * cols + s1 * br + r]);
             }
         }
     }
-    (new_left, new_right)
+    (new_left, new_right, rel_discarded)
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -191,7 +199,7 @@ fn metal_path(
     gate: &[Complex64; 16],
     max_bond_dim: usize,
     threshold: f64,
-) -> Option<(MpsTensor, MpsTensor)> {
+) -> Option<(MpsTensor, MpsTensor, f64)> {
     use crate::metal_runtime::{self, MetalRuntime};
 
     let bl = left.bond_left;
@@ -289,7 +297,7 @@ mod tests {
         let left = make_tensor(2, 3, 0xA);
         let right = make_tensor(3, 2, 0xB);
         let gate = cnot_gate();
-        let (l1, r1) = cpu_path(&left, &right, &gate, 8, 1e-14);
+        let (l1, r1, _w) = cpu_path(&left, &right, &gate, 8, 1e-14);
         // Hand-computed sanity check via the reference identity path
         // — at max_bond_dim = 8 (>> 3 = bm), every singular value is
         // kept, so cpu_path is bit-identical to the Mps::apply_2q
@@ -341,7 +349,7 @@ mod tests {
         let gate = cnot_gate();
         let from_metal = metal_path(&left, &right, &gate, 8, 1e-14);
         let from_cpu = cpu_path(&left, &right, &gate, 8, 1e-14);
-        let Some((ml, mr)) = from_metal else {
+        let Some((ml, mr, _w)) = from_metal else {
             // No Metal device — skip.
             return;
         };
@@ -392,12 +400,12 @@ mod tests {
         let left = make_tensor(2, bm, 0x1111);
         let right = make_tensor(bm, 2, 0x2222);
         let gate = cnot_gate();
-        let (ml, mr, used) = apply_two_site_gate_metal(&left, &right, &gate, bm, 1e-14);
+        let (ml, mr, _w, used) = apply_two_site_gate_metal(&left, &right, &gate, bm, 1e-14);
         if !used {
             // Metal device unavailable on this host — skip.
             return;
         }
-        let (cl, cr) = cpu_path(&left, &right, &gate, bm, 1e-14);
+        let (cl, cr, _w) = cpu_path(&left, &right, &gate, bm, 1e-14);
 
         // Reconstruction L · R is gauge-invariant; entries themselves
         // are not (SVD U/V phase freedom). Compare reconstructions.
@@ -435,7 +443,7 @@ mod tests {
         let left = make_tensor(1, 2, 0xE);
         let right = make_tensor(2, 1, 0xF);
         let gate = identity_gate();
-        let (_, _, used_metal) = apply_two_site_gate_metal(&left, &right, &gate, 4, 1e-14);
+        let (_, _, _w, used_metal) = apply_two_site_gate_metal(&left, &right, &gate, 4, 1e-14);
         // bm = 2 is well below MIN_BOND_DIM_FOR_METAL = 32, so even
         // with `--features metal` enabled the public entry point
         // returns `used_metal = false`.

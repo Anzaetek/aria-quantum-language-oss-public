@@ -101,16 +101,17 @@ pub fn metal_contract_2q(
     gate: &[Complex64; 16],
     max_bond_dim: usize,
     threshold: f64,
-) -> Option<(MpsTensor, MpsTensor)> {
+) -> Option<(MpsTensor, MpsTensor, f64)> {
     // Below the GPU threshold, decline immediately so the MPS backend takes its
     // own exact-f64 path — no wasted CPU recompute inside the metal helper.
     if left.bond_right < min_bond_dim_for_metal() {
         return None;
     }
-    let (nl, nr, used) = apply_two_site_gate_metal(left, right, gate, max_bond_dim, threshold);
+    let (nl, nr, rel_discarded, used) =
+        apply_two_site_gate_metal(left, right, gate, max_bond_dim, threshold);
     if used {
         METAL_CONTRACTIONS.fetch_add(1, Ordering::Relaxed);
-        Some((nl, nr))
+        Some((nl, nr, rel_discarded))
     } else {
         None
     }
