@@ -341,11 +341,13 @@ fn apply_op_dagger(state: &MetalState, op: &GateOp, params: &ParameterBinding) -
         GateKind::CCX => state.apply_ccx(q0, op.qubits[1].0, op.qubits[2].0),
         GateKind::CSwap => state.apply_cswap(q0, op.qubits[1].0, op.qubits[2].0),
 
-        // Reset / Measure / Custom rejected upstream
+        // Reset / Measure / photonic / RBS / Custom rejected upstream (no
+        // native Metal kernel; the CPU statevector backend handles these).
         GateKind::Reset
         | GateKind::Measure
         | GateKind::PhaseShifter
         | GateKind::BeamSplitterRx
+        | GateKind::Rbs
         | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "metal adjoint dagger: unsupported gate {:?}",
