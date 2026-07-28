@@ -125,9 +125,17 @@ for _ in 0..250 {
 # }
 ```
 
-For a batched trainer with Adam, freeze masks, and MSE/BCE, see
-`aria_runtime::train` (`train_expectation`, `TrainConfig`, `Optimizer`) and
-`omega_core::qml::QmlTrainer`.
+For dataset training (rows + labels) with Adam, freeze masks and MSE/**BCE**, use
+`aria_runtime::train_supervised(circuit, &x, &y, observable, &cfg, sel)` with
+`SupervisedConfig { loss: Loss::Bce, frozen, optimizer: Optimizer::Adam, .. }`;
+see "Saving and reloading a trained model" below for persisting the result. The
+other two trainers are narrower: `aria_runtime::train::train_expectation`
+minimises a *single observable* (VQE-shaped, no dataset — `TrainConfig` has no
+loss field), and `omega_core::qml::QmlTrainer` is the encode-then-ansatz
+**MSE-only** trainer. For a one-shot expectation **and** gradient of a circuit
+(name-keyed, no manual lowering), use
+`aria_runtime::expectation_with_gradient(circuit, observable, &bindings, sel,
+method, only)`.
 
 ## Backends
 

@@ -19,10 +19,19 @@ The default build needs no libtorch and no GPU.
 - aria-runtime :: `lower::lower(&Circuit) -> Lowered { ir: CircuitIR, symbol_ids: HashMap<String,SymbolId>, .. }`.
   Binding-order contract on `Lowered`: SymbolIds are dense 0..N in first-appearance order (tested).
   `run::{expectation, statevector, run_counts}` — one-shot CLI-style wrappers (re-lower each call; not for loops).
-  `run::BackendSel::{Sim, Mps{chi}, Gpu, Tch, PauliProp}` + `BackendSel::parse("mps:128")`.
+  `run::expectation_with_gradient(circuit, obs, &bindings, sel, GradMethod, only: Option<&[&str]>) -> (f64, HashMap<String,f64>)` — name-keyed one-shot expectation + gradient (re-lowers; not for loops).
+  `run::BackendSel::{Sim, Mps{chi}, MpsAuto{max_chi}, Gpu, Tch, PauliProp}` + `BackendSel::parse("mps:128" | "mps:auto" | "mps:auto:512")` (adaptive bond grows to a ceiling).
+  `run::take_last_mps_stats() -> Option<MpsRunStats>` — truncation certificate of the last `run::*` MPS call (thread-local side channel; signatures unchanged).
   `train::{train_expectation, TrainConfig, Optimizer::{Gd,Adam}}` — single-observable variational trainer (VQE-shaped).
+  `train_supervised::{train_supervised, SupervisedConfig, Loss::{Mse,Bce}, SupervisedResult}` — DATASET trainer:
+    rows + labels + readout observable -> weights + affine head. Features are the symbols named `{feature_prefix}_*`
+    (bound per row); everything else is trainable. Use this one for supervised/QML, not `train_expectation`.
+  `model::{TrainedModel, ModelMetadata}` — `from_result` / `save` / `load` / `predict(&x, sel)`: self-contained
+    trained-model JSON (weights + symbol order + head).
 - omega-core :: the runtime types every backend and gradient path share.
-  `executor::Backend` (trait): `expectation`, `expectation_multi`, `adjoint_gradient`, `execute`.
+  `executor::Backend` (trait): `expectation`, `expectation_multi` (batches OBSERVABLES),
+    `expectation_batch` / `adjoint_gradient_batch` (batch ROWS: `&[&ParameterBinding]`, rayon-parallel on
+    statevector, index-preserving), `adjoint_gradient`, `execute`.
   `executor::Observable::parse("0.5*X0 + Z1 Z2")`; `executor::PauliOp`.
   `circuit::{CircuitIR, GateOp, GateKind, ParamExpr, SymbolId=u32, Qubit}`.
   `params::ParameterBinding` — `new()`, `bind(SymbolId, f64)`; the typed parameter vector.
@@ -34,6 +43,7 @@ The default build needs no libtorch and no GPU.
 ## Backends (all impl omega_core::executor::Backend)
 - omega-backend-statevector :: `StatevectorBackend::new()` — pure-Rust dense, exact, ≲24 qubits. Implements `adjoint_gradient`.
 - omega-backend-mps :: `MpsBackend::new(chi)` — matrix-product-state, bond dim `chi` (2^(n/2) = exact).
+  `MpsBackend::last_run_stats() -> MpsRunStats { discarded_weight, max_bond_reached }` — truncation certificate of the last run (0 = exact).
 - omega-backend-pauliprop :: `PauliPropBackend` — Heisenberg-picture Pauli propagation; expectations only, width-unbounded on Clifford.
 - omega-backend-pauli :: stabilizer tableau (Clifford).
 - omega-backend-photonics :: Fock/optical modes (BeamSplitterRx, PhaseShifter).
@@ -48,13 +58,16 @@ The default build needs no libtorch and no GPU.
 - crates/apps/<name> :: one crate per shipped example; each `pub fn run(Transport) -> Result<Verdict,String>`.
 
 ## CLI (crates/aria-cli, the `aria` binary)
-- `aria run <f.aria> --circuit C [--int k=v] [--bind s=v] [--shots N] [--backend sim|mps[:chi]|gpu|tch|pauliprop] [--statevector] [--expectation OBS]`
-- `aria train <f.aria> --circuit C --observable OBS [--steps N --lr R --opt adam --freeze a,b --set a=0.5 --grad parallel]`
+- `aria run <f.aria> --circuit C [--int k=v] [--bind s=v] [--shots N] [--backend sim|mps[:chi]|mps:auto[:ceiling]|gpu|tch|pauliprop] [--statevector] [--expectation OBS] [--strict-truncation EPS]`
+  (`mps:auto` grows the bond adaptively to a ceiling; an MPS run prints `mps: discarded_weight=… max_bond_reached=…` to stderr when it truncates, and `--strict-truncation EPS` fails if it exceeds EPS.)
+- `aria train <f.aria> --circuit C --observable OBS [--steps N --lr R --opt adam --freeze a,b --set a=0.5 --grad parallel]` — single-observable trainer.
+- `aria train <f.aria> --circuit C --data X.csv [--labels y.csv] [--loss mse|bce] [--feature-prefix x] [--save-model m.json]` — DATASET (supervised) trainer.
+- `aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]` — score rows with a saved model.
 - `aria export <f.aria> --circuit C (--qasm|--json|--lean|--gate-model)`
 - `aria list|parse <f.aria>`
 
 ## Server / remote (optional)
-- omega-server :: HTTP execution service (`POST /v1/quantum/execute`; PQC bearer auth). omega-client :: Rust client.
+- omega-server :: HTTP execution service (`POST /v1/quantum/execute`, `POST /v1/quantum/expectation` (IR + binding + observable -> f64); PQC bearer auth). omega-client :: Rust client (`omega-client quantum execute|expectation`).
 
 ## Proofs
 - proofs/lean4/QuantumProofs/*.lean :: sorry-free correctness theorems (Bell, QFT, QPE, Grover, HHL, QSVT, RBS gate).
