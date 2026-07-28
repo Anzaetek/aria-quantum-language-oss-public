@@ -1071,7 +1071,9 @@ fn main() {
                     let backend = MpsBackend::new(64);
                     let r = backend.execute(&circuit, &params, &config);
                     let stats = backend.last_run_stats();
-                    if stats.discarded_weight > 0.0 {
+                    // Report REAL truncation only; a ~1e-28 rounding tail isn't
+                    // worth a line (1e-12 floor sits above it, below real loss).
+                    if stats.discarded_weight > 1e-12 {
                         eprintln!(
                             "mps: discarded_weight={:.3e} max_bond_reached={}",
                             stats.discarded_weight, stats.max_bond_reached

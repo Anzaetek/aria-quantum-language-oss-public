@@ -155,6 +155,15 @@ pub fn take_last_mps_stats() -> Option<MpsRunStats> {
     LAST_MPS_STATS.with(|c| c.take())
 }
 
+/// Clear the thread-local certificate. Every `run::*` entry point that does NOT
+/// produce MPS truncation stats (the noisy trajectory paths, remote) calls this
+/// so a later `take_last_mps_stats` can never return a *previous* MPS run's
+/// value — the side channel means "the most recent run", not "the most recent
+/// MPS run ago".
+fn clear_mps_stats() {
+    LAST_MPS_STATS.with(|c| c.set(None));
+}
+
 /// Run `f` against the selected backend, recording the MPS truncation
 /// certificate into the thread-local side channel when the backend is MPS (so
 /// [`take_last_mps_stats`] can surface it) and clearing it otherwise. Holds the
@@ -168,18 +177,24 @@ fn with_backend_stats<T>(
         BackendSel::Mps { chi } => {
             let b = make_mps(chi);
             let out = f(&b);
-            LAST_MPS_STATS.with(|c| c.set(Some(b.last_run_stats())));
+            // Record stats only on success — a failed run must not leave a clean
+            // zero certificate that reads as "no truncation".
+            LAST_MPS_STATS.with(|c| {
+                c.set(out.is_ok().then(|| b.last_run_stats()));
+            });
             out
         }
         BackendSel::MpsAuto { max_chi } => {
             let b = make_mps(max_chi).with_adaptive(MPS_AUTO_EPS);
             let out = f(&b);
-            LAST_MPS_STATS.with(|c| c.set(Some(b.last_run_stats())));
+            LAST_MPS_STATS.with(|c| {
+                c.set(out.is_ok().then(|| b.last_run_stats()));
+            });
             out
         }
         other => {
             let b = make_backend(other)?;
-            LAST_MPS_STATS.with(|c| c.set(None));
+            clear_mps_stats();
             f(b.as_ref())
         }
     }
@@ -430,6 +445,7 @@ pub fn run_counts_noisy(
     sel: BackendSel,
     model: &NoiseModel,
 ) -> Result<ExecResult, String> {
+    clear_mps_stats(); // trajectory path tracks no truncation stats
     let low = concrete_ir(circuit, bindings)?;
     let cfg = ExecConfig {
         shots: Some(shots),
@@ -492,6 +508,7 @@ pub fn expectation_noisy(
     sel: BackendSel,
     model: &NoiseModel,
 ) -> Result<f64, String> {
+    clear_mps_stats(); // pauliprop path tracks no MPS truncation stats
     if sel != BackendSel::PauliProp {
         return Err(format!(
             "--noise with --expectation is only supported on --backend pauliprop (its Heisenberg \
@@ -571,9 +588,10 @@ pub fn expectation_with_gradient(
     method: GradMethod,
     only: Option<&[&str]>,
 ) -> Result<(f64, HashMap<String, f64>), String> {
-    // Lower WITHOUT folding the bindings into the IR: gradients differentiate
-    // w.r.t. the live symbols, so they must survive lowering (unlike
-    // `expectation`, which uses `concrete_ir`).
+    clear_mps_stats(); // gradient path doesn't surface MPS truncation stats
+                       // Lower WITHOUT folding the bindings into the IR: gradients differentiate
+                       // w.r.t. the live symbols, so they must survive lowering (unlike
+                       // `expectation`, which uses `concrete_ir`).
     let low = lower(circuit)?;
     let obs = Observable::parse(observable)?;
 
@@ -640,6 +658,13 @@ pub fn expectation_with_gradient(
         low.symbol_ids.iter().map(|(n, &i)| (i, n)).collect();
     let mut out = HashMap::with_capacity(grads.len());
     for (id, g) in grads {
+        // Every id from `compute_gradient_for` is a symbol of this lowered
+        // circuit, so it must be in the map; a miss would be an engine bug, not
+        // a value to silently drop.
+        debug_assert!(
+            id_to_name.contains_key(&id),
+            "gradient for unknown SymbolId {id}"
+        );
         if let Some(name) = id_to_name.get(&id) {
             out.insert((*name).clone(), g);
         }
@@ -670,6 +695,7 @@ pub fn expectation_pauliprop(
     bindings: &HashMap<String, f64>,
     trunc: PauliPropTruncation,
 ) -> Result<(f64, f64), String> {
+    clear_mps_stats();
     let low = concrete_ir(circuit, bindings)?;
     let obs = Observable::parse(observable)?;
     make_pauliprop(trunc.coeff_min, trunc.max_weight, trunc.max_freq)

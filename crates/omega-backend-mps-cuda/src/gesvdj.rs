@@ -20,8 +20,10 @@
 //! # Truncation certificate (`discarded_weight`)
 //!
 //! `SvdResultFlat` now carries `discarded_weight` = Σσ² over the singular
-//! values dropped by truncation (the MPS fidelity proxy). This device path
-//! sets it from the full spectrum cuSOLVER returns, mirroring the CPU kernel.
+//! values dropped by truncation (the MPS fidelity proxy). gesvda only returns
+//! `rank = min(max_rank, k)` singular values — not the truncated tail — so this
+//! device path computes the weight as ‖A‖²_F − Σσ²_kept (the Frobenius
+//! identity), which is exact regardless of how many σ the solver returned.
 //! Because CUDA only swaps the *SVD* (via `MpsBackend::with_svd_fn`) and leaves
 //! the split/accumulation in `Mps::apply_2q_with_svd_flat`, the per-run
 //! accumulation onto `Mps::discarded_weight` works automatically once this
@@ -379,9 +381,26 @@ impl CudaSvdContext {
             .max(1);
 
         let s_out: Vec<f64> = s_host[..kept].to_vec();
-        // Truncation certificate: Σσ² over the singular values the solver
-        // returned but truncation dropped (mirrors the CPU kernel exactly).
-        let discarded_weight: f64 = s_host[kept..].iter().map(|&sv| sv * sv).sum();
+        // Truncation certificate: the dropped singular-value weight. We CANNOT
+        // sum `s_host[kept..]` — gesvda was asked for only `rank = min(max_rank,
+        // k)` singular values, so when the bond is saturated (`kept == rank`,
+        // i.e. every truncating split) that tail is empty and the σ beyond
+        // `rank` were never fetched. Use the Frobenius identity instead:
+        // Σσ²_all = ‖A‖²_F, so discarded = ‖A‖²_F − Σσ²_kept. Exact regardless
+        // of how many σ the solver returned, and it keeps kept+discarded == the
+        // caller's `total` so the split's unitarity assert holds.
+        let frob_sq: f64 = {
+            let mut acc = 0.0;
+            for row_h in 0..m_host {
+                let base = row_h * stride;
+                for col_h in 0..n_host {
+                    acc += matrix[base + col_h].norm_sqr();
+                }
+            }
+            acc
+        };
+        let kept_sq: f64 = s_out.iter().map(|&sv| sv * sv).sum();
+        let discarded_weight: f64 = (frob_sq - kept_sq).max(0.0);
 
         // Build U (m_host × kept) and Vt (kept × n_host) in row-major
         // flat. When we transposed:

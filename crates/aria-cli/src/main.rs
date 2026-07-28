@@ -401,10 +401,18 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
 /// captured). stderr-only + opt-in, so stdout and default exit codes are
 /// unchanged for every existing invocation.
 fn report_mps_truncation(strict: Option<f64>) -> Result<(), String> {
+    if let Some(eps) = strict {
+        if eps.is_nan() || eps < 0.0 {
+            return Err(format!("--strict-truncation must be ≥ 0 (got {eps})"));
+        }
+    }
     let Some(stats) = aria_runtime::take_last_mps_stats() else {
         return Ok(());
     };
-    if stats.discarded_weight > 0.0 {
+    // Only report REAL truncation. A rounding-level tail (σ ≤ 1e-14 dropped by
+    // an otherwise-exact split) leaves a ~1e-28 weight that isn't worth a line;
+    // 1e-12 is comfortably above that floor and below any meaningful loss.
+    if stats.discarded_weight > 1e-12 {
         eprintln!(
             "mps: discarded_weight={:.3e} max_bond_reached={}",
             stats.discarded_weight, stats.max_bond_reached

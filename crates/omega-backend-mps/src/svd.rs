@@ -149,7 +149,9 @@ pub fn truncated_svd_flat(
     // `max_rank` strictly above `threshold`, never fewer than 1 (unchanged
     // semantics). The dropped tail's Σσ² is the truncation certificate.
     let mut order: Vec<usize> = (0..k_full).collect();
-    order.sort_by(|&i, &j| s_full[j].partial_cmp(&s_full[i]).unwrap());
+    // total_cmp (not partial_cmp().unwrap()) so a NaN/Inf σ from a pathological
+    // input yields a defined order instead of a panic.
+    order.sort_by(|&i, &j| s_full[j].total_cmp(&s_full[i]));
     let rank = order
         .iter()
         .take(max_rank)
@@ -228,7 +230,12 @@ fn one_sided_jacobi(
 
     // Cyclic sweeps over every column pair. Converged when a whole sweep rotates
     // nothing — the correct criterion, unlike the old fixed 100-rotation cap
-    // that could not diagonalise a 128-column matrix.
+    // that could not diagonalise a 128-column matrix. One-sided Jacobi is
+    // GLOBALLY convergent (each rotation strictly reduces the off-diagonal Gram
+    // norm and never increases it), and converges quadratically — empirically
+    // ~6-10 sweeps for matrices this size. 60 is therefore a safety ceiling with
+    // large margin, not a hopeful cap; converged inputs break out early via
+    // `rotated == false`, so the extra headroom is free.
     let tol = 1e-14;
     for _sweep in 0..60 {
         let mut rotated = false;
