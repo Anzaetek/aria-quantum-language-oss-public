@@ -1,0 +1,16 @@
+# aria-tune — a small, dependency-free optimisation engine (ask / report /
+# tell) for tuning Aria programs.
+#
+# Deliberately has NO dependencies: samplers, pruners, RNG, CSV and JSON are
+# all in-tree, so the crate builds anywhere the workspace does and a study is
+# reproducible bit-for-bit from its seed alone.
+[package]
+name = "aria-tune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dependency-free hyper-parameter optimisation (TPE / random / grid samplers, median / successive-halving / gate pruners) for Aria programs."
+
+[dependencies]

@@ -85,6 +85,7 @@ members = [
     "crates/apps/schrodingerize",
     "crates/apps/forward",
     "crates/aria-verify",
+    "crates/aria-tune",
     # "crates/aria-backend-tch",# added in Phase 4 (optional)
 ]
 
