@@ -58,21 +58,37 @@ fn int_rejects_a_non_positive_step() {
 #[test]
 fn try_add_reports_instead_of_panicking() {
     let e = Space::new()
-        .try_add("lr", Param::LogFloat { lo: -1.0, hi: 1.0, res: 3 })
+        .try_add(
+            "lr",
+            Param::LogFloat {
+                lo: -1.0,
+                hi: 1.0,
+                res: 3,
+            },
+        )
         .unwrap_err();
     assert!(e.contains("strictly positive"), "{e}");
-    assert!(
-        Space::new()
-            .try_add("n", Param::Int { lo: 1, hi: 4, step: 1 })
-            .is_ok()
-    );
+    assert!(Space::new()
+        .try_add(
+            "n",
+            Param::Int {
+                lo: 1,
+                hi: 4,
+                step: 1
+            }
+        )
+        .is_ok());
 }
 
 #[test]
 fn a_hand_built_bad_log_float_still_never_yields_nan() {
     // `Param` is a public enum, so validation at the Space builder is not the
     // only path in. value() must not emit NaN even when constructed directly.
-    let p = Param::LogFloat { lo: 0.0, hi: 1.0, res: 4 };
+    let p = Param::LogFloat {
+        lo: 0.0,
+        hi: 1.0,
+        res: 4,
+    };
     for i in 0..4 {
         let v = p.value(i).as_float().unwrap();
         assert!(v.is_finite(), "grid point {i} is {v}");
@@ -87,8 +103,7 @@ fn json_is_parseable_for_a_realistic_study() {
         .int("n", 2, 8, 2)
         .log_float("lr", 1e-3, 1e-1, 4)
         .categorical("opt", &["gd", "adam"]);
-    let mut s = Study::new(space, Direction::Maximize)
-        .with_sampler(Box::new(TpeSampler::new(3)));
+    let mut s = Study::new(space, Direction::Maximize).with_sampler(Box::new(TpeSampler::new(3)));
     for i in 0..12 {
         let t = s.ask();
         s.tell(t.id, if i == 4 { f64::NAN } else { 0.1 * i as f64 });
