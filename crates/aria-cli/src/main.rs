@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         "parse" => cmd_parse(rest),
         "run" => cmd_run(rest),
         "train" => cmd_train(rest),
+        "tune" => cmd_tune(rest),
         "predict" => cmd_predict(rest),
         "export" => cmd_export(rest),
         "-h" | "--help" | "help" | "" => {
@@ -60,6 +61,9 @@ fn usage() {
          aria train  <file.aria> --circuit NAME --observable OBS [--int k=v]...\n              \
          [--steps N] [--lr R] [--seed S] [--init-scale S] [--opt gd|adam] [--freeze a,b] [--grad adjoint|shift|parallel]\n              \
          (supervised: --data X.csv [--labels y.csv] [--loss mse|bce] [--feature-prefix x] [--save-model m.json]  → fit a labelled dataset)\n  \
+         aria tune   <file.aria> --circuit NAME --observable OBS --data X.csv [--labels y.csv]\n              \
+         --space \"n=4..8:2,L=1..3,lr=log:1e-3..3e-1,opt=gd|adam\"\n              \
+         [--trials N] [--steps N] [--seed S] [--sampler tpe|random|grid] [--pruner median|none] [--csv out.csv]\n  \
          aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]\n  \
          aria export <file.aria> --circuit NAME (--qasm | --json | --lean | --gate-model) [--int k=v]...\n"
     );
@@ -770,4 +774,271 @@ fn cmd_export(raw: &[String]) -> Result<(), String> {
     };
     print!("{out}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `aria tune` — hyper-parameter search over a circuit's compile-time ints and
+// training knobs, driven by `aria-tune`.
+// ---------------------------------------------------------------------------
+
+/// Parse a `--space` spec into an `aria_tune::Space`.
+///
+/// Grammar (comma-separated dimensions):
+///   `n=4..8:2`            int from 4 to 8 step 2
+///   `L=1..3`              int, step 1
+///   `lr=log:1e-3..3e-1`   log-spaced float, default resolution
+///   `lr=lin:0..1:5`       linearly spaced float, 5 grid points
+///   `opt=gd|adam`         categorical
+///
+/// Every dimension is a grid, which is what lets one TPE cover them all —
+/// see `aria_tune::space`.
+fn parse_space(spec: &str) -> Result<aria_tune::Space, String> {
+    const DEFAULT_RES: usize = 8;
+    let mut space = aria_tune::Space::new();
+    for dim in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (name, body) = dim
+            .split_once('=')
+            .ok_or_else(|| format!("bad --space dimension '{dim}' (want name=spec)"))?;
+        let (name, body) = (name.trim(), body.trim());
+        let num = |s: &str| -> Result<f64, String> {
+            s.trim()
+                .parse::<f64>()
+                .map_err(|_| format!("bad number '{s}' in --space dimension '{dim}'"))
+        };
+
+        if let Some(rest) = body
+            .strip_prefix("log:")
+            .or_else(|| body.strip_prefix("lin:"))
+        {
+            let is_log = body.starts_with("log:");
+            let mut parts = rest.split(':');
+            let range = parts
+                .next()
+                .ok_or_else(|| format!("bad --space dimension '{dim}'"))?;
+            let res: usize = match parts.next() {
+                Some(r) => r
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("bad resolution in '{dim}'"))?,
+                None => DEFAULT_RES,
+            };
+            let (lo, hi) = range
+                .split_once("..")
+                .ok_or_else(|| format!("bad range in '{dim}' (want lo..hi)"))?;
+            let (lo, hi) = (num(lo)?, num(hi)?);
+            space = space
+                .try_add(
+                    name,
+                    if is_log {
+                        aria_tune::Param::LogFloat { lo, hi, res }
+                    } else {
+                        aria_tune::Param::Float { lo, hi, res }
+                    },
+                )
+                .map_err(|e| format!("--space dimension '{dim}': {e}"))?;
+        } else if body.contains("..") {
+            let (lo, rest) = body
+                .split_once("..")
+                .ok_or_else(|| format!("bad range in '{dim}'"))?;
+            let (hi, step) = match rest.split_once(':') {
+                Some((h, s)) => (h, num(s)? as i64),
+                None => (rest, 1),
+            };
+            space = space
+                .try_add(
+                    name,
+                    aria_tune::Param::Int {
+                        lo: num(lo)? as i64,
+                        hi: num(hi)? as i64,
+                        step,
+                    },
+                )
+                .map_err(|e| format!("--space dimension '{dim}': {e}"))?;
+        } else {
+            let choices: Vec<String> = body.split('|').map(|s| s.trim().to_string()).collect();
+            space = space
+                .try_add(name, aria_tune::Param::Categorical(choices))
+                .map_err(|e| format!("--space dimension '{dim}': {e}"))?;
+        }
+    }
+    if space.is_empty() {
+        return Err("--space defined no dimensions".into());
+    }
+    Ok(space)
+}
+
+fn cmd_tune(raw: &[String]) -> Result<(), String> {
+    use aria_runtime::{train_supervised, Loss, Optimizer, SupervisedConfig};
+    use aria_tune::{Direction, MedianPruner, NoPruner, RandomSampler, Sampler, Study, TpeSampler};
+
+    let a = parse_args(raw, &[])?;
+    let path = a.first_positional("<file.aria>")?;
+    let name = a.opt("circuit").ok_or("tune requires --circuit NAME")?;
+    let spec = a
+        .opt("space")
+        .ok_or("tune requires --space \"n=4..8:2,L=1..3,lr=log:1e-3..3e-1,opt=gd|adam\"")?;
+    let obs = a
+        .opt("observable")
+        .ok_or("tune requires --observable OBS (e.g. \"Z0\")")?;
+    let data_path = a.opt("data").ok_or("tune requires --data X.csv")?;
+    let sel = BackendSel::parse(a.opt("backend").unwrap_or("sim"))?;
+    let space = parse_space(spec)?;
+
+    let n_trials: usize = match a.opt("trials") {
+        Some(v) => v.parse().map_err(|_| format!("bad --trials '{v}'"))?,
+        None => 20,
+    };
+    let seed: u64 = match a.opt("seed") {
+        Some(v) => v.parse().map_err(|_| format!("bad --seed '{v}'"))?,
+        None => 1,
+    };
+    let steps: usize = match a.opt("steps") {
+        Some(v) => v.parse().map_err(|_| format!("bad --steps '{v}'"))?,
+        None => 40,
+    };
+    let sampler: Box<dyn Sampler> = match a.opt("sampler").unwrap_or("tpe") {
+        "tpe" => Box::new(TpeSampler::new(seed)),
+        "random" => Box::new(RandomSampler::new(seed)),
+        "grid" => Box::new(aria_tune::GridSampler::new()),
+        other => return Err(format!("unknown --sampler '{other}' (tpe | random | grid)")),
+    };
+    let pruner: Box<dyn aria_tune::Pruner> = match a.opt("pruner").unwrap_or("median") {
+        "median" => Box::new(MedianPruner::default()),
+        "none" => Box::new(NoPruner),
+        other => return Err(format!("unknown --pruner '{other}' (median | none)")),
+    };
+
+    // Dataset: same convention as `aria train --data`.
+    let rows = read_numeric_csv(data_path)?;
+    let (train_x, train_y): (Vec<Vec<f64>>, Vec<f64>) = match a.opt("labels") {
+        Some(lp) => {
+            let ly = read_numeric_csv(lp)?;
+            (
+                train_x_check(rows, ly.len())?,
+                ly.iter().map(|r| r[0]).collect(),
+            )
+        }
+        None => {
+            let mut xs = rows;
+            let mut ys = Vec::with_capacity(xs.len());
+            for row in &mut xs {
+                ys.push(row.pop().ok_or("empty --data row")?);
+            }
+            (xs, ys)
+        }
+    };
+    let src = read_source(path)?;
+    let base_ints = parse_kv_i64(a.all("int").into_iter())?;
+
+    let feat_prefix = format!("{}_", a.opt("feature-prefix").unwrap_or("x"));
+    let mut narrowed = false;
+    let mut study = Study::new(space, Direction::Maximize)
+        .with_sampler(sampler)
+        .with_pruner(pruner);
+
+    for _ in 0..n_trials {
+        let t = study.ask();
+        // Any dimension whose name matches a circuit int becomes a
+        // compile-time parameter; the rest are training knobs.
+        let mut ints: Vec<(String, i64)> = base_ints.clone();
+        for (dim, _) in t.params.iter() {
+            if let Some(v) = t.int(dim) {
+                if dim != "steps" {
+                    ints.retain(|(k, _)| k != dim);
+                    ints.push((dim.clone(), v));
+                }
+            }
+        }
+        let circuit = match instantiate(&src, name, &ints) {
+            Ok(c) => c,
+            // A shape the template cannot build is a dead trial, not a fatal
+            // error — record it and let the sampler learn to avoid the region.
+            Err(_) => {
+                study.tell(t.id, f64::NEG_INFINITY);
+                continue;
+            }
+        };
+        // Tuning the wire count changes how many features the circuit
+        // accepts, but --data has one fixed width. Slice each trial's data to
+        // the feature symbols the instantiated circuit actually declares.
+        let want = match aria_runtime::lower(&circuit) {
+            Ok(low) => low
+                .symbol_ids
+                .keys()
+                .filter(|k| {
+                    k.strip_prefix(&feat_prefix)
+                        .is_some_and(|r| r.parse::<usize>().is_ok())
+                })
+                .count(),
+            Err(_) => {
+                study.tell(t.id, f64::NEG_INFINITY);
+                continue;
+            }
+        };
+        if want > train_x[0].len() {
+            return Err(format!(
+                "trial needs {want} features but --data has {} columns",
+                train_x[0].len()
+            ));
+        }
+        let trial_x: Vec<Vec<f64>> = if want == train_x[0].len() {
+            train_x.clone()
+        } else {
+            if !narrowed {
+                eprintln!(
+                    "note: slicing --data to each trial's feature count \
+                     (the circuit declares '{feat_prefix}0..' per wire)"
+                );
+                narrowed = true;
+            }
+            train_x.iter().map(|r| r[..want].to_vec()).collect()
+        };
+
+        let cfg = SupervisedConfig {
+            steps,
+            lr: t.float("lr").unwrap_or(0.1),
+            seed,
+            loss: match a.opt("loss") {
+                Some(s) => Loss::parse(s)?,
+                None => Loss::Bce,
+            },
+            optimizer: match t.cat("opt").or_else(|| t.cat("optimizer")) {
+                Some("adam") => Optimizer::adam(),
+                _ => Optimizer::Gd,
+            },
+            ..Default::default()
+        };
+        let r = train_supervised(&circuit, &trial_x, &train_y, obs, &cfg, sel)?;
+        for (i, l) in r.loss_history.iter().enumerate() {
+            study.report(t.id, i, -l, &[]);
+        }
+        study.tell(t.id, r.final_auc);
+    }
+
+    let best = study.best().ok_or("no trial completed")?;
+    println!("sampler    : {}", study.sampler_name());
+    println!("pruner     : {}", study.pruner_name());
+    println!("trials     : {n_trials}");
+    println!("pruned     : {}", study.n_pruned());
+    println!("best_score : {:.6}", best.state.score().unwrap_or(f64::NAN));
+    println!("best_params:");
+    for (k, v) in &best.params {
+        println!("  {k} = {v}");
+    }
+    if let Some(out) = a.opt("csv") {
+        std::fs::write(out, study.to_csv()).map_err(|e| format!("write {out}: {e}"))?;
+        println!("csv        : {out}");
+    }
+    Ok(())
+}
+
+/// Row-count guard shared by the `--labels` path.
+fn train_x_check(rows: Vec<Vec<f64>>, n_labels: usize) -> Result<Vec<Vec<f64>>, String> {
+    if rows.len() != n_labels {
+        return Err(format!(
+            "--data has {} rows but --labels has {n_labels}",
+            rows.len()
+        ));
+    }
+    Ok(rows)
 }
