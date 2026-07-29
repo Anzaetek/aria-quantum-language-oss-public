@@ -57,6 +57,42 @@ case "$zz" in
   *) echo "  FAIL: expected <Z0 Z1> = 1, got: $zz"; exit 1 ;;
 esac
 
+# `aria tune` smoke: a seeded TPE study over the fixed qml_tune template must
+# beat chance on the synthetic set and dump one CSV row per trial.
+TUNE_DATA=$(mktemp -t aria_tune_data)
+python3 - "$TUNE_DATA" <<'PYEOF'
+import sys
+st = 20260729
+def nxt():
+    global st
+    st = (st + 0x9E3779B97F4A7C15) % (1 << 64)
+    z = st
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) % (1 << 64)
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) % (1 << 64)
+    return ((z ^ (z >> 31)) >> 11) / float(1 << 53)
+w = [1.0, 0.85, 0.7, 0.55, 0.4, 0.25, 0.1, -0.05]
+with open(sys.argv[1], "w") as f:
+    for _ in range(80):
+        r = [2 * nxt() - 1 for _ in range(8)]
+        s = sum(a * b for a, b in zip(r, w))
+        f.write(",".join(f"{v:.6f}" for v in r + [1.0 if s >= 0 else 0.0]) + "\n")
+PYEOF
+TUNE_CSV=$(mktemp -t aria_tune_csv)
+TUNE_OUT=$("$ARIA" tune examples/aria/qml_tune.aria --circuit QmlTune \
+  --observable Z0 --data "$TUNE_DATA" \
+  --space "n=4..8:2,L=1..3,lr=log:1e-3..3e-1,opt=gd|adam" \
+  --trials 8 --steps 12 --seed 7 --csv "$TUNE_CSV" 2>/dev/null)
+TUNE_BEST=$(echo "$TUNE_OUT" | sed -n 's/^best_score : \(.*\)$/\1/p')
+TUNE_ROWS=$(( $(wc -l < "$TUNE_CSV") - 1 ))
+echo "  aria tune best_score=$TUNE_BEST csv_rows=$TUNE_ROWS"
+if awk -v b="$TUNE_BEST" 'BEGIN{exit !(b >= 0.70)}' && [ "$TUNE_ROWS" -eq 8 ]; then
+  echo "  OK: aria tune best_score >= 0.70 and one CSV row per trial"
+else
+  echo "  FAIL: aria tune best_score=$TUNE_BEST (floor 0.70), csv_rows=$TUNE_ROWS (want 8)"
+  rm -f "$TUNE_DATA" "$TUNE_CSV"; exit 1
+fi
+rm -f "$TUNE_DATA" "$TUNE_CSV"
+
 step "7/9  Build WASM guests (wasm32-wasip1) for the application harnesses"
 if rustup target list --installed 2>/dev/null | grep -q wasm32-wasip1; then
   for g in "${WASM_GUESTS[@]}"; do

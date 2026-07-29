@@ -24,4 +24,5 @@ tch = ["aria-runtime/tch"]
 [dependencies]
 aria-core = { path = "../aria-core" }
 aria-runtime = { path = "../aria-runtime" }
+aria-tune = { path = "../aria-tune" }
 omega-core = { path = "../omega-core" }
