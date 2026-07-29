@@ -1,0 +1,16 @@
+# aria-app-qml-tune — application harness for the `qml_tune` Aria example.
+# Meta-parameter tuning of a FIXED circuit template with aria-tune.
+# Run standalone: cargo run -p aria-app-qml-tune     (or: aria-verify qml_tune)
+[package]
+publish = false
+name = "aria-app-qml-tune"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Meta-parameter tuning (width/depth/lr/optimizer) of a fixed Aria circuit template with aria-tune."
+
+[dependencies]
+aria-verify-core = { path = "../../aria-verify-core" }
+aria-core = { path = "../../aria-core" }
+aria-runtime = { path = "../../aria-runtime" }
+aria-tune = { path = "../../aria-tune" }

@@ -7,7 +7,7 @@ set -euo pipefail
 APP_CRATES=(-p aria-app-qsvd -p aria-app-qft -p aria-app-vqe-ansatz \
   -p aria-app-grover3 -p aria-app-bernstein-vazirani -p aria-app-deutsch-jozsa \
   -p aria-app-swap-test -p aria-app-teleport -p aria-app-qaoa-maxcut \
-  -p aria-app-qml-classifier -p aria-app-butterfly-qnn -p aria-app-jl-sketch-digits \
+  -p aria-app-qml-classifier -p aria-app-qml-tune -p aria-app-butterfly-qnn -p aria-app-jl-sketch-digits \
   -p aria-app-spectra \
   -p aria-app-qos -p aria-app-circulant -p aria-app-cqs -p aria-app-noise \
   -p aria-app-bell -p aria-app-ghz -p aria-app-superdense -p aria-app-simon -p aria-app-qpe \

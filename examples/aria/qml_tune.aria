@@ -1,0 +1,44 @@
+-- Meta-parameter tuning target: angle encoding + StronglyEntanglingLayers.
+-- Rust harness: crates/apps/qml-tune/src/lib.rs  (cargo run -p aria-verify -- qml_tune)
+-- VERIFIED: aria-tune finds a configuration reaching the accuracy floor, its
+--   pruner stops at least one hopeless trial early, and TPE ≥ random on the
+--   same budget and seeds.
+--
+-- The circuit TOPOLOGY is fixed — this is exactly the StronglyEntangling
+-- ansatz of strongly_entangling.aria with an RY angle-encoding prefix. Only
+-- META-parameters are tuned (width `n`, depth `L`, learning rate, optimizer);
+-- searching over ansatz families or entanglement patterns is deliberately out
+-- of scope here.
+--
+-- `n` and `L` are compile-time ints, so each trial instantiates its own
+-- circuit and the parameter count follows from the pair.
+--
+-- Symbols: x[0..n-1]        one angle-encoded feature per wire (bound per row)
+--          theta[0..3nL-1]  trainable ansatz angles
+
+@assert unitary
+@bound parameters = 3 * n * L + n
+
+circuit QmlTune(n: int, L: int) {
+    qreg q[n]
+
+    let theta = symbolic[3 * n * L]
+    let x = symbolic[n]
+
+    -- Angle encoding: one feature per wire.
+    repeat i from 0 to n - 1 {
+        apply RY(x[i]) on q[i]
+    }
+
+    -- StronglyEntanglingLayers: per-qubit ZYZ Euler rotation, then a CX chain.
+    repeat layer from 0 to L - 1 {
+        repeat i from 0 to n - 1 {
+            apply RZ(theta[3 * (layer * n + i) + 0]) on q[i]
+            apply RY(theta[3 * (layer * n + i) + 1]) on q[i]
+            apply RZ(theta[3 * (layer * n + i) + 2]) on q[i]
+        }
+        repeat i from 0 to n - 2 {
+            apply CX on q[i], q[i + 1]
+        }
+    }
+}
