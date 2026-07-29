@@ -117,3 +117,34 @@ fn json_is_parseable_for_a_realistic_study() {
     assert_eq!(brackets, 0, "unbalanced brackets: {j}");
     assert!(!j.contains("NaN") && !j.contains(":inf"), "{j}");
 }
+
+#[test]
+fn nan_bounds_are_rejected_not_silently_accepted() {
+    // `NaN <= 0.0` is false, so a naive positivity check would let a NaN
+    // bound through and put NaN at every grid point. Finiteness is checked
+    // first for exactly that reason.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let e = Space::new()
+            .try_add(
+                "lr",
+                Param::LogFloat {
+                    lo: bad,
+                    hi: 1.0,
+                    res: 3,
+                },
+            )
+            .unwrap_err();
+        assert!(e.contains("finite"), "bound {bad} gave: {e}");
+        let e2 = Space::new()
+            .try_add(
+                "x",
+                Param::Float {
+                    lo: 0.0,
+                    hi: bad,
+                    res: 3,
+                },
+            )
+            .unwrap_err();
+        assert!(e2.contains("finite"), "Float bound {bad} gave: {e2}");
+    }
+}
