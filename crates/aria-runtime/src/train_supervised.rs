@@ -72,6 +72,14 @@ pub struct SupervisedConfig {
     /// Weight symbols excluded from updates (frozen).
     pub frozen: Vec<String>,
     pub grad_method: GradMethod,
+    /// Optional warm start: initial weight values by symbol name. Names not
+    /// present fall back to the seeded random init, so a partial map is fine.
+    ///
+    /// This is what makes *chunked* training possible — run `steps`, keep the
+    /// returned weights, run more — which in turn is what lets an outer tuner
+    /// prune a trial early and actually save the remaining compute rather than
+    /// discovering after the fact that it should have stopped.
+    pub init_weights: Option<HashMap<String, f64>>,
 }
 
 impl Default for SupervisedConfig {
@@ -86,6 +94,7 @@ impl Default for SupervisedConfig {
             optimizer: Optimizer::Gd,
             frozen: Vec::new(),
             grad_method: GradMethod::Adjoint,
+            init_weights: None,
         }
     }
 }
@@ -270,10 +279,17 @@ pub fn train_supervised(
         .map(|(k, &id)| (id, k))
         .collect();
 
-    // Seeded init.
+    // Seeded init, overridden per-symbol by any warm-start value.
     let mut rng = SplitMix64(cfg.seed);
-    let mut w: Vec<f64> = (0..weight_ids.len())
-        .map(|_| (rng.next_f64() * 2.0 - 1.0) * cfg.init_scale)
+    let mut w: Vec<f64> = weight_names
+        .iter()
+        .map(|name| {
+            let seeded = (rng.next_f64() * 2.0 - 1.0) * cfg.init_scale;
+            cfg.init_weights
+                .as_ref()
+                .and_then(|m| m.get(name).copied())
+                .unwrap_or(seeded)
+        })
         .collect();
 
     // BCE label canonicalisation: threshold at the midpoint of the range.

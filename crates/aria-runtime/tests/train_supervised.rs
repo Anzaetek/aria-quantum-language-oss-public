@@ -303,3 +303,68 @@ fn heart_dataset_smoke_reaches_reasonable_auc() {
         r.final_auc
     );
 }
+
+#[test]
+fn warm_start_makes_chunked_training_continue_rather_than_restart() {
+    // Without `init_weights` an outer tuner cannot stop a trial early and
+    // resume it: every call re-inits from the seed. With it, N chunks of k
+    // steps must land in the same place as one run of N·k steps.
+    let c = reuploader(2);
+    let (x, y) = synthetic();
+    let base = SupervisedConfig {
+        steps: 12,
+        lr: 0.25,
+        seed: 9,
+        loss: Loss::Mse,
+        optimizer: Optimizer::Gd,
+        ..Default::default()
+    };
+
+    let one_shot = train_supervised(&c, &x, &y, "Z0", &base, BackendSel::Sim).unwrap();
+
+    // Same budget, split into three chunks, each warm-started from the last.
+    let mut weights = None;
+    let mut chunked = None;
+    for _ in 0..3 {
+        let cfg = SupervisedConfig {
+            steps: 4,
+            init_weights: weights.clone(),
+            ..base.clone()
+        };
+        let r = train_supervised(&c, &x, &y, "Z0", &cfg, BackendSel::Sim).unwrap();
+        weights = Some(r.weights.clone());
+        chunked = Some(r);
+    }
+    let chunked = chunked.unwrap();
+
+    for (name, v) in &one_shot.weights {
+        let got = chunked.weights[name];
+        assert!(
+            (got - v).abs() < 1e-9,
+            "weight {name}: chunked {got} vs one-shot {v}"
+        );
+    }
+    assert!((chunked.final_loss - one_shot.final_loss).abs() < 1e-9);
+}
+
+#[test]
+fn warm_start_accepts_a_partial_map() {
+    // Symbols absent from the map fall back to the seeded init, so a caller
+    // may pin just the weights it cares about.
+    let c = reuploader(2);
+    let (x, y) = synthetic();
+    let mut partial = std::collections::HashMap::new();
+    partial.insert("theta_0".to_string(), 0.75);
+    let cfg = SupervisedConfig {
+        steps: 0,
+        init_weights: Some(partial),
+        ..Default::default()
+    };
+    let r = train_supervised(&c, &x, &y, "Z0", &cfg, BackendSel::Sim).unwrap();
+    assert!(
+        (r.weights["theta_0"] - 0.75).abs() < 1e-12,
+        "pinned weight was overwritten: {}",
+        r.weights["theta_0"]
+    );
+    assert_eq!(r.weights.len(), 6, "other weights should still exist");
+}
