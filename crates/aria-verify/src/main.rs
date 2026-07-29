@@ -29,6 +29,7 @@ fn registry() -> Vec<(&'static str, ExampleFn)> {
         ("teleport", aria_app_teleport::run),
         ("qaoa_maxcut", aria_app_qaoa_maxcut::run),
         ("qml_classifier", aria_app_qml_classifier::run),
+        ("qml_tune", aria_app_qml_tune::run),
         ("butterfly_qnn", aria_app_butterfly_qnn::run),
         ("jl_sketch_digits", aria_app_jl_sketch_digits::run),
         ("spectra", aria_app_spectra::run),
