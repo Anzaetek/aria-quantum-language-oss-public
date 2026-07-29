@@ -145,13 +145,16 @@ impl Param {
                 Ok(())
             }
             Param::LogFloat { lo, hi, res } => {
-                if !(*lo > 0.0) || !(*hi > 0.0) {
+                // Finiteness first, so the positivity check below cannot be
+                // handed a NaN — `NaN <= 0.0` is false, which would let a NaN
+                // bound through and put NaN at every grid point.
+                if !lo.is_finite() || !hi.is_finite() {
+                    return Err(format!("LogFloat bounds must be finite, got {lo}..{hi}"));
+                }
+                if *lo <= 0.0 || *hi <= 0.0 {
                     return Err(format!(
                         "LogFloat bounds must be strictly positive, got {lo}..{hi}"
                     ));
-                }
-                if !lo.is_finite() || !hi.is_finite() {
-                    return Err(format!("LogFloat bounds must be finite, got {lo}..{hi}"));
                 }
                 if *res == 0 {
                     return Err("LogFloat res must be ≥ 1".into());
