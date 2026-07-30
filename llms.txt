@@ -15,7 +15,7 @@ The default build needs no libtorch and no GPU.
 
 ## The core flow (3 crates)
 - aria-core :: `ast::parse_aria(src) -> Program`; `Program::instantiate(name, &[(k,i64)]) -> Circuit`.
-  `ast::qasm::to_qasm(&Circuit) -> String` (OPENQASM 2.0 export). `ast::GateKind` (incl. `RBS`).
+  `ast::qasm::to_qasm(&Circuit) -> String` (OPENQASM 2.0 export); `ast::qasm::to_qasm3` (OpenQASM 3.0 export — `qubit[n]`/`bit[n]`, `c = measure q`, decimal params); `ast::qasm::from_qasm(&str) -> Result<Circuit,String>` (2.0 import, fails loud on 3.x headers / unparsed lines). `ast::GateKind` (incl. `RBS`).
 - aria-runtime :: `lower::lower(&Circuit) -> Lowered { ir: CircuitIR, symbol_ids: HashMap<String,SymbolId>, .. }`.
   Binding-order contract on `Lowered`: SymbolIds are dense 0..N in first-appearance order (tested).
   `run::{expectation, statevector, run_counts}` — one-shot CLI-style wrappers (re-lower each call; not for loops).
@@ -63,7 +63,7 @@ The default build needs no libtorch and no GPU.
 - `aria train <f.aria> --circuit C --observable OBS [--steps N --lr R --opt adam --freeze a,b --set a=0.5 --grad parallel]` — single-observable trainer.
 - `aria train <f.aria> --circuit C --data X.csv [--labels y.csv] [--loss mse|bce] [--feature-prefix x] [--save-model m.json]` — DATASET (supervised) trainer.
 - `aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]` — score rows with a saved model.
-- `aria export <f.aria> --circuit C (--qasm|--json|--lean|--gate-model)`
+- `aria export <f.aria> --circuit C (--qasm|--qasm3|--json|--lean|--gate-model)`
 - `aria list|parse <f.aria>`
 
 ## Server / remote (optional)
