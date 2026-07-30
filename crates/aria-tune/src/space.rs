@@ -12,6 +12,11 @@
 //! grid points. For tuning work that is the right trade: it makes the study
 //! finite, enumerable by `GridSampler`, and reproducible.
 
+/// Upper bound on the number of grid points an integer dimension may declare.
+/// A grid larger than this is always a mistake (a fat-fingered bound), and
+/// enumerating it would be pointless anyway — [`Param::validate`] rejects it.
+const MAX_INT_CARDINALITY: i128 = 100_000_000;
+
 /// One dimension of the search space.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Param {
@@ -74,11 +79,16 @@ impl Param {
     pub fn cardinality(&self) -> usize {
         match self {
             Param::Int { lo, hi, step } => {
-                let step = (*step).max(1);
+                // i128 so a wide-but-in-range span (e.g. `i64::MIN..i64::MAX`)
+                // can't overflow the subtraction or the `+ 1`; `validate`
+                // rejects a genuinely enormous grid up front, this is the
+                // belt-and-braces path for a hand-built `Param`.
+                let step = (*step).max(1) as i128;
                 if hi < lo {
                     1
                 } else {
-                    (((hi - lo) / step) + 1) as usize
+                    let n = ((*hi as i128 - *lo as i128) / step) + 1;
+                    n.clamp(1, usize::MAX as i128) as usize
                 }
             }
             Param::Float { res, .. } | Param::LogFloat { res, .. } => (*res).max(1),
@@ -91,7 +101,12 @@ impl Param {
         let k = self.cardinality();
         let i = i.min(k - 1);
         match self {
-            Param::Int { lo, step, .. } => ParamValue::Int(lo + (i as i64) * (*step).max(1)),
+            Param::Int { lo, step, .. } => {
+                // i128 + clamp: `i * step` for a large-step dimension would
+                // otherwise overflow `i64` even at a small grid index.
+                let v = (*lo as i128) + (i as i128) * ((*step).max(1) as i128);
+                ParamValue::Int(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+            }
             Param::Float { lo, hi, .. } => {
                 if k == 1 {
                     ParamValue::Float(*lo)
@@ -132,6 +147,17 @@ impl Param {
                 }
                 if hi < lo {
                     return Err(format!("Int range is empty: lo {lo} > hi {hi}"));
+                }
+                // A grid this size is never an intended search — reject it
+                // loudly (in i128, so the count itself can't overflow) rather
+                // than let a fat-fingered bound like `n=0..9e18` try to
+                // materialise 9·10^18 points.
+                let card = ((*hi as i128 - *lo as i128) / (*step as i128)) + 1;
+                if card > MAX_INT_CARDINALITY {
+                    return Err(format!(
+                        "Int grid too large: {card} points from {lo}..{hi} step {step} \
+                         (max {MAX_INT_CARDINALITY})"
+                    ));
                 }
                 Ok(())
             }
@@ -284,6 +310,38 @@ mod tests {
         };
         assert_eq!(q.cardinality(), 3);
         assert_eq!(q.value(2), ParamValue::Int(5));
+    }
+
+    #[test]
+    fn int_grid_wide_span_neither_panics_nor_overflows() {
+        // A near-`i64`-range span used to overflow `(hi - lo) / step + 1` in
+        // i64 and panic in a debug build. cardinality now computes in i128 and
+        // clamps; validate rejects the grid up front.
+        let wide = Param::Int {
+            lo: 0,
+            hi: i64::MAX,
+            step: 1,
+        };
+        // No panic — the count is computed and clamped into usize.
+        let _ = wide.cardinality();
+        // …and it is rejected as an intended search space.
+        assert!(wide.validate().is_err());
+        // A large-step, tiny-grid dimension evaluates without overflowing.
+        let coarse = Param::Int {
+            lo: 0,
+            hi: i64::MAX,
+            step: i64::MAX,
+        };
+        assert_eq!(coarse.cardinality(), 2);
+        assert_eq!(coarse.value(1), ParamValue::Int(i64::MAX));
+        // A sane grid still validates.
+        assert!(Param::Int {
+            lo: 4,
+            hi: 8,
+            step: 2
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

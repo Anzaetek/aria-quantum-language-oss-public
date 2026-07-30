@@ -354,7 +354,40 @@ fn parse_param(s: &str) -> Result<f64, String> {
 /// fuller pest-based pipeline that accepts a QASM 3 minimal subset lives in the
 /// `omega-parser` crate and is unaffected by this function.)
 pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
+    // Parse a `\d+` capture as a non-negative index. The regexes below accept
+    // arbitrarily long digit runs, so an oversized literal (`q[99999999999999999999]`)
+    // must fail loudly here rather than panic on `.parse().unwrap()` — the same
+    // fail-loud contract every other malformed input in this importer honors.
+    fn parse_idx(raw: &str, lineno: usize) -> Result<usize, String> {
+        raw.parse::<usize>().map_err(|_| {
+            format!("'{raw}' at line {lineno} is not a valid non-negative integer")
+        })
+    }
+    // Reject a bit reference to an undeclared register or an out-of-range index,
+    // so `x q[5]` on `qreg q[1]` fails at import instead of producing a circuit
+    // that only misbehaves (or panics) downstream.
+    fn check_ref(
+        sizes: &std::collections::HashMap<String, usize>,
+        kind: &str,
+        name: &str,
+        index: usize,
+        lineno: usize,
+    ) -> Result<(), String> {
+        match sizes.get(name) {
+            None => Err(format!(
+                "undeclared {kind} register '{name}' at line {lineno}"
+            )),
+            Some(&size) if index >= size => Err(format!(
+                "{kind} index {name}[{index}] out of range at line {lineno} \
+                 (register '{name}' has size {size})"
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
     let mut circuit = Circuit::new("imported");
+    let mut qreg_sizes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut creg_sizes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let version_re = Regex::new(r"^OPENQASM\s+(\d+)(?:\.(\d+))?\s*;").unwrap();
     let reg_re = Regex::new(r"(qreg|creg)\s+(\w+)\[(\d+)\];").unwrap();
     let gate_re = Regex::new(r"(\w+)(?:\(([^)]*)\))?\s+(.+);").unwrap();
@@ -399,13 +432,15 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
         if let Some(caps) = reg_re.captures(line) {
             let kind_str = &caps[1];
             let name = &caps[2];
-            let size: usize = caps[3].parse().unwrap();
+            let size: usize = parse_idx(&caps[3], lineno)?;
             match kind_str {
                 "qreg" => {
                     circuit.qreg(name, size);
+                    qreg_sizes.insert(name.to_string(), size);
                 }
                 "creg" => {
                     circuit.creg(name, size);
+                    creg_sizes.insert(name.to_string(), size);
                 }
                 _ => {}
             }
@@ -416,8 +451,12 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
         if line.starts_with("barrier") {
             let qubits: Vec<Qubit> = bit_re
                 .captures_iter(line)
-                .map(|c| Qubit::new(&c[1], c[2].parse().unwrap()))
-                .collect();
+                .map(|c| {
+                    let i = parse_idx(&c[2], lineno)?;
+                    check_ref(&qreg_sizes, "qubit", &c[1], i, lineno)?;
+                    Ok(Qubit::new(&c[1], i))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             circuit.barrier(&qubits);
             continue;
         }
@@ -426,8 +465,8 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
         if line.starts_with("measure") {
             let refs: Vec<(String, usize)> = bit_re
                 .captures_iter(line)
-                .map(|c| (c[1].to_string(), c[2].parse().unwrap()))
-                .collect();
+                .map(|c| Ok((c[1].to_string(), parse_idx(&c[2], lineno)?)))
+                .collect::<Result<Vec<_>, String>>()?;
             if refs.len() < 2 {
                 return Err(format!(
                     "unsupported measure at line {lineno}: '{line}' — only the indexed \
@@ -435,6 +474,8 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
                      `measure q -> c;` is not)"
                 ));
             }
+            check_ref(&qreg_sizes, "qubit", &refs[0].0, refs[0].1, lineno)?;
+            check_ref(&creg_sizes, "clbit", &refs[1].0, refs[1].1, lineno)?;
             let q = Qubit::new(&refs[0].0, refs[0].1);
             let c = Clbit::new(&refs[1].0, refs[1].1);
             circuit.measure(&q, &c);
@@ -449,7 +490,9 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
                      form `reset q[i];` is supported"
                 ));
             };
-            let q = Qubit::new(&caps[1], caps[2].parse().unwrap());
+            let i = parse_idx(&caps[2], lineno)?;
+            check_ref(&qreg_sizes, "qubit", &caps[1], i, lineno)?;
+            let q = Qubit::new(&caps[1], i);
             circuit.reset_qubit(&q);
             continue;
         }
@@ -474,8 +517,12 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
             };
             let qubits: Vec<Qubit> = bit_re
                 .captures_iter(&caps[3])
-                .map(|c| Qubit::new(&c[1], c[2].parse().unwrap()))
-                .collect();
+                .map(|c| {
+                    let i = parse_idx(&c[2], lineno)?;
+                    check_ref(&qreg_sizes, "qubit", &c[1], i, lineno)?;
+                    Ok(Qubit::new(&c[1], i))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             if qubits.is_empty() {
                 return Err(format!(
                     "gate '{gate_name}' at line {lineno} has no indexed qubit operands: \
@@ -633,6 +680,27 @@ mod tests {
         assert!(from_qasm("qreg q[2];\nh q;\n")
             .unwrap_err()
             .contains("no indexed qubit"));
+    }
+
+    #[test]
+    fn from_qasm_fails_loud_on_oversized_and_out_of_range_indices() {
+        // An index literal too large for usize must return Err, not panic on
+        // `.parse().unwrap()` — the same fail-loud contract as every other
+        // malformed input.
+        let err = from_qasm("qreg q[1];\nh q[99999999999999999999];\n").unwrap_err();
+        assert!(err.contains("valid non-negative integer"), "{err}");
+        // An in-range integer that exceeds the declared register size is
+        // rejected rather than silently imported.
+        let err = from_qasm("qreg q[1];\nx q[5];\n").unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+        // A reference to a register that was never declared is rejected.
+        let err = from_qasm("qreg q[1];\nh r[0];\n").unwrap_err();
+        assert!(err.contains("undeclared"), "{err}");
+        // The measure clbit is range-checked against its creg too.
+        let err = from_qasm("qreg q[1];\ncreg c[1];\nmeasure q[0] -> c[3];\n").unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+        // A valid indexed circuit still imports.
+        assert!(from_qasm("qreg q[2];\ncreg c[2];\nh q[0];\nmeasure q[0] -> c[0];\n").is_ok());
     }
 
     #[test]
