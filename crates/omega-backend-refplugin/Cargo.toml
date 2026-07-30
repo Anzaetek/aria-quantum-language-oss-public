@@ -1,0 +1,20 @@
+[package]
+name = "omega-backend-refplugin"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reference backend plugin (cdylib) exercising the omega plugin ABI."
+
+[lib]
+# cdylib: the loadable plugin artifact (`omega_backend_init` + ABI version).
+# rlib:   lets the in-repo tests link the conversion logic directly, without
+#         going through a dynamic load.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+num-complex = { workspace = true }
+smallvec = { workspace = true }

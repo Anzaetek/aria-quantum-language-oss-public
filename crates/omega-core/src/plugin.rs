@@ -20,12 +20,34 @@ pub struct LoadedBackend {
 impl LoadedBackend {
     /// Load a backend from a shared library path.
     ///
-    /// The library must export `omega_backend_init() -> BackendVTable`.
+    /// The library must export `omega_backend_abi_version() -> u32` (checked
+    /// first, and rejected loudly on mismatch) and
+    /// `omega_backend_init() -> BackendVTable`.
     pub fn load(path: &Path) -> Result<Self> {
         unsafe {
             let lib = libloading::Library::new(path).map_err(|e| {
                 OmegaError::Backend(format!("failed to load {}: {}", path.display(), e))
             })?;
+
+            // ABI handshake first — a version mismatch means the vtable layout
+            // may differ, so refuse before calling any other exported symbol.
+            let abi_fn: libloading::Symbol<unsafe extern "C" fn() -> u32> =
+                lib.get(b"omega_backend_abi_version").map_err(|e| {
+                    OmegaError::Backend(format!(
+                        "no omega_backend_abi_version in {} (unversioned or pre-ABI plugin): {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+            let abi = abi_fn();
+            if abi != OMEGA_BACKEND_ABI_VERSION {
+                return Err(OmegaError::Backend(format!(
+                    "plugin {} reports ABI version {} but this build requires {}",
+                    path.display(),
+                    abi,
+                    OMEGA_BACKEND_ABI_VERSION
+                )));
+            }
 
             let init_fn: libloading::Symbol<unsafe extern "C" fn() -> BackendVTable> =
                 lib.get(b"omega_backend_init").map_err(|e| {
@@ -152,6 +174,13 @@ impl BackendRegistry {
         self.backends.iter().find(|b| b.supports(circuit_type))
     }
 
+    /// Find a loaded backend by its exact name (as reported by the plugin's
+    /// `name()` vtable entry). Used by the CLI/server to resolve
+    /// `--backend NAME` against plugins *after* the compiled-in backends.
+    pub fn find_by_name(&self, name: &str) -> Option<&LoadedBackend> {
+        self.backends.iter().find(|b| b.name() == name)
+    }
+
     /// List all loaded backends.
     pub fn list(&self) -> Vec<&str> {
         self.backends.iter().map(|b| b.name()).collect()
@@ -218,6 +247,29 @@ fn flatten_circuit(circuit: &CircuitIR, params: &ParameterBinding) -> Result<Vec
     }
 
     Ok(ffi_ops)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abi_version_is_pinned() {
+        // A bump here is a deliberate layout-breaking change; the reserved
+        // tail is for additive growth and must not require it.
+        assert_eq!(OMEGA_BACKEND_ABI_VERSION, 1);
+    }
+
+    #[test]
+    fn vtable_layout_canary() {
+        // 4 function pointers + an 8-slot reserved tail, all usize-sized under
+        // repr(C). If this changes, every compiled plugin must be rebuilt and
+        // OMEGA_BACKEND_ABI_VERSION bumped.
+        assert_eq!(
+            std::mem::size_of::<BackendVTable>(),
+            12 * std::mem::size_of::<usize>()
+        );
+    }
 }
 
 /// Convert FFI result back to ExecResult.

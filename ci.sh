@@ -20,7 +20,7 @@ FMT_CRATES=(-p aria-runtime -p aria-cli -p aria-verify-core -p aria-qec -p aria-
   -p aria-tune "${APP_CRATES[@]}")
 # Pure-Rust omega crates the default Aria build links against.
 OMEGA_CORE=(-p omega-core -p omega-backend-statevector -p omega-backend-mps \
-  -p omega-backend-pauliprop)
+  -p omega-backend-pauliprop -p omega-parser -p omega-backend-refplugin)
 # WASM guests loaded into omega-wasm-runtime by the application harnesses.
 WASM_GUESTS=(vqe omega_app)
 
@@ -92,6 +92,27 @@ else
   rm -f "$TUNE_DATA" "$TUNE_CSV"; exit 1
 fi
 rm -f "$TUNE_DATA" "$TUNE_CSV"
+
+step "6b/9  Backend plugin ABI: load the reference cdylib and run through it"
+# Builds the reference plugin, drops it in a dir, and runs a Bell circuit
+# through omega-run's plugin loader. Exercises the full FFI round-trip
+# (ABI-version handshake, vtable, execute, free_result) that the in-process
+# unit tests can't reach. All-CPU, headless.
+OMEGA_RUN=$(cargo build -p omega-cli --message-format=json 2>/dev/null \
+  | sed -n 's/.*"executable":"\([^"]*omega-run\)".*/\1/p' | head -1)
+[ -x "$OMEGA_RUN" ] || OMEGA_RUN="target/debug/omega-run"
+cargo build -p omega-backend-refplugin >/dev/null 2>&1
+PLUGIN_DIR=$(mktemp -d)
+# The cdylib file extension is platform-specific (.dylib on macOS, .so on Linux).
+cp target/debug/libomega_backend_refplugin.* "$PLUGIN_DIR"/ 2>/dev/null || true
+"$ARIA" export examples/aria/bell.aria --circuit Bell --qasm > "$PLUGIN_DIR/bell.qasm"
+plugin_out=$("$OMEGA_RUN" "$PLUGIN_DIR/bell.qasm" --backend refplugin \
+  --backend-dir "$PLUGIN_DIR" --shots 512 2>/dev/null)
+echo "$plugin_out" | grep -qE '\|00>|\|11>' \
+  && ! echo "$plugin_out" | grep -qE '\|01>|\|10>' \
+  && echo "  OK: refplugin ran Bell to correlated counts" \
+  || { echo "  FAIL: refplugin output unexpected:"; echo "$plugin_out"; exit 1; }
+rm -rf "$PLUGIN_DIR"
 
 step "7/9  Build WASM guests (wasm32-wasip1) for the application harnesses"
 if rustup target list --installed 2>/dev/null | grep -q wasm32-wasip1; then
