@@ -1,5 +1,6 @@
 pub mod annotation;
 pub mod aria;
+pub mod aria_emit;
 pub mod builder;
 pub mod expr;
 pub mod json;
@@ -9,6 +10,7 @@ pub mod qasm;
 
 pub use annotation::{Annotation, CmpOp, Property};
 pub use aria::{parse_aria, parse_aria_circuit, AriaProgram, CircuitTemplate, ObservableTemplate};
+pub use aria_emit::to_aria_source;
 pub use builder::CircuitBuilder;
 pub use expr::ParamExpr;
 pub use json::{from_json, to_json};

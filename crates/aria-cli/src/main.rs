@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         "tune" => cmd_tune(rest),
         "predict" => cmd_predict(rest),
         "export" => cmd_export(rest),
+        "import" => cmd_import(rest),
         "-h" | "--help" | "help" | "" => {
             usage();
             return ExitCode::SUCCESS;
@@ -65,7 +66,8 @@ fn usage() {
          --space \"n=4..8:2,L=1..3,lr=log:1e-3..3e-1,opt=gd|adam\"\n              \
          [--trials N] [--steps N] [--seed S] [--sampler tpe|random|grid] [--pruner median|none] [--csv out.csv]\n  \
          aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]\n  \
-         aria export <file.aria> --circuit NAME (--qasm | --qasm3 | --json | --lean | --gate-model) [--int k=v]...\n"
+         aria export <file.aria> --circuit NAME (--qasm | --qasm3 | --json | --lean | --gate-model) [--int k=v]...\n  \
+         aria import <file.qasm> [--name NAME]   (OpenQASM 2.0 -> .aria source on stdout)\n"
     );
 }
 
@@ -1047,4 +1049,17 @@ fn train_x_check(rows: Vec<Vec<f64>>, n_labels: usize) -> Result<Vec<Vec<f64>>, 
         ));
     }
     Ok(rows)
+}
+
+/// `aria import <file.qasm> [--name NAME]` — parse an OpenQASM 2.0 file (the
+/// fail-loud importer) and print equivalent `.aria` source to stdout.
+fn cmd_import(raw: &[String]) -> Result<(), String> {
+    let a = parse_args(raw, &[])?;
+    let path = a.first_positional("<file.qasm>")?;
+    let name = a.opt("name").unwrap_or("Imported");
+    let qasm = read_source(path)?;
+    let circuit = aria_core::ast::from_qasm(&qasm)?;
+    let out = aria_core::ast::to_aria_source(&circuit, name);
+    print!("{out}");
+    Ok(())
 }
