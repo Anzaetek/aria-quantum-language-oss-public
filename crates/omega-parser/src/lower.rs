@@ -672,6 +672,43 @@ measure q[1] -> c[1];
         assert_eq!(ir.ops[1].gate, GateKind::CX);
     }
 
+    /// QASM 3 assignment measurement `c[i] = measure q[i];` lowers to the
+    /// same `Measure` op as the QASM 2 arrow form. This is the form the
+    /// `to_qasm3` exporter emits, so accepting it keeps the export round-
+    /// trippable through this parser.
+    #[test]
+    fn test_lower_qasm3_measure_assignment() {
+        let src = r#"OPENQASM 3.0;
+include "stdgates.inc";
+qubit[2] q;
+bit[2] c;
+h q[0];
+cx q[0], q[1];
+rz(0.7853981633974483) q[1];
+c[0] = measure q[0];
+c[1] = measure q[1];
+"#;
+        let ir = lower_to_ir(src).unwrap();
+        assert_eq!(ir.num_qubits, 2);
+        assert_eq!(ir.num_classical_bits, 2);
+        assert_eq!(ir.circuit_type, CircuitType::GateBased);
+        // h, cx, rz, measure, measure = 5 ops
+        assert_eq!(ir.ops.len(), 5);
+        let measures = ir
+            .ops
+            .iter()
+            .filter(|o| o.gate == GateKind::Measure)
+            .count();
+        assert_eq!(measures, 2, "both v3-form measurements must lower");
+        // The decimal parameter must survive (defect-B class check on the v3 path).
+        match &ir.ops[2].params[0] {
+            ParamExpr::Concrete(v) => {
+                assert!((v - std::f64::consts::FRAC_PI_4).abs() < 1e-12)
+            }
+            other => panic!("expected concrete param, got {other:?}"),
+        }
+    }
+
     /// QASM 3 mixed-form: a single circuit can use either v2 or v3
     /// register-decl syntax interchangeably, in any order.
     #[test]

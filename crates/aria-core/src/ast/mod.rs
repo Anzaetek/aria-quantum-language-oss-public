@@ -14,7 +14,7 @@ pub use expr::ParamExpr;
 pub use json::{from_json, to_json};
 pub use nodes::*;
 pub use opticqasm::{from_opticqasm, to_opticqasm};
-pub use qasm::{from_qasm, to_qasm};
+pub use qasm::{from_qasm, to_qasm, to_qasm3};
 
 pub mod export_lean;
 pub mod export_rocq;

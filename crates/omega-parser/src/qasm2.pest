@@ -12,6 +12,7 @@ statement = {
   | qreg_decl
   | creg_decl
   | gate_def
+  | measure_assign_v3
   | measure_stmt
   | barrier_stmt
   | reset_stmt
@@ -58,6 +59,9 @@ qubit_ref = { ident ~ "[" ~ integer ~ "]" | ident }
 cbit_ref  = { ident ~ "[" ~ integer ~ "]" | ident }
 
 measure_stmt = { "measure" ~ qubit_ref ~ "->" ~ cbit_ref ~ ";" }
+// QASM 3 assignment form: `c[i] = measure q[i];`. Lowers identically to the
+// QASM 2 `measure q -> c;` form (operand order reversed in the syntax).
+measure_assign_v3 = { cbit_ref ~ "=" ~ "measure" ~ qubit_ref ~ ";" }
 barrier_stmt = { "barrier" ~ qubit_list_app ~ ";" }
 reset_stmt   = { "reset" ~ qubit_ref ~ ";" }
 

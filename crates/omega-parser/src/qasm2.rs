@@ -132,6 +132,14 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt
             let cbit = parse_cbit_ref(it.next().unwrap())?;
             Ok(Some(Qasm2Stmt::Measure { qubit, cbit }))
         }
+        Rule::measure_assign_v3 => {
+            // `c[i] = measure q[i];` — cbit first, then qubit (reversed vs the
+            // QASM 2 arrow form), same `Measure` AST node.
+            let mut it = inner.into_inner();
+            let cbit = parse_cbit_ref(it.next().unwrap())?;
+            let qubit = parse_qubit_ref(it.next().unwrap())?;
+            Ok(Some(Qasm2Stmt::Measure { qubit, cbit }))
+        }
         Rule::barrier_stmt => {
             let mut qubits = Vec::new();
             for part in inner.into_inner() {

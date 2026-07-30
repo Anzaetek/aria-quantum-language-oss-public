@@ -7,7 +7,7 @@
 //! - `aria run    <file.aria> --circuit NAME [--int k=v]... [--bind s=v]...
 //!   [--shots N] [--seed S] [--backend sim|mps[:chi]|mps:auto[:ceiling]|gpu|tch|pauliprop|remote]
 //!   [--statevector] [--expectation OBS] [--strict-truncation EPS]`
-//! - `aria export <file.aria> --circuit NAME (--qasm|--json|--lean|--gate-model) [--int k=v]...`
+//! - `aria export <file.aria> --circuit NAME (--qasm|--qasm3|--json|--lean|--gate-model) [--int k=v]...`
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -65,7 +65,7 @@ fn usage() {
          --space \"n=4..8:2,L=1..3,lr=log:1e-3..3e-1,opt=gd|adam\"\n              \
          [--trials N] [--steps N] [--seed S] [--sampler tpe|random|grid] [--pruner median|none] [--csv out.csv]\n  \
          aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]\n  \
-         aria export <file.aria> --circuit NAME (--qasm | --json | --lean | --gate-model) [--int k=v]...\n"
+         aria export <file.aria> --circuit NAME (--qasm | --qasm3 | --json | --lean | --gate-model) [--int k=v]...\n"
     );
 }
 
@@ -737,7 +737,7 @@ fn cmd_predict(raw: &[String]) -> Result<(), String> {
 }
 
 fn cmd_export(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &["qasm", "json", "lean", "gate-model"])?;
+    let a = parse_args(raw, &["qasm", "qasm3", "json", "lean", "gate-model"])?;
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("export requires --circuit NAME")?;
     let ints = parse_kv_i64(a.all("int").into_iter())?;
@@ -745,15 +745,19 @@ fn cmd_export(raw: &[String]) -> Result<(), String> {
     let circuit = instantiate(&src, name, &ints)?;
     // Mutually-exclusive output formats — reject combos so a requested format is
     // never silently dropped (e.g. `--lean --gate-model`).
-    let n_fmt = ["qasm", "json", "lean", "gate-model"]
+    let n_fmt = ["qasm", "qasm3", "json", "lean", "gate-model"]
         .iter()
         .filter(|f| a.has(f))
         .count();
     if n_fmt > 1 {
-        return Err("export takes exactly one of --qasm | --json | --lean | --gate-model".into());
+        return Err(
+            "export takes exactly one of --qasm | --qasm3 | --json | --lean | --gate-model".into(),
+        );
     }
     let out = if a.has("qasm") {
         aria_core::ast::to_qasm(&circuit)
+    } else if a.has("qasm3") {
+        aria_core::ast::to_qasm3(&circuit)
     } else if a.has("json") {
         aria_core::ast::to_json(&circuit)?
     } else if a.has("lean") {
@@ -770,7 +774,9 @@ fn cmd_export(raw: &[String]) -> Result<(), String> {
             )
         })?
     } else {
-        return Err("export requires one of --qasm | --json | --lean | --gate-model".into());
+        return Err(
+            "export requires one of --qasm | --qasm3 | --json | --lean | --gate-model".into(),
+        );
     };
     print!("{out}");
     Ok(())

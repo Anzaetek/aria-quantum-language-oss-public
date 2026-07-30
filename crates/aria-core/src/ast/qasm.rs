@@ -137,6 +137,109 @@ pub fn to_qasm(circuit: &Circuit) -> String {
     lines.join("\n") + "\n"
 }
 
+/// QASM 3 gate name for a kind. Identical to the 2.0 table except `U` is the
+/// OpenQASM 3 built-in gate (2.0 spells it `u3`).
+fn gate_to_qasm3(kind: GateKind) -> Option<&'static str> {
+    match kind {
+        GateKind::U => Some("U"),
+        other => gate_to_qasm(other),
+    }
+}
+
+/// Format a parameter as a plain shortest-round-trip decimal. QASM 3 export
+/// deliberately keeps `format_param`'s `pi`-fraction pretty-printing **out** of
+/// the interchange path — a decimal parses back to the same f64 without the
+/// formatter-drift class of bug that `parse_param` had to absorb on the 2.0
+/// side.
+fn format_param3(p: f64) -> String {
+    format!("{p}")
+}
+
+/// Convert a Circuit AST to an OpenQASM **3.0** string.
+///
+/// Additive to [`to_qasm`] (which stays OpenQASM 2.0): same gate decompositions
+/// — including the exact RBS expansion — but a `OPENQASM 3.0;` +
+/// `stdgates.inc` header, `qubit[n]` / `bit[n]` declarations, the
+/// `c = measure q;` assignment form, and plain-decimal parameters.
+///
+/// Profile: gate model only. Emitted constructs are register declarations,
+/// unitary gate applications (unsupported kinds become `// unsupported gate:`
+/// comments, as in 2.0), `barrier`, `reset`, and single-bit
+/// `creg[i] = measure qreg[i];` measurements. No pulse blocks, no classical
+/// control flow (`if`), no gate/subroutine definitions are emitted.
+pub fn to_qasm3(circuit: &Circuit) -> String {
+    let mut lines = vec![
+        "OPENQASM 3.0;".to_string(),
+        "include \"stdgates.inc\";".to_string(),
+        String::new(),
+    ];
+
+    for reg in &circuit.registers {
+        match reg.kind {
+            RegisterKind::Quantum => lines.push(format!("qubit[{}] {};", reg.size, reg.name)),
+            RegisterKind::Classical => lines.push(format!("bit[{}] {};", reg.size, reg.name)),
+        }
+    }
+    lines.push(String::new());
+
+    for inst in &circuit.instructions {
+        match inst.gate.kind {
+            GateKind::Barrier => {
+                let qrefs: Vec<String> = inst.qubits.iter().map(|q| q.to_string()).collect();
+                lines.push(format!("barrier {};", qrefs.join(", ")));
+            }
+            GateKind::Measure => {
+                // QASM 3 assignment form: `c[i] = measure q[i];`.
+                lines.push(format!("{} = measure {};", inst.clbits[0], inst.qubits[0]));
+            }
+            GateKind::Reset => {
+                lines.push(format!("reset {};", inst.qubits[0]));
+            }
+            GateKind::RBS => {
+                // Same exact decomposition as the 2.0 path (stdgates has no
+                // RBS): RBS(θ) = (H⊗H)·CZ·(Ry(−θ)⊗Ry(θ))·CZ·(H⊗H).
+                let theta = inst
+                    .gate
+                    .params
+                    .first()
+                    .and_then(|p| p.try_as_f64())
+                    .unwrap_or(0.0);
+                let (a, b) = (&inst.qubits[0], &inst.qubits[1]);
+                lines.push(format!("// rbs({}) {}, {}", format_param3(theta), a, b));
+                lines.push(format!("h {a};"));
+                lines.push(format!("h {b};"));
+                lines.push(format!("cz {a}, {b};"));
+                lines.push(format!("ry({}) {a};", format_param3(-theta)));
+                lines.push(format!("ry({}) {b};", format_param3(theta)));
+                lines.push(format!("cz {a}, {b};"));
+                lines.push(format!("h {a};"));
+                lines.push(format!("h {b};"));
+            }
+            _ => {
+                if let Some(qasm_name) = gate_to_qasm3(inst.gate.kind) {
+                    let params = if inst.gate.params.is_empty() {
+                        String::new()
+                    } else {
+                        let ps: Vec<String> = inst
+                            .gate
+                            .params
+                            .iter()
+                            .map(|p| format_param3(p.try_as_f64().unwrap_or(0.0)))
+                            .collect();
+                        format!("({})", ps.join(", "))
+                    };
+                    let qrefs: Vec<String> = inst.qubits.iter().map(|q| q.to_string()).collect();
+                    lines.push(format!("{qasm_name}{params} {};", qrefs.join(", ")));
+                } else {
+                    lines.push(format!("// unsupported gate: {:?}", inst.gate.kind));
+                }
+            }
+        }
+    }
+
+    lines.join("\n") + "\n"
+}
+
 // ---------------------------------------------------------------------------
 // Import: QASM string -> Circuit
 // ---------------------------------------------------------------------------
@@ -172,40 +275,98 @@ fn qasm_to_gate(name: &str) -> Option<GateKind> {
     }
 }
 
-fn parse_param(s: &str) -> f64 {
-    let s = s.trim();
-    // Handle pi expressions
-    let s = s.replace("pi", &format!("{PI}"));
-    // Evaluate simple arithmetic
-    // Support: number, number*number, number/number, -number
-    let s = s.trim();
-    if let Some((a, b)) = s.split_once('/') {
-        let a: f64 = a.trim().parse().unwrap_or(0.0);
-        let b: f64 = b.trim().parse().unwrap_or(1.0);
-        return a / b;
+/// Parse a single QASM parameter atom: a decimal literal (incl. scientific
+/// notation) or the constant `pi` (optionally sign-prefixed).
+fn parse_atom(atom: &str) -> Result<f64, String> {
+    let atom = atom.trim();
+    match atom {
+        "pi" => Ok(PI),
+        "-pi" => Ok(-PI),
+        "+pi" => Ok(PI),
+        _ => atom
+            .parse::<f64>()
+            .map_err(|_| format!("cannot parse QASM parameter atom '{atom}'")),
     }
-    if let Some((a, b)) = s.split_once('*') {
-        let a: f64 = a.trim().parse().unwrap_or(0.0);
-        let b: f64 = b.trim().parse().unwrap_or(1.0);
-        return a * b;
+}
+
+/// Evaluate a QASM parameter expression: a sequence of `pi`/decimal atoms
+/// joined by `*` and `/`, applied **left-to-right at equal precedence**.
+///
+/// This is sufficient for everything `format_param` emits (`pi`, `-pi`,
+/// `n*pi`, `n*pi/2`, `n*pi/4`) and for common external QASM (`2*pi`, `pi/2`,
+/// `3*pi/4`, decimals, scientific notation).
+///
+/// It returns an `Err` on anything it cannot evaluate rather than silently
+/// defaulting to `0.0`. The previous implementation split on `/` *before*
+/// `*`, so `1*pi/4` parsed as `parse("1*3.14159…") = 0.0` divided by 4 — every
+/// `n*pi/2` / `n*pi/4` angle silently became 0.0 on re-import.
+fn parse_param(s: &str) -> Result<f64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty QASM parameter expression".to_string());
     }
-    s.parse().unwrap_or(0.0)
+    let mut result = 1.0_f64;
+    let mut op = '*';
+    let mut atom = String::new();
+    for c in s.chars() {
+        if c == '*' || c == '/' {
+            let a = parse_atom(&atom)?;
+            if op == '*' {
+                result *= a;
+            } else {
+                result /= a;
+            }
+            op = c;
+            atom.clear();
+        } else {
+            atom.push(c);
+        }
+    }
+    let a = parse_atom(&atom)?;
+    if op == '*' {
+        result *= a;
+    } else {
+        result /= a;
+    }
+    Ok(result)
 }
 
 /// Parse an OpenQASM 2.0 string into a Circuit AST.
+///
+/// This importer reads the OpenQASM **2.0** subset only. It fails loudly
+/// rather than silently dropping content: an `OPENQASM` header declaring a
+/// version outside `2.x` is rejected, and any non-empty statement that is not
+/// a recognized declaration/gate/measure/reset/barrier returns an `Err`. (The
+/// fuller pest-based pipeline that accepts a QASM 3 minimal subset lives in the
+/// `omega-parser` crate and is unaffected by this function.)
 pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
     let mut circuit = Circuit::new("imported");
+    let version_re = Regex::new(r"^OPENQASM\s+(\d+)(?:\.(\d+))?\s*;").unwrap();
     let reg_re = Regex::new(r"(qreg|creg)\s+(\w+)\[(\d+)\];").unwrap();
     let gate_re = Regex::new(r"(\w+)(?:\(([^)]*)\))?\s+(.+);").unwrap();
     let bit_re = Regex::new(r"(\w+)\[(\d+)\]").unwrap();
 
-    for line in qasm_str.lines() {
-        let line = line.trim();
-        if line.is_empty()
-            || line.starts_with("//")
-            || line.starts_with("OPENQASM")
-            || line.starts_with("include")
-        {
+    for (idx, raw_line) in qasm_str.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with("include") {
+            continue;
+        }
+
+        // Version header — accept 2.x, reject everything else loudly rather
+        // than silently reading a 3.x program as a mangled 2.0 fragment.
+        if line.starts_with("OPENQASM") {
+            let caps = version_re.captures(line).ok_or_else(|| {
+                format!("malformed OPENQASM version header at line {lineno}: '{line}'")
+            })?;
+            let major: u32 = caps[1].parse().unwrap_or(0);
+            if major != 2 {
+                let minor = caps.get(2).map(|m| m.as_str()).unwrap_or("0");
+                return Err(format!(
+                    "unsupported OPENQASM version {major}.{minor} at line {lineno}: \
+                     this importer reads OpenQASM 2.0"
+                ));
+            }
             continue;
         }
 
@@ -265,19 +426,30 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
             let params_str = caps.get(2).map(|m| m.as_str());
             let _operands_str = &caps[3];
 
-            if let Some(kind) = qasm_to_gate(gate_name) {
-                let params: Vec<f64> = match params_str {
-                    Some(s) if !s.is_empty() => s.split(',').map(parse_param).collect(),
-                    _ => vec![],
-                };
-                let qubits: Vec<Qubit> = bit_re
-                    .captures_iter(&caps[3])
-                    .map(|c| Qubit::new(&c[1], c[2].parse().unwrap()))
-                    .collect();
-                let gate = GateDef::with_params(kind, params);
-                circuit.apply(gate, qubits);
-            }
+            let Some(kind) = qasm_to_gate(gate_name) else {
+                return Err(format!(
+                    "unsupported gate '{gate_name}' at line {lineno}: '{line}'"
+                ));
+            };
+            let params: Vec<f64> = match params_str {
+                Some(s) if !s.is_empty() => s
+                    .split(',')
+                    .map(parse_param)
+                    .collect::<Result<Vec<f64>, String>>()?,
+                _ => vec![],
+            };
+            let qubits: Vec<Qubit> = bit_re
+                .captures_iter(&caps[3])
+                .map(|c| Qubit::new(&c[1], c[2].parse().unwrap()))
+                .collect();
+            let gate = GateDef::with_params(kind, params);
+            circuit.apply(gate, qubits);
+            continue;
         }
+
+        // Nothing matched — a non-empty statement we do not understand. Fail
+        // loudly instead of dropping it (the failure mode this importer had).
+        return Err(format!("unparsed statement at line {lineno}: '{line}'"));
     }
 
     Ok(circuit)
@@ -308,6 +480,127 @@ mod tests {
         assert_eq!(reimported.n_clbits(), original.n_clbits());
         assert_eq!(reimported.gate_count(), original.gate_count());
         assert_eq!(reimported.instructions.len(), original.instructions.len());
+
+        // Parameters must survive the round-trip, not just gate counts. The
+        // RZ(pi/4) is exactly the shape that used to re-import as 0.0.
+        for (orig, back) in original
+            .instructions
+            .iter()
+            .zip(reimported.instructions.iter())
+        {
+            assert_eq!(orig.gate.params.len(), back.gate.params.len());
+            for (po, pb) in orig.gate.params.iter().zip(back.gate.params.iter()) {
+                let (vo, vb) = (po.try_as_f64().unwrap(), pb.try_as_f64().unwrap());
+                assert!(
+                    (vo - vb).abs() <= 1e-12,
+                    "parameter changed on round-trip: {vo} -> {vb}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qasm_param_roundtrip_is_exact() {
+        // Every angle format_param can emit, plus decimals and scientific
+        // notation, must survive to_qasm -> from_qasm to 1e-12.
+        for &theta in &[
+            PI / 4.0,
+            3.0 * PI / 4.0,
+            PI / 2.0,
+            PI,
+            -PI / 4.0,
+            1e-5,
+            0.123_456_789,
+        ] {
+            let circ = CircuitBuilder::new("p", 2, 0)
+                .rx(0, theta)
+                .ry(1, theta)
+                .rz(0, theta)
+                .build();
+            let back = from_qasm(&to_qasm(&circ)).unwrap();
+            for (orig, imported) in circ.instructions.iter().zip(back.instructions.iter()) {
+                let vo = orig.gate.params[0].try_as_f64().unwrap();
+                let vb = imported.gate.params[0].try_as_f64().unwrap();
+                assert!(
+                    (vo - vb).abs() <= 1e-12,
+                    "theta {theta}: {vo} -> {vb} not exact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn to_qasm3_emits_v3_profile() {
+        let circ = CircuitBuilder::new("test", 2, 2)
+            .h(0)
+            .cx(0, 1)
+            .rz(1, PI / 4.0)
+            .measure_all()
+            .build();
+        let out = to_qasm3(&circ);
+
+        assert!(out.contains("OPENQASM 3.0;"));
+        assert!(out.contains("include \"stdgates.inc\";"));
+        assert!(!out.contains("OPENQASM 2.0"));
+        // QASM 3 register-declaration form.
+        assert!(out.contains("qubit[2] q;"));
+        assert!(out.contains("bit[2] c;"));
+        assert!(out.contains("h q[0];"));
+        assert!(out.contains("cx q[0], q[1];"));
+        // Plain-decimal parameter, not a pi-fraction — this is the exact
+        // string the omega-parser round-trip test consumes verbatim.
+        assert!(out.contains("rz(0.7853981633974483) q[1];"));
+        assert!(!out.contains("pi"));
+        // QASM 3 assignment measurement form.
+        assert!(out.contains("c[0] = measure q[0];"));
+    }
+
+    #[test]
+    fn from_qasm_rejects_qasm3_header() {
+        // The Defect-A reproducer: a QASM3 program must not be accepted as a
+        // mangled 2.0 fragment.
+        let qasm3 = "OPENQASM 3.0;\n\
+                     include \"stdgates.inc\";\n\
+                     qubit[2] q;\n\
+                     bit[2] c;\n\
+                     h q[0];\n\
+                     ry(0.25) q[0];\n\
+                     c = measure q;\n";
+        let err = from_qasm(qasm3).unwrap_err();
+        assert!(err.contains("3.0"), "error should name the version: {err}");
+        assert!(err.contains("2.0"), "error should mention 2.0: {err}");
+    }
+
+    #[test]
+    fn from_qasm_errors_on_unknown_gate_and_garbage() {
+        let unknown = "OPENQASM 2.0;\nqreg q[1];\nnotagate q[0];\n";
+        assert!(from_qasm(unknown).unwrap_err().contains("notagate"));
+
+        let garbage = "OPENQASM 2.0;\nqreg q[1];\nthis is not qasm\n";
+        assert!(from_qasm(garbage).unwrap_err().contains("unparsed"));
+    }
+
+    #[test]
+    fn from_qasm_accepts_headerless_2_0() {
+        // Header-less input stays accepted (existing embedder inputs).
+        let circ = from_qasm("qreg q[1];\nh q[0];\n").unwrap();
+        assert_eq!(circ.n_qubits(), 1);
+        assert_eq!(circ.gate_count(), 1);
+    }
+
+    #[test]
+    fn parse_param_evaluates_left_to_right() {
+        assert!((parse_param("1*pi/4").unwrap() - PI / 4.0).abs() < 1e-12);
+        assert!((parse_param("-3*pi/4").unwrap() + 3.0 * PI / 4.0).abs() < 1e-12);
+        assert!((parse_param("pi/2").unwrap() - PI / 2.0).abs() < 1e-12);
+        assert!((parse_param("2*pi").unwrap() - 2.0 * PI).abs() < 1e-12);
+        assert!((parse_param("-pi").unwrap() + PI).abs() < 1e-12);
+        assert!((parse_param("1.5e-3").unwrap() - 1.5e-3).abs() < 1e-15);
+        assert!((parse_param("0").unwrap()).abs() < 1e-15);
+        // Unparseable expressions error rather than defaulting to 0.0.
+        assert!(parse_param("pi+1").is_err());
+        assert!(parse_param("bogus").is_err());
+        assert!(parse_param("").is_err());
     }
 
     #[test]

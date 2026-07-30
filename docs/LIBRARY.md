@@ -194,6 +194,11 @@ $ aria predict m.json --data X.csv --out scores.csv
 `aria_core::ast::qasm::to_qasm(&circuit)` additionally returns OPENQASM 2.0 for a
 circuit with concrete parameters — bind your trained weights back into the AST
 and export, and "the trained model is a circuit you can read" holds literally.
+`to_qasm3(&circuit)` emits the OpenQASM 3.0 profile (`qubit[n]`/`bit[n]`
+declarations, `c = measure q;` measurement, plain-decimal parameters, same exact
+RBS decomposition) for hardware toolchains that consume QASM3 directly.
+`from_qasm(&str)` imports the OpenQASM 2.0 subset and fails loudly — a `3.x`
+header or any unparsed statement returns `Err` rather than silently dropping it.
 
 ## See also
 
