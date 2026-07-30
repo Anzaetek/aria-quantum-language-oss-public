@@ -274,7 +274,8 @@ $ cargo run -q -p aria-verify -- all      # whole suite (what CI asserts)
 $ cargo run -q -p aria-app-qsvd           # a single example, standalone crate
 ```
 
-Check: `14/14 passed` (exit code 0). Per-example numeric goldens:
+Check: `49/49 passed` (exit code 0). A representative set of the per-example
+numeric goldens:
 
 | example              | computed quantity                         | classical oracle              | golden / tol |
 |----------------------|-------------------------------------------|-------------------------------|--------------|
@@ -299,7 +300,10 @@ Check: `14/14 passed` (exit code 0). Per-example numeric goldens:
 
 The four `qec_*` demos run key algorithms on **transversally QEC-encoded logical
 qubits** via the `aria-qec` crate (Steane [[7,1,3]] + rotated surface code) and
-are native-only (no wasm guest). `aria-verify -- all` reports `36/36 passed`.
+are native-only (no wasm guest). `aria-verify -- all` reports `49/49 passed`
+(the harness registry has grown well beyond the goldens tabled above — QML,
+SPECTRA, HHL/QSVT, and GPU/kernel families among them; the table samples the
+load-bearing ones).
 
 Run a single example: `cargo run -q -p aria-verify -- qsvd`. Force the native
 fallback (no wasm guest): add `--native`.
