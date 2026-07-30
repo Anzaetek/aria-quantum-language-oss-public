@@ -4,6 +4,15 @@
 
 use std::os::raw::c_char;
 
+/// ABI version exported by every plugin via `omega_backend_abi_version()`.
+///
+/// The loader refuses to load a plugin whose reported version differs, so a
+/// stale cdylib fails loudly instead of reading a mismatched vtable layout.
+/// Bump this only for a layout-breaking change to the FFI types below;
+/// additive growth is carved from [`BackendVTable::reserved`] and does **not**
+/// bump the version.
+pub const OMEGA_BACKEND_ABI_VERSION: u32 = 1;
+
 /// Circuit type enum for C ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +99,13 @@ pub struct BackendVTable {
 
     /// Free a result allocated by execute.
     pub free_result: extern "C" fn(result: *mut FfiExecResult),
+
+    /// Reserved for additive evolution within this ABI version. A plugin must
+    /// zero-initialize this tail. Future capability function-pointer slots are
+    /// carved from it (an `Option<extern "C" fn ...>` is `usize`-sized and
+    /// null-optimized), so the struct size and `OMEGA_BACKEND_ABI_VERSION`
+    /// stay put while existing plugins keep loading.
+    pub reserved: [usize; 8],
 }
 
 // Gate kind constants (matching GateKind enum order)

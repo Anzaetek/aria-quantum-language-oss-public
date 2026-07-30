@@ -43,7 +43,13 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --backend NAME         statevector (default), mps, pauli, photonics,");
-    eprintln!("                         pauliprop (Pauli propagation; --expectation only)");
+    eprintln!("                         pauliprop (Pauli propagation; --expectation only).");
+    eprintln!("                         A name matching a loaded plugin resolves after the");
+    eprintln!("                         compiled-in backends.");
+    eprintln!("  --backend-dir DIR      Load backend plugins (.so/.dylib/.dll) from DIR");
+    eprintln!("                         (repeatable; also OMEGA_BACKEND_DIR, then");
+    eprintln!("                         ~/.omega/backends). Plugins run the default sample mode.");
+    eprintln!("  --list-backends        List compiled-in backends and loaded plugins, then exit");
     eprintln!("  --bridge NAME          Route execution through an external simulator");
     eprintln!("                         (qiskit, perceval). Only the default sample mode");
     eprintln!("                         is supported; statevector / expectation / gradient");
@@ -131,6 +137,48 @@ fn parse_format(args: &[String]) -> Format {
     Format::Text
 }
 
+/// Collect the directories to probe for backend plugins, in resolution order:
+/// explicit `--backend-dir` flags, then `OMEGA_BACKEND_DIR` (`:`-separated),
+/// then the default `~/.omega/backends`. Missing directories are harmless —
+/// `load_dir` returns `Ok(0)` for them.
+fn build_plugin_registry(explicit_dirs: &[String]) -> omega_core::plugin::BackendRegistry {
+    let mut registry = omega_core::plugin::BackendRegistry::new();
+    let mut dirs: Vec<std::path::PathBuf> =
+        explicit_dirs.iter().map(std::path::PathBuf::from).collect();
+    if let Ok(env_dirs) = env::var("OMEGA_BACKEND_DIR") {
+        for d in env_dirs.split(':').filter(|s| !s.is_empty()) {
+            dirs.push(std::path::PathBuf::from(d));
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".omega/backends");
+        dirs.push(p);
+    }
+    for dir in dirs {
+        if let Err(e) = registry.load_dir(&dir) {
+            eprintln!("Warning: backend-dir {}: {}", dir.display(), e);
+        }
+    }
+    registry
+}
+
+/// Scan raw args for `--backend-dir <dir>` pairs (used by the early
+/// `--list-backends` path, which runs before the main arg loop).
+fn scan_backend_dirs(args: &[String]) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--backend-dir" && i + 1 < args.len() {
+            dirs.push(args[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    dirs
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -167,6 +215,20 @@ fn main() {
         return;
     }
 
+    // --list-backends: enumerate compiled-in backends and loaded plugins, then
+    // exit. Handled here (before the positional circuit file is required) so it
+    // works without a circuit argument.
+    if args.iter().any(|a| a == "--list-backends") {
+        let registry = build_plugin_registry(&scan_backend_dirs(&args));
+        for name in ["statevector", "mps", "pauli", "pauliprop", "photonics"] {
+            println!("builtin  {name}");
+        }
+        for name in registry.list() {
+            println!("plugin   {name}");
+        }
+        return;
+    }
+
     let file_path = &args[1];
     let mut shots: Option<u32> = Some(1024);
     let mut seed: Option<u64> = None;
@@ -181,6 +243,7 @@ fn main() {
     let mut grad_method_name: Option<String> = None;
     let mut noise_json: Option<String> = None;
     let mut bridge_name: Option<String> = None;
+    let mut backend_dirs: Vec<String> = Vec::new();
 
     let mut i = 2;
     while i < args.len() {
@@ -199,6 +262,10 @@ fn main() {
             "--backend" => {
                 i += 1;
                 backend_name = Some(args[i].clone());
+            }
+            "--backend-dir" => {
+                i += 1;
+                backend_dirs.push(args[i].clone());
             }
             "--bridge" => {
                 i += 1;
@@ -1112,11 +1179,27 @@ fn main() {
                 backend.execute(&circuit, &params, &config)
             }
             other => {
-                eprintln!(
-                    "Unknown backend: {}. Options: statevector, mps, pauli, pauliprop, photonics",
-                    other
-                );
-                std::process::exit(1);
+                // Compiled-in names resolved above; fall back to plugins.
+                // Built lazily so a normal statevector/mps run never scans a
+                // plugin dir. The registry only needs to outlive this
+                // `execute`, which returns an owned result.
+                let registry = build_plugin_registry(&backend_dirs);
+                if let Some(plugin) = registry.find_by_name(other) {
+                    plugin.execute(&circuit, &params, &config)
+                } else {
+                    let plugins = registry.list();
+                    let plugin_note = if plugins.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Plugins: {}.", plugins.join(", "))
+                    };
+                    eprintln!(
+                        "Unknown backend: {}. Builtins: statevector, mps, pauli, pauliprop, \
+                         photonics.{}",
+                        other, plugin_note
+                    );
+                    std::process::exit(1);
+                }
             }
         }
     };

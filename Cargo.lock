@@ -2529,6 +2529,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-backend-refplugin"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "omega-backend-statevector",
+ "omega-core",
+ "smallvec",
+]
+
+[[package]]
 name = "omega-backend-statevector"
 version = "0.1.0"
 dependencies = [
