@@ -40,6 +40,7 @@ const EXAMPLES: &[(&str, &str, &[(&str, i64)])] = &[
     ("qft.aria", "QFT", &[("n", 4)]),
     ("qgan.aria", "QGANGenerator", &[("n", 2), ("L", 2)]),
     ("qml_classifier.aria", "QMLClassifier", &[("L", 3)]),
+    ("qml_tune.aria", "QmlTune", &[("n", 4), ("L", 2)]),
     (
         "qclassifier_rich.aria",
         "QClassifierRich",
