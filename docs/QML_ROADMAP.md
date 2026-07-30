@@ -211,20 +211,37 @@ is cross-checked against the lowered `spectra_heisenberg.aria` (Δ = 0).
   2^(1.15·n) — the paper's 2^(1.14·n) — with an illustrative crossover
   extrapolation near n* ≈ 14 (paper: 13–19).
 
-Original long-term sketch (for reference):
+**Also landed: the search ENGINE** — `crates/aria-tune`, a dependency-free
+ask / report / tell optimiser in the Optuna mould: a typed `Space`
+(categorical / int / float / log-float), `Random`/`Grid`/`Tpe` samplers, and
+`Median`/`SuccessiveHalving`/`Gate` pruners, all driven by an explicit
+SplitMix64 seed so a study replays bit-for-bit. `crates/apps/qml-tune`
+(`cargo run -p aria-verify -- qml_tune`) is the verified consumer: it tunes
+`{n, L, lr, optimizer}` of the FIXED `qml_tune.aria` template and gates on
+best accuracy ≥ 0.85, ≥ 1 trial pruned, and TPE ≥ `RandomSampler` on
+identical seeds and budget. The pruning is **real, not retrospective** —
+training runs in chunks warm-started from the previous chunk's weights via
+`SupervisedConfig::init_weights`, so a stopped trial genuinely never pays for
+its remaining epochs. The same engine is exposed as `aria tune`.
+
+Scope note: this repo tunes **meta-parameters only** — width, depth, learning
+rate, optimizer. Searching over ansatz *families*, entanglement patterns or
+RBS layouts is deliberately out of scope here; `arch_search` / `arch_evolve`
+above remain the topology-search examples, each fixed to its own study.
+
+Still unrealised from the original sketch (for reference):
 - **Search space**: layered placements of RBS / Rot / entangler gates with
   a connectivity mask per layer (butterfly = stride masks {n/2, …, 2, 1});
-  Hamming-weight-preserving subspaces prunable analytically.
+  Hamming-weight-preserving subspaces prunable analytically. `arch_evolve`
+  covers a 125-genome slice of this; the general masked space is not built.
 - **Search signal**: Tier-1 SPECTRA statistics of the dataset (off-grid
   ratio, interaction order) → prior over frequencies/depth; validation MSE
   with parameter-shift-trainability regularizer (penalize non-commuting
-  final blocks — keeps the parallel-shift speedup applicable).
-- **Search loop**: evolutionary or successive-halving over the mask space
-  (cheap: each candidate trains layer-wise with frozen prefixes, reusing
-  `TrainConfig::frozen` + `ParallelParameterShift`).
+  final blocks — keeps the parallel-shift speedup applicable). `arch_priors`
+  landed the frequency-prior half; the trainability regularizer did not.
 - **Success criterion**: rediscover the butterfly masks on the Heisenberg
   substrate; report what it finds on the sparse pocket (expected: a single
   3-way joint block — matching the known ground truth).
 
 This builds only on landed pieces (freeze masks, parallel shift, SPECTRA
-generators) and needs no new engine features.
+generators, `aria-tune`) and needs no new engine features.

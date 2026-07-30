@@ -29,7 +29,7 @@ There are two kinds of run-gate oracle:
 One row per `aria-verify` harness (`cargo run -p aria-verify -- all` asserts
 every PASS); the four `arch_*`/`spectra_scaling` rows are search/scaling
 harnesses that reuse `spectra_heisenberg.aria` rather than shipping their own
-`.aria` file. Of the 43 `.aria` example files, 42 are run-verified and
+`.aria` file. Of the 44 `.aria` example files, 43 are run-verified and
 `shor_ecdlp` is the parse-only showcase.
 
 | Example | Gate | Oracle | What is checked |
@@ -56,6 +56,7 @@ harnesses that reuse `spectra_heisenberg.aria` rather than shipping their own
 | qaoa_maxcut | run | classical | cut value vs brute-force max-cut |
 | qml_classifier | run | classical | accuracy vs ground-truth labels |
 | butterfly_qnn | run | classical | parallel commuting-block gradients (arXiv:2606.03517) == serial 4-term Givens shifts, \|Δ\| ≤ 1e-9; imputation MSE ≤ mean-imputer on UCI heart (open data, 30% MCAR) |
+| qml_tune | run | classical | `aria-tune` study over `{n, L, lr, optimizer}` of a FIXED template: best accuracy ≥ 0.85, ≥ 1 trial pruned (real chunked warm-start pruning, not retrospective), TPE ≥ RandomSampler on identical seeds/budget, CSV has one row per trial |
 | jl_sketch_digits | run | differential | forward ⟨Z_q⟩ profile vs independent statevector; optdigits 3-vs-8 accuracy ≥ 0.85 on quantum features (open data) |
 | spectra | run | classical | SPECTRA certificate (arXiv:2607.15815): heart + planted-term pocket REFUSED (order-matched classical panel wins), quantum-generated Heisenberg substrate CERTIFIED (bootstrap CI_lo > 0 + ablation gate); probe ⟨Z_q⟩ vs independent oracle ≤ 1e-9 |
 | qos | run | classical | sketch error scales as O(1/N²) |
