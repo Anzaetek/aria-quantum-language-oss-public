@@ -275,6 +275,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-app-qml-tune"
+version = "0.1.0"
+dependencies = [
+ "aria-core",
+ "aria-runtime",
+ "aria-tune",
+ "aria-verify-core",
+]
+
+[[package]]
 name = "aria-app-qos"
 version = "0.1.0"
 dependencies = [
@@ -395,6 +405,7 @@ version = "0.1.0"
 dependencies = [
  "aria-core",
  "aria-runtime",
+ "aria-tune",
  "omega-core",
 ]
 
@@ -444,6 +455,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aria-tune"
+version = "0.1.0"
+
+[[package]]
 name = "aria-verify"
 version = "0.1.0"
 dependencies = [
@@ -466,6 +481,7 @@ dependencies = [
  "aria-app-qec-qpe",
  "aria-app-qft",
  "aria-app-qml-classifier",
+ "aria-app-qml-tune",
  "aria-app-qos",
  "aria-app-qpe",
  "aria-app-qsp",
