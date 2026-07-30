@@ -79,6 +79,39 @@ impl LoadedBackend {
         (self.vtable.supports)(ffi_type)
     }
 
+    /// The plugin's capability descriptor, or `None` if it declares none.
+    pub fn caps(&self) -> Option<BackendCaps> {
+        self.vtable.caps.map(|f| f())
+    }
+
+    /// Check a circuit against the plugin's declared capabilities, returning a
+    /// loud error naming the first unsupported feature. A plugin that declares
+    /// no capabilities (`caps() == None`) is treated permissively — the check
+    /// passes and any real limitation surfaces as an execute-time error.
+    pub fn check_circuit_supported(&self, circuit: &CircuitIR) -> Result<()> {
+        let Some(caps) = self.caps() else {
+            return Ok(());
+        };
+        if caps.max_qubits > 0 && circuit.num_qubits > caps.max_qubits {
+            return Err(OmegaError::Backend(format!(
+                "plugin '{}' supports at most {} qubits, circuit has {}",
+                self.name, caps.max_qubits, circuit.num_qubits
+            )));
+        }
+        for op in &circuit.ops {
+            // Custom gates have no FFI encoding; execute would reject them too.
+            if let Ok(bit_index) = gate_kind_to_ffi(&op.gate) {
+                if caps.native_gates & gate_bit(bit_index) == 0 {
+                    return Err(OmegaError::Backend(format!(
+                        "plugin '{}' does not declare support for gate {:?}",
+                        self.name, op.gate
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute(
         &self,
         circuit: &CircuitIR,
@@ -187,45 +220,49 @@ impl BackendRegistry {
     }
 }
 
+/// Map a `GateKind` to its `GATE_*` FFI constant. `Custom` has no FFI encoding.
+/// Shared by `flatten_circuit` and the capability check so the two never drift.
+pub fn gate_kind_to_ffi(gate: &GateKind) -> Result<u32> {
+    Ok(match gate {
+        GateKind::H => GATE_H,
+        GateKind::X => GATE_X,
+        GateKind::Y => GATE_Y,
+        GateKind::Z => GATE_Z,
+        GateKind::S => GATE_S,
+        GateKind::Sdg => GATE_SDG,
+        GateKind::T => GATE_T,
+        GateKind::Tdg => GATE_TDG,
+        GateKind::Id => GATE_ID,
+        GateKind::Rx => GATE_RX,
+        GateKind::Ry => GATE_RY,
+        GateKind::Rz => GATE_RZ,
+        GateKind::U3 => GATE_U3,
+        GateKind::U2 => GATE_U2,
+        GateKind::U1 => GATE_U1,
+        GateKind::CX => GATE_CX,
+        GateKind::CY => GATE_CY,
+        GateKind::CZ => GATE_CZ,
+        GateKind::Swap => GATE_SWAP,
+        GateKind::CRz => GATE_CRZ,
+        GateKind::CU3 => GATE_CU3,
+        GateKind::Rbs => GATE_RBS,
+        GateKind::CCX => GATE_CCX,
+        GateKind::CSwap => GATE_CSWAP,
+        GateKind::PhaseShifter => GATE_PS,
+        GateKind::BeamSplitterRx => GATE_BS_RX,
+        GateKind::Measure => GATE_MEASURE,
+        GateKind::Barrier => GATE_BARRIER,
+        GateKind::Reset => GATE_RESET,
+        GateKind::Custom(_) => return Err(OmegaError::Unsupported("custom gates in FFI".into())),
+    })
+}
+
 /// Flatten a CircuitIR + params into a Vec<FfiGateOp>.
 fn flatten_circuit(circuit: &CircuitIR, params: &ParameterBinding) -> Result<Vec<FfiGateOp>> {
     let mut ffi_ops = Vec::with_capacity(circuit.ops.len());
 
     for op in &circuit.ops {
-        let gate_kind = match &op.gate {
-            GateKind::H => GATE_H,
-            GateKind::X => GATE_X,
-            GateKind::Y => GATE_Y,
-            GateKind::Z => GATE_Z,
-            GateKind::S => GATE_S,
-            GateKind::Sdg => GATE_SDG,
-            GateKind::T => GATE_T,
-            GateKind::Tdg => GATE_TDG,
-            GateKind::Id => GATE_ID,
-            GateKind::Rx => GATE_RX,
-            GateKind::Ry => GATE_RY,
-            GateKind::Rz => GATE_RZ,
-            GateKind::U3 => GATE_U3,
-            GateKind::U2 => GATE_U2,
-            GateKind::U1 => GATE_U1,
-            GateKind::CX => GATE_CX,
-            GateKind::CY => GATE_CY,
-            GateKind::CZ => GATE_CZ,
-            GateKind::Swap => GATE_SWAP,
-            GateKind::CRz => GATE_CRZ,
-            GateKind::CU3 => GATE_CU3,
-            GateKind::Rbs => GATE_RBS,
-            GateKind::CCX => GATE_CCX,
-            GateKind::CSwap => GATE_CSWAP,
-            GateKind::PhaseShifter => GATE_PS,
-            GateKind::BeamSplitterRx => GATE_BS_RX,
-            GateKind::Measure => GATE_MEASURE,
-            GateKind::Barrier => GATE_BARRIER,
-            GateKind::Reset => GATE_RESET,
-            GateKind::Custom(_) => {
-                return Err(OmegaError::Unsupported("custom gates in FFI".into()))
-            }
-        };
+        let gate_kind = gate_kind_to_ffi(&op.gate)?;
 
         let mut qubits = [0u32; 3];
         for (i, q) in op.qubits.iter().enumerate().take(3) {

@@ -44,7 +44,8 @@ pub extern "C" fn omega_backend_init() -> BackendVTable {
         supports,
         execute,
         free_result,
-        reserved: [0usize; 8],
+        caps: Some(backend_caps),
+        reserved: [0usize; 7],
     }
 }
 
@@ -56,6 +57,56 @@ extern "C" fn backend_name() -> *const c_char {
 
 extern "C" fn supports(circuit_type: FfiCircuitType) -> bool {
     matches!(circuit_type, FfiCircuitType::GateBased)
+}
+
+/// The gate-model gate kinds `ffi_gate_to_kind` reconstructs (i.e. everything
+/// the wrapped statevector simulator runs). Photonic kinds (`GATE_PS`,
+/// `GATE_BS_RX`) are deliberately absent, so a photonic circuit is refused.
+const REFPLUGIN_GATES: u64 = gate_bit(GATE_H)
+    | gate_bit(GATE_X)
+    | gate_bit(GATE_Y)
+    | gate_bit(GATE_Z)
+    | gate_bit(GATE_S)
+    | gate_bit(GATE_SDG)
+    | gate_bit(GATE_T)
+    | gate_bit(GATE_TDG)
+    | gate_bit(GATE_ID)
+    | gate_bit(GATE_RX)
+    | gate_bit(GATE_RY)
+    | gate_bit(GATE_RZ)
+    | gate_bit(GATE_U3)
+    | gate_bit(GATE_U2)
+    | gate_bit(GATE_U1)
+    | gate_bit(GATE_CX)
+    | gate_bit(GATE_CY)
+    | gate_bit(GATE_CZ)
+    | gate_bit(GATE_SWAP)
+    | gate_bit(GATE_CRZ)
+    | gate_bit(GATE_CU3)
+    | gate_bit(GATE_RBS)
+    | gate_bit(GATE_CCX)
+    | gate_bit(GATE_CSWAP)
+    | gate_bit(GATE_MEASURE)
+    | gate_bit(GATE_BARRIER)
+    | gate_bit(GATE_RESET);
+
+extern "C" fn backend_caps() -> BackendCaps {
+    static VERSION: OnceLock<CString> = OnceLock::new();
+    let engine_version = VERSION
+        .get_or_init(|| CString::new(concat!("refplugin/", env!("CARGO_PKG_VERSION"))).unwrap())
+        .as_ptr();
+    BackendCaps {
+        struct_size: std::mem::size_of::<BackendCaps>() as u32,
+        max_qubits: 24,
+        kind: CAPS_KIND_SIMULATOR,
+        supports_shots: true,
+        supports_expectation: false,
+        noise: CAPS_NOISE_NONE,
+        device: 0,
+        native_gates: REFPLUGIN_GATES,
+        opt_in_cpu_fallback: false,
+        engine_version,
+    }
 }
 
 extern "C" fn execute(
@@ -308,5 +359,23 @@ mod tests {
     fn refplugin_rejects_photonic() {
         assert!(!supports(FfiCircuitType::Photonic));
         assert!(supports(FfiCircuitType::GateBased));
+    }
+
+    #[test]
+    fn refplugin_declares_gate_model_caps() {
+        let caps = backend_caps();
+        assert_eq!(
+            caps.struct_size as usize,
+            std::mem::size_of::<BackendCaps>()
+        );
+        assert_eq!(caps.kind, CAPS_KIND_SIMULATOR);
+        assert!(caps.supports_shots);
+        assert_eq!(caps.max_qubits, 24);
+        // Gate-model gates are declared; photonic gates are not.
+        assert_ne!(caps.native_gates & gate_bit(GATE_H), 0);
+        assert_ne!(caps.native_gates & gate_bit(GATE_CX), 0);
+        assert_eq!(caps.native_gates & gate_bit(GATE_PS), 0);
+        assert_eq!(caps.native_gates & gate_bit(GATE_BS_RX), 0);
+        assert!(!caps.engine_version.is_null());
     }
 }

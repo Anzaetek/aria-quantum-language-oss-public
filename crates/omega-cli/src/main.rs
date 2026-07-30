@@ -1185,6 +1185,12 @@ fn main() {
                 // `execute`, which returns an owned result.
                 let registry = build_plugin_registry(&backend_dirs);
                 if let Some(plugin) = registry.find_by_name(other) {
+                    // Refuse a circuit the plugin doesn't declare support for,
+                    // loudly — never dispatch and risk a wrong answer.
+                    if let Err(e) = plugin.check_circuit_supported(&circuit) {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
                     plugin.execute(&circuit, &params, &config)
                 } else {
                     let plugins = registry.list();
