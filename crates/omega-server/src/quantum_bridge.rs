@@ -100,28 +100,23 @@ pub enum OmegaBackendSel {
 }
 
 /// Lazily-loaded backend-plugin registry, populated once from
-/// `OMEGA_BACKEND_DIR` (`:`-separated) and `~/.omega/backends`. Plugin backends
-/// must be thread-safe: the registry is shared across job handlers and plugin
-/// execution is not serialized.
+/// `OMEGA_BACKEND_DIR` (`:`-separated). Plugin loading is **opt-in** — the
+/// server never probes a home directory implicitly, so no plugin is dlopened
+/// unless an operator configured `OMEGA_BACKEND_DIR`.
+///
+/// Plugin backends must be thread-safe: the registry is shared across job
+/// handlers and plugin execution is not serialized. (This mirrors the
+/// requirement stated on `BackendVTable` in the ABI.)
 fn plugin_registry() -> &'static omega_core::plugin::BackendRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<omega_core::plugin::BackendRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         let mut reg = omega_core::plugin::BackendRegistry::new();
-        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
         if let Ok(env_dirs) = std::env::var("OMEGA_BACKEND_DIR") {
             for d in env_dirs.split(':').filter(|s| !s.is_empty()) {
-                dirs.push(std::path::PathBuf::from(d));
-            }
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            let mut p = std::path::PathBuf::from(home);
-            p.push(".omega/backends");
-            dirs.push(p);
-        }
-        for dir in dirs {
-            if let Err(e) = reg.load_dir(&dir) {
-                eprintln!("[quantum] backend-dir {}: {}", dir.display(), e);
+                if let Err(e) = reg.load_dir(std::path::Path::new(d)) {
+                    eprintln!("[quantum] backend-dir {d}: {e}");
+                }
             }
         }
         reg

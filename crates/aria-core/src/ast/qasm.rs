@@ -142,6 +142,12 @@ pub fn to_qasm(circuit: &Circuit) -> String {
 fn gate_to_qasm3(kind: GateKind) -> Option<&'static str> {
     match kind {
         GateKind::U => Some("U"),
+        // `stdgates.inc` defines no rxx/ryy/rzz — emitting those names produces
+        // a file a strict OpenQASM 3 consumer rejects. Fall through to `None`
+        // so they become `// unsupported gate:` comments like any other
+        // kind without a stdgates spelling (the 2.0 path, pinned, still emits
+        // them for backward compatibility).
+        GateKind::RXX | GateKind::RYY | GateKind::RZZ => None,
         other => gate_to_qasm(other),
     }
 }
@@ -260,8 +266,11 @@ fn qasm_to_gate(name: &str) -> Option<GateKind> {
         "ry" => Some(GateKind::RY),
         "rz" => Some(GateKind::RZ),
         "p" | "u1" => Some(GateKind::P),
-        "u3" | "u" => Some(GateKind::U),
-        "cx" | "cnot" => Some(GateKind::CX),
+        // `U` and `CX` are the OpenQASM 2.0 *builtin* gates (qelib1 adds the
+        // lowercase `u3`/`cx` spellings); accept both so a spec-valid file that
+        // doesn't include qelib1 still imports.
+        "u3" | "u" | "U" => Some(GateKind::U),
+        "cx" | "cnot" | "CX" => Some(GateKind::CX),
         "cy" => Some(GateKind::CY),
         "cz" => Some(GateKind::CZ),
         "swap" => Some(GateKind::SWAP),
@@ -328,6 +337,11 @@ fn parse_param(s: &str) -> Result<f64, String> {
     } else {
         result /= a;
     }
+    // A non-finite angle (e.g. `pi/0`, or an `inf`/`nan` atom that `f64::parse`
+    // accepts) is never a valid gate parameter — reject rather than import it.
+    if !result.is_finite() {
+        return Err(format!("QASM parameter '{s}' is not a finite value"));
+    }
     Ok(result)
 }
 
@@ -370,6 +384,17 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
             continue;
         }
 
+        // Reject multiple statements on one physical line — the line-oriented
+        // arms below would mis-merge them (e.g. `h q[0]; x q[1];` would apply H
+        // to both qubits and drop the X). QASM is newline-insensitive, so this
+        // is a real limitation, surfaced loudly rather than silently mis-parsed.
+        let code = line.split("//").next().unwrap_or(line);
+        if code.matches(';').count() > 1 {
+            return Err(format!(
+                "multiple statements on line {lineno}: '{line}' — put each on its own line"
+            ));
+        }
+
         // Register declaration
         if let Some(caps) = reg_re.captures(line) {
             let kind_str = &caps[1];
@@ -403,20 +428,29 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
                 .captures_iter(line)
                 .map(|c| (c[1].to_string(), c[2].parse().unwrap()))
                 .collect();
-            if refs.len() >= 2 {
-                let q = Qubit::new(&refs[0].0, refs[0].1);
-                let c = Clbit::new(&refs[1].0, refs[1].1);
-                circuit.measure(&q, &c);
+            if refs.len() < 2 {
+                return Err(format!(
+                    "unsupported measure at line {lineno}: '{line}' — only the indexed \
+                     form `measure q[i] -> c[j];` is supported (register-broadcast \
+                     `measure q -> c;` is not)"
+                ));
             }
+            let q = Qubit::new(&refs[0].0, refs[0].1);
+            let c = Clbit::new(&refs[1].0, refs[1].1);
+            circuit.measure(&q, &c);
             continue;
         }
 
         // Reset
         if line.starts_with("reset") {
-            if let Some(caps) = bit_re.captures(line) {
-                let q = Qubit::new(&caps[1], caps[2].parse().unwrap());
-                circuit.reset_qubit(&q);
-            }
+            let Some(caps) = bit_re.captures(line) else {
+                return Err(format!(
+                    "unsupported reset at line {lineno}: '{line}' — only the indexed \
+                     form `reset q[i];` is supported"
+                ));
+            };
+            let q = Qubit::new(&caps[1], caps[2].parse().unwrap());
+            circuit.reset_qubit(&q);
             continue;
         }
 
@@ -442,6 +476,12 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
                 .captures_iter(&caps[3])
                 .map(|c| Qubit::new(&c[1], c[2].parse().unwrap()))
                 .collect();
+            if qubits.is_empty() {
+                return Err(format!(
+                    "gate '{gate_name}' at line {lineno} has no indexed qubit operands: \
+                     '{line}' (register-broadcast forms like `h q;` are not supported)"
+                ));
+            }
             let gate = GateDef::with_params(kind, params);
             circuit.apply(gate, qubits);
             continue;
@@ -578,6 +618,40 @@ mod tests {
 
         let garbage = "OPENQASM 2.0;\nqreg q[1];\nthis is not qasm\n";
         assert!(from_qasm(garbage).unwrap_err().contains("unparsed"));
+    }
+
+    #[test]
+    fn from_qasm_fails_loud_on_silent_drop_forms() {
+        // Register-broadcast measure / reset and gate-on-a-register were
+        // previously dropped silently; they must now error.
+        assert!(from_qasm("qreg q[2];\ncreg c[2];\nmeasure q -> c;\n")
+            .unwrap_err()
+            .contains("measure"));
+        assert!(from_qasm("qreg q[1];\nreset q;\n")
+            .unwrap_err()
+            .contains("reset"));
+        assert!(from_qasm("qreg q[2];\nh q;\n")
+            .unwrap_err()
+            .contains("no indexed qubit"));
+    }
+
+    #[test]
+    fn from_qasm_rejects_multiple_statements_per_line() {
+        let err = from_qasm("qreg q[2];\nh q[0]; x q[1];\n").unwrap_err();
+        assert!(err.contains("multiple statements"), "{err}");
+    }
+
+    #[test]
+    fn from_qasm_accepts_qasm2_builtin_U_and_CX() {
+        let circ = from_qasm("qreg q[2];\nU(pi/2, 0, pi) q[0];\nCX q[0], q[1];\n").unwrap();
+        assert_eq!(circ.gate_count(), 2);
+    }
+
+    #[test]
+    fn parse_param_rejects_non_finite() {
+        assert!(parse_param("pi/0").is_err());
+        assert!(parse_param("inf").is_err());
+        assert!(parse_param("nan").is_err());
     }
 
     #[test]

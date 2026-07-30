@@ -103,8 +103,12 @@ OMEGA_RUN=$(cargo build -p omega-cli --message-format=json 2>/dev/null \
 [ -x "$OMEGA_RUN" ] || OMEGA_RUN="target/debug/omega-run"
 cargo build -p omega-backend-refplugin >/dev/null 2>&1
 PLUGIN_DIR=$(mktemp -d)
-# The cdylib file extension is platform-specific (.dylib on macOS, .so on Linux).
-cp target/debug/libomega_backend_refplugin.* "$PLUGIN_DIR"/ 2>/dev/null || true
+# The cdylib file extension is platform-specific (.dylib on macOS, .so on Linux,
+# .dll on Windows). Copy only the shared library — NOT cargo's `.d` dep-info
+# file, which shares the basename and would fail to dlopen.
+for ext in dylib so dll; do
+  cp "target/debug/libomega_backend_refplugin.$ext" "$PLUGIN_DIR"/ 2>/dev/null || true
+done
 "$ARIA" export examples/aria/bell.aria --circuit Bell --qasm > "$PLUGIN_DIR/bell.qasm"
 plugin_out=$("$OMEGA_RUN" "$PLUGIN_DIR/bell.qasm" --backend refplugin \
   --backend-dir "$PLUGIN_DIR" --shots 512 2>/dev/null)
@@ -117,7 +121,14 @@ echo "$plugin_out" | grep -qE '\|00>|\|11>' \
 CONF=$(cargo build -p omega-plugin-conformance --message-format=json 2>/dev/null \
   | sed -n 's/.*"executable":"\([^"]*omega-plugin-conformance\)".*/\1/p' | head -1)
 [ -x "$CONF" ] || CONF="target/debug/omega-plugin-conformance"
-REFPLUGIN_DYLIB=$(ls "$PLUGIN_DIR"/libomega_backend_refplugin.* 2>/dev/null | head -1)
+# Pick the shared library by extension (never cargo's `.d` dep-info file).
+# A plain `ls a b c` would exit non-zero for the absent extensions and, under
+# `set -euo pipefail`, abort the script — so test each candidate instead.
+REFPLUGIN_DYLIB=""
+for ext in dylib so dll; do
+  cand="$PLUGIN_DIR/libomega_backend_refplugin.$ext"
+  [ -f "$cand" ] && REFPLUGIN_DYLIB="$cand" && break
+done
 if "$CONF" "$REFPLUGIN_DYLIB"; then
   echo "  OK: refplugin passed the conformance corpus"
 else

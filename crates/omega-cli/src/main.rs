@@ -47,8 +47,8 @@ fn print_usage() {
     eprintln!("                         A name matching a loaded plugin resolves after the");
     eprintln!("                         compiled-in backends.");
     eprintln!("  --backend-dir DIR      Load backend plugins (.so/.dylib/.dll) from DIR");
-    eprintln!("                         (repeatable; also OMEGA_BACKEND_DIR, then");
-    eprintln!("                         ~/.omega/backends). Plugins run the default sample mode.");
+    eprintln!("                         (repeatable; also OMEGA_BACKEND_DIR). Plugin loading");
+    eprintln!("                         is opt-in; plugins run the default sample mode.");
     eprintln!("  --list-backends        List compiled-in backends and loaded plugins, then exit");
     eprintln!("  --bridge NAME          Route execution through an external simulator");
     eprintln!("                         (qiskit, perceval). Only the default sample mode");
@@ -137,10 +137,11 @@ fn parse_format(args: &[String]) -> Format {
     Format::Text
 }
 
-/// Collect the directories to probe for backend plugins, in resolution order:
-/// explicit `--backend-dir` flags, then `OMEGA_BACKEND_DIR` (`:`-separated),
-/// then the default `~/.omega/backends`. Missing directories are harmless —
-/// `load_dir` returns `Ok(0)` for them.
+/// Collect the directories to load backend plugins from: explicit
+/// `--backend-dir` flags, then `OMEGA_BACKEND_DIR` (`:`-separated). Plugin
+/// loading is **opt-in** — there is no implicit `~/.omega/backends` probe, so a
+/// mistyped `--backend NAME` never dlopens code the user didn't ask for.
+/// Missing directories are harmless — `load_dir` returns `Ok(0)` for them.
 fn build_plugin_registry(explicit_dirs: &[String]) -> omega_core::plugin::BackendRegistry {
     let mut registry = omega_core::plugin::BackendRegistry::new();
     let mut dirs: Vec<std::path::PathBuf> =
@@ -149,11 +150,6 @@ fn build_plugin_registry(explicit_dirs: &[String]) -> omega_core::plugin::Backen
         for d in env_dirs.split(':').filter(|s| !s.is_empty()) {
             dirs.push(std::path::PathBuf::from(d));
         }
-    }
-    if let Some(home) = env::var_os("HOME") {
-        let mut p = std::path::PathBuf::from(home);
-        p.push(".omega/backends");
-        dirs.push(p);
     }
     for dir in dirs {
         if let Err(e) = registry.load_dir(&dir) {
