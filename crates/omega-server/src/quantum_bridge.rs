@@ -94,6 +94,47 @@ pub enum OmegaBackendSel {
     Mps { max_bond_dim: u32 },
     Stabilizer,
     Photonic,
+    /// A dynamically-loaded backend plugin, selected by name. Never chosen by
+    /// `Auto` resolution — a client must request it explicitly.
+    Plugin { name: String },
+}
+
+/// Lazily-loaded backend-plugin registry, populated once from
+/// `OMEGA_BACKEND_DIR` (`:`-separated) and `~/.omega/backends`. Plugin backends
+/// must be thread-safe: the registry is shared across job handlers and plugin
+/// execution is not serialized.
+fn plugin_registry() -> &'static omega_core::plugin::BackendRegistry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<omega_core::plugin::BackendRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut reg = omega_core::plugin::BackendRegistry::new();
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(env_dirs) = std::env::var("OMEGA_BACKEND_DIR") {
+            for d in env_dirs.split(':').filter(|s| !s.is_empty()) {
+                dirs.push(std::path::PathBuf::from(d));
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut p = std::path::PathBuf::from(home);
+            p.push(".omega/backends");
+            dirs.push(p);
+        }
+        for dir in dirs {
+            if let Err(e) = reg.load_dir(&dir) {
+                eprintln!("[quantum] backend-dir {}: {}", dir.display(), e);
+            }
+        }
+        reg
+    })
+}
+
+/// Names of the plugin backends currently loaded, for `/v1/backends`.
+pub fn loaded_plugin_names() -> Vec<String> {
+    plugin_registry()
+        .list()
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,6 +287,15 @@ pub fn execute_quantum_ir(
         OmegaBackendSel::Photonic => {
             omega_backend_photonics::PhotonicsBackend::new().execute(&core, &binding, &config)?
         }
+        OmegaBackendSel::Plugin { name } => {
+            let registry = plugin_registry();
+            let plugin = registry.find_by_name(name).ok_or_else(|| {
+                omega_core::error::OmegaError::Backend(format!("no plugin backend named '{name}'"))
+            })?;
+            // Refuse a circuit the plugin does not declare support for, loudly.
+            plugin.check_circuit_supported(&core)?;
+            plugin.execute(&core, &binding, &config)?
+        }
     };
     Ok((result, resolved))
 }
@@ -278,6 +328,13 @@ pub fn expectation_quantum_ir(
             return Err(omega_core::error::OmegaError::Unsupported(
                 "expectation is not defined on the photonic backend".into(),
             ))
+        }
+        OmegaBackendSel::Plugin { name } => {
+            // The plugin ABI has no expectation fast path; report it loudly
+            // rather than silently pulling a statevector and reducing here.
+            return Err(omega_core::error::OmegaError::Unsupported(format!(
+                "expectation is not supported over the plugin ABI (backend '{name}')"
+            )));
         }
     };
     Ok((value, resolved))
@@ -318,6 +375,7 @@ fn backend_name(sel: &OmegaBackendSel) -> String {
         OmegaBackendSel::Mps { max_bond_dim } => format!("mps(bond={})", max_bond_dim),
         OmegaBackendSel::Stabilizer => "stabilizer".into(),
         OmegaBackendSel::Photonic => "photonic".into(),
+        OmegaBackendSel::Plugin { name } => format!("plugin({name})"),
     }
 }
 
@@ -727,5 +785,60 @@ mod tests {
         let parsed: OmegaCircuitIR = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.ops.len(), 2);
         assert_eq!(parsed.backend, OmegaBackendSel::Mps { max_bond_dim: 32 });
+    }
+
+    #[test]
+    fn plugin_backend_sel_serde_roundtrip() {
+        let sel = OmegaBackendSel::Plugin {
+            name: "refplugin".to_string(),
+        };
+        let s = serde_json::to_string(&sel).unwrap();
+        assert!(s.contains("Plugin"));
+        assert!(s.contains("refplugin"));
+        let parsed: OmegaBackendSel = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, sel);
+    }
+
+    #[test]
+    fn backend_name_renders_plugin() {
+        let sel = OmegaBackendSel::Plugin {
+            name: "acme".to_string(),
+        };
+        assert_eq!(backend_name(&sel), "plugin(acme)");
+    }
+
+    #[test]
+    fn auto_never_selects_a_plugin() {
+        // Auto resolution must never pick a plugin — a client opts in by name.
+        let ir = bell_ir(OmegaBackendSel::Auto);
+        assert!(!matches!(
+            resolve_backend(&ir),
+            OmegaBackendSel::Plugin { .. }
+        ));
+    }
+
+    #[test]
+    fn expectation_over_plugin_is_rejected() {
+        // The plugin ABI has no expectation fast path — loud error, not a
+        // silent statevector reduction.
+        let obs = Observable::parse("Z0").unwrap();
+        let ir = ry_ir(
+            0.5,
+            OmegaBackendSel::Plugin {
+                name: "refplugin".to_string(),
+            },
+        );
+        let err = expectation_quantum_ir(&ir, &obs).unwrap_err();
+        assert!(format!("{err}").contains("plugin"));
+    }
+
+    #[test]
+    fn execute_unknown_plugin_errors_loudly() {
+        // No plugin by this name is loaded in the test environment.
+        let ir = bell_ir(OmegaBackendSel::Plugin {
+            name: "definitely-not-loaded-xyz".to_string(),
+        });
+        let err = execute_quantum_ir(&ir, Some(16), Some(1)).unwrap_err();
+        assert!(format!("{err}").contains("no plugin backend named"));
     }
 }

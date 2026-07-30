@@ -354,15 +354,18 @@ async fn list_backends(Extension(claims): Extension<TokenClaims>) -> impl IntoRe
     if let Err(resp) = middleware::check_rights(&claims, rights::READ) {
         return resp;
     }
-    Json(serde_json::json!({
-        "backends": [
-            { "name": "statevector", "type": "gate_based" },
-            { "name": "mps",         "type": "gate_based", "parametric": true },
-            { "name": "stabilizer",  "type": "gate_based", "requires": "clifford" },
-            { "name": "photonics",   "type": "photonic" },
-        ]
-    }))
-    .into_response()
+    let mut backends = vec![
+        serde_json::json!({ "name": "statevector", "type": "gate_based" }),
+        serde_json::json!({ "name": "mps",         "type": "gate_based", "parametric": true }),
+        serde_json::json!({ "name": "stabilizer",  "type": "gate_based", "requires": "clifford" }),
+        serde_json::json!({ "name": "photonics",   "type": "photonic" }),
+    ];
+    // Append dynamically-loaded plugin backends, tagged so a client can tell
+    // them apart from the compiled-in ones.
+    for name in quantum_bridge::loaded_plugin_names() {
+        backends.push(serde_json::json!({ "name": name, "type": "plugin", "plugin": true }));
+    }
+    Json(serde_json::json!({ "backends": backends })).into_response()
 }
 
 async fn create_circuit(
