@@ -100,12 +100,65 @@ pub struct BackendVTable {
     /// Free a result allocated by execute.
     pub free_result: extern "C" fn(result: *mut FfiExecResult),
 
-    /// Reserved for additive evolution within this ABI version. A plugin must
-    /// zero-initialize this tail. Future capability function-pointer slots are
-    /// carved from it (an `Option<extern "C" fn ...>` is `usize`-sized and
-    /// null-optimized), so the struct size and `OMEGA_BACKEND_ABI_VERSION`
-    /// stay put while existing plugins keep loading.
-    pub reserved: [usize; 8],
+    /// Optional capability descriptor. `None` means the plugin declares no
+    /// capabilities and the host treats it permissively. Carved from the
+    /// reserved tail — an `Option<extern "C" fn ...>` is `usize`-sized and
+    /// null-optimized, so the struct size and `OMEGA_BACKEND_ABI_VERSION`
+    /// are unchanged and pre-caps plugins keep loading.
+    pub caps: Option<extern "C" fn() -> BackendCaps>,
+
+    /// Reserved for further additive evolution within this ABI version. A
+    /// plugin must zero-initialize this tail.
+    pub reserved: [usize; 7],
+}
+
+/// Backend capability kinds.
+pub const CAPS_KIND_SIMULATOR: u32 = 0;
+pub const CAPS_KIND_HARDWARE: u32 = 1;
+
+/// Backend noise support levels.
+pub const CAPS_NOISE_NONE: u32 = 0;
+pub const CAPS_NOISE_MODEL: u32 = 1;
+pub const CAPS_NOISE_PHYSICAL: u32 = 2;
+
+/// Capability descriptor a plugin may expose via [`BackendVTable::caps`].
+///
+/// `#[repr(C)]` and ABI-stable. `native_gates` is a bitmask over the `GATE_*`
+/// constants (bit `k` set ⇔ the plugin runs gate kind `k`); the host uses it,
+/// with `max_qubits`, to refuse a circuit a plugin cannot handle **loudly**
+/// rather than dispatch it and get a wrong answer. `engine_version` is an
+/// optional null-terminated string (may be null).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BackendCaps {
+    /// `size_of::<BackendCaps>()` as seen by the plugin — a forward-compat guard.
+    pub struct_size: u32,
+    /// Maximum qubit count the backend accepts. 0 means "unspecified/unbounded".
+    pub max_qubits: u32,
+    /// `CAPS_KIND_SIMULATOR` or `CAPS_KIND_HARDWARE`.
+    pub kind: u32,
+    /// Whether shot-based sampling is supported.
+    pub supports_shots: bool,
+    /// Whether an expectation fast path is supported.
+    pub supports_expectation: bool,
+    /// One of the `CAPS_NOISE_*` levels.
+    pub noise: u32,
+    /// Compute device (see `omega_core::device`); 0 = cpu.
+    pub device: u32,
+    /// Bitmask over the `GATE_*` constants of natively supported gate kinds.
+    pub native_gates: u64,
+    /// Whether the host may apply the trait `cpu_fallback` default for this
+    /// plugin. Off by default: plugins error loudly instead of falling back.
+    pub opt_in_cpu_fallback: bool,
+    /// Optional engine version string (null-terminated); may be null.
+    pub engine_version: *const c_char,
+}
+
+/// The bitmask bit for a `GATE_*` constant, for building/testing
+/// [`BackendCaps::native_gates`]. All gate constants are < 64.
+#[inline]
+pub const fn gate_bit(gate_kind: u32) -> u64 {
+    1u64 << gate_kind
 }
 
 // Gate kind constants (matching GateKind enum order)
