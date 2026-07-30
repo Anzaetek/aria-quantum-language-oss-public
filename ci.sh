@@ -112,6 +112,17 @@ echo "$plugin_out" | grep -qE '\|00>|\|11>' \
   && ! echo "$plugin_out" | grep -qE '\|01>|\|10>' \
   && echo "  OK: refplugin ran Bell to correlated counts" \
   || { echo "  FAIL: refplugin output unexpected:"; echo "$plugin_out"; exit 1; }
+# Conformance kit: the corpus (bell/ghz3/uniform/rotation) vs the statevector
+# oracle. Exit 0 iff every case is within tolerance.
+CONF=$(cargo build -p omega-plugin-conformance --message-format=json 2>/dev/null \
+  | sed -n 's/.*"executable":"\([^"]*omega-plugin-conformance\)".*/\1/p' | head -1)
+[ -x "$CONF" ] || CONF="target/debug/omega-plugin-conformance"
+REFPLUGIN_DYLIB=$(ls "$PLUGIN_DIR"/libomega_backend_refplugin.* 2>/dev/null | head -1)
+if "$CONF" "$REFPLUGIN_DYLIB"; then
+  echo "  OK: refplugin passed the conformance corpus"
+else
+  echo "  FAIL: refplugin failed conformance"; exit 1
+fi
 rm -rf "$PLUGIN_DIR"
 
 step "7/9  Build WASM guests (wasm32-wasip1) for the application harnesses"
