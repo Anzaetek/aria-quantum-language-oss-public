@@ -84,11 +84,29 @@ impl LoadedBackend {
         self.vtable.caps.map(|f| f())
     }
 
-    /// Check a circuit against the plugin's declared capabilities, returning a
-    /// loud error naming the first unsupported feature. A plugin that declares
-    /// no capabilities (`caps() == None`) is treated permissively — the check
-    /// passes and any real limitation surfaces as an execute-time error.
+    /// Check a circuit against what the plugin ABI can carry and against the
+    /// plugin's declared capabilities, returning a loud error naming the first
+    /// unsupported feature — so the host never dispatches a circuit that would
+    /// silently produce a wrong result.
+    ///
+    /// Two classes of check:
+    /// 1. **ABI limitations** (apply to *every* plugin, even one that declares
+    ///    no caps): the flattened FFI circuit carries no classical condition
+    ///    and no mid-circuit-measurement mode, so a classically-conditioned
+    ///    gate or a measurement followed by further operations cannot be
+    ///    represented and is refused.
+    /// 2. **Declared capabilities** (only when `caps()` is `Some`): qubit count
+    ///    and native gate set.
     pub fn check_circuit_supported(&self, circuit: &CircuitIR) -> Result<()> {
+        // (1) ABI limitations — independent of declared caps.
+        if let Some(reason) = circuit_ffi_limitation(circuit) {
+            return Err(OmegaError::Backend(format!(
+                "plugin '{}': {reason}",
+                self.name
+            )));
+        }
+
+        // (2) Declared capabilities.
         let Some(caps) = self.caps() else {
             return Ok(());
         };
@@ -141,11 +159,13 @@ impl LoadedBackend {
             )));
         }
 
-        let ffi_result = unsafe { ffi_result.assume_init() };
+        let mut ffi_result = unsafe { ffi_result.assume_init() };
         let result = unflatten_result(&ffi_result);
 
-        // Free the FFI result
-        (self.vtable.free_result)(&ffi_result as *const _ as *mut _);
+        // Free the FFI result. Pass a genuine `&mut` — a plugin's `free_result`
+        // is allowed to write (e.g. null the pointers it frees), and a `*mut`
+        // derived from a shared borrow would make that undefined behaviour.
+        (self.vtable.free_result)(&mut ffi_result as *mut _);
 
         result
     }
@@ -218,6 +238,38 @@ impl BackendRegistry {
     pub fn list(&self) -> Vec<&str> {
         self.backends.iter().map(|b| b.name()).collect()
     }
+}
+
+/// Return a reason string if the circuit uses a feature the flattened FFI form
+/// cannot carry, or `None` if it is representable. The FFI `FfiGateOp` has no
+/// classical-condition fields and `FfiExecConfig` has no mid-circuit mode, so a
+/// conditioned gate or a mid-circuit measurement (a `measure` followed by
+/// further gates) would be silently mis-executed by any plugin and must be
+/// refused before dispatch. `pub` so the ABI-limitation policy is testable
+/// without a loaded plugin.
+pub fn circuit_ffi_limitation(circuit: &CircuitIR) -> Option<String> {
+    let mut measured = false;
+    for op in &circuit.ops {
+        if op.condition.is_some() {
+            return Some(
+                "classically-conditioned gates are not representable over the plugin ABI".into(),
+            );
+        }
+        match op.gate {
+            GateKind::Measure => measured = true,
+            GateKind::Barrier => {}
+            _ => {
+                if measured {
+                    return Some(
+                        "mid-circuit measurement (a measure followed by further gates) is not \
+                         supported over the plugin ABI"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Map a `GateKind` to its `GATE_*` FFI constant. `Custom` has no FFI encoding.
@@ -298,9 +350,45 @@ mod tests {
     }
 
     #[test]
+    fn ffi_limitation_flags_conditions_and_mid_circuit() {
+        use crate::circuit::{CircuitType, GateOp, Qubit};
+        use smallvec::smallvec;
+
+        let mk = |gate: GateKind, condition| GateOp {
+            gate,
+            qubits: smallvec![Qubit(0)],
+            params: smallvec![],
+            classical_bit: None,
+            condition,
+        };
+
+        // Terminal measurements are fine.
+        let mut ok = CircuitIR::new(1, CircuitType::GateBased);
+        ok.add_op(mk(GateKind::H, None));
+        ok.add_op(mk(GateKind::Measure, None));
+        assert!(circuit_ffi_limitation(&ok).is_none());
+
+        // A classically-conditioned gate is refused.
+        let mut cond = CircuitIR::new(1, CircuitType::GateBased);
+        cond.add_op(mk(GateKind::X, Some((0, 1, 1))));
+        assert!(circuit_ffi_limitation(&cond)
+            .unwrap()
+            .contains("conditioned"));
+
+        // Mid-circuit measurement (measure then a gate) is refused.
+        let mut mid = CircuitIR::new(1, CircuitType::GateBased);
+        mid.add_op(mk(GateKind::Measure, None));
+        mid.add_op(mk(GateKind::X, None));
+        assert!(circuit_ffi_limitation(&mid)
+            .unwrap()
+            .contains("mid-circuit"));
+    }
+
+    #[test]
     fn vtable_layout_canary() {
-        // 4 function pointers + an 8-slot reserved tail, all usize-sized under
-        // repr(C). If this changes, every compiled plugin must be rebuilt and
+        // 5 function-pointer-sized slots (name, supports, execute, free_result,
+        // caps) + a 7-slot reserved tail = 12 usize under repr(C). If this
+        // total changes, every compiled plugin must be rebuilt and
         // OMEGA_BACKEND_ABI_VERSION bumped.
         assert_eq!(
             std::mem::size_of::<BackendVTable>(),

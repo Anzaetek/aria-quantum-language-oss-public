@@ -81,6 +81,12 @@ pub struct FfiExecResult {
 }
 
 /// Backend vtable: function pointers exported by each backend DLL.
+///
+/// **Thread-safety contract:** the host may call any vtable function
+/// (`execute`, `supports`, `caps`, …) concurrently from multiple threads — the
+/// `omega-server` shares one loaded backend across job handlers without
+/// serialization. Plugin implementations must therefore be reentrant / free of
+/// unsynchronized mutable global state.
 #[repr(C)]
 pub struct BackendVTable {
     /// Returns the backend name as a null-terminated string.
@@ -128,10 +134,28 @@ pub const CAPS_NOISE_PHYSICAL: u32 = 2;
 /// with `max_qubits`, to refuse a circuit a plugin cannot handle **loudly**
 /// rather than dispatch it and get a wrong answer. `engine_version` is an
 /// optional null-terminated string (may be null).
+///
+/// **Enforcement scope:** the host's pre-dispatch check
+/// (`LoadedBackend::check_circuit_supported`) enforces only `max_qubits` and
+/// `native_gates`. The remaining fields (`kind`, `supports_shots`,
+/// `supports_expectation`, `noise`, `device`, `engine_version`) are descriptive
+/// — a client reads them to route work, but the host does not veto a job on
+/// them (expectation over any plugin is separately rejected at the server, as
+/// the ABI has no expectation entry point).
+///
+/// **Growing this struct is NOT additive.** Because [`BackendVTable::caps`]
+/// returns `BackendCaps` **by value**, adding a field changes the function's
+/// return ABI; a host built against the old layout calling a new plugin (or
+/// vice-versa) is undefined behaviour that `struct_size` cannot prevent (it is
+/// read only *after* the mismatched call). Any change to this struct therefore
+/// requires bumping [`OMEGA_BACKEND_ABI_VERSION`], which the loader checks
+/// before reading the vtable. `struct_size` remains a cheap defensive sanity
+/// check for a plugin/host pair that agree on the version.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BackendCaps {
-    /// `size_of::<BackendCaps>()` as seen by the plugin — a forward-compat guard.
+    /// `size_of::<BackendCaps>()` as seen by the plugin — a defensive sanity
+    /// check (see the struct-level note on why it is not a growth mechanism).
     pub struct_size: u32,
     /// Maximum qubit count the backend accepts. 0 means "unspecified/unbounded".
     pub max_qubits: u32,
