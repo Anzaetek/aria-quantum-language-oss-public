@@ -813,6 +813,18 @@ fn parse_space(spec: &str) -> Result<aria_tune::Space, String> {
                 .parse::<f64>()
                 .map_err(|_| format!("bad number '{s}' in --space dimension '{dim}'"))
         };
+        // Integer bounds come in as f64 and are cast to i64. A cast of an
+        // out-of-range value *saturates* (1e20 → i64::MAX), silently building a
+        // different grid than asked; reject it here instead.
+        let int_bound = |s: &str| -> Result<i64, String> {
+            let v = num(s)?;
+            if !v.is_finite() || v.abs() >= 9.2e18 {
+                return Err(format!(
+                    "integer bound '{s}' in --space dimension '{dim}' is out of range"
+                ));
+            }
+            Ok(v as i64)
+        };
 
         if let Some(rest) = body
             .strip_prefix("log:")
@@ -849,15 +861,15 @@ fn parse_space(spec: &str) -> Result<aria_tune::Space, String> {
                 .split_once("..")
                 .ok_or_else(|| format!("bad range in '{dim}'"))?;
             let (hi, step) = match rest.split_once(':') {
-                Some((h, s)) => (h, num(s)? as i64),
+                Some((h, s)) => (h, int_bound(s)?),
                 None => (rest, 1),
             };
             space = space
                 .try_add(
                     name,
                     aria_tune::Param::Int {
-                        lo: num(lo)? as i64,
-                        hi: num(hi)? as i64,
+                        lo: int_bound(lo)?,
+                        hi: int_bound(hi)?,
                         step,
                     },
                 )
@@ -935,6 +947,9 @@ fn cmd_tune(raw: &[String]) -> Result<(), String> {
             (xs, ys)
         }
     };
+    if train_x.is_empty() || train_x[0].is_empty() {
+        return Err("--data has no usable feature columns".into());
+    }
     let src = read_source(path)?;
     let base_ints = parse_kv_i64(a.all("int").into_iter())?;
 
@@ -957,10 +972,13 @@ fn cmd_tune(raw: &[String]) -> Result<(), String> {
                 }
             }
         }
+        // An infeasible shape (won't instantiate, won't lower, or needs more
+        // features than the data has) is a dead trial, not a fatal error: mark
+        // it and move on. A non-finite score records it as `Pruned`, which the
+        // sampler's history excludes — so the point isn't actively steered
+        // toward, though (unlike a completed low score) it may be re-proposed.
         let circuit = match instantiate(&src, name, &ints) {
             Ok(c) => c,
-            // A shape the template cannot build is a dead trial, not a fatal
-            // error — record it and let the sampler learn to avoid the region.
             Err(_) => {
                 study.tell(t.id, f64::NEG_INFINITY);
                 continue;
@@ -984,10 +1002,11 @@ fn cmd_tune(raw: &[String]) -> Result<(), String> {
             }
         };
         if want > train_x[0].len() {
-            return Err(format!(
-                "trial needs {want} features but --data has {} columns",
-                train_x[0].len()
-            ));
+            // Same class as an un-buildable shape: this trial's wire count
+            // needs more feature columns than --data carries. Skip it (dead
+            // trial) instead of aborting the whole study.
+            study.tell(t.id, f64::NEG_INFINITY);
+            continue;
         }
         let trial_x: Vec<Vec<f64>> = if want == train_x[0].len() {
             train_x.clone()
@@ -1002,25 +1021,57 @@ fn cmd_tune(raw: &[String]) -> Result<(), String> {
             train_x.iter().map(|r| r[..want].to_vec()).collect()
         };
 
-        let cfg = SupervisedConfig {
-            steps,
-            lr: t.float("lr").unwrap_or(0.1),
-            seed,
-            loss: match a.opt("loss") {
-                Some(s) => Loss::parse(s)?,
-                None => Loss::Bce,
-            },
-            optimizer: match t.cat("opt").or_else(|| t.cat("optimizer")) {
-                Some("adam") => Optimizer::adam(),
-                _ => Optimizer::Gd,
-            },
-            ..Default::default()
+        let loss = match a.opt("loss") {
+            Some(s) => Loss::parse(s)?,
+            None => Loss::Bce,
         };
-        let r = train_supervised(&circuit, &trial_x, &train_y, obs, &cfg, sel)?;
-        for (i, l) in r.loss_history.iter().enumerate() {
-            study.report(t.id, i, -l, &[]);
+        let use_adam = matches!(t.cat("opt").or_else(|| t.cat("optimizer")), Some("adam"));
+        let lr = t.float("lr").unwrap_or(0.1);
+
+        // Train in rungs so the pruner has intermediate values to judge and can
+        // stop a hopeless trial early. Each rung warm-starts from the previous
+        // rung's weights (`init_weights`), so the split reproduces one long run
+        // rather than N cold restarts. Without this the pruner is inert — a
+        // single full train exposes no rung to `should_prune`.
+        const RUNGS: usize = 5;
+        let n_rungs = steps.clamp(1, RUNGS);
+        let mut warm: Option<std::collections::HashMap<String, f64>> = None;
+        let mut last_auc = f64::NEG_INFINITY;
+        for rung in 0..n_rungs {
+            // Even split of `steps` across the rungs (remainder in the early
+            // rungs) so the total step budget is exactly `steps`.
+            let rung_steps = steps / n_rungs + usize::from(rung < steps % n_rungs);
+            if rung_steps == 0 {
+                continue;
+            }
+            let cfg = SupervisedConfig {
+                steps: rung_steps,
+                lr,
+                seed,
+                loss,
+                optimizer: if use_adam {
+                    Optimizer::adam()
+                } else {
+                    Optimizer::Gd
+                },
+                init_weights: warm.clone(),
+                ..Default::default()
+            };
+            let r = train_supervised(&circuit, &trial_x, &train_y, obs, &cfg, sel)?;
+            warm = Some(r.weights.clone());
+            last_auc = r.final_auc;
+            study.report(
+                t.id,
+                rung,
+                r.final_auc,
+                &[("final_loss".to_string(), r.final_loss)],
+            );
+            if study.should_prune(t.id) {
+                break;
+            }
         }
-        study.tell(t.id, r.final_auc);
+        // A pruned trial stays pruned — `tell` only finalizes a still-running one.
+        study.tell(t.id, last_auc);
     }
 
     let best = study.best().ok_or("no trial completed")?;
