@@ -11,11 +11,11 @@ pure-Rust runtime that needs no libtorch and is backed by Lean 4 correctness pro
 ![license](https://img.shields.io/badge/license-Apache--2.0-2ea043)
 ![language](https://img.shields.io/badge/language-pure%20Rust-de5833)
 ![runtime](https://img.shields.io/badge/runtime-no%20libtorch%20required-7c5cff)
-![examples](https://img.shields.io/badge/examples-42%2F43%20numerically%20verified-36c2ff)
+![examples](https://img.shields.io/badge/examples-43%2F44%20numerically%20verified-36c2ff)
 ![proofs](https://img.shields.io/badge/proofs-Lean%204%20%C2%B7%20sorry--free-22e0c8)
 ![backends](https://img.shields.io/badge/backends-CPU%20%C2%B7%20MPS%20%C2%B7%20CUDA%2FMetal%2FOpenCL%20%C2%B7%20tch-f59e0b)
 
-`APACHE-2.0` · `PURE RUST` · `NO LIBTORCH` · `LEAN 4 PROVEN` · `42/43 VERIFIED` · see [LICENSE](./LICENSE)
+`APACHE-2.0` · `PURE RUST` · `NO LIBTORCH` · `LEAN 4 PROVEN` · `43/44 VERIFIED` · see [LICENSE](./LICENSE)
 
 🔗 **https://github.com/Anzaetek/aria-quantum-language-oss-public**
 
@@ -100,6 +100,12 @@ $ aria export examples/aria/bell.aria --circuit Bell --qasm
 # VQE: recover the H2 ground-state energy (exact min = -1.851199).
 $ aria train examples/aria/vqe_ansatz.aria --circuit VQEAnsatz --int n_layers=2 \
       --observable "-0.4804*I0+0.3435*Z0+-0.4347*Z1+0.5716*Z0Z1+0.0910*X0X1+0.0910*Y0Y1"
+
+# Tune a template's meta-parameters — TPE proposes, a median pruner stops the
+# hopeless trials. Ints matching circuit params (n, L) recompile per trial.
+$ aria tune examples/aria/qml_tune.aria --circuit QmlTune --observable Z0 \
+      --space "n=4..8:2,L=1..2,lr=log:1e-2..3e-1" \
+      --data examples/data/optdigits_train.csv --trials 8 --steps 12 --seed 7
 ```
 
 ## Learn the language
@@ -125,6 +131,12 @@ and train parameters over a dataset:
 - **`aria train … --data X.csv --loss bce`** fits a labelled dataset;
   **`aria predict model.json --data X.csv`** scores one — see
   [`aria train --data`](docs/LIBRARY.md#saving-and-reloading-a-trained-model).
+- **[`aria-tune`](crates/aria-tune)** — a dependency-free ask/report/tell
+  optimiser (typed space · TPE/random/grid samplers · median, successive-halving
+  and gate pruners, all seeded so a study replays bit-for-bit). Drive it from
+  Rust, or from the CLI as **`aria tune … --space "n=4..8:2,lr=log:1e-3..3e-1"`**.
+  Pruning is real, not retrospective: trials train in warm-started chunks, so a
+  stopped one never pays for its remaining epochs.
 - **[`bindings/aria-py`](bindings/aria-py)** — opt-in Python bindings (pyo3):
   numpy expectations/gradients plus a PyTorch `AriaLayer` (`nn.Module`) and
   `autograd.Function`. Built with maturin; the default build stays pure Rust.
@@ -201,8 +213,8 @@ the quantum and classical results agree numerically. Two oracle kinds are used:
 a **classical** one where a closed-form algorithm gives the ground truth (DFT,
 SVD, max-cut, recovered bits/phase, …), and a **differential** one for
 parametrized circuits with no closed-form answer, where an independent pure-Rust
-statevector simulator reproduces the full `⟨Z_q⟩` profile. **42 of 43 examples
-are numerically verified** (the 43rd, `shor_ecdlp`, is a parse-only showcase) —
+statevector simulator reproduces the full `⟨Z_q⟩` profile. **43 of 44 examples
+are numerically verified** (the 44th, `shor_ecdlp`, is a parse-only showcase) —
 the full table is in [`VERIFICATION.md`](VERIFICATION.md), boundaries in
 [`LIMITATIONS.md`](LIMITATIONS.md).
 
