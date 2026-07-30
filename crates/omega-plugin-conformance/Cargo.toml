@@ -1,0 +1,17 @@
+[package]
+name = "omega-plugin-conformance"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Conformance test kit for omega backend plugins (cdylib)."
+
+[[bin]]
+name = "omega-plugin-conformance"
+path = "src/main.rs"
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+num-complex = { workspace = true }

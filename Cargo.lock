@@ -2673,6 +2673,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-plugin-conformance"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "omega-backend-statevector",
+ "omega-core",
+]
+
+[[package]]
 name = "omega-server"
 version = "0.1.0"
 dependencies = [
