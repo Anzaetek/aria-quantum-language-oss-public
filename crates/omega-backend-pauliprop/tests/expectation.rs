@@ -787,6 +787,7 @@ fn noise_per_qubit_depolarizing() {
         depolarizing: Depolarizing {
             one_q: omega_core::noise::Rate::PerQubit(vec![0.0, p]),
             two_q: omega_core::noise::Rate::Uniform(0.0),
+            ..Default::default()
         },
         ..Default::default()
     };

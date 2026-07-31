@@ -215,10 +215,8 @@ impl PauliPropBackend {
         if matches!(op.gate, GateKind::Measure | GateKind::Barrier) {
             return;
         }
-        let arity = op.qubits.len();
-        for qb in &op.qubits {
-            let q = qb.0 as usize;
-
+        let gate_qubits: Vec<usize> = op.qubits.iter().map(|q| q.0 as usize).collect();
+        for &q in &gate_qubits {
             // Amplitude damping γ (non-unital): X,Y → √(1−γ)·; Z → (1−γ)Z + γ·I.
             // Applied FIRST (see the ordering note above) so the spawned identity
             // term is not rescaled by the diagonal channels below.
@@ -228,7 +226,8 @@ impl PauliPropBackend {
             }
 
             // Depolarizing: identity untouched, any non-I Pauli → (1 − 4p/3).
-            let p = model.depolarizing.at(q, arity);
+            // A two-qubit gate's pair selects a per-pair rate when configured.
+            let p = model.depolarizing.at_gate(q, &gate_qubits);
             if p > 0.0 {
                 let lam = 1.0 - 4.0 * p / 3.0;
                 scale_by_local_pauli(sum, q, |x, z| if x || z { lam } else { 1.0 });

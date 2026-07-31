@@ -353,9 +353,10 @@ impl NoisyMpsBackend {
                 _ => {
                     apply_gate_mps(&mut mps, op, params)?;
                     if self.model.has_gate_channel() {
-                        let arity = op.qubits.len();
-                        for qb in &op.qubits {
-                            apply_mps_channel(&mut mps, &self.model, qb.0 as usize, arity, rng);
+                        let gate_qubits: Vec<usize> =
+                            op.qubits.iter().map(|q| q.0 as usize).collect();
+                        for &q in &gate_qubits {
+                            apply_mps_channel(&mut mps, &self.model, q, &gate_qubits, rng);
                         }
                     }
                 }
@@ -449,11 +450,12 @@ fn apply_mps_channel<R: Rng>(
     mps: &mut Mps,
     model: &NoiseModel,
     q: usize,
-    arity: usize,
+    gate_qubits: &[usize],
     rng: &mut R,
 ) {
     // Depolarizing: with prob p, a uniformly chosen X/Y/Z (unitary unravelling).
-    let p = model.depolarizing.at(q, arity);
+    // A two-qubit gate's pair selects a per-pair rate when one is configured.
+    let p = model.depolarizing.at_gate(q, gate_qubits);
     if p > 0.0 && rng.random::<f64>() < p {
         match (rng.random::<f64>() * 3.0) as u8 {
             0 => mps.apply_1q(q, &gates::x()),
