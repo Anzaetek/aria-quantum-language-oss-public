@@ -29,11 +29,11 @@ fn fmt_vec(v: &[f64]) -> String {
 
 /// Print the banner header common to every harness.
 pub fn header(name: &str, computes: &str, transport: &str) {
-    println!("\n═══════════════════════════════════════════════════════════════");
-    println!("  example : {name}");
-    println!("  COMPUTES: {computes}");
-    println!("  transport: {transport}");
-    println!("───────────────────────────────────────────────────────────────");
+    eprintln!("\n═══════════════════════════════════════════════════════════════");
+    eprintln!("  example : {name}");
+    eprintln!("  COMPUTES: {computes}");
+    eprintln!("  transport: {transport}");
+    eprintln!("───────────────────────────────────────────────────────────────");
 }
 
 /// Compare two equal-length real vectors elementwise; print and return verdict.
@@ -56,8 +56,8 @@ pub fn report_values(
         .map(|(q, c)| (q - c).abs())
         .fold(0.0_f64, f64::max);
     let pass = max_abs_diff <= tol;
-    println!("  QUANTUM   ({quantum_label}): {}", fmt_vec(quantum));
-    println!("  CLASSICAL ({classical_label}): {}", fmt_vec(classical));
+    eprintln!("  QUANTUM   ({quantum_label}): {}", fmt_vec(quantum));
+    eprintln!("  CLASSICAL ({classical_label}): {}", fmt_vec(classical));
     print_verdict(name, max_abs_diff, tol, pass)
 }
 
@@ -72,8 +72,8 @@ pub fn report_scalar(
 ) -> Verdict {
     let max_abs_diff = (quantum - classical).abs();
     let pass = max_abs_diff <= tol;
-    println!("  QUANTUM   ({quantum_label}): {quantum:+.10}");
-    println!("  CLASSICAL ({classical_label}): {classical:+.10}");
+    eprintln!("  QUANTUM   ({quantum_label}): {quantum:+.10}");
+    eprintln!("  CLASSICAL ({classical_label}): {classical:+.10}");
     print_verdict(name, max_abs_diff, tol, pass)
 }
 
@@ -87,11 +87,11 @@ pub fn report_exact_u64(
     width: usize,
 ) -> Verdict {
     let pass = quantum == classical;
-    println!(
+    eprintln!(
         "  QUANTUM   ({quantum_label}): {quantum:0width$b} (={quantum})",
         width = width
     );
-    println!(
+    eprintln!(
         "  CLASSICAL ({classical_label}): {classical:0width$b} (={classical})",
         width = width
     );
@@ -112,15 +112,15 @@ pub fn report_confusion(
 ) -> Verdict {
     let total = (tp + fn_ + fp + tn).max(1);
     let accuracy = (tp + tn) as f64 / total as f64;
-    println!("  QUANTUM   ({quantum_label}) vs CLASSICAL (ground-truth labels):");
-    println!("              pred +1   pred −1");
-    println!("  actual +1     {tp:>4}      {fn_:>4}");
-    println!("  actual −1     {fp:>4}      {tn:>4}");
-    println!("  accuracy = {accuracy:.4} ({}/{} correct)", tp + tn, total);
+    eprintln!("  QUANTUM   ({quantum_label}) vs CLASSICAL (ground-truth labels):");
+    eprintln!("              pred +1   pred −1");
+    eprintln!("  actual +1     {tp:>4}      {fn_:>4}");
+    eprintln!("  actual −1     {fp:>4}      {tn:>4}");
+    eprintln!("  accuracy = {accuracy:.4} ({}/{} correct)", tp + tn, total);
     let pass = accuracy >= min_accuracy;
     let tag = if pass { "PASS" } else { "FAIL" };
-    println!("  {tag} (accuracy ≥ {min_accuracy:.2})");
-    println!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  {tag} (accuracy ≥ {min_accuracy:.2})");
+    eprintln!("═══════════════════════════════════════════════════════════════");
     Verdict {
         name: name.to_string(),
         pass,
@@ -131,8 +131,8 @@ pub fn report_confusion(
 
 fn print_verdict(name: &str, max_abs_diff: f64, tol: f64, pass: bool) -> Verdict {
     let tag = if pass { "PASS" } else { "FAIL" };
-    println!("  Δmax = {max_abs_diff:.3e}   {tag} (tol {tol:.1e})");
-    println!("═══════════════════════════════════════════════════════════════");
+    eprintln!("  Δmax = {max_abs_diff:.3e}   {tag} (tol {tol:.1e})");
+    eprintln!("═══════════════════════════════════════════════════════════════");
     Verdict {
         name: name.to_string(),
         pass,

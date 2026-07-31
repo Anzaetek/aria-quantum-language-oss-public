@@ -122,7 +122,7 @@ fn grover3_remote(remote: &Remote) -> Result<Verdict, String> {
     let p_marked = prob_of(&counts, marked);
     let theta = (1.0 / 8.0_f64.sqrt()).asin();
     let p_analytic = ((2.0 * k + 1.0) * theta).sin().powi(2);
-    println!("  most-likely outcome = {amax} (marked = {marked})");
+    eprintln!("  most-likely outcome = {amax} (marked = {marked})");
     if amax != marked {
         return Err(format!("grover returned {amax}, want {marked}"));
     }
