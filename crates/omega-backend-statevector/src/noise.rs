@@ -18,17 +18,18 @@ use omega_core::noise::{NoiseModel, ReadoutError};
 use crate::gates;
 use crate::sim::apply_1q;
 
-/// Apply the full per-gate channel to qubit `q`, for a gate acting on `arity`
-/// qubits (the arity selects the 1q vs 2q depolarizing rate).
+/// Apply the full per-gate channel to qubit `q` of a gate acting on
+/// `gate_qubits` (the arity selects the 1q vs 2q depolarizing rate, and a
+/// two-qubit gate's pair selects a per-pair rate when one is configured).
 pub fn apply_channel<R: Rng>(
     model: &NoiseModel,
     state: &mut [Complex64],
     n: usize,
     q: usize,
-    arity: usize,
+    gate_qubits: &[usize],
     rng: &mut R,
 ) {
-    let depol = model.depolarizing.at(q, arity);
+    let depol = model.depolarizing.at_gate(q, gate_qubits);
     if depol > 0.0 {
         let r: f64 = rng.random();
         if r < depol {

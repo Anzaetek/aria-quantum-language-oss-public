@@ -20,11 +20,19 @@
 //!     "readout":[{"p10":0.02,"p01":0.03}, …]}`.
 //!   Each qubit and each gate arity gets its own error, and readout is
 //!   asymmetric (`p10 = P(read 1 | true 0)`, `p01 = P(read 0 | true 1)`).
+//!   The two-qubit depolarizing rate may also be given **per coupled pair**,
+//!   since a real device calibrates a distinct rate for every edge of its
+//!   coupling map rather than one rate per qubit:
+//!   `{"depolarizing":{"1q":[…],"2q":{"0,1":7.2e-3,"1,2":4.1e-3,"default":3e-3}}}`.
+//!   Keys are ordered qubit pairs `"i,j"`; a two-qubit gate on a pair absent
+//!   from the table (or when no table is given) uses the `"default"` /
+//!   per-qubit `2q` fallback.
 //!
 //! Both forms parse into the same struct, so a backend never has to know which
 //! regime it is running.
 
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Recognised top-level keys in a `--noise` object. Anything else is rejected
 /// by [`NoiseModel::from_json`] so a typo (e.g. `readout` vs `readout_flip`)
@@ -98,13 +106,29 @@ impl Rate {
     }
 }
 
+/// Per-pair two-qubit depolarizing rates, keyed by the ordered qubit pair
+/// `(min, max)`. A `BTreeMap` so `Debug`/equality stay order-stable.
+pub type PairRates = BTreeMap<(usize, usize), f64>;
+
 /// Depolarizing rate, split by gate arity so a two-qubit gate can carry a
 /// larger error than a one-qubit gate (as on real hardware). A bare number or
 /// array sets both arities equal.
+///
+/// Two-qubit gates may additionally carry a **per-pair** rate via
+/// [`two_q_pairs`](Self::two_q_pairs): a real device calibration gives a
+/// distinct two-qubit error for every coupled pair, not one rate per qubit. A
+/// gate whose pair is present there uses that rate; every other two-qubit gate
+/// falls back to [`two_q`](Self::two_q). Leaving `two_q_pairs` `None` (the
+/// default) reproduces the earlier per-qubit-only behaviour exactly.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Depolarizing {
     pub one_q: Rate,
     pub two_q: Rate,
+    /// Optional per-pair two-qubit rates, keyed by the ordered qubit pair
+    /// `(min, max)`. `None` means "no pair table" — every two-qubit gate uses
+    /// `two_q`. A `BTreeMap` (not `HashMap`) so `Debug`/equality are
+    /// order-stable.
+    pub two_q_pairs: Option<PairRates>,
 }
 
 impl Depolarizing {
@@ -113,11 +137,14 @@ impl Depolarizing {
         Depolarizing {
             one_q: Rate::Uniform(p),
             two_q: Rate::Uniform(p),
+            two_q_pairs: None,
         }
     }
 
     /// The depolarizing rate applied to a qubit touched by a gate acting on
-    /// `arity` qubits (1 → `one_q`, otherwise `two_q`).
+    /// `arity` qubits (1 → `one_q`, otherwise `two_q`). Pair-unaware — kept for
+    /// callers that only know the arity; prefer [`Self::at_gate`] on a
+    /// two-qubit gate so a per-pair rate is honoured.
     pub fn at(&self, q: usize, arity: usize) -> f64 {
         if arity <= 1 {
             self.one_q.at(q)
@@ -126,12 +153,39 @@ impl Depolarizing {
         }
     }
 
+    /// The depolarizing rate for qubit `q` of a gate acting on `qubits`.
+    ///
+    /// One-qubit gates use `one_q`. A two-qubit gate prefers the per-pair rate
+    /// for its ordered pair when one is configured, and otherwise falls back to
+    /// the per-qubit / scalar `two_q`. Gates of arity > 2 use `two_q` (there is
+    /// no higher-arity pair table). With no pair table this is identical to
+    /// [`Self::at`].
+    pub fn at_gate(&self, q: usize, qubits: &[usize]) -> f64 {
+        if qubits.len() <= 1 {
+            return self.one_q.at(q);
+        }
+        if qubits.len() == 2 {
+            if let Some(pairs) = &self.two_q_pairs {
+                let key = (qubits[0].min(qubits[1]), qubits[0].max(qubits[1]));
+                if let Some(&p) = pairs.get(&key) {
+                    return p;
+                }
+            }
+        }
+        self.two_q.at(q)
+    }
+
     pub fn is_zero(&self) -> bool {
-        self.one_q.is_zero() && self.two_q.is_zero()
+        self.one_q.is_zero()
+            && self.two_q.is_zero()
+            && self
+                .two_q_pairs
+                .as_ref()
+                .is_none_or(|m| m.values().all(|v| *v == 0.0))
     }
 
     fn from_json(v: &Value) -> Result<Depolarizing, String> {
-        // Object form: {"1q": rate, "2q": rate}. Scalar/array form: both equal.
+        // Object form: {"1q": rate, "2q": rate|pairs}. Scalar/array form: both equal.
         if let Some(obj) = v.as_object() {
             for k in obj.keys() {
                 if !matches!(k.as_str(), "1q" | "2q") {
@@ -145,20 +199,63 @@ impl Depolarizing {
                 .map(Rate::from_json)
                 .transpose()?
                 .unwrap_or_default();
-            let two_q = obj
+            let (two_q, two_q_pairs) = obj
                 .get("2q")
-                .map(Rate::from_json)
+                .map(parse_two_q)
                 .transpose()?
                 .unwrap_or_default();
-            Ok(Depolarizing { one_q, two_q })
+            Ok(Depolarizing {
+                one_q,
+                two_q,
+                two_q_pairs,
+            })
         } else {
             let r = Rate::from_json(v)?;
             Ok(Depolarizing {
                 one_q: r.clone(),
                 two_q: r,
+                two_q_pairs: None,
             })
         }
     }
+}
+
+/// Parse an ordered two-qubit pair key `"i,j"` into `(min, max)`.
+fn parse_pair_key(k: &str) -> Result<(usize, usize), String> {
+    let (a, b) = k
+        .split_once(',')
+        .ok_or_else(|| format!("depolarizing 2q pair key '{k}' must be \"i,j\""))?;
+    let parse = |s: &str| -> Result<usize, String> {
+        s.trim()
+            .parse::<usize>()
+            .map_err(|_| format!("depolarizing 2q pair key '{k}' has a bad qubit index"))
+    };
+    let (a, b) = (parse(a)?, parse(b)?);
+    Ok((a.min(b), a.max(b)))
+}
+
+/// Parse the `2q` value: a number or array is the per-qubit/scalar rate (no
+/// pair table); an object is a per-pair table whose keys are `"i,j"` pairs,
+/// with an optional `"default"` key giving the scalar/array fallback for pairs
+/// absent from the table.
+fn parse_two_q(v: &Value) -> Result<(Rate, Option<PairRates>), String> {
+    let Some(obj) = v.as_object() else {
+        return Ok((Rate::from_json(v)?, None));
+    };
+    let mut pairs = BTreeMap::new();
+    let mut default = Rate::default();
+    for (k, val) in obj {
+        if k == "default" {
+            default = Rate::from_json(val)?;
+            continue;
+        }
+        let key = parse_pair_key(k)?;
+        let rate = val
+            .as_f64()
+            .ok_or_else(|| format!("depolarizing 2q pair '{k}' must be a number"))?;
+        pairs.insert(key, rate);
+    }
+    Ok((default, (!pairs.is_empty()).then_some(pairs)))
 }
 
 /// Per-qubit Pauli channel: after each gate, apply X/Y/Z with the given
@@ -409,6 +506,45 @@ mod tests {
         let m2 = NoiseModel::from_json(r#"{"depolarizing":0.005}"#).unwrap();
         assert_eq!(m2.depolarizing.at(0, 1), 0.005);
         assert_eq!(m2.depolarizing.at(0, 2), 0.005);
+    }
+
+    #[test]
+    fn depolarizing_per_pair_two_qubit_rate() {
+        // A pair table selects the 2q rate by the pair the gate acts on, with a
+        // per-qubit/scalar `default` fallback for pairs absent from the table.
+        let m = NoiseModel::from_json(
+            r#"{"depolarizing":{"1q":1e-4,"2q":{"0,1":7.2e-3,"1,2":4.1e-3,"default":3e-3}}}"#,
+        )
+        .unwrap();
+        // 1q gates unaffected by the pair table.
+        assert_eq!(m.depolarizing.at_gate(0, &[0]), 1e-4);
+        // A configured pair returns its own rate, regardless of qubit order and
+        // for whichever qubit of the pair is being kicked.
+        assert_eq!(m.depolarizing.at_gate(0, &[0, 1]), 7.2e-3);
+        assert_eq!(m.depolarizing.at_gate(1, &[0, 1]), 7.2e-3);
+        assert_eq!(m.depolarizing.at_gate(2, &[2, 1]), 4.1e-3);
+        // An unlisted pair falls back to `default`.
+        assert_eq!(m.depolarizing.at_gate(0, &[0, 3]), 3e-3);
+        // Arity > 2 uses the scalar/per-qubit fallback, not the pair table.
+        assert_eq!(m.depolarizing.at_gate(0, &[0, 1, 2]), 3e-3);
+        assert!(m.has_gate_channel() && !m.noiseless());
+
+        // The plain pair-object form (no explicit default) fills absent pairs
+        // with 0.0, and back-compat: a spec with no pair table matches `at`.
+        let plain = NoiseModel::from_json(r#"{"depolarizing":{"2q":{"0,1":9e-3}}}"#).unwrap();
+        assert_eq!(plain.depolarizing.at_gate(0, &[0, 1]), 9e-3);
+        assert_eq!(plain.depolarizing.at_gate(0, &[5, 6]), 0.0);
+        let legacy = NoiseModel::from_json(r#"{"depolarizing":{"2q":0.012}}"#).unwrap();
+        assert!(legacy.depolarizing.two_q_pairs.is_none());
+        assert_eq!(
+            legacy.depolarizing.at_gate(3, &[3, 4]),
+            legacy.depolarizing.at(3, 2)
+        );
+
+        // Malformed pair keys / values fail loudly rather than coercing.
+        assert!(NoiseModel::from_json(r#"{"depolarizing":{"2q":{"0-1":1e-3}}}"#).is_err());
+        assert!(NoiseModel::from_json(r#"{"depolarizing":{"2q":{"0,x":1e-3}}}"#).is_err());
+        assert!(NoiseModel::from_json(r#"{"depolarizing":{"2q":{"0,1":"bad"}}}"#).is_err());
     }
 
     #[test]

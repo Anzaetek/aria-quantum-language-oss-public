@@ -307,14 +307,15 @@ impl NoisyStatevectorBackend {
                 _ => {
                     apply_gate(&mut state, n, op, params)?;
                     if !self.model.noiseless() {
-                        let arity = op.qubits.len();
-                        for &qubit in &op.qubits {
+                        let gate_qubits: Vec<usize> =
+                            op.qubits.iter().map(|q| q.0 as usize).collect();
+                        for &q in &gate_qubits {
                             crate::noise::apply_channel(
                                 &self.model,
                                 &mut state,
                                 n,
-                                qubit.0 as usize,
-                                arity,
+                                q,
+                                &gate_qubits,
                                 rng,
                             );
                         }
