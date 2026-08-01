@@ -212,7 +212,10 @@ if [ "${ARIA_CUDA:-0}" = "1" ]; then
   # (cargo test takes one positional filter, so run the two gates separately.)
   cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda_agrees_with_sim_on_qft
   cargo test -p aria-runtime --features cuda --test run_examples gpu_mps_cuda_agrees_with_sim
-  echo "  OK: CUDA GPU statevector + MPS(gesvdj) + pauliprop(branch) match CPU"
+  # RBS (Givens) statevector forward ≡ CPU (f32, tol 1e-5) AND the RBS adjoint
+  # gradient ≡ CPU adjoint (tol 1e-4). The `rbs` filter runs both gates.
+  cargo test -p aria-runtime --features cuda --test run_examples rbs
+  echo "  OK: CUDA GPU statevector + MPS(gesvdj) + pauliprop(branch) + RBS match CPU"
 else
   echo
   echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"
@@ -238,7 +241,10 @@ if [ "${ARIA_METAL:-0}" = "1" ]; then
   cargo test --release -p aria-runtime --features metal --test run_examples gpu_metal_agrees_with_sim_on_qft
   cargo test --release -p aria-runtime --features metal --test run_examples gpu_mps_metal_agrees_with_sim
   cargo test --release -p aria-runtime --features metal --test run_examples gpu_pauliprop_metal_agrees_with_sim
-  echo "  OK: Metal GPU statevector + MPS(θ-contraction) + pauliprop(branch) match CPU"
+  # RBS (Givens) statevector forward ≡ CPU (f32, tol 1e-6) AND the RBS adjoint
+  # gradient ≡ CPU adjoint (tol 1e-5). The `rbs` filter runs both gates.
+  cargo test --release -p aria-runtime --features metal --test run_examples rbs
+  echo "  OK: Metal GPU statevector + MPS(θ-contraction) + pauliprop(branch) + RBS match CPU"
 else
   echo
   echo "  (skipping Metal backends — set ARIA_METAL=1 on an Apple Silicon Mac to enable)"

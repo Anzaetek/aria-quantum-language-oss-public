@@ -571,6 +571,58 @@ impl CudaState {
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    pub fn apply_rbs(&mut self, qa: u32, qb: u32, theta: f64) -> Result<(), CudaError> {
+        // Reconfigurable Beam Splitter / Givens rotation: identity on
+        // {|00>, |11>}, a real 2x2 rotation on span{|01>, |10>}.
+        //
+        // `apply_2q`'s basis order swaps indices 1<->2 relative to the CPU
+        // `gates::rbs` builder (this is exactly the `perm_2q_to_cuda`
+        // permutation [0,2,1,3] the adjoint applies to CPU 2q matrices). RBS is
+        // sign-antisymmetric on the off-diagonal block, so under that swap
+        // `gates::rbs(theta)` becomes the block below — the +sin/-sin sit at
+        // [1][2]/[2][1] rather than the CPU [1][2]=-sin/[2][1]=+sin. Verified
+        // numerically against the CPU statevector by
+        // `gpu_cuda_agrees_with_sim_on_rbs`.
+        let z = Complex64::new(0.0, 0.0);
+        let o = Complex64::new(1.0, 0.0);
+        let cv = Complex64::new(theta.cos(), 0.0);
+        let sv = Complex64::new(theta.sin(), 0.0);
+        let nsv = Complex64::new(-theta.sin(), 0.0);
+        #[rustfmt::skip]
+        let u = [
+            o, z,   z,   z,
+            z, cv,  sv,  z,
+            z, nsv, cv,  z,
+            z, z,   z,   o,
+        ];
+        self.apply_2q(qa, qb, &u)
+    }
+
+    /// Reset qubit `q` to |0⟩, matching the CPU `apply_reset` semantics
+    /// exactly: fold each |1⟩ amplitude into its paired |0⟩ slot, zero the
+    /// |1⟩ slot, then renormalise the whole state.
+    ///
+    /// The fold `new0 = old0 + old1, new1 = 0` is the (non-unitary) 1-qubit
+    /// matvec `[[1,1],[0,0]]`; `apply_1q` applies arbitrary 2×2 matrices — the
+    /// same path the adjoint uses for non-unitary derivative gates — so no new
+    /// kernel is needed. The norm is `⟨ψ|I|ψ⟩` (identity Pauli masks
+    /// `(0, 0, 1)`), and a uniform `apply_diagonal(q, inv, inv)` rescales.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    pub fn apply_reset(&mut self, q: u32) -> Result<(), CudaError> {
+        let one = Complex64::new(1.0, 0.0);
+        let zero = Complex64::new(0.0, 0.0);
+        // Fold |1⟩ → |0⟩ (coherent add), zero |1⟩. Row-major [m00,m01,m10,m11].
+        self.apply_1q(q, &[one, one, zero, zero])?;
+        // norm² = ⟨ψ|I|ψ⟩ (f32 device reduction), then uniform rescale.
+        let norm_sq = self.pauli_expectation(0, 0, one)?.re;
+        if norm_sq > 0.0 {
+            let inv = Complex64::new(1.0 / norm_sq.sqrt(), 0.0);
+            self.apply_diagonal(q, inv, inv)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_crz(&mut self, qc: u32, qt: u32, theta: f64) -> Result<(), CudaError> {
         let z = Complex64::new(0.0, 0.0);
         let o = Complex64::new(1.0, 0.0);
@@ -678,21 +730,17 @@ impl Backend for CudaStatevectorBackend {
         let n = circuit.num_qubits;
         let mut state = self.allocate(n)?;
 
-        // Mid-circuit measurement, reset, etc. aren't supported on
-        // GPU — refuse so the CLI dispatcher can fall back to CPU.
+        // Reset is handled in-sequence by `apply_ops_fused` (deterministic
+        // fold + renormalise, matching the CPU backend). Mid-circuit
+        // measurement with collapse still isn't supported on GPU — refuse so
+        // the CLI dispatcher can fall back to CPU.
         for op in &circuit.ops {
-            match &op.gate {
-                GateKind::Reset => {
-                    return Err(OmegaError::Unsupported(
-                        "cuda: Reset is non-unitary; not yet implemented".into(),
-                    ));
-                }
-                GateKind::Measure if config.mid_circuit_mode == MidCircuitMode::Collapse => {
+            if let GateKind::Measure = &op.gate {
+                if config.mid_circuit_mode == MidCircuitMode::Collapse {
                     return Err(OmegaError::Unsupported(
                         "cuda: mid-circuit measurement not yet implemented".into(),
                     ));
                 }
-                _ => {}
             }
         }
 
@@ -745,13 +793,7 @@ impl Backend for CudaStatevectorBackend {
     ) -> OmegaResult<f64> {
         let n = circuit.num_qubits;
         let mut psi = self.allocate(n)?;
-        for op in &circuit.ops {
-            if matches!(&op.gate, GateKind::Reset) {
-                return Err(OmegaError::Unsupported(
-                    "cuda expectation: Reset not supported".into(),
-                ));
-            }
-        }
+        // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
         apply_ops_fused(&mut psi, &circuit.ops, params, |op| {
             matches!(&op.gate, GateKind::Measure)
         })?;
@@ -790,13 +832,7 @@ impl Backend for CudaStatevectorBackend {
 
         let n = circuit.num_qubits;
         let mut psi = self.allocate(n)?;
-        for op in &circuit.ops {
-            if matches!(&op.gate, GateKind::Reset) {
-                return Err(OmegaError::Unsupported(
-                    "cuda expectation_multi: Reset not supported".into(),
-                ));
-            }
-        }
+        // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
         apply_ops_fused(&mut psi, &circuit.ops, params, |op| {
             matches!(&op.gate, GateKind::Measure)
         })?;
@@ -821,6 +857,16 @@ impl Backend for CudaStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        // Circuits with Reset are non-unitary — no adjoint. Decline (Ok(None))
+        // so the runtime falls back to parameter-shift, which runs the
+        // (now reset-capable) forward `expectation`. Mirrors the CPU backend.
+        if circuit
+            .ops
+            .iter()
+            .any(|op| matches!(op.gate, GateKind::Reset))
+        {
+            return Ok(None);
+        }
         adjoint::adjoint_gradient(&self.handle, circuit, params, observable)
     }
 
@@ -1094,6 +1140,7 @@ pub(crate) fn apply_op(
         GateKind::Swap => state.apply_swap(q0(), q1()),
         GateKind::CRz => state.apply_crz(q0(), q1(), resolved[0]),
         GateKind::CU3 => state.apply_cu3(q0(), q1(), resolved[0], resolved[1], resolved[2]),
+        GateKind::Rbs => state.apply_rbs(q0(), q1(), resolved[0]),
 
         GateKind::CCX => state.apply_ccx(q0(), q1(), op.qubits[2].0),
         GateKind::CSwap => state.apply_cswap(q0(), q1(), op.qubits[2].0),
@@ -1105,10 +1152,7 @@ pub(crate) fn apply_op(
             )));
         }
 
-        GateKind::PhaseShifter
-        | GateKind::BeamSplitterRx
-        | GateKind::Rbs
-        | GateKind::Custom(_) => {
+        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "cuda-statevector: gate {:?} is not supported on this backend",
                 op.gate
@@ -1186,6 +1230,17 @@ where
             continue;
         }
         if matches!(&op.gate, GateKind::Id | GateKind::Barrier) {
+            continue;
+        }
+        // Reset is non-unitary and full-state: flush any fused diagonals
+        // first, then apply it in sequence. Kept out of `apply_op` (whose
+        // Reset arm stays a "filtered upstream" guard) so the adjoint dagger
+        // path never silently treats it as unitary.
+        if matches!(&op.gate, GateKind::Reset) {
+            flush_pending(state, &mut pending)?;
+            state
+                .apply_reset(op.qubits[0].0)
+                .map_err(OmegaError::from)?;
             continue;
         }
         match diagonal_factor(op, params)? {
@@ -1604,6 +1659,55 @@ mod tests {
         for ((sa, ga), (sb, gb)) in grad.iter().zip(grad_ref.iter()) {
             assert_eq!(sa, sb);
             assert!((ga - gb).abs() < 1e-6, "grad {sa}: {ga} vs {gb}");
+        }
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    #[test]
+    fn reset_matches_cpu() {
+        // Mid-circuit Reset on the GPU must reproduce the CPU backend's
+        // deterministic fold-and-renormalise semantics. Reset a qubit out of an
+        // entangled, non-|0⟩ state (Bell + RY), then keep computing so a wrong
+        // reset would propagate into the final amplitudes. f32 tolerance 1e-5.
+        use omega_backend_statevector::StatevectorBackend;
+        use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
+
+        let push = |c: &mut CircuitIR, gate, qubits: &[u32], params: &[f64]| {
+            c.ops.push(GateOp {
+                gate,
+                qubits: qubits.iter().map(|&q| Qubit(q)).collect(),
+                params: params.iter().map(|&p| ParamExpr::Concrete(p)).collect(),
+                classical_bit: None,
+                condition: None,
+            });
+        };
+        let mut circuit = CircuitIR::new(2, CircuitType::GateBased);
+        push(&mut circuit, GateKind::H, &[0], &[]);
+        push(&mut circuit, GateKind::CX, &[0, 1], &[]);
+        push(&mut circuit, GateKind::Ry, &[1], &[0.7]);
+        push(&mut circuit, GateKind::Reset, &[0], &[]);
+        push(&mut circuit, GateKind::H, &[1], &[]);
+
+        let params = ParameterBinding::new();
+        let cfg = ExecConfig {
+            shots: None,
+            ..ExecConfig::default()
+        };
+        let cpu = StatevectorBackend::new();
+        let cuda = CudaStatevectorBackend::new().expect("cuda");
+        let cpu_res = cpu.execute(&circuit, &params, &cfg).expect("cpu execute");
+        let cuda_res = cuda.execute(&circuit, &params, &cfg).expect("cuda execute");
+        match (cpu_res, cuda_res) {
+            (ExecResult::Statevector(a), ExecResult::Statevector(b)) => {
+                assert_eq!(a.len(), b.len());
+                let max = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (x - y).norm())
+                    .fold(0.0f64, f64::max);
+                assert!(max < 1e-5, "max amp diff {max}");
+            }
+            _ => panic!("expected statevectors"),
         }
     }
 

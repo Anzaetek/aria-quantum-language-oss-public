@@ -268,6 +268,8 @@ fn apply_op_dagger(
             op.qubits[1].0,
             &perm_2q_to_cuda(&gates::cu3(resolved[0], resolved[1], resolved[2])),
         ),
+        // RBS(θ)† = RBS(−θ) (real orthogonal Givens rotation).
+        GateKind::Rbs => state.apply_rbs(q0, op.qubits[1].0, -resolved[0]),
 
         GateKind::CCX => state.apply_ccx(q0, op.qubits[1].0, op.qubits[2].0),
         GateKind::CSwap => state.apply_cswap(q0, op.qubits[1].0, op.qubits[2].0),
@@ -276,7 +278,6 @@ fn apply_op_dagger(
         | GateKind::Measure
         | GateKind::PhaseShifter
         | GateKind::BeamSplitterRx
-        | GateKind::Rbs
         | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "cuda adjoint dagger: unsupported gate {:?}",
@@ -334,6 +335,13 @@ fn apply_op_derivative(
             q0,
             op.qubits[1].0,
             &perm_2q_to_cuda(&gates::dcu3_dl(resolved[0], resolved[1], resolved[2])),
+        ),
+        // dRBS/dθ: same [0,2,1,3] basis permutation as the other CPU 2q
+        // derivative matrices (matches the forward `apply_rbs` convention).
+        (GateKind::Rbs, 0) => state.apply_2q(
+            q0,
+            op.qubits[1].0,
+            &perm_2q_to_cuda(&gates::drbs(resolved[0])),
         ),
         _ => {
             return Err(OmegaError::Unsupported(format!(

@@ -765,6 +765,50 @@ impl MetalState {
         self.apply_2q(qa, qb, &u)
     }
 
+    /// RBS(θ) / Givens rotation on `(qa, qb)`: identity on {|00⟩, |11⟩}, a real
+    /// 2×2 rotation on span{|01⟩, |10⟩}.
+    ///
+    /// Metal's `apply_2q` shares CUDA's basis order (identical `apply_cx`
+    /// matrices), which swaps indices 1↔2 relative to the CPU `gates::rbs`
+    /// builder. RBS is sign-antisymmetric on the off-diagonal block, so the
+    /// +sin/−sin land at [1][2]/[2][1] — byte-for-byte the CUDA `apply_rbs`
+    /// matrix. The f32 result tracks the CPU f64 amplitudes to ~1e-6.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn apply_rbs(&self, qa: u32, qb: u32, theta: f64) -> Result<(), MetalError> {
+        let z = Complex64::new(0.0, 0.0);
+        let o = Complex64::new(1.0, 0.0);
+        let cv = Complex64::new(theta.cos(), 0.0);
+        let sv = Complex64::new(theta.sin(), 0.0);
+        let nsv = Complex64::new(-theta.sin(), 0.0);
+        #[rustfmt::skip]
+        let u = [
+            o, z,   z,   z,
+            z, cv,  sv,  z,
+            z, nsv, cv,  z,
+            z, z,   z,   o,
+        ];
+        self.apply_2q(qa, qb, &u)
+    }
+
+    /// Reset qubit `q` to |0⟩, matching the CPU `apply_reset` and the CUDA
+    /// `apply_reset` exactly: fold each |1⟩ amplitude into its paired |0⟩ slot
+    /// (`new0 = old0 + old1, new1 = 0` — the non-unitary 1q matvec
+    /// `[[1,1],[0,0]]`, applied via `apply_1q` like the adjoint's derivative
+    /// gates), zero the |1⟩ slot, then renormalise by `⟨ψ|I|ψ⟩` (identity
+    /// masks `(0,0,1)`) via a uniform `apply_diagonal`.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn apply_reset(&self, q: u32) -> Result<(), MetalError> {
+        let one = Complex64::new(1.0, 0.0);
+        let zero = Complex64::new(0.0, 0.0);
+        self.apply_1q(q, &[one, one, zero, zero])?;
+        let norm_sq = self.pauli_expectation(0, 0, one)?.re;
+        if norm_sq > 0.0 {
+            let inv = Complex64::new(1.0 / norm_sq.sqrt(), 0.0);
+            self.apply_diagonal(q, inv, inv)?;
+        }
+        Ok(())
+    }
+
     /// CRz(θ) with control = `qc`, target = `qt`.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn apply_crz(&self, qc: u32, qt: u32, theta: f64) -> Result<(), MetalError> {
@@ -894,26 +938,19 @@ impl Backend for MetalStatevectorBackend {
         let n = circuit.num_qubits;
         let state = self.lease(n)?;
 
-        // Mid-circuit measurement, reset, CCX, and CSwap aren't on the
-        // GPU yet (steps 8 / 9). Refuse circuits that need them so the
-        // CLI dispatcher can fall back to the CPU backend deterministically.
+        // Reset is applied in-sequence by `apply_ops_fused` (deterministic
+        // fold + renormalise, matching the CPU backend). Mid-circuit
+        // measurement with collapse isn't on the GPU yet — refuse so the CLI
+        // dispatcher can fall back to the CPU backend deterministically. (CCX
+        // and CSwap are decomposed into 1q+2q kernels by `apply_op`.)
         for op in &circuit.ops {
-            match &op.gate {
-                GateKind::Reset => {
-                    return Err(OmegaError::Unsupported(
-                        "metal: Reset is non-unitary; not yet implemented (Phase 1 step 8)".into(),
-                    ));
-                }
-                GateKind::Measure if config.mid_circuit_mode == MidCircuitMode::Collapse => {
+            if let GateKind::Measure = &op.gate {
+                if config.mid_circuit_mode == MidCircuitMode::Collapse {
                     return Err(OmegaError::Unsupported(
                         "metal: mid-circuit measurement not yet implemented (Phase 1 step 8)"
                             .into(),
                     ));
                 }
-                // CCX and CSwap are decomposed into 1q+2q kernel calls
-                // by `apply_op`; no special-case rejection needed any
-                // longer.
-                _ => {}
             }
         }
 
@@ -993,14 +1030,7 @@ impl Backend for MetalStatevectorBackend {
         // instead of ~300, plus we skip the per-term state clone.
         let n = circuit.num_qubits;
         let psi = self.lease(n)?;
-        // Reject Reset upfront so the fusion walker doesn't see it.
-        for op in &circuit.ops {
-            if matches!(&op.gate, GateKind::Reset) {
-                return Err(OmegaError::Unsupported(
-                    "metal expectation: Reset not supported".into(),
-                ));
-            }
-        }
+        // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
         // Forward sweep with diagonal-gate fusion (consecutive Z / S /
         // Sdg / T / Tdg / Rz / U1 collapse into one
         // `apply_diagonal_product` dispatch). Measure ops are silently
@@ -1051,13 +1081,7 @@ impl Backend for MetalStatevectorBackend {
 
         let n = circuit.num_qubits;
         let psi = self.lease(n)?;
-        for op in &circuit.ops {
-            if matches!(&op.gate, GateKind::Reset) {
-                return Err(OmegaError::Unsupported(
-                    "metal expectation_multi: Reset not supported".into(),
-                ));
-            }
-        }
+        // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
         apply_ops_fused(&psi, &circuit.ops, params, |op| {
             matches!(&op.gate, GateKind::Measure)
         })?;
@@ -1082,6 +1106,16 @@ impl Backend for MetalStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        // Circuits with Reset are non-unitary — no adjoint. Decline (Ok(None))
+        // so the runtime falls back to parameter-shift over the (now
+        // reset-capable) forward `expectation`. Mirrors the CPU/CUDA backends.
+        if circuit
+            .ops
+            .iter()
+            .any(|op| matches!(op.gate, GateKind::Reset))
+        {
+            return Ok(None);
+        }
         adjoint::adjoint_gradient(self, circuit, params, observable)
     }
 
@@ -1243,6 +1277,7 @@ pub(crate) fn apply_op(
         GateKind::Swap => state.apply_swap(q0(), q1()),
         GateKind::CRz => state.apply_crz(q0(), q1(), resolved[0]),
         GateKind::CU3 => state.apply_cu3(q0(), q1(), resolved[0], resolved[1], resolved[2]),
+        GateKind::Rbs => state.apply_rbs(q0(), q1(), resolved[0]),
 
         // Three-qubit gates — decomposed via existing 1q+2q kernels.
         GateKind::CCX => state.apply_ccx(q0(), q1(), op.qubits[2].0),
@@ -1257,12 +1292,9 @@ pub(crate) fn apply_op(
             )));
         }
 
-        // Photonic / RBS / custom — no native Metal kernel; the CPU
-        // statevector backend handles these (RBS decomposes to H·CZ·Ry·CZ·H).
-        GateKind::PhaseShifter
-        | GateKind::BeamSplitterRx
-        | GateKind::Rbs
-        | GateKind::Custom(_) => {
+        // Photonic / custom — no native Metal kernel; the CPU statevector
+        // backend handles these. (RBS now runs natively via `apply_rbs`.)
+        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "metal-statevector: gate {:?} is not supported on this backend",
                 op.gate
@@ -1395,6 +1427,20 @@ where
             // dispatch (common after compiler-inserted barriers between
             // optimisation passes).
             if matches!(&op.gate, GateKind::Id | GateKind::Barrier) {
+                continue;
+            }
+            // Reset is non-unitary and full-state: flush fused diagonals, then
+            // apply it in sequence. `apply_reset`'s `pauli_expectation` calls
+            // `end_batch_if_open` (committing the just-flushed dispatches before
+            // it reads the norm), so the open batch is drained correctly;
+            // reopen one so subsequent gates keep batching. Kept out of
+            // `apply_op` so the adjoint dagger never treats Reset as unitary.
+            if matches!(&op.gate, GateKind::Reset) {
+                flush(state, &mut pending)?;
+                state
+                    .apply_reset(op.qubits[0].0)
+                    .map_err(OmegaError::from)?;
+                state.inner.begin_batch();
                 continue;
             }
             match diagonal_factor(op, params)? {
