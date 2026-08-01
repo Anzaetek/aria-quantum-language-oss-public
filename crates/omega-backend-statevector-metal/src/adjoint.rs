@@ -336,18 +336,19 @@ fn apply_op_dagger(state: &MetalState, op: &GateOp, params: &ParameterBinding) -
             op.qubits[1].0,
             &perm_2q_to_metal(&gates::cu3(resolved[0], resolved[1], resolved[2])),
         ),
+        // RBS(θ)† = RBS(−θ) (real orthogonal Givens rotation).
+        GateKind::Rbs => state.apply_rbs(q0, op.qubits[1].0, -resolved[0]),
 
         // 3q involutions — applying CCX / CSwap again undoes them.
         GateKind::CCX => state.apply_ccx(q0, op.qubits[1].0, op.qubits[2].0),
         GateKind::CSwap => state.apply_cswap(q0, op.qubits[1].0, op.qubits[2].0),
 
-        // Reset / Measure / photonic / RBS / Custom rejected upstream (no
-        // native Metal kernel; the CPU statevector backend handles these).
+        // Reset / Measure / photonic / Custom rejected upstream (no native
+        // Metal kernel; the CPU statevector backend handles these).
         GateKind::Reset
         | GateKind::Measure
         | GateKind::PhaseShifter
         | GateKind::BeamSplitterRx
-        | GateKind::Rbs
         | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "metal adjoint dagger: unsupported gate {:?}",
@@ -410,7 +411,11 @@ fn apply_op_derivative_into(
         // the legacy copy_into + in-place path for CU3 / CRz. CRz's
         // dCRz is the round-9b apply_diagonal_2q fast-path; CU3
         // takes apply_2q. Both still in-place.
-        (GateKind::CRz, 0) | (GateKind::CU3, 0) | (GateKind::CU3, 1) | (GateKind::CU3, 2) => {
+        (GateKind::CRz, 0)
+        | (GateKind::CU3, 0)
+        | (GateKind::CU3, 1)
+        | (GateKind::CU3, 2)
+        | (GateKind::Rbs, 0) => {
             // Slow path: copy then in-place. Caller is responsible
             // for the memcpy here so this branch stays a single
             // function call.
@@ -483,6 +488,13 @@ fn apply_op_derivative(
             q0,
             op.qubits[1].0,
             &perm_2q_to_metal(&gates::dcu3_dl(resolved[0], resolved[1], resolved[2])),
+        ),
+        // dRBS/dθ — same [0,2,1,3] perm as the other CPU 2q derivative
+        // matrices (matches the forward `apply_rbs` convention).
+        (GateKind::Rbs, 0) => state.apply_2q(
+            q0,
+            op.qubits[1].0,
+            &perm_2q_to_metal(&gates::drbs(resolved[0])),
         ),
         _ => {
             return Err(OmegaError::Unsupported(format!(

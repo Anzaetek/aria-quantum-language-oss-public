@@ -288,6 +288,51 @@ fn gpu_cuda_agrees_with_sim_on_qft() {
     }
 }
 
+/// Asymmetric RBS probe: an entangling H/RY prelude then RBS on adjacent
+/// (0,1),(1,2) and non-adjacent (0,2) pairs. The RBS off-diagonal block is
+/// sign-antisymmetric — `RBS(θ)` and `RBS(−θ)` differ only in the sign of the
+/// |01⟩↔|10⟩ coupling — so an amplitude match against the CPU pins the GPU
+/// gate's sign convention AND qubit order, not just its magnitude.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const RBS_PROBE_SRC: &str = "circuit RbsProbe() {\n\
+    qreg q[3]\n\
+    apply H on q[0]\n\
+    apply RY(0.9) on q[1]\n\
+    apply RBS(0.7) on q[0], q[1]\n\
+    apply RBS(1.3) on q[1], q[2]\n\
+    apply RY(0.4) on q[2]\n\
+    apply RBS(2.1) on q[0], q[2]\n\
+}\n";
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_cuda_agrees_with_sim_on_rbs() {
+    // RBS was previously refused on the CUDA statevector backend; it now runs
+    // the Givens rotation on span{|01>,|10>} via the generic 2q apply, matching
+    // the CPU f64 amplitudes to f32 round-off.
+    let c = inline(RBS_PROBE_SRC, "RbsProbe");
+    let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
+    let gpu = statevector(&c, &no_binds(), BackendSel::Gpu).unwrap();
+    assert_eq!(cpu.len(), gpu.len());
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).norm() < 1e-5, "amp[{i}]: sim {a} vs gpu {b}");
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn gpu_metal_agrees_with_sim_on_rbs() {
+    // Metal mirror of `gpu_cuda_agrees_with_sim_on_rbs` — RBS now runs on the
+    // Metal statevector backend (f32) and must reproduce the CPU amplitudes.
+    let c = inline(RBS_PROBE_SRC, "RbsProbe");
+    let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
+    let gpu = statevector(&c, &no_binds(), BackendSel::Gpu).unwrap();
+    assert_eq!(cpu.len(), gpu.len());
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        assert!((a - b).norm() < 1e-6, "amp[{i}]: sim {a} vs gpu {b}");
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn gpu_mps_cuda_agrees_with_sim() {
@@ -453,6 +498,67 @@ fn expectation_with_gradient_matches_analytic_derivative() {
     let err =
         expectation_with_gradient(&c, "Z0", &bad, SIM, GradMethod::Adjoint, None).unwrap_err();
     assert!(err.contains("unknown symbol 'nope'"), "got: {err}");
+}
+
+/// Symbolic RBS circuit for GPU adjoint-gradient parity. `X` first lifts the
+/// weight-0 vacuum into span{|01>,|10>} so the Hamming-weight-preserving RBS
+/// actually rotates it; a trailing RY gives a second non-trivial partial.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const RBS_GRAD_SRC: &str = "circuit RbsGrad() {\n\
+    qreg q[2]\n\
+    let t = symbolic[2]\n\
+    apply X on q[0]\n\
+    apply RBS(t[0]) on q[0], q[1]\n\
+    apply RY(t[1]) on q[1]\n\
+}\n";
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_cuda_rbs_gradient_agrees_with_sim() {
+    // The CUDA adjoint now differentiates RBS (dRBS/dθ via the shared
+    // perm_2q_to_cuda(drbs) path); value AND both partials must match the CPU
+    // adjoint to f32 round-off.
+    use aria_runtime::{expectation_with_gradient, GradMethod};
+    let c = inline(RBS_GRAD_SRC, "RbsGrad");
+    let binds: HashMap<String, f64> = [("t_0".to_string(), 0.6), ("t_1".to_string(), 0.9)].into();
+    let (vc, gc) =
+        expectation_with_gradient(&c, "Z1", &binds, SIM, GradMethod::Adjoint, None).unwrap();
+    let (vg, gg) =
+        expectation_with_gradient(&c, "Z1", &binds, BackendSel::Gpu, GradMethod::Adjoint, None)
+            .unwrap();
+    assert!((vc - vg).abs() < 1e-4, "value: sim {vc} vs gpu {vg}");
+    for name in ["t_0", "t_1"] {
+        assert!(
+            (gc[name] - gg[name]).abs() < 1e-4,
+            "∂/∂{name}: sim {} vs gpu {}",
+            gc[name],
+            gg[name]
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn gpu_metal_rbs_gradient_agrees_with_sim() {
+    // Metal mirror: dRBS/dθ via perm_2q_to_metal(drbs) through the in-place
+    // (copy_into) derivative path. Value and both partials match the CPU adjoint.
+    use aria_runtime::{expectation_with_gradient, GradMethod};
+    let c = inline(RBS_GRAD_SRC, "RbsGrad");
+    let binds: HashMap<String, f64> = [("t_0".to_string(), 0.6), ("t_1".to_string(), 0.9)].into();
+    let (vc, gc) =
+        expectation_with_gradient(&c, "Z1", &binds, SIM, GradMethod::Adjoint, None).unwrap();
+    let (vg, gg) =
+        expectation_with_gradient(&c, "Z1", &binds, BackendSel::Gpu, GradMethod::Adjoint, None)
+            .unwrap();
+    assert!((vc - vg).abs() < 1e-5, "value: sim {vc} vs gpu {vg}");
+    for name in ["t_0", "t_1"] {
+        assert!(
+            (gc[name] - gg[name]).abs() < 1e-5,
+            "∂/∂{name}: sim {} vs gpu {}",
+            gc[name],
+            gg[name]
+        );
+    }
 }
 
 #[cfg(feature = "tch")]
