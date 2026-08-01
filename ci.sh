@@ -255,6 +255,32 @@ else
   echo "  (skipping Metal backends — set ARIA_METAL=1 on an Apple Silicon Mac to enable)"
 fi
 
+# Optional: OpenCL GPU statevector backend (opt-in; needs an OpenCL ICD and a
+# device — Apple's OpenCL.framework, the Intel/AMD/NVIDIA runtimes, or POCL).
+# Mirrors the ARIA_CUDA / ARIA_METAL stages: the OpenCL path is optional with a
+# CPU fallback, so the default CI stays green on hosts with no ICD. Set
+# ARIA_OPENCL=1 to assert the OpenCL kernels numerically match CPU.
+if [ "${ARIA_OPENCL:-0}" = "1" ]; then
+  step "+   Optional: OpenCL GPU statevector backend"
+  # Full OpenCL suite: the per-kernel smokes (apply_1q / apply_diagonal /
+  # apply_diagonal_product / inner_product), buffer-pool semantics, shot-
+  # sampling TVD, the adjoint-vs-CPU gradient parity, and pauli_expectation —
+  # including `pauli_expectation_matches_host_on_random_14q`, whose X·Y·Z
+  # string has an ODD Y count and so pins the (-i)^|Y| prefactor in
+  # `pauli_masks`. That gate is why this stage exists: the odd-Y sign bug was
+  # fixed in all three GPU backends, but OpenCL had no CI stage to prove it.
+  #
+  # ARIA_OPENCL_REQUIRE_DEVICE=1 turns the crate's "no device → silently
+  # return" test guard into a hard failure (tests/device_present.rs). Without
+  # it this stage would report OK on a host where not one kernel ever ran.
+  ARIA_OPENCL_REQUIRE_DEVICE=1 \
+    cargo test -p omega-backend-statevector-opencl --features opencl
+  echo "  OK: OpenCL statevector kernels + adjoint + pauli(odd-Y) match CPU"
+else
+  echo
+  echo "  (skipping OpenCL backend — set ARIA_OPENCL=1 on a host with an OpenCL ICD to enable)"
+fi
+
 # Optional: Lean 4 proof tree (opt-in; needs a warm mathlib cache via elan/lake).
 # Makes `aria export --lean` self-contained and ships the proven circulant
 # correspondence + noise-deviation theorems.

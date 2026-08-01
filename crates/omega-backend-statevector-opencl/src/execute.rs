@@ -219,7 +219,12 @@ fn apply_op(state: &mut StateBuffer, op: &GateOp, params: &ParameterBinding) -> 
         GateKind::Reset => Err(OmegaError::Unsupported(
             "opencl: Reset is non-unitary; should have been filtered before apply_op".into(),
         )),
-        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
+        // Photonic / RBS / custom — no OpenCL kernel. RBS runs natively on the
+        // CUDA and Metal statevector backends, but not here; per LIMITATIONS.md
+        // this backend surfaces a clean "unsupported gate" error so the CLI
+        // dispatcher falls back to the CPU statevector backend (which supports
+        // RBS and its Givens parameter-shift rule).
+        GateKind::Rbs | GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
             Err(OmegaError::Unsupported(format!(
                 "opencl-statevector: gate {:?} is not supported on this backend",
                 op.gate
@@ -356,8 +361,11 @@ fn run_to_state_buffer(
 /// * `sign_mask` has bit `q` set if qubit `q` carries Y or Z (each
 ///   contributes `(-1)^bit_q(i)` to the phase). The kernel uses
 ///   `(-1)^popcount(i & sign_mask)`.
-/// * `y_factor = i^{|Y|}` — the global Y-count prefactor folded in
-///   inside the kernel before the reduction sums.
+/// * `y_factor = (-i)^{|Y|}` — the global Y-count prefactor folded in
+///   inside the kernel before the reduction sums. It is `(-i)`, not
+///   `(+i)`, per Y: the kernel forms the matrix element `P[i, i^x]`,
+///   which for a Y qubit is `(-i)·(-1)^bit_i` (`Y|0⟩ = i|1⟩`,
+///   `Y|1⟩ = -i|0⟩`), and the `(-1)^bit` half is in `sign_mask`.
 ///
 /// I qubits are no-ops. Direct port of Metal's `pauli_masks`.
 pub fn pauli_masks(pauli_string: &[(u32, PauliOp)]) -> (u32, u32, Complex64) {

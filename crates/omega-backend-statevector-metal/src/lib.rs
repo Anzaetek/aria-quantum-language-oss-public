@@ -1021,7 +1021,7 @@ impl Backend for MetalStatevectorBackend {
         // GPU-side expectation: run forward, get |ψ⟩ resident on GPU,
         // then evaluate each Pauli term in *one* fused kernel
         // (`pauli_expectation`) that computes `⟨ψ|P|ψ⟩` directly
-        // from the masks (x/y/z bits + i^{|Y|} prefactor) without
+        // from the masks (x/y/z bits + (-i)^{|Y|} prefactor) without
         // cloning the state or stepping σ kernels per qubit.
         //
         // Cuts per-term host-syncs from ~3 (state-clone + N σ-applies
@@ -1469,8 +1469,11 @@ where
 /// * `sign_mask` has bit `q` set if qubit `q` carries Y or Z (each
 ///   contributes `(-1)^bit_q(i)` to the phase). The kernel uses
 ///   `(-1)^popcount(i & sign_mask)` per index.
-/// * `y_factor = i^{|Y|}` — the global Y-count prefactor folded in
-///   inside the kernel before the reduction.
+/// * `y_factor = (-i)^{|Y|}` — the global Y-count prefactor folded in
+///   inside the kernel before the reduction. It is `(-i)`, not `(+i)`,
+///   per Y: the kernel forms the matrix element `P[i, i^x]`, which for
+///   a Y qubit is `(-i)·(-1)^bit_i` (`Y|0⟩ = i|1⟩`, `Y|1⟩ = -i|0⟩`),
+///   and the `(-1)^bit` half is already carried by `sign_mask`.
 ///
 /// I qubits are no-ops and contribute to none of the three.
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -1547,7 +1550,16 @@ fn cpu_pauli_expectation(
                 }
             }
         }
-        acc += state[i].conj() * phase * state[j];
+        // P|i⟩ = phase·|j⟩, so the contribution to ⟨ψ|P|ψ⟩ is
+        // conj(ψ[j])·phase·ψ[i] — the `bit`-keyed phase is a KET-side
+        // coefficient and belongs with ψ[i], not ψ[j]. Pairing it as
+        // conj(ψ[i])·phase·ψ[j] instead silently negates every string with
+        // an odd number of Y factors (Y's two matrix elements have opposite
+        // signs; X and Z are symmetric, so they are unaffected). This
+        // oracle carried that error and so agreed with the old `i^|Y|`
+        // kernel — two sign bugs cancelling. Matches the production CPU
+        // `sim::expectation_pauli` and its `tests/pauli_y_expectation.rs`.
+        acc += state[j].conj() * phase * state[i];
     }
     // ⟨ψ|P|ψ⟩ for Hermitian P is real; tiny imag is round-off.
     acc.re
@@ -3159,21 +3171,27 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
-    fn backend_rejects_reset_with_unsupported() {
+    fn backend_rejects_collapse_measurement_with_unsupported() {
+        // The CLI dispatcher falls back to the CPU statevector backend on
+        // `Unsupported`, so what this backend refuses is load-bearing. Reset
+        // is no longer refused — it runs the deterministic fold-and-
+        // renormalise (see `reset_matches_cpu`) — but mid-circuit measurement
+        // WITH COLLAPSE still has no GPU implementation and must keep failing
+        // loudly rather than silently returning an uncollapsed state.
         use omega_core::circuit::{CircuitIR, CircuitType, GateOp, Qubit};
         let mut circuit = CircuitIR::new(1, CircuitType::GateBased);
         circuit.ops.push(GateOp {
-            gate: GateKind::Reset,
+            gate: GateKind::Measure,
             qubits: smallvec::smallvec![Qubit(0)],
             params: smallvec::smallvec![],
             condition: None,
-            classical_bit: None,
+            classical_bit: Some(0),
         });
         let pb = ParameterBinding::new();
         let cfg = ExecConfig {
             shots: None,
             seed: None,
-            mid_circuit_mode: MidCircuitMode::Skip,
+            mid_circuit_mode: MidCircuitMode::Collapse,
         };
         let backend = new_backend();
         let res = backend.execute(&circuit, &pb, &cfg);

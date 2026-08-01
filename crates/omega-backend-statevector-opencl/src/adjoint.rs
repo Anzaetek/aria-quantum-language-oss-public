@@ -314,9 +314,12 @@ fn apply_op_dagger(
             )));
         }
 
-        // Photonic / custom / non-unitary rejected upstream
+        // Photonic / RBS / custom / non-unitary rejected upstream. (RBS has a
+        // GPU adjoint on CUDA and Metal but no OpenCL kernel — see the
+        // matching arm in `execute::apply_op`.)
         GateKind::Reset
         | GateKind::Measure
+        | GateKind::Rbs
         | GateKind::PhaseShifter
         | GateKind::BeamSplitterRx
         | GateKind::Custom(_) => {

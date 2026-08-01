@@ -10,10 +10,13 @@
 //              where sign_mask = y_mask | z_mask
 //              (Y contributes (-1)^bit at the source qubit; Z does the same)
 //   contrib  = conj(ψ[i]) * sign(i) * ψ[j]
-//   total    = i^{|Y|} * Σ_i contrib(i)
+//   total    = (-i)^{|Y|} * Σ_i contrib(i)
 //
-// The i^{|Y|} prefactor is folded into `y_factor` host-side: 1+0i,
-// 0+1i, -1+0i, or 0-1i for |Y| mod 4 = 0, 1, 2, 3 respectively.
+// The prefactor is (-i)^{|Y|}, NOT i^{|Y|}: `contrib` uses the matrix
+// element P[i,j], and for a Y qubit that is (-i)·(-1)^bit_i (Y|0⟩ =
+// i|1⟩, Y|1⟩ = -i|0⟩) — the (-1)^bit part is already in `sign_mask`,
+// leaving (-i) per Y. It is folded into `y_factor` host-side: 1+0i,
+// 0-1i, -1+0i, or 0+1i for |Y| mod 4 = 0, 1, 2, 3 respectively.
 // Folded in here so the per-thread complex multiply costs are kept
 // in-kernel rather than added as a host pass.
 //
@@ -52,7 +55,7 @@ kernel void pauli_expectation(
     if ((popcount(sign_bits) & 1u) != 0u) {
         contrib = -contrib;
     }
-    // Apply the global i^{|Y|} prefactor inside the kernel so the
+    // Apply the global (-i)^{|Y|} prefactor inside the kernel so the
     // reduction sums the final amplitude directly.
     contrib = cmul(contrib, y_factor);
     scratch[tid] = contrib;
