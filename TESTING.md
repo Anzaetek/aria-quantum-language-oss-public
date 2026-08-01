@@ -135,13 +135,19 @@ $ $ARIA export examples/aria/qft.aria --circuit QFT --int n=3 --json | python3 -
 
 Check: QASM contains exactly one `cx q[0], q[1];`; QFT(n=3) JSON has 7 instructions.
 
-## 9. Metal GPU backends agree with CPU (Apple Silicon; opt-in `ARIA_METAL=1`)
+## 9. Metal GPU backends agree with CPU (Apple Silicon; **on by default**)
 
 On an Apple Silicon Mac, three GPU paths are numerically gated against the CPU —
-the same three the CUDA arm wires (§9a). All are optional and fall back to the
-CPU when the feature is off, the host isn't macOS, or no device is present, so
-`./ci.sh` stays green off-Mac; set `ARIA_METAL=1 ./ci.sh` to run them, or invoke
-directly (this is the exact command list the `ARIA_METAL=1` stage runs):
+the same three the CUDA arm wires (§9a). **`./ci.sh` runs this stage
+automatically on macOS**: every Apple Silicon Mac has a GPU, so there is nothing
+to opt into. Off-Mac the stage is skipped (there is no Metal to test), so the
+default CI stays green everywhere. `ARIA_METAL=0 ./ci.sh` forces it off.
+
+This default is not cosmetic: the RBS/Reset work landed verified on a CUDA box
+with the Metal mirrors deferred, and shipped with two failing Metal tests
+precisely because no contributor's default `./ci.sh` ran them.
+
+The stage runs exactly this command list:
 
 ```console
 $ cargo test --release -p omega-backend-pauliprop-metal --features metal
@@ -233,13 +239,17 @@ Metal (Apple Silicon) wires all three arms too — statevector, the MPS two-site
 `ARIA_METAL=1` (§9). The one piece deferred on Metal is on-GPU Jacobi SVD, which
 Apple's lack of native f64 rules out (see `GPU_BACKEND_PLAN.md`).
 
-### 9b. OpenCL GPU statevector agrees with CPU (cross-vendor; opt-in `ARIA_OPENCL=1`)
+### 9b. OpenCL GPU statevector agrees with CPU (cross-vendor; on by default on macOS)
 
 The OpenCL statevector backend is the cross-vendor arm (Apple's
 `OpenCL.framework`, the Intel/AMD/NVIDIA runtimes, or POCL). Only the
 statevector is wired — there is no OpenCL MPS or pauliprop arm — and RBS,
 photonic, and 3q gates surface a clean *"unsupported gate"* error so the CLI
-falls back to CPU. Set `ARIA_OPENCL=1 ./ci.sh` to run it, or invoke directly:
+falls back to CPU.
+
+**On macOS this stage runs by default** (Apple ships `OpenCL.framework`).
+Elsewhere it is opt-in with `ARIA_OPENCL=1`, since a Linux/Windows host may have
+no ICD installed. `ARIA_OPENCL=0` forces it off. Invoke directly with:
 
 ```console
 $ ARIA_OPENCL_REQUIRE_DEVICE=1 cargo test -p omega-backend-statevector-opencl --features opencl
@@ -335,9 +345,20 @@ $ $aria run examples/aria/bell.aria --circuit Bell --backend remote \
 Check: only `|00>`/`|11>` appear, each probability in `[0.45, 0.55]` — the same
 physics as the local `sim` backend, executed over HTTP.
 
-## 11. libtorch (tch) backend trains VQE (tol ≤ 1e-3)
+## 11. libtorch (tch) backend trains VQE (tol ≤ 1e-3; **on by default**)
 
-Needs `LIBTORCH` (libtorch 2.7.0, see `INSTALL_LIBTORCH.md`). Do **not** set
+`./ci.sh` runs this stage automatically and **fetches libtorch itself** if it
+isn't already configured — it resolves `$LIBTORCH`, then `./tch-env.sh`, then
+falls back to `tools/setup-libtorch.sh`, which downloads the pinned 2.7.0 CPU
+dist (~67 MB, one-time per machine; the script is idempotent and reuses an
+existing install). Auto-download covers macOS arm64 and Linux x86_64; on other
+platforms the stage prints a SKIP with the manual steps rather than failing.
+`ARIA_TCH=0 ./ci.sh` skips it.
+
+To drive it by hand, see `INSTALL_LIBTORCH.md`. Two requirements are easy to
+miss and the CI stage applies both: the Apple-clang ≥ 21 workaround (libtorch
+2.7 specializes `std::is_arithmetic`, which newer libc++ forbids), and
+`--test-threads=1` (`tch` uses a process-global RNG). Do **not** set
 `LIBTORCH_USE_PYTORCH` — any value makes `torch-sys` look for a pip `torch`:
 
 ```console

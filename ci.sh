@@ -207,14 +207,63 @@ else
   trap - EXIT
 fi
 
-# Optional: libtorch backend, only when LIBTORCH is configured.
-if [ -n "${LIBTORCH:-}" ]; then
-  step "+   Optional: libtorch (tch) backend"
-  cargo test -p aria-runtime --features tch --test run_examples tch_backend
+# libtorch (tch) backend — ON by default. If libtorch isn't configured this
+# stage FETCHES it rather than telling you to go install it: the pinned CPU dist
+# is one download away and tools/setup-libtorch.sh already knows how.
+# Resolution order:
+#   1. an existing $LIBTORCH
+#   2. ./tch-env.sh (written by a previous setup run)
+#   3. tools/setup-libtorch.sh --no-verify (downloads ~67 MB, idempotent — it
+#      reuses an existing install, so this is a one-time cost per machine)
+# `ARIA_TCH=0 ./ci.sh` skips the stage.
+if [ "${ARIA_TCH:-1}" = "1" ]; then
+  step "+   libtorch (tch) backend"
+  if [ -z "${LIBTORCH:-}" ] && [ -f ./tch-env.sh ]; then
+    # shellcheck disable=SC1091
+    . ./tch-env.sh
+  fi
+  if [ -z "${LIBTORCH:-}" ] || [ ! -f "${LIBTORCH}/build-version" ]; then
+    echo "  libtorch not configured — fetching the pinned CPU dist..."
+    if tools/setup-libtorch.sh --no-verify; then
+      # shellcheck disable=SC1091
+      . ./tch-env.sh
+    else
+      echo "  SKIP: could not install libtorch automatically on this platform."
+      echo "        Grab the 2.7.0 CPU dist per INSTALL_LIBTORCH.md and re-run"
+      echo "        with LIBTORCH=/path/to/libtorch."
+    fi
+  fi
+  if [ -n "${LIBTORCH:-}" ] && [ -f "${LIBTORCH}/build-version" ]; then
+    # Apple clang >= 21 rejects libtorch 2.7's std::is_arithmetic specialization
+    # (c10/util/strong_type.h); demote it or torch-sys will not compile.
+    export CXXFLAGS="${CXXFLAGS:--std=gnu++17 -Wno-invalid-specialization -Wno-error=invalid-specialization}"
+    # Any value of LIBTORCH_USE_PYTORCH makes torch-sys hunt for a pip torch.
+    unset LIBTORCH_USE_PYTORCH || true
+    # tch uses a process-global RNG, so the backend tests run single-threaded.
+    cargo test -p aria-runtime --features tch --test run_examples tch_backend \
+      -- --test-threads=1
+    echo "  OK: tch statevector matches CPU (libtorch $(cat "$LIBTORCH/build-version"))"
+  fi
 else
   echo
-  echo "  (skipping tch backend — set LIBTORCH to enable; see INSTALL_LIBTORCH.md)"
+  echo "  (skipping tch backend — ARIA_TCH=0)"
 fi
+
+# --- Mac GPU stages default ON -----------------------------------------------
+# Every Apple Silicon Mac has a GPU, so on macOS there is nothing to opt into:
+# `ARIA_METAL` and `ARIA_OPENCL` default to 1 and the stages just run. The
+# reason is concrete — the Metal RBS/Reset work landed verified on a CUDA box
+# with the Metal mirrors "deferred to the Mac box" (GPU_BACKEND_PLAN.md) and
+# shipped with two failing Metal tests, because no Mac contributor's default
+# `./ci.sh` ever ran them. Now it does.
+#
+# `ARIA_METAL=0 ./ci.sh` (or `ARIA_OPENCL=0`) still forces a stage off.
+case "$(uname -s)" in
+  Darwin)
+    : "${ARIA_METAL:=1}"
+    : "${ARIA_OPENCL:=1}"
+    ;;
+esac
 
 # Optional: CUDA GPU backends (opt-in; needs an NVIDIA GPU + CUDA toolkit).
 # GPU paths are always optional with a CPU fallback, so the default CI above
@@ -251,11 +300,6 @@ else
   echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"
 fi
 
-# Optional: Metal GPU backends (opt-in; needs an Apple Silicon Mac). Mirrors the
-# ARIA_CUDA stage: GPU paths are always optional with a CPU fallback, so the
-# default CI above stays green off-Mac. Set ARIA_METAL=1 on a Mac to assert the
-# GPU statevector / MPS-θ-contraction / pauliprop-branch paths numerically match
-# CPU. Uses --release: the Metal QML/statevector suites are slow in a debug build.
 # Opt-in Qiskit differential cross-check. Independent implementation, so
 # agreement is evidence rather than a shared convention. Needs a venv with
 # qiskit (never system Python) — see tools/qiskit_xcheck/README.md.
@@ -274,6 +318,11 @@ if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
     fi
 fi
 
+# Metal GPU backends. Default ON on macOS (see the Mac block above), skipped
+# elsewhere — off-Mac there is no Metal to test, so the default CI stays green.
+# Asserts the GPU statevector / MPS-θ-contraction / pauliprop-branch / RBS paths
+# numerically match CPU. Uses --release: the Metal QML/statevector suites are
+# slow in a debug build.
 if [ "${ARIA_METAL:-0}" = "1" ]; then
   step "+   Optional: Metal GPU backends"
   # PauliProp GPU branch: integer symplectic on the GPU, f64 coefficients on the
@@ -295,18 +344,17 @@ if [ "${ARIA_METAL:-0}" = "1" ]; then
   echo "  OK: Metal GPU statevector + MPS(θ-contraction) + pauliprop(branch) + RBS match CPU"
 else
   echo
-  echo "  (skipping Metal backends — set ARIA_METAL=1 on an Apple Silicon Mac to enable)"
+  echo "  (skipping Metal backends — not macOS; on a Mac this runs by default)"
 fi
 
-# Optional: OpenCL GPU statevector backend (opt-in; needs an OpenCL ICD and a
-# device — Apple's OpenCL.framework, the Intel/AMD/NVIDIA runtimes, or POCL).
-# Mirrors the ARIA_CUDA / ARIA_METAL stages: the OpenCL path is optional with a
-# CPU fallback, so the default CI stays green on hosts with no ICD. Set
-# ARIA_OPENCL=1 to assert the OpenCL kernels numerically match CPU.
+# OpenCL GPU statevector backend. Default ON on macOS (Apple ships
+# OpenCL.framework, so there is nothing to opt into — see the Mac block above);
+# elsewhere opt-in via ARIA_OPENCL=1, since a Linux/Windows host may have no ICD
+# and no device. Asserts the OpenCL kernels numerically match CPU.
 #
-# Linking also needs the ICD *loader* dev symlink `libOpenCL.so` (not just the
-# runtime `libOpenCL.so.1`): `cl-sys` emits `-lOpenCL`, which the linker can
-# only resolve against the `.so`. Most hosts get it from `ocl-icd-opencl-dev`.
+# Off-Mac, linking also needs the ICD *loader* dev symlink `libOpenCL.so` (not
+# just the runtime `libOpenCL.so.1`): `cl-sys` emits `-lOpenCL`, which the linker
+# can only resolve against the `.so`. Most hosts get it from `ocl-icd-opencl-dev`.
 # A CUDA-only box (nvidia.icd present, no ocl-icd-opencl-dev) has the loader at
 # $CUDA/targets/<arch>/lib/libOpenCL.so but not on the default link path — point
 # the linker at it, e.g.:
@@ -329,7 +377,7 @@ if [ "${ARIA_OPENCL:-0}" = "1" ]; then
   echo "  OK: OpenCL statevector kernels + adjoint + pauli(odd-Y) match CPU"
 else
   echo
-  echo "  (skipping OpenCL backend — set ARIA_OPENCL=1 on a host with an OpenCL ICD to enable)"
+  echo "  (skipping OpenCL backend — set ARIA_OPENCL=1 on a host with an OpenCL ICD; on a Mac this runs by default)"
 fi
 
 # Optional: Lean 4 proof tree (opt-in; needs a warm mathlib cache via elan/lake).

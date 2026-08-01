@@ -3,9 +3,10 @@
 The `tch` backend (`--features tch`, `--backend tch`) links **libtorch**, the
 C++ runtime behind PyTorch, via the [`tch`](https://crates.io/crates/tch) crate.
 It is an **optional accelerator** — the default Aria training path is pure Rust
-and needs none of this (`cargo build`, `cargo test`, and `./ci.sh` all pass with
-no libtorch installed). Install libtorch only if you want to exercise
-`--backend tch`.
+and needs none of this (`cargo build` and `cargo test` pass with no libtorch
+installed). You do not have to follow this file to run CI: `./ci.sh` fetches
+libtorch on its own (see the bottom of this page). Read on only if you want to
+install it by hand or something went wrong.
 
 ## Quick start (macOS arm64)
 
@@ -98,6 +99,11 @@ $ cargo run -p aria-cli --features tch -- train examples/aria/vqe_ansatz.aria \
 #   final   <O>: -1.851199...   (exact H₂ ground state -1.851199, ±1e-3)
 ```
 
-`./ci.sh` runs the numeric gate automatically when `LIBTORCH` is set, and skips
-it (with a pointer to this file) otherwise. See `TESTING.md` §11 for the same
-steps in the manual testing manual.
+`./ci.sh` runs the numeric gate **by default** and installs libtorch itself if
+you haven't: it resolves `$LIBTORCH`, then `./tch-env.sh`, then falls back to
+`tools/setup-libtorch.sh`, which downloads the pinned CPU dist (macOS arm64 and
+Linux x86_64 are auto-detected; other platforms print a SKIP with these manual
+steps rather than failing the run). So none of the above is a prerequisite for
+`./ci.sh` — it is the manual path. `ARIA_TCH=0 ./ci.sh` skips the stage.
+
+See `TESTING.md` §11 for the same steps in the manual testing manual.
