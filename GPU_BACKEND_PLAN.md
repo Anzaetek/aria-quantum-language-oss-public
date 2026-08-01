@@ -13,6 +13,47 @@
 > symplectic work on the GPU, f64 coefficients on the CPU → **exact**, ≤1e-9).
 > An `ARIA_METAL=1 ./ci.sh` stage mirrors `ARIA_CUDA=1`. Only M4 re-verification
 > and the deferred on-GPU SVD remain (see below).
+>
+> **Status (2026-08-01): Linux CI fix + `RBS` GPU statevector parity.** Two
+> follow-ups on the CUDA box:
+> 1. **Linux `ci.sh` fix** — step 6/9 (`aria tune` smoke) used `mktemp -t
+>    aria_tune_data`, which is BSD-only; GNU coreutils needs ≥3 trailing `X`s, so
+>    the default CI aborted on Linux. Switched to the portable
+>    `mktemp "${TMPDIR:-/tmp}/aria_tune_data.XXXXXX"` form. Default `./ci.sh` now
+>    green end-to-end on Linux (all 9 stages) and `ARIA_CUDA=1 ./ci.sh` green.
+> 2. **`RBS` now runs on the CUDA + Metal statevector backends** (it was refused
+>    on both, despite CPU/MPS support). Forward: the Givens rotation on
+>    span{|01⟩,|10⟩} via the generic 2q apply; the RBS matrix is the CPU
+>    `gates::rbs` under the backends' `perm_2q_to_{cuda,metal}` basis swap
+>    ([0,2,1,3]) — RBS is sign-antisymmetric so the naïve matrix gives RBS(−θ);
+>    fixed. Gradient: `dRBS/dθ` wired into both GPU adjoints via
+>    `perm_2q_to_{cuda,metal}(drbs)` + dagger `RBS(θ)†=RBS(−θ)`. New CI gates
+>    `gpu_cuda_agrees_with_sim_on_rbs` (≤1e-5) and
+>    `gpu_cuda_rbs_gradient_agrees_with_sim` (≤1e-4) pass on-hardware; the Metal
+>    mirrors are wired into the `ARIA_METAL=1` stage (deferred to the Mac box).
+> 3. **Mid-circuit `Reset` now runs on the CUDA + Metal statevector backends.**
+>    The CPU backend's *deterministic, non-selective* reset (fold each |1⟩
+>    amplitude into its |0⟩ partner, zero |1⟩, renormalise) composes from
+>    existing primitives with no new kernel: the fold is the non-unitary 1q
+>    matvec `[[1,1],[0,0]]` via `apply_1q`, the norm is `⟨ψ|I|ψ⟩` via
+>    `pauli_expectation`, and the rescale is a uniform `apply_diagonal`.
+>    `apply_ops_fused` applies it in-sequence (the Metal path relies on
+>    `pauli_expectation`'s `end_batch_if_open` to drain the open command batch
+>    before the norm readback). Forward `execute` / `expectation` /
+>    `expectation_multi` now accept reset; `adjoint_gradient` returns `Ok(None)`
+>    for reset circuits so the runtime uses parameter-shift (matching CPU), so
+>    reset + gradient works too. New CI gate `reset_matches_cpu` (CUDA, ≤1e-5,
+>    on-hardware; Metal mirror in the `ARIA_METAL=1` suite). Still GPU-refused:
+>    mid-circuit *measurement* with collapse, and photonic gates — CPU-only.
+> 4. **Pre-existing odd-Y `pauli_expectation` bug fixed (CUDA + Metal + OpenCL).**
+>    Surfaced by wiring the statevector-CUDA suite into CI: the fused Pauli
+>    expectation kernel forms `conj(ψ[i])·ψ[i^x]·phase`, so `phase` must be the
+>    matrix element `P[i,i^x]`; for a Y qubit that is `(-i)·(-1)^bit_i`, i.e. the
+>    global prefactor is `(-i)^|Y|`, but the host folded `i^|Y|` — silently
+>    negating every observable term with an ODD number of Y factors. Fixed the
+>    `y_factor` table in all three GPU backends (`pauli_masks`); verified on CUDA
+>    by `expectation_matches_cpu_pauli_string` (was off by ~0.5, now ≤1e-5) and
+>    added a Metal mirror. The full statevector-CUDA suite is now CI-gated.
 
 > Active dev repo: **`aria-quantum-language-oss-public`** (per the README banner,
 > all future dev lands here). Rules from `CLAUDE.md` apply: local CI is the
