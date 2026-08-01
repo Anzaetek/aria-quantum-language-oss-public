@@ -11,10 +11,13 @@
 //   sign(i)  = (-1)^popcount(i & sign_mask)
 //              where sign_mask = y_mask | z_mask
 //   contrib  = conj(ψ[i]) · sign(i) · ψ[j]
-//   total    = i^{|Y|} · Σ_i contrib(i)
+//   total    = (-i)^{|Y|} · Σ_i contrib(i)
 //
-// The i^{|Y|} prefactor is folded into `y_factor` host-side: 1+0i,
-// 0+1i, -1+0i, 0-1i for |Y| mod 4 = 0, 1, 2, 3. Doing it in-kernel
+// The prefactor is (-i)^{|Y|}, NOT i^{|Y|}: `contrib` uses the matrix
+// element P[i,j], and for a Y qubit that is (-i)·(-1)^bit_i (Y|0⟩ =
+// i|1⟩, Y|1⟩ = -i|0⟩) — the (-1)^bit part is already in `sign_mask`,
+// leaving (-i) per Y. It is folded into `y_factor` host-side: 1+0i,
+// 0-1i, -1+0i, 0+1i for |Y| mod 4 = 0, 1, 2, 3. Doing it in-kernel
 // keeps the reduction one-pass.
 //
 // All masks live in `uint` because MAX_QUBITS = 28 (dim ≤ 2^28).

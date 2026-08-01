@@ -9,10 +9,13 @@
 //   j        = i XOR x_mask
 //   sign(i)  = (-1)^popcount(i & sign_mask)   sign_mask = y_mask | z_mask
 //   contrib  = conj(ψ[i]) * sign(i) * ψ[j]
-//   total    = i^{|Y|} * Σ_i contrib(i)
+//   total    = (-i)^{|Y|} * Σ_i contrib(i)
 //
-// `y_factor = i^{|Y|}` is folded by the host before dispatch. Masks are
-// u32 because MAX_QUBITS = 28 (dim ≤ 2^28).
+// `y_factor = (-i)^{|Y|}` — NOT i^{|Y|} — is folded by the host before
+// dispatch: `contrib` uses the matrix element P[i,j], and for a Y qubit
+// that is (-i)·(-1)^bit_i (Y|0⟩ = i|1⟩, Y|1⟩ = -i|0⟩), with the
+// (-1)^bit part already carried by `sign_mask`. Masks are u32 because
+// MAX_QUBITS = 28 (dim ≤ 2^28).
 
 extern "C" {
 

@@ -1038,7 +1038,7 @@ impl StateBuffer {
     /// dispatch. Skips the previous "clone state → apply σ → inner
     /// product" trio: per-thread, conj(ψ[i]) · sign · ψ[i XOR x_mask]
     /// with `sign = (-1)^popcount(i & sign_mask)`, then a global
-    /// `i^{|Y|}` prefactor folded in via `y_factor`.
+    /// `(-i)^{|Y|}` prefactor folded in via `y_factor`.
     ///
     /// `x_mask`, `sign_mask`, and `y_factor` are computed by the
     /// caller (see `lib.rs::expectation` and `lib.rs::pauli_masks`).

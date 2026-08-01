@@ -77,7 +77,14 @@ fn host_pauli(sv: &[Complex64], pauli_string: &[(u32, PauliOp)]) -> Complex64 {
                 }
             }
         }
-        result += sv[i].conj() * coeff * sv[j];
+        // P|i⟩ = coeff·|j⟩, so the contribution to ⟨ψ|P|ψ⟩ is
+        // conj(ψ[j])·coeff·ψ[i] — the `bit`-keyed coeff is a KET-side
+        // coefficient and belongs with ψ[i], not ψ[j]. Pairing it as
+        // conj(ψ[i])·coeff·ψ[j] instead silently negates every string with
+        // an odd number of Y factors (Y's two matrix elements have opposite
+        // signs; X and Z are symmetric, so they are unaffected). Matches the
+        // production CPU `sim::expectation_pauli`.
+        result += sv[j].conj() * coeff * sv[i];
     }
     result
 }
@@ -136,7 +143,9 @@ fn pauli_y_on_plus_state_is_zero() {
     // ⟨+|Y|+⟩ = 0: Y mixes |0⟩↔|1⟩ with imaginary phases that average
     // out on the real-amplitude |+⟩. Pins the y_factor + sign_mask
     // path together — `pauli_masks` builds (x_mask=1, sign_mask=1,
-    // y_factor=i) for a single Y on q0.
+    // y_factor=-i) for a single Y on q0. Note the expected value is 0,
+    // so this case cannot see the SIGN of y_factor; the odd-Y sign is
+    // pinned by `pauli_expectation_matches_host_on_random_14q` below.
     let backend = match OpenClStatevectorBackend::new() {
         Ok(b) => b,
         Err(_) => return,
