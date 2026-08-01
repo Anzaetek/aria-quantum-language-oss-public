@@ -59,7 +59,7 @@ esac
 
 # `aria tune` smoke: a seeded TPE study over the fixed qml_tune template must
 # beat chance on the synthetic set and dump one CSV row per trial.
-TUNE_DATA=$(mktemp -t aria_tune_data)
+TUNE_DATA=$(mktemp "${TMPDIR:-/tmp}/aria_tune_data.XXXXXX")
 python3 - "$TUNE_DATA" <<'PYEOF'
 import sys
 st = 20260729
@@ -77,7 +77,7 @@ with open(sys.argv[1], "w") as f:
         s = sum(a * b for a, b in zip(r, w))
         f.write(",".join(f"{v:.6f}" for v in r + [1.0 if s >= 0 else 0.0]) + "\n")
 PYEOF
-TUNE_CSV=$(mktemp -t aria_tune_csv)
+TUNE_CSV=$(mktemp "${TMPDIR:-/tmp}/aria_tune_csv.XXXXXX")
 TUNE_OUT=$("$ARIA" tune examples/aria/qml_tune.aria --circuit QmlTune \
   --observable Z0 --data "$TUNE_DATA" \
   --space "n=4..8:2,L=1..3,lr=log:1e-3..3e-1,opt=gd|adam" \
