@@ -288,7 +288,7 @@ classical oracle. Run the whole suite:
 # Build the wasm guests once, then:
 $ cargo run -p aria-verify -- all
 ...
-  31/31 passed
+  49/49 passed
 ```
 
 See [`VERIFICATION.md`](VERIFICATION.md) for the per-example oracle table, and

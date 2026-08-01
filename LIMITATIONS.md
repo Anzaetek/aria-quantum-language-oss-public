@@ -35,10 +35,12 @@ end-to-end implementation, and which deeper features are deferred.
   both forward runs and adjoint gradients of butterfly / unary QML circuits are
   numerically gated against the CPU f64 path (`gpu_cuda_agrees_with_sim_on_rbs`
   / `gpu_cuda_rbs_gradient_agrees_with_sim` and their Metal mirrors). The
-  OpenCL statevector backend, the Clifford `pauli` backend, and the optional
-  `tch` plugin still dispatch it to their wildcard arm and surface a clean
-  *"unsupported gate"* error at runtime; QASM 2.0 export decomposes it exactly,
-  so exported circuits run anywhere.
+  OpenCL statevector backend refuses it explicitly (in both `execute` and the
+  adjoint dagger), and the Clifford `pauli` backend and the optional `tch`
+  plugin dispatch it to their wildcard arm; all three surface a clean
+  *"unsupported gate"* error at runtime, so the CLI falls back to the CPU
+  statevector backend rather than producing a wrong result. QASM 2.0 export
+  decomposes it exactly, so exported circuits run anywhere.
 
 ## Classical linear-algebra stack (`omega_core`, `aria_runtime::linalg`)
 

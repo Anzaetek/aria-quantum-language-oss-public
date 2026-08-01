@@ -35,17 +35,34 @@ as an unproven assumption with its rationale.
 `crates/aria-verify` runs every shipped `.aria` application through the omega
 runtime (WASM guest, with a native fallback) and compares the quantum result to
 a **pure-Rust classical oracle**, emitting `Δmax` vs a stated `tol` and a
-`PASS/FAIL` verdict. CI asserts `14/14 passed`.
+`PASS/FAIL` verdict. CI asserts `49/49 passed`.
 
-Latest run (`cargo run -p aria-verify -- all`):
+Latest run (`cargo run -p aria-verify -- all`, 2026-08-01):
 
 ```
 qsvd PASS   qft PASS   vqe_ansatz PASS   grover3 PASS
 bernstein_vazirani PASS   deutsch_jozsa PASS   swap_test PASS
 teleport PASS   qaoa_maxcut PASS   qml_classifier PASS
+qml_tune PASS   butterfly_qnn PASS   jl_sketch_digits PASS
+spectra PASS   arch_search PASS   arch_evolve PASS
+arch_priors PASS   spectra_scaling PASS
 qos PASS   circulant PASS   cqs PASS   noise PASS
-14/14 passed
+bell PASS   ghz PASS   superdense PASS   simon PASS   qpe PASS
+qsp PASS   trotter PASS   qdrift PASS   taylor_lcu PASS
+shor PASS   schrodingerize PASS
+qec_grover PASS   qec_qft PASS   qec_qpe PASS   qec_memory PASS
+iqp_born PASS   quantum_kernel PASS   qcnn PASS
+qcbm_strongly_entangling PASS   qgan PASS   qclassifier_rich PASS
+qssl PASS   sketch_qml PASS   strongly_entangling PASS
+qasm_gpu PASS   hhl PASS   qsvt_invert PASS
+49/49 passed
 ```
+
+The first fourteen rows above are the original LE2 set that A1–A5 were written
+against; the remainder were added as the application corpus grew and are held to
+the same per-app `tol`. Two deep harnesses (`spectra_noise`,
+`spectra_scaling_noise`) are excluded from `all` for runtime and run by name or
+under `ARIA_DEEP=1`, so `49/49` is the count `all` asserts, not the total corpus.
 
 The three **QLSS reproductions named in the LE2 gate** all conform:
 

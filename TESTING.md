@@ -141,17 +141,30 @@ On an Apple Silicon Mac, three GPU paths are numerically gated against the CPU �
 the same three the CUDA arm wires (§9a). All are optional and fall back to the
 CPU when the feature is off, the host isn't macOS, or no device is present, so
 `./ci.sh` stays green off-Mac; set `ARIA_METAL=1 ./ci.sh` to run them, or invoke
-directly:
+directly (this is the exact command list the `ARIA_METAL=1` stage runs):
 
 ```console
+$ cargo test --release -p omega-backend-pauliprop-metal --features metal
+$ cargo test --release -p omega-backend-mps-metal --features metal
+$ cargo test --release -p omega-backend-statevector-metal --features metal
 $ cargo test --release -p aria-runtime --features metal --test run_examples gpu_metal_agrees_with_sim_on_qft
 $ cargo test --release -p aria-runtime --features metal --test run_examples gpu_mps_metal_agrees_with_sim
 $ cargo test --release -p aria-runtime --features metal --test run_examples gpu_pauliprop_metal_agrees_with_sim
-$ cargo test --release -p omega-backend-mps-metal --features metal
-$ cargo test --release -p omega-backend-pauliprop-metal --features metal
+$ cargo test --release -p aria-runtime --features metal --test run_examples rbs
 ```
 
 Checks (each prints `... ok`):
+- The `omega-backend-statevector-metal` suite is the per-kernel layer under the
+  three end-to-end gates below: `apply_1q` / `apply_2q` / the diagonal fast
+  paths, the adjoint and its QML-training parity, `reset_matches_cpu` (the
+  deterministic mid-circuit Reset ≡ the CPU gate), and
+  `expectation_matches_cpu_pauli_string` (an odd-Y observable, pinning the
+  `(-i)^|Y|` prefactor in `pauli_masks` — see §9c).
+- `gpu_metal_agrees_with_sim_on_rbs` / `gpu_metal_rbs_gradient_agrees_with_sim`
+  (the `rbs` filter runs both) — RBS (Givens) forward ≤ 1e-6 and its adjoint
+  gradient ≤ 1e-5 vs the CPU f64 path. RBS is sign-antisymmetric, so an
+  amplitude match pins the gate's sign convention and qubit order, not just its
+  magnitude.
 - `gpu_metal_agrees_with_sim_on_qft` — Metal statevector == CPU statevector on
   QFT(n=3), ≤ 1e-6 (f32 kernels). Use `--backend gpu` to run on the GPU.
 - `gpu_mps_metal_agrees_with_sim` — `--backend mps` with the Metal two-site
@@ -181,12 +194,21 @@ is off or no device is present, so `./ci.sh` stays green without a GPU; set
 `ARIA_CUDA=1 ./ci.sh` to run them, or invoke directly:
 
 ```console
-$ cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda gpu_mps_cuda
+$ cargo test -p omega-backend-statevector-cuda --features cuda
 $ cargo test -p omega-backend-mps-cuda --features cuda
 $ cargo test -p omega-backend-pauliprop-cuda --features cuda
+$ cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda_agrees_with_sim_on_qft
+$ cargo test -p aria-runtime --features cuda --test run_examples gpu_mps_cuda_agrees_with_sim
+$ cargo test -p aria-runtime --features cuda --test run_examples rbs
 ```
 
 Checks (each test prints `... ok`):
+- The `omega-backend-statevector-cuda` suite — `apply_2q` / adjoint / execute,
+  `reset_matches_cpu` (deterministic mid-circuit Reset ≡ the CPU gate), and
+  `expectation_matches_cpu_pauli_string` (odd-Y, pinning `(-i)^|Y|`; see §9c).
+- `gpu_cuda_agrees_with_sim_on_rbs` / `gpu_cuda_rbs_gradient_agrees_with_sim`
+  (the `rbs` filter runs both) — RBS forward ≤ 1e-5 and its adjoint gradient
+  ≤ 1e-4 vs CPU.
 - `gpu_cuda_agrees_with_sim_on_qft` — CUDA statevector == CPU statevector on
   QFT(n=4), ≤ 1e-5 (f32 kernels).
 - `gpu_mps_cuda_agrees_with_sim` — `--backend mps` with the cuSOLVER `gesvdj`
@@ -210,6 +232,71 @@ Metal (Apple Silicon) wires all three arms too — statevector, the MPS two-site
 θ-contraction (SVD stays on CPU), and the pauliprop branch — verified under
 `ARIA_METAL=1` (§9). The one piece deferred on Metal is on-GPU Jacobi SVD, which
 Apple's lack of native f64 rules out (see `GPU_BACKEND_PLAN.md`).
+
+### 9b. OpenCL GPU statevector agrees with CPU (cross-vendor; opt-in `ARIA_OPENCL=1`)
+
+The OpenCL statevector backend is the cross-vendor arm (Apple's
+`OpenCL.framework`, the Intel/AMD/NVIDIA runtimes, or POCL). Only the
+statevector is wired — there is no OpenCL MPS or pauliprop arm — and RBS,
+photonic, and 3q gates surface a clean *"unsupported gate"* error so the CLI
+falls back to CPU. Set `ARIA_OPENCL=1 ./ci.sh` to run it, or invoke directly:
+
+```console
+$ ARIA_OPENCL_REQUIRE_DEVICE=1 cargo test -p omega-backend-statevector-opencl --features opencl
+```
+
+Checks: the per-kernel smokes (`apply_1q`, `apply_diagonal`,
+`apply_diagonal_product`, `inner_product`), the end-to-end `execute` smoke,
+buffer-pool semantics, shot-sampling TVD, the adjoint gradient vs the CPU
+adjoint, and `pauli_expectation` — of which
+`pauli_expectation_matches_host_on_random_14q` is the load-bearing one: its
+X·Y·Z string has an **odd** Y count, so it pins the `(-i)^|Y|` prefactor in
+`pauli_masks` against a host oracle. (An even-Y or Y-free string cannot see that
+sign, and `⟨+|Y|+⟩ = 0` cannot either.)
+
+`ARIA_OPENCL_REQUIRE_DEVICE=1` is what makes the stage honest. Every other test
+in the crate skips itself when the constructor can't reach a device, and
+`is_available()` reports only compile-time feature presence — so without the
+env var, `cargo test --features opencl` reports "ok" on a host where not one
+kernel ran. With it, `tests/device_present.rs` turns that silent skip into a
+loud failure. Unset, that test is a no-op, so `cargo test --all-features`
+elsewhere is unaffected.
+
+### 9c. The Pauli-expectation sign convention (all backends)
+
+One convention is shared by every backend and is the single easiest thing to get
+silently wrong, so it is stated once here. For a Pauli string `P`, the fused
+kernels and the CPU loop both accumulate over basis indices `i` with
+`j = i XOR x_mask`:
+
+```
+⟨ψ|P|ψ⟩ = Σ_i conj(ψ[j]) · coeff(i) · ψ[i]
+```
+
+where `coeff(i)` is the **ket-side** coefficient of `P|i⟩ = coeff(i)·|j⟩`. The
+coefficient is keyed on the bits of `i`, so it belongs with `ψ[i]`, not `ψ[j]`.
+
+Pairing it the other way — `conj(ψ[i]) · coeff(i) · ψ[j]` — negates every string
+with an **odd** number of Y factors, and nothing else. X and Z are symmetric
+matrices, so they are unaffected; Y is antisymmetric (`Yᵀ = −Y`), so transposing
+the element flips its sign. Equivalently, on the GPU side the global prefactor
+is `(-i)^|Y|`, not `i^|Y|`: the kernel forms the matrix element `P[i, i^x]`,
+which for a Y qubit is `(-i)·(-1)^bit_i`, and the `(-1)^bit` half is already
+carried by `sign_mask`.
+
+The failure mode is silent — a wrong-signed observable, not a crash — and two
+such errors cancel, so a test oracle that makes the same mistake will agree with
+a broken kernel. The gates that pin it:
+
+| layer | test |
+|---|---|
+| CPU | `omega-backend-statevector/tests/pauli_y_expectation.rs` |
+| Metal | `expectation_matches_cpu_pauli_string`, `pauli_expectation_matches_cpu_oracle` |
+| CUDA | `expectation_matches_cpu_pauli_string` |
+| OpenCL | `pauli_expectation_matches_host_on_random_14q` |
+
+Each uses a string with an odd Y count. An even-Y string, a Y-free string, or
+`⟨+|Y|+⟩ = 0` cannot see the sign at all.
 
 ## 10. Remote backend via omega-server (tol ±5%)
 
@@ -252,8 +339,10 @@ libtorch.
 $ cargo test -p aria-core --test aria_examples
 ```
 
-Check: `test result: ok` — all 30 `.aria` examples parse and instantiate to a
-non-empty circuit, and every `.aria` file on disk is covered by the table.
+Check: `test result: ok` — all 44 `.aria` examples parse and instantiate to a
+non-empty circuit, and every `.aria` file on disk is covered by the table. The
+second assertion is the one that keeps this number honest: adding a `.aria` file
+without a table entry fails the test rather than silently going untested.
 
 ## 13. Application harnesses — quantum vs classical (`aria-verify`)
 
