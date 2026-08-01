@@ -381,11 +381,15 @@ pub fn pauli_masks(pauli_string: &[(u32, PauliOp)]) -> (u32, u32, Complex64) {
             }
         }
     }
+    // Per-Y prefactor is (-i)^|Y|, NOT i^|Y| — the kernel forms
+    // conj(ψ[i])·ψ[i^x]·phase, and for a Y qubit P[i,i^x] = (-i)·(-1)^bit_i
+    // (Y|0⟩=i|1⟩, Y|1⟩=-i|0⟩). Using i^|Y| silently negates every Pauli string
+    // with an ODD number of Y factors (see the CPU `expectation_pauli` note).
     let y_factor = match y_count & 3 {
         0 => Complex64::new(1.0, 0.0),
-        1 => Complex64::new(0.0, 1.0),
+        1 => Complex64::new(0.0, -1.0),
         2 => Complex64::new(-1.0, 0.0),
-        _ => Complex64::new(0.0, -1.0),
+        _ => Complex64::new(0.0, 1.0),
     };
     (x_mask, sign_mask, y_factor)
 }

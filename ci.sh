@@ -203,6 +203,11 @@ fi
 # assert the GPU statevector / MPS-SVD / pauliprop paths numerically match CPU.
 if [ "${ARIA_CUDA:-0}" = "1" ]; then
   step "+   Optional: CUDA GPU backends"
+  # Full statevector-CUDA unit suite: apply_2q / adjoint / execute, the
+  # deterministic mid-circuit Reset ≡ CPU gate, and the odd-Y Pauli-expectation
+  # regression (pauli_expectation now uses the correct (-i)^|Y| prefactor).
+  # Mirrors the Metal stage, which already runs its full statevector suite.
+  cargo test -p omega-backend-statevector-cuda --features cuda
   # MPS cuSOLVER gesvdj ≡ CPU Jacobi SVD (native f64: reconstruction + GPU-taken).
   cargo test -p omega-backend-mps-cuda --features cuda
   # PauliProp GPU branch expansion ≡ CPU branch (exact + max_freq, incl. budget).

@@ -1410,11 +1410,17 @@ fn pauli_masks(pauli_string: &[(u32, omega_core::executor::PauliOp)]) -> (u32, u
             }
         }
     }
+    // Per-Y prefactor is (-i)^|Y|, NOT i^|Y|. The kernel forms
+    // conj(ψ[i])·ψ[i^x]·phase, so `phase` must equal the matrix element
+    // P[i, i^x]; for a Y qubit that is (-i)·(-1)^bit_i (Y|0⟩=i|1⟩, Y|1⟩=-i|0⟩),
+    // i.e. the global Y prefactor is (-i)^|Y|. Using i^|Y| silently negates
+    // every Pauli string with an ODD number of Y factors (matches the CPU
+    // `expectation_pauli` warning in omega-backend-statevector/src/sim.rs).
     let y_factor = match y_count & 3 {
         0 => Complex64::new(1.0, 0.0),
-        1 => Complex64::new(0.0, 1.0),
+        1 => Complex64::new(0.0, -1.0),
         2 => Complex64::new(-1.0, 0.0),
-        _ => Complex64::new(0.0, -1.0),
+        _ => Complex64::new(0.0, 1.0),
     };
     (x_mask, sign_mask, y_factor)
 }
