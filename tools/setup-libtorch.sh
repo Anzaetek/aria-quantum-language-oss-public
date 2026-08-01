@@ -24,14 +24,21 @@ ENV_FILE="$REPO_DIR/tch-env.sh"
 DO_VERIFY=1
 [ "${1:-}" = "--no-verify" ] && DO_VERIFY=0
 
-# Only the macOS arm64 URL is auto-detected; other platforms: grab the matching
-# CPU dist from https://pytorch.org/get-started/locally/ and pass LIBTORCH=...
+# Auto-detected CPU dists. Anything else: grab the matching CPU build from
+# https://pytorch.org/get-started/locally/ and pass LIBTORCH=...
 uname_s="$(uname -s)"; uname_m="$(uname -m)"
-if [ "$uname_s" = "Darwin" ] && [ "$uname_m" = "arm64" ]; then
-  LIBTORCH_URL="https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${LIBTORCH_VERSION}.zip"
-else
-  LIBTORCH_URL=""
-fi
+case "$uname_s/$uname_m" in
+  Darwin/arm64)
+    LIBTORCH_URL="https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${LIBTORCH_VERSION}.zip"
+    ;;
+  Linux/x86_64)
+    # The cxx11-ABI shared-with-deps build is the one torch-sys links against.
+    LIBTORCH_URL="https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip"
+    ;;
+  *)
+    LIBTORCH_URL=""
+    ;;
+esac
 
 echo "==> libtorch dir : $LIBTORCH_DIR"
 echo "==> repo         : $REPO_DIR"
