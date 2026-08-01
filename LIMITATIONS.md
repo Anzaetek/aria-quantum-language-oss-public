@@ -29,11 +29,16 @@ end-to-end implementation, and which deeper features are deferred.
 - **`RBS` (Givens rotation) backend coverage.** The native `RBS` gate runs on
   the CPU statevector and MPS backends — the engines every trainer and
   verification harness uses — with analytic adjoint derivatives and the 4-term
-  Givens parameter-shift rule. The GPU backends (metal / cuda / opencl), the
-  Clifford `pauli` backend, and the optional `tch` plugin dispatch it to their
-  wildcard arm and surface a clean *"unsupported gate"* error at runtime; QASM
-  2.0 export decomposes it exactly, so exported circuits run anywhere. GPU
-  kernels are deferred until a GPU-scale QML example needs them.
+  Givens parameter-shift rule. It also runs on the **CUDA and Metal statevector
+  backends**: the Givens rotation on span{|01⟩, |10⟩} goes through the generic
+  2-qubit apply (f32 kernels), and `dRBS/dθ` is wired into the GPU adjoint, so
+  both forward runs and adjoint gradients of butterfly / unary QML circuits are
+  numerically gated against the CPU f64 path (`gpu_cuda_agrees_with_sim_on_rbs`
+  / `gpu_cuda_rbs_gradient_agrees_with_sim` and their Metal mirrors). The
+  OpenCL statevector backend, the Clifford `pauli` backend, and the optional
+  `tch` plugin still dispatch it to their wildcard arm and surface a clean
+  *"unsupported gate"* error at runtime; QASM 2.0 export decomposes it exactly,
+  so exported circuits run anywhere.
 
 ## Classical linear-algebra stack (`omega_core`, `aria_runtime::linalg`)
 
