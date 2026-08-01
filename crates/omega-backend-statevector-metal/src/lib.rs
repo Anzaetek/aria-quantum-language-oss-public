@@ -1496,11 +1496,15 @@ fn pauli_masks(pauli_string: &[(u32, omega_core::executor::PauliOp)]) -> (u32, u
             }
         }
     }
+    // Per-Y prefactor is (-i)^|Y|, NOT i^|Y| — the kernel forms
+    // conj(ψ[i])·ψ[i^x]·phase, and for a Y qubit P[i,i^x] = (-i)·(-1)^bit_i
+    // (Y|0⟩=i|1⟩, Y|1⟩=-i|0⟩). Using i^|Y| silently negates every Pauli string
+    // with an ODD number of Y factors (see the CPU `expectation_pauli` note).
     let y_factor = match y_count & 3 {
         0 => Complex64::new(1.0, 0.0),
-        1 => Complex64::new(0.0, 1.0),
+        1 => Complex64::new(0.0, -1.0),
         2 => Complex64::new(-1.0, 0.0),
-        _ => Complex64::new(0.0, -1.0),
+        _ => Complex64::new(0.0, 1.0),
     };
     (x_mask, sign_mask, y_factor)
 }
@@ -2898,6 +2902,113 @@ mod tests {
             );
         }
         eprintln!("12q/16-param HEA: max abs diff vs CPU adjoint = {max_diff:.3e}");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn reset_matches_cpu() {
+        // Mid-circuit Reset on Metal must reproduce the CPU backend's
+        // deterministic fold-and-renormalise semantics. Reset a qubit out of an
+        // entangled, non-|0⟩ state (Bell + RY), then keep computing so a wrong
+        // reset would propagate into the final amplitudes. f32 tolerance 1e-5.
+        use omega_backend_statevector::StatevectorBackend;
+        use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
+
+        let push = |c: &mut CircuitIR, gate, qubits: &[u32], params: &[f64]| {
+            c.ops.push(GateOp {
+                gate,
+                qubits: qubits.iter().map(|&q| Qubit(q)).collect(),
+                params: params.iter().map(|&p| ParamExpr::Concrete(p)).collect(),
+                classical_bit: None,
+                condition: None,
+            });
+        };
+        let mut circuit = CircuitIR::new(2, CircuitType::GateBased);
+        push(&mut circuit, GateKind::H, &[0], &[]);
+        push(&mut circuit, GateKind::CX, &[0, 1], &[]);
+        push(&mut circuit, GateKind::Ry, &[1], &[0.7]);
+        push(&mut circuit, GateKind::Reset, &[0], &[]);
+        push(&mut circuit, GateKind::H, &[1], &[]);
+
+        let params = ParameterBinding::new();
+        let cfg = ExecConfig {
+            shots: None,
+            ..ExecConfig::default()
+        };
+        let cpu = StatevectorBackend::new();
+        let metal = MetalStatevectorBackend::new().expect("metal");
+        let cpu_res = cpu.execute(&circuit, &params, &cfg).expect("cpu execute");
+        let metal_res = metal
+            .execute(&circuit, &params, &cfg)
+            .expect("metal execute");
+        match (cpu_res, metal_res) {
+            (ExecResult::Statevector(a), ExecResult::Statevector(b)) => {
+                assert_eq!(a.len(), b.len());
+                let max = a
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (x - y).norm())
+                    .fold(0.0f64, f64::max);
+                assert!(max < 1e-5, "max amp diff {max}");
+            }
+            _ => panic!("expected statevectors"),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn expectation_matches_cpu_pauli_string() {
+        // Odd-Y regression: the observable's `-0.4·⟨Y2⟩` term (|Y| = 1) pins the
+        // `(-i)^|Y|` Pauli prefactor. With the old `i^|Y|` it came out sign-
+        // flipped (~0.5 error). Mirrors the CUDA `expectation_matches_cpu_pauli_string`.
+        use omega_backend_statevector::StatevectorBackend;
+        use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
+        use omega_core::executor::PauliOp;
+
+        let n: u32 = 5;
+        let mut circuit = CircuitIR::new(n, CircuitType::GateBased);
+        circuit.symbols.insert(0, "theta".into());
+        circuit.ops.push(GateOp {
+            gate: GateKind::H,
+            qubits: smallvec::smallvec![Qubit(0)],
+            params: smallvec::smallvec![],
+            classical_bit: None,
+            condition: None,
+        });
+        circuit.ops.push(GateOp {
+            gate: GateKind::Rx,
+            qubits: smallvec::smallvec![Qubit(2)],
+            params: smallvec::smallvec![ParamExpr::Symbol(0)],
+            classical_bit: None,
+            condition: None,
+        });
+        circuit.ops.push(GateOp {
+            gate: GateKind::CX,
+            qubits: smallvec::smallvec![Qubit(0), Qubit(3)],
+            params: smallvec::smallvec![],
+            classical_bit: None,
+            condition: None,
+        });
+
+        let mut params = ParameterBinding::new();
+        params.bind(0, 0.731);
+        let obs = Observable {
+            terms: vec![
+                (1.5, vec![(0, PauliOp::X), (3, PauliOp::Z)]),
+                (-0.4, vec![(2, PauliOp::Y)]),
+                (0.6, vec![(1, PauliOp::Z), (4, PauliOp::Z)]),
+            ],
+        };
+
+        let cpu = StatevectorBackend::new();
+        let cpu_e = cpu.expectation(&circuit, &params, &obs).expect("cpu");
+        let metal = MetalStatevectorBackend::new().expect("metal");
+        let metal_e = metal.expectation(&circuit, &params, &obs).expect("metal");
+        assert!(
+            (cpu_e - metal_e).abs() < 1e-5,
+            "cpu = {cpu_e}, metal = {metal_e}, diff = {:.3e}",
+            (cpu_e - metal_e).abs()
+        );
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
