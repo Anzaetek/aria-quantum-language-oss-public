@@ -245,6 +245,23 @@ falls back to CPU. Set `ARIA_OPENCL=1 ./ci.sh` to run it, or invoke directly:
 $ ARIA_OPENCL_REQUIRE_DEVICE=1 cargo test -p omega-backend-statevector-opencl --features opencl
 ```
 
+> **Linking needs the ICD loader *dev* symlink.** `cl-sys` emits `-lOpenCL`,
+> which the linker can only resolve against `libOpenCL.so` — the bare runtime
+> `libOpenCL.so.1` that ships with a driver is not enough, so the command above
+> fails with `rust-lld: error: unable to find library -lOpenCL` on an otherwise
+> working host. Most distros provide it in `ocl-icd-opencl-dev`
+> (`sudo apt install ocl-icd-opencl-dev`). A CUDA box already has one under the
+> toolkit but not on the default link path, so without root:
+>
+> ```console
+> $ RUSTFLAGS="-L native=/usr/local/cuda/targets/x86_64-linux/lib" \
+>     ARIA_OPENCL_REQUIRE_DEVICE=1 \
+>     cargo test -p omega-backend-statevector-opencl --features opencl
+> ```
+>
+> Verified on the Linux/CUDA box (NVIDIA ICD, 43 tests). The same `RUSTFLAGS`
+> applies to `ARIA_OPENCL=1 ./ci.sh` — see the note above that stage in `ci.sh`.
+
 Checks: the per-kernel smokes (`apply_1q`, `apply_diagonal`,
 `apply_diagonal_product`, `inner_product`), the end-to-end `execute` smoke,
 buffer-pool semantics, shot-sampling TVD, the adjoint gradient vs the CPU
