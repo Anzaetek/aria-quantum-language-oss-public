@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 
 use omega_core::circuit::*;
 use omega_core::error::{OmegaError, Result};
@@ -82,13 +82,13 @@ impl Backend for PauliBackend {
                                 }
                                 GateKind::Barrier => {}
                                 _ => {
-                                    apply_gate(&mut tab, op, params)?;
+                                    apply_gate(&mut tab, op, params, &mut rng, false)?;
                                 }
                             }
                         }
                     } else {
                         // Legacy: apply all gates, then measure at end
-                        apply_circuit(&mut tab, circuit, params)?;
+                        apply_circuit(&mut tab, circuit, params, &mut rng, false)?;
                     }
 
                     let mut bitstring = 0u64;
@@ -116,7 +116,7 @@ impl Backend for PauliBackend {
                 // where k = number of non-identity stabilizers.
                 // Compute by checking stabilizer constraints on each basis state.
                 let mut tab = StabilizerTableau::zero_state(n);
-                apply_circuit(&mut tab, circuit, params)?;
+                apply_circuit(&mut tab, circuit, params, &mut analytic_rng(), true)?;
 
                 for basis in 0..dim {
                     probs[basis] = stabilizer_probability(&tab, basis, n);
@@ -135,7 +135,7 @@ impl Backend for PauliBackend {
     ) -> Result<f64> {
         let n = circuit.num_qubits as usize;
         let mut tab = StabilizerTableau::zero_state(n);
-        apply_circuit(&mut tab, circuit, params)?;
+        apply_circuit(&mut tab, circuit, params, &mut analytic_rng(), true)?;
 
         let mut total = 0.0;
         for (coeff, pauli_terms) in &observable.terms {
@@ -161,7 +161,7 @@ impl Backend for PauliBackend {
         }
         let n = circuit.num_qubits as usize;
         let mut tab = StabilizerTableau::zero_state(n);
-        apply_circuit(&mut tab, circuit, params)?;
+        apply_circuit(&mut tab, circuit, params, &mut analytic_rng(), true)?;
         let mut out = Vec::with_capacity(observables.len());
         for obs in observables {
             let mut total = 0.0;
@@ -175,19 +175,36 @@ impl Backend for PauliBackend {
 }
 
 /// Apply all gates in the circuit to the stabilizer tableau.
+/// RNG for the analytic paths. Those paths refuse `Reset` first, and `Reset` is
+/// the only consumer of randomness in `apply_gate`, so this is never drawn from;
+/// it exists to satisfy the shared signature. Seeded for determinism.
+fn analytic_rng() -> StdRng {
+    StdRng::seed_from_u64(0)
+}
+
 fn apply_circuit(
     tab: &mut StabilizerTableau,
     circuit: &CircuitIR,
     params: &ParameterBinding,
+    rng: &mut impl Rng,
+    analytic: bool,
 ) -> Result<()> {
     for op in &circuit.ops {
-        apply_gate(tab, op, params)?;
+        apply_gate(tab, op, params, rng, analytic)?;
     }
     Ok(())
 }
 
 /// Apply a single gate to the tableau.
-fn apply_gate(tab: &mut StabilizerTableau, op: &GateOp, _params: &ParameterBinding) -> Result<()> {
+/// `rng` is consumed only by [`GateKind::Reset`], a stochastic channel rather
+/// than a gate — see [`apply_reset_stabilizer`].
+fn apply_gate(
+    tab: &mut StabilizerTableau,
+    op: &GateOp,
+    _params: &ParameterBinding,
+    rng: &mut impl Rng,
+    analytic: bool,
+) -> Result<()> {
     let q = |i: usize| op.qubits[i].0 as usize;
 
     match &op.gate {
@@ -224,7 +241,7 @@ fn apply_gate(tab: &mut StabilizerTableau, op: &GateOp, _params: &ParameterBindi
         }
 
         GateKind::Reset => {
-            apply_reset_stabilizer(tab, q(0));
+            apply_reset_stabilizer(tab, q(0), rng, analytic)?;
         }
 
         GateKind::Measure => {} // handled by caller (sampling loop or mid-circuit)
@@ -259,52 +276,57 @@ fn apply_gate(tab: &mut StabilizerTableau, op: &GateOp, _params: &ParameterBindi
     Ok(())
 }
 
-/// Reset qubit `q` to |0⟩ in the stabilizer tableau.
+/// Reset qubit `q` to |0⟩ in the stabilizer tableau — the reset **channel**
+/// ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ).
 ///
-/// Deterministic reset: force the qubit into the +1 eigenstate of Z_q.
-/// Equivalent to measure-then-conditionally-X, but without randomness.
-fn apply_reset_stabilizer(tab: &mut StabilizerTableau, q: usize) {
-    let n = tab.n;
+/// Measure `q` (collapsing the tableau onto a *sampled* outcome) and apply X
+/// when that outcome is 1. `tab.measure` already handles both cases correctly:
+/// a random outcome (some stabilizer anticommutes with Z_q) is drawn 50/50 and
+/// the tableau updated, and a determined outcome is read off.
+///
+/// **Do not force the outcome to 0.** The previous implementation collapsed the
+/// anticommuting row and then set the stabilizer to `+Z_q`, i.e. it
+/// *post-selected* on measuring 0 rather than sampling. That is a different
+/// channel: on Bell + `reset q0` it drove the partner to |0⟩ as well, so q1 read
+/// 0 on all 4000 shots where the reset channel gives 50/50. It happens to agree
+/// with the truth in the X basis, which is why cross-backend checks against the
+/// (differently wrong) statevector fold never caught it. Pinned by
+/// `tests/reset_channel.rs`.
+///
+/// `analytic` marks a `shots = None` run. There is no ensemble to average over
+/// there, so a reset whose measurement outcome is *random* — i.e. some
+/// stabilizer anticommutes with Z_q, meaning the qubit is not in a Z
+/// eigenstate — is refused rather than silently collapsed one way. This is
+/// deliberately conservative: an unentangled |+⟩ also has a random outcome yet
+/// its reset is deterministic, and that case is refused too. The statevector
+/// backend uses the sharper reduced-purity test; matching it here would need an
+/// entanglement test on the tableau, which is left as a follow-up.
+fn apply_reset_stabilizer(
+    tab: &mut StabilizerTableau,
+    q: usize,
+    rng: &mut impl Rng,
+    analytic: bool,
+) -> Result<()> {
+    if analytic && !reset_outcome_is_determined(tab, q) {
+        return Err(OmegaError::Unsupported(format!(
+            "pauli: analytic probabilities/expectation of Reset on qubit {q} is ill-defined — \
+             the outcome is random, so the reset leaves the register in a mixed state that one \
+             tableau cannot represent. Run with shots (each shot is an independent trajectory)."
+        )));
+    }
+    if tab.measure(q, rng) {
+        tab.x(q);
+    }
+    Ok(())
+}
 
-    // Build Z_q for anticommutativity checks
+/// True when measuring `q` has a determined outcome: no stabilizer anticommutes
+/// with Z_q, so the qubit sits in a Z eigenstate and reset is deterministic.
+fn reset_outcome_is_determined(tab: &StabilizerTableau, q: usize) -> bool {
+    let n = tab.n;
     let mut z_q = PauliRow::identity(n);
     z_q.z[q] = true;
-
-    // Find a stabilizer that anticommutes with Z_q
-    let anticommuting = (n..2 * n).find(|&i| tab.rows[i].anticommutes(&z_q));
-
-    match anticommuting {
-        Some(p) => {
-            // Qubit outcome is random — we must collapse it.
-            // 1. For all rows i ≠ p that anticommute with Z_q, multiply by row p
-            for i in 0..2 * n {
-                if i != p && tab.rows[i].anticommutes(&z_q) {
-                    tab.rowmult(i, p);
-                }
-            }
-            // 2. Replace destabilizer and stabilizer for this slot
-            let destab_idx = p - n;
-            tab.rows[destab_idx] = tab.rows[p].clone();
-            // 3. Set stabilizer to +Z_q (outcome forced to 0)
-            tab.rows[p] = PauliRow::identity(n);
-            tab.rows[p].z[q] = true;
-            tab.rows[p].sign = false; // +Z_q → eigenvalue +1 → outcome 0
-        }
-        None => {
-            // Qubit is already in a Z eigenstate.
-            // Determine if it's |0⟩ (+Z) or |1⟩ (-Z).
-            let mut scratch = PauliRow::identity(n);
-            for i in 0..n {
-                if tab.rows[i].anticommutes(&z_q) {
-                    scratch = tab.row_product(&scratch, &tab.rows[n + i]);
-                }
-            }
-            if scratch.sign {
-                // Qubit is |1⟩, apply X to flip to |0⟩
-                tab.x(q);
-            }
-        }
-    }
+    !(n..2 * n).any(|i| tab.rows[i].anticommutes(&z_q))
 }
 
 /// Compute the probability of measuring a particular basis state from a stabilizer state.

@@ -69,7 +69,7 @@ impl Backend for StatevectorBackend {
                 config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0;
             let mut counts: HashMap<u64, u32> = HashMap::new();
             for _ in 0..shots {
-                let (state, cbits) = evolve_once(circuit, params, config, &mut rng)?;
+                let (state, cbits) = evolve_once(circuit, params, config, &mut rng, false)?;
                 let key = if by_creg {
                     creg_to_u64(&cbits)
                 } else {
@@ -83,7 +83,8 @@ impl Backend for StatevectorBackend {
             return Ok(ExecResult::Counts(counts));
         }
 
-        let (state, classical_bits) = evolve_once(circuit, params, config, &mut rng)?;
+        let (state, classical_bits) =
+            evolve_once(circuit, params, config, &mut rng, config.shots.is_none())?;
 
         match config.shots {
             None => Ok(ExecResult::Statevector(state)),
@@ -123,7 +124,6 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
-        reject_reset_in_analytic_mode(circuit)?;
         // Get statevector
         let config = ExecConfig {
             shots: None,
@@ -163,7 +163,6 @@ impl Backend for StatevectorBackend {
         if observables.is_empty() {
             return Ok(Vec::new());
         }
-        reject_reset_in_analytic_mode(circuit)?;
         let config = ExecConfig {
             shots: None,
             seed: None,
@@ -298,7 +297,7 @@ impl NoisyStatevectorBackend {
                 }
                 GateKind::Barrier => continue,
                 _ => {
-                    apply_gate(&mut state, n, op, params, rng)?;
+                    apply_gate(&mut state, n, op, params, rng, false)?;
                     if !self.model.noiseless() {
                         let gate_qubits: Vec<usize> =
                             op.qubits.iter().map(|q| q.0 as usize).collect();
@@ -457,22 +456,48 @@ fn apply_readout_flip(
     out
 }
 
-/// Analytic (`shots = None`) expectation of a circuit containing `Reset` is
-/// not a well-defined pure-state quantity: the channel leaves the register in
-/// a mixed state, and one statevector holds a single trajectory, so the answer
-/// would silently depend on an RNG draw. Refuse instead of returning a random
-/// number. Callers wanting the correct value run with `shots` (each shot is an
-/// independent trajectory) or use a density-matrix capable backend.
-fn reject_reset_in_analytic_mode(circuit: &CircuitIR) -> Result<()> {
-    if circuit_has_reset(circuit) {
-        return Err(OmegaError::Unsupported(
-            "statevector: analytic expectation of a circuit containing Reset is ill-defined \
-             (Reset produces a mixed state); run with shots so each shot is an independent \
-             trajectory"
-                .into(),
-        ));
+/// Purity `Tr(ρ_q²)` of qubit `q`'s reduced state, where ρ_q is the 2×2 matrix
+/// obtained by tracing out every other qubit. Equals 1 exactly when `q` is
+/// **unentangled** from the rest of the register.
+fn reduced_purity(state: &[Complex64], n: usize, q: usize) -> f64 {
+    let dim = 1usize << n;
+    let mask = 1usize << q;
+    let (mut r00, mut r11) = (0.0_f64, 0.0_f64);
+    let mut r01 = Complex64::new(0.0, 0.0);
+    for i in 0..dim {
+        if i & mask == 0 {
+            r00 += state[i].norm_sqr();
+            r01 += state[i] * state[i | mask].conj();
+        } else {
+            r11 += state[i].norm_sqr();
+        }
     }
-    Ok(())
+    r00 * r00 + r11 * r11 + 2.0 * r01.norm_sqr()
+}
+
+/// Whether resetting `q` is a *deterministic* operation on this state.
+///
+/// If `q` is unentangled (ρ_q pure) the register factorises as |φ⟩_q ⊗ |rest⟩,
+/// and reset yields |0⟩ ⊗ |rest⟩ whatever outcome is sampled — projecting onto
+/// |0⟩, or onto |1⟩ and then flipping, give the *same* state. So the analytic
+/// answer is exact and `apply_reset` may run with any RNG.
+///
+/// If `q` is entangled, reset genuinely decoheres the partners: the result is
+/// mixed, a statevector holds one trajectory, and there is no exact pure-state
+/// answer. That is the case the caller must be refused for.
+fn reset_is_deterministic(state: &[Complex64], n: usize, q: usize) -> bool {
+    (reduced_purity(state, n, q) - 1.0).abs() < 1e-9
+}
+
+/// Error for an analytic (`shots = None`) expectation whose `Reset` acts on an
+/// entangled qubit — see [`reset_is_deterministic`].
+fn entangled_reset_in_analytic_mode(q: usize) -> OmegaError {
+    OmegaError::Unsupported(format!(
+        "statevector: analytic expectation of Reset on qubit {q} is ill-defined — the qubit is \
+         entangled, so the reset leaves the register in a mixed state that one statevector \
+         cannot represent. Run with shots (each shot is an independent trajectory), or reset \
+         only unentangled qubits."
+    ))
 }
 
 /// True when the circuit contains a `Reset`, i.e. a stochastic channel whose
@@ -493,6 +518,7 @@ fn evolve_once(
     params: &ParameterBinding,
     config: &ExecConfig,
     rng: &mut impl Rng,
+    analytic: bool,
 ) -> Result<(Vec<Complex64>, Vec<u8>)> {
     let n = circuit.num_qubits as usize;
     let dim = 1usize << n;
@@ -522,7 +548,7 @@ fn evolve_once(
             }
             GateKind::Barrier => continue,
             _ => {
-                apply_gate(&mut state, n, op, params, rng)?;
+                apply_gate(&mut state, n, op, params, rng, analytic)?;
             }
         }
     }
@@ -537,6 +563,7 @@ fn apply_gate(
     op: &GateOp,
     params: &ParameterBinding,
     rng: &mut impl Rng,
+    analytic: bool,
 ) -> Result<()> {
     // Resolve parameters
     let resolved: Vec<f64> = op
@@ -640,7 +667,7 @@ fn apply_gate(
             op.qubits[2].0 as usize,
         ),
 
-        GateKind::Reset => apply_reset(state, n, op.qubits[0].0 as usize, rng),
+        GateKind::Reset => apply_reset(state, n, op.qubits[0].0 as usize, rng, analytic)?,
 
         GateKind::Measure | GateKind::Barrier => {}
 
@@ -676,10 +703,24 @@ fn apply_gate(
 /// amplitudes cancelled to zero — the `norm_sq > 0.0` guard then skipped
 /// renormalisation and left an all-zero state, so a freshly reset qubit
 /// sampled as |1⟩ on every shot. Pinned by `tests/reset_channel.rs`.
-fn apply_reset(state: &mut [Complex64], n: usize, q: usize, rng: &mut impl Rng) {
+///
+/// `analytic` marks a `shots = None` run, where there is no ensemble to average
+/// over; a reset on an entangled qubit is then refused rather than silently
+/// returning one RNG-dependent trajectory (see [`reset_is_deterministic`]).
+fn apply_reset(
+    state: &mut [Complex64],
+    n: usize,
+    q: usize,
+    rng: &mut impl Rng,
+    analytic: bool,
+) -> Result<()> {
+    if analytic && !reset_is_deterministic(state, n, q) {
+        return Err(entangled_reset_in_analytic_mode(q));
+    }
     if projective_measure(state, n, q, rng) == 1 {
         apply_1q(state, n, q, &gates::x());
     }
+    Ok(())
 }
 
 /// Projective measurement: collapse qubit `q`, return outcome (0 or 1).
@@ -1393,32 +1434,30 @@ mod tests {
 
     #[test]
     fn test_reset_partial_entangled() {
-        // Bell state on qubits 0,1, then reset qubit 0 → qubit 0 is |0⟩, qubit 1 mixed
+        // Bell state on qubits 0,1, then reset qubit 0 → qubit 0 is |0⟩ on every
+        // trajectory and qubit 1 is left MIXED. A statevector cannot represent
+        // that mixture, so:
+        //   * analytic mode (shots = None) refuses — this used to return the
+        //     coherent fold's pure state and call it the answer;
+        //   * with shots, each shot is an independent trajectory and q1 comes
+        //     out 50/50 (Qiskit Aer ground truth; see tests/reset_channel.rs).
         let backend = StatevectorBackend::new();
         let mut circuit = CircuitIR::new(2, CircuitType::GateBased);
-        circuit.add_op(GateOp {
-            gate: GateKind::H,
-            qubits: smallvec::smallvec![Qubit(0)],
-            params: smallvec::smallvec![],
-            classical_bit: None,
-            condition: None,
-        });
-        circuit.add_op(GateOp {
-            gate: GateKind::CX,
-            qubits: smallvec::smallvec![Qubit(0), Qubit(1)],
-            params: smallvec::smallvec![],
-            classical_bit: None,
-            condition: None,
-        });
-        circuit.add_op(GateOp {
-            gate: GateKind::Reset,
-            qubits: smallvec::smallvec![Qubit(0)],
-            params: smallvec::smallvec![],
-            classical_bit: None,
-            condition: None,
-        });
+        for (gate, qubits) in [
+            (GateKind::H, vec![Qubit(0)]),
+            (GateKind::CX, vec![Qubit(0), Qubit(1)]),
+            (GateKind::Reset, vec![Qubit(0)]),
+        ] {
+            circuit.add_op(GateOp {
+                gate,
+                qubits: qubits.into_iter().collect(),
+                params: smallvec::smallvec![],
+                classical_bit: None,
+                condition: None,
+            });
+        }
 
-        let result = backend
+        let err = backend
             .execute(
                 &circuit,
                 &ParameterBinding::new(),
@@ -1428,15 +1467,28 @@ mod tests {
                     mid_circuit_mode: MidCircuitMode::Skip,
                 },
             )
+            .expect_err("analytic reset on an entangled qubit must refuse");
+        assert!(format!("{err:?}").contains("entangled"));
+
+        let counts = backend
+            .execute(
+                &circuit,
+                &ParameterBinding::new(),
+                &ExecConfig {
+                    shots: Some(4000),
+                    seed: Some(7),
+                    mid_circuit_mode: MidCircuitMode::Skip,
+                },
+            )
             .unwrap();
-        let sv = result.statevector();
-        // After reset qubit 0: only basis states with qubit 0 = 0 should survive
-        // |00⟩ and |10⟩ in original → qubit 0 bit is bit 0 → indices 0,1 have q0=0
-        assert!(sv[1].norm() < 1e-10, "|01⟩ (q0=1) should be zero");
-        assert!(sv[3].norm() < 1e-10, "|11⟩ (q0=1) should be zero");
-        // State should be normalised
-        let norm_sq: f64 = sv.iter().map(|a| a.norm_sqr()).sum();
-        assert!((norm_sq - 1.0).abs() < 1e-10);
+        let m = counts.counts();
+        let q0_ones: u32 = m.iter().filter(|(k, _)| *k & 1 != 0).map(|(_, v)| v).sum();
+        let q1_ones: u32 = m.iter().filter(|(k, _)| *k & 2 != 0).map(|(_, v)| v).sum();
+        assert_eq!(q0_ones, 0, "q0 must be |0⟩ on every shot, got {m:?}");
+        assert!(
+            q1_ones.abs_diff(2000) < 250,
+            "q1 must be maximally mixed (~2000/4000 ones), got {q1_ones}"
+        );
     }
 
     // --- Noise channel tests ---

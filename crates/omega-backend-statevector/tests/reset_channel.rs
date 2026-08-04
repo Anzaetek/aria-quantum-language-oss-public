@@ -140,11 +140,11 @@ fn reset_qubit_is_zero_on_every_shot() {
     );
 }
 
-/// Analytic expectation over a Reset circuit is a mixed-state quantity and a
-/// statevector holds one trajectory, so it must refuse rather than return a
-/// silently RNG-dependent number.
+/// Analytic expectation of a reset on an ENTANGLED qubit is a mixed-state
+/// quantity and a statevector holds one trajectory, so it must refuse rather
+/// than return a silently RNG-dependent number.
 #[test]
-fn analytic_expectation_refuses_reset() {
+fn analytic_expectation_refuses_entangled_reset() {
     let obs = Observable {
         terms: vec![(1.0, vec![(1, PauliOp::X)])],
     };
@@ -153,7 +153,41 @@ fn analytic_expectation_refuses_reset() {
         .expect_err("analytic expectation over Reset must refuse");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("Reset"),
-        "refusal should name Reset, got: {msg}"
+        msg.contains("Reset") && msg.contains("entangled"),
+        "refusal should name Reset and say why, got: {msg}"
     );
+}
+
+/// ...but a reset on an UNENTANGLED qubit is deterministic — projecting onto
+/// |0⟩, or onto |1⟩ and flipping, give the same state — so the analytic answer
+/// is exact and must still be served. X|0⟩ = |1⟩, reset → |0⟩, ⟨Z⟩ = +1.
+#[test]
+fn analytic_expectation_allows_unentangled_reset() {
+    let mut c = CircuitIR::new(1, CircuitType::GateBased);
+    c.add_op(g(GateKind::X, &[0], None));
+    c.add_op(g(GateKind::Reset, &[0], None));
+    let obs = Observable {
+        terms: vec![(1.0, vec![(0, PauliOp::Z)])],
+    };
+    let v = StatevectorBackend::new()
+        .expectation(&c, &ParameterBinding::new(), &obs)
+        .expect("unentangled reset is deterministic — must not refuse");
+    assert!((v - 1.0).abs() < 1e-12, "⟨Z⟩ after reset = {v}, want +1");
+}
+
+/// Same, but the qubit is in a superposition (|−⟩) yet still unentangled:
+/// reset is deterministic, so this is exact too.
+#[test]
+fn analytic_expectation_allows_unentangled_superposition_reset() {
+    let mut c = CircuitIR::new(1, CircuitType::GateBased);
+    c.add_op(g(GateKind::X, &[0], None));
+    c.add_op(g(GateKind::H, &[0], None)); // |−⟩
+    c.add_op(g(GateKind::Reset, &[0], None));
+    let obs = Observable {
+        terms: vec![(1.0, vec![(0, PauliOp::Z)])],
+    };
+    let v = StatevectorBackend::new()
+        .expectation(&c, &ParameterBinding::new(), &obs)
+        .expect("unentangled reset is deterministic — must not refuse");
+    assert!((v - 1.0).abs() < 1e-12, "⟨Z⟩ after reset(|−⟩) = {v}, want +1");
 }
