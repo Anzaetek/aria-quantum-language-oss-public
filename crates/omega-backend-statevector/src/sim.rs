@@ -51,48 +51,39 @@ impl Backend for StatevectorBackend {
         config: &ExecConfig,
     ) -> Result<ExecResult> {
         let n = circuit.num_qubits as usize;
-        let dim = 1usize << n;
 
-        // Initialize |00...0> state
-        let mut state = vec![Complex64::new(0.0, 0.0); dim];
-        state[0] = Complex64::new(1.0, 0.0);
-
-        // Classical bits for mid-circuit measurement
-        let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
-
-        // RNG for mid-circuit measurements
+        // RNG for mid-circuit measurements and for Reset's Born-rule sampling.
         let mut rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
             None => rand::make_rng::<StdRng>(),
         };
 
-        // Apply gates
-        for op in &circuit.ops {
-            // Check classical condition (multi-bit creg comparison
-            // per QASM2 semantics; see GateOp::condition_satisfied).
-            if !op.condition_satisfied(&classical_bits) {
-                continue;
+        // `Reset` is a stochastic CHANNEL, not a gate: one statevector carries
+        // one trajectory, so correct shot statistics need independent
+        // evolutions. Sampling `shots` times from a single post-reset state
+        // would replay one draw of the reset outcome for every shot and report
+        // it as certainty. Mirrors `NoisyStatevectorBackend`'s per-trajectory
+        // loop. See `apply_reset` and `tests/reset_channel.rs`.
+        if let (true, Some(shots)) = (circuit_has_reset(circuit), config.shots) {
+            let by_creg =
+                config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0;
+            let mut counts: HashMap<u64, u32> = HashMap::new();
+            for _ in 0..shots {
+                let (state, cbits) = evolve_once(circuit, params, config, &mut rng)?;
+                let key = if by_creg {
+                    creg_to_u64(&cbits)
+                } else {
+                    sample_counts(&state, n, 1, Some(rng.random()))
+                        .into_keys()
+                        .next()
+                        .unwrap_or(0)
+                };
+                *counts.entry(key).or_insert(0) += 1;
             }
-
-            match &op.gate {
-                GateKind::Measure => {
-                    if config.mid_circuit_mode == MidCircuitMode::Collapse {
-                        let q = op.qubits[0].0 as usize;
-                        let outcome = projective_measure(&mut state, n, q, &mut rng);
-                        if let Some(cbit) = op.classical_bit {
-                            if (cbit as usize) < classical_bits.len() {
-                                classical_bits[cbit as usize] = outcome;
-                            }
-                        }
-                    }
-                    // MidCircuitMode::Skip → do nothing (backward compat)
-                }
-                GateKind::Barrier => continue,
-                _ => {
-                    apply_gate(&mut state, n, op, params)?;
-                }
-            }
+            return Ok(ExecResult::Counts(counts));
         }
+
+        let (state, classical_bits) = evolve_once(circuit, params, config, &mut rng)?;
 
         match config.shots {
             None => Ok(ExecResult::Statevector(state)),
@@ -132,6 +123,7 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        reject_reset_in_analytic_mode(circuit)?;
         // Get statevector
         let config = ExecConfig {
             shots: None,
@@ -171,6 +163,7 @@ impl Backend for StatevectorBackend {
         if observables.is_empty() {
             return Ok(Vec::new());
         }
+        reject_reset_in_analytic_mode(circuit)?;
         let config = ExecConfig {
             shots: None,
             seed: None,
@@ -305,7 +298,7 @@ impl NoisyStatevectorBackend {
                 }
                 GateKind::Barrier => continue,
                 _ => {
-                    apply_gate(&mut state, n, op, params)?;
+                    apply_gate(&mut state, n, op, params, rng)?;
                     if !self.model.noiseless() {
                         let gate_qubits: Vec<usize> =
                             op.qubits.iter().map(|q| q.0 as usize).collect();
@@ -357,7 +350,7 @@ impl Backend for NoisyStatevectorBackend {
             // Per-trajectory Monte-Carlo when a channel acts during evolution
             // OR when mid-circuit measurement collapses the state (the latter is
             // inherently stochastic per shot, so it can't reuse one evolution).
-            Some(shots) if self.model.has_gate_channel() || collapses(circuit, config) => {
+            Some(shots) if self.model.has_gate_channel() || stochastic_evolution(circuit, config) => {
                 // One independent trajectory per shot — this is what turns a
                 // per-gate channel (amplitude damping, depolarizing, …) into the
                 // right shot statistics instead of one branch drawn once and
@@ -404,6 +397,14 @@ impl Backend for NoisyStatevectorBackend {
 /// creg, matching the noiseless backend).
 fn collapses(circuit: &CircuitIR, config: &ExecConfig) -> bool {
     config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0
+}
+
+/// True when evolution is stochastic *regardless* of the noise model, so one
+/// evolution cannot stand in for every shot. `Reset` samples a Born-rule
+/// outcome per trajectory (see [`apply_reset`]); collapse-mode measurement
+/// does too.
+fn stochastic_evolution(circuit: &CircuitIR, config: &ExecConfig) -> bool {
+    collapses(circuit, config) || circuit_has_reset(circuit)
 }
 
 /// Pack the classical register (bit `i` = cbit `i`) into a `u64` counts key,
@@ -456,11 +457,86 @@ fn apply_readout_flip(
     out
 }
 
+/// Analytic (`shots = None`) expectation of a circuit containing `Reset` is
+/// not a well-defined pure-state quantity: the channel leaves the register in
+/// a mixed state, and one statevector holds a single trajectory, so the answer
+/// would silently depend on an RNG draw. Refuse instead of returning a random
+/// number. Callers wanting the correct value run with `shots` (each shot is an
+/// independent trajectory) or use a density-matrix capable backend.
+fn reject_reset_in_analytic_mode(circuit: &CircuitIR) -> Result<()> {
+    if circuit_has_reset(circuit) {
+        return Err(OmegaError::Unsupported(
+            "statevector: analytic expectation of a circuit containing Reset is ill-defined \
+             (Reset produces a mixed state); run with shots so each shot is an independent \
+             trajectory"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// True when the circuit contains a `Reset`, i.e. a stochastic channel whose
+/// randomness must be redrawn per shot. See [`apply_reset`].
+pub(crate) fn circuit_has_reset(circuit: &CircuitIR) -> bool {
+    circuit
+        .ops
+        .iter()
+        .any(|op| matches!(op.gate, GateKind::Reset))
+}
+
+/// Evolve |0…0⟩ through `circuit` once, returning the final state and the
+/// classical register. One call = one trajectory: every `Reset` (and, in
+/// `Collapse` mode, every mid-circuit `Measure`) draws a fresh outcome from
+/// `rng`, so callers wanting shot statistics must invoke this once per shot.
+fn evolve_once(
+    circuit: &CircuitIR,
+    params: &ParameterBinding,
+    config: &ExecConfig,
+    rng: &mut impl Rng,
+) -> Result<(Vec<Complex64>, Vec<u8>)> {
+    let n = circuit.num_qubits as usize;
+    let dim = 1usize << n;
+
+    let mut state = vec![Complex64::new(0.0, 0.0); dim];
+    state[0] = Complex64::new(1.0, 0.0);
+    let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
+
+    for op in &circuit.ops {
+        // Check classical condition (multi-bit creg comparison per QASM2
+        // semantics; see GateOp::condition_satisfied).
+        if !op.condition_satisfied(&classical_bits) {
+            continue;
+        }
+        match &op.gate {
+            GateKind::Measure => {
+                if config.mid_circuit_mode == MidCircuitMode::Collapse {
+                    let q = op.qubits[0].0 as usize;
+                    let outcome = projective_measure(&mut state, n, q, rng);
+                    if let Some(cbit) = op.classical_bit {
+                        if (cbit as usize) < classical_bits.len() {
+                            classical_bits[cbit as usize] = outcome;
+                        }
+                    }
+                }
+                // MidCircuitMode::Skip → do nothing (backward compat)
+            }
+            GateKind::Barrier => continue,
+            _ => {
+                apply_gate(&mut state, n, op, params, rng)?;
+            }
+        }
+    }
+    Ok((state, classical_bits))
+}
+
+/// `rng` is consumed only by [`GateKind::Reset`], which is a stochastic
+/// channel rather than a gate — see [`apply_reset`].
 fn apply_gate(
     state: &mut [Complex64],
     n: usize,
     op: &GateOp,
     params: &ParameterBinding,
+    rng: &mut impl Rng,
 ) -> Result<()> {
     // Resolve parameters
     let resolved: Vec<f64> = op
@@ -564,7 +640,7 @@ fn apply_gate(
             op.qubits[2].0 as usize,
         ),
 
-        GateKind::Reset => apply_reset(state, n, op.qubits[0].0 as usize),
+        GateKind::Reset => apply_reset(state, n, op.qubits[0].0 as usize, rng),
 
         GateKind::Measure | GateKind::Barrier => {}
 
@@ -579,35 +655,30 @@ fn apply_gate(
     Ok(())
 }
 
-/// Reset qubit `q` to |0⟩: zero all amplitudes where qubit q is |1⟩,
-/// then renormalise so the state remains valid.
-fn apply_reset(state: &mut [Complex64], n: usize, q: usize) {
-    let dim = 1usize << n;
-    let step = 1usize << q;
-
-    // Move |1⟩ amplitudes into |0⟩ slots, zero the |1⟩ slots
-    let mut i = 0;
-    while i < dim {
-        for j in i..i + step {
-            let i0 = j; // qubit q = 0
-            let i1 = j + step; // qubit q = 1
-                               // |ψ⟩ → |0⟩⟨0|ψ⟩ + |0⟩⟨1|ψ⟩  (trace out and reset)
-                               // After reset: amplitude at i0 gets contribution from both i0 and i1
-                               // We need to handle this probabilistically, but for a deterministic reset
-                               // (non-selective), we combine amplitudes: i0 keeps both, i1 zeroed.
-            state[i0] += state[i1];
-            state[i1] = Complex64::new(0.0, 0.0);
-        }
-        i += step << 1;
-    }
-
-    // Renormalise
-    let norm_sq: f64 = state.iter().map(|a| a.norm_sqr()).sum();
-    if norm_sq > 0.0 {
-        let inv_norm = 1.0 / norm_sq.sqrt();
-        for a in state.iter_mut() {
-            *a *= inv_norm;
-        }
+/// Reset qubit `q` to |0⟩ — the reset **channel** ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ).
+///
+/// Implemented as **sample → project → flip**, which is what Qiskit Aer's
+/// statevector method does: measure `q` in the computational basis with the
+/// trajectory RNG, collapse onto the sampled outcome, then apply X if that
+/// outcome was 1. The qubit ends in |0⟩ on every trajectory; averaged over
+/// shots the *rest* of the register sees the correct decohered marginal.
+///
+/// The randomness is essential and must live in the per-shot trajectory (see
+/// [`needs_trajectories`]): a single statevector cannot represent the mixed
+/// state the channel produces when `q` is entangled, so the ensemble has to
+/// come from running independent shots.
+///
+/// **Do not "fold" the amplitudes.** The previous implementation applied the
+/// non-unitary matvec `[[1,1],[0,0]]` (`state[i0] += state[i1]`) and
+/// renormalised. That is not a reset: it turns entanglement with the rest of
+/// the register into a *coherent* superposition. On Bell + `reset q0` it gave
+/// ⟨X₁⟩ = +1 where the channel gives 0, and on a qubit in |−⟩ the two
+/// amplitudes cancelled to zero — the `norm_sq > 0.0` guard then skipped
+/// renormalisation and left an all-zero state, so a freshly reset qubit
+/// sampled as |1⟩ on every shot. Pinned by `tests/reset_channel.rs`.
+fn apply_reset(state: &mut [Complex64], n: usize, q: usize, rng: &mut impl Rng) {
+    if projective_measure(state, n, q, rng) == 1 {
+        apply_1q(state, n, q, &gates::x());
     }
 }
 
