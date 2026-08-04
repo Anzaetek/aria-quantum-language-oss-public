@@ -103,9 +103,15 @@ fn adjoint_gradient_inner(
                 .allocate(n)
                 .map_err(|e| OmegaError::Backend(format!("cuda alloc phi: {e}")))?;
             let mut phi_state = CudaState { inner: phi_inner };
-            crate::apply_ops_fused(&mut phi_state, unitary_ops.iter().copied(), params, |_| {
-                false
-            })?;
+            // `unitary_ops` excludes Reset by construction (the adjoint path
+            // refuses non-unitary circuits upstream), so no trajectory RNG.
+            crate::apply_ops_fused(
+                &mut phi_state,
+                unitary_ops.iter().copied(),
+                params,
+                |_| false,
+                None,
+            )?;
             phi_state
         }
     };
