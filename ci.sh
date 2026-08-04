@@ -260,6 +260,14 @@ fi
 # Mirrors the ARIA_CUDA / ARIA_METAL stages: the OpenCL path is optional with a
 # CPU fallback, so the default CI stays green on hosts with no ICD. Set
 # ARIA_OPENCL=1 to assert the OpenCL kernels numerically match CPU.
+#
+# Linking also needs the ICD *loader* dev symlink `libOpenCL.so` (not just the
+# runtime `libOpenCL.so.1`): `cl-sys` emits `-lOpenCL`, which the linker can
+# only resolve against the `.so`. Most hosts get it from `ocl-icd-opencl-dev`.
+# A CUDA-only box (nvidia.icd present, no ocl-icd-opencl-dev) has the loader at
+# $CUDA/targets/<arch>/lib/libOpenCL.so but not on the default link path — point
+# the linker at it, e.g.:
+#   RUSTFLAGS="-L native=/usr/local/cuda/targets/x86_64-linux/lib" ARIA_OPENCL=1 ./ci.sh
 if [ "${ARIA_OPENCL:-0}" = "1" ]; then
   step "+   Optional: OpenCL GPU statevector backend"
   # Full OpenCL suite: the per-kernel smokes (apply_1q / apply_diagonal /
