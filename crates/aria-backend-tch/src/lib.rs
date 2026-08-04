@@ -288,7 +288,19 @@ impl TchBackend {
         let mut st = State::zero(circuit.num_qubits as usize, self.device, self.rkind);
         for op in &circuit.ops {
             match op.gate {
-                GateKind::Measure | GateKind::Barrier | GateKind::Reset => continue,
+                GateKind::Measure | GateKind::Barrier => continue,
+                // Reset is NOT skippable: it is a non-unitary channel
+                // (rho -> |0><0|_q (x) Tr_q(rho)). This backend evolves a
+                // single pure state through unitaries, so skipping it silently
+                // answered a different circuit. Refuse and let the caller fall
+                // back to the statevector backend, which samples it per shot.
+                GateKind::Reset => {
+                    return Err(OmegaError::Unsupported(
+                        "tch: Reset is a non-unitary channel and is not supported; use the \
+                         statevector or MPS backend"
+                            .into(),
+                    ))
+                }
                 _ => {}
             }
             let resolved: Vec<f64> = op

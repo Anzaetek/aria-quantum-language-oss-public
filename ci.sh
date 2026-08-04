@@ -45,6 +45,25 @@ cargo test "${ARIA_CRATES[@]}"
 # them, so run their tests here or those gates never execute in CI.
 cargo test "${OMEGA_CORE[@]}"
 
+# --- Reset-channel regression gates (every CPU backend) ---------------------
+# `reset q` is the non-unitary CHANNEL rho -> |0><0|_q (x) Tr_q(rho): the qubit
+# is discarded and any entanglement it had is DESTROYED, not transferred. Three
+# backends each shipped a DIFFERENT wrong version of it — statevector and MPS
+# folded the amplitudes ([[1,1],[0,0]]), the stabilizer post-selected on
+# outcome 0, and pauliprop/tch/aria-verify skipped it entirely — and each is
+# wrong in a different basis, so every pairwise "backends agree" check landed
+# on one where two of them happened to coincide. Run these as a NAMED stage so
+# a regression is obvious instead of buried in a 100-test summary. Expected
+# values are pinned to Qiskit Aer's exact DensityMatrix (qiskit 2.4.1 /
+# aer 0.17.2); see the module docs in tests/reset_channel.rs.
+cargo test -p omega-backend-statevector --test reset_channel
+cargo test -p omega-backend-mps --test reset_channel
+cargo test -p omega-backend-pauli --test reset_channel
+# pauliprop (and the tch plugin / aria-verify reference sim) cannot represent
+# the channel at all, so their contract is a clean refusal rather than a value.
+cargo test -p omega-backend-pauliprop --test reset_refused
+echo "  OK: Reset channel == Aer on statevector + MPS + stabilizer"
+
 step "6/9  Numeric smoke against the built 'aria' binary"
 ARIA=$(cargo build -p aria-cli --message-format=json 2>/dev/null \
   | sed -n 's/.*"executable":"\([^"]*aria\)".*/\1/p' | head -1)
@@ -220,7 +239,13 @@ if [ "${ARIA_CUDA:-0}" = "1" ]; then
   # RBS (Givens) statevector forward ≡ CPU (f32, tol 1e-5) AND the RBS adjoint
   # gradient ≡ CPU adjoint (tol 1e-4). The `rbs` filter runs both gates.
   cargo test -p aria-runtime --features cuda --test run_examples rbs
+  # The statevector-CUDA suite above includes the Reset-channel gates:
+  # `reset_matches_cpu` (GPU vs CPU shot distributions + both refusing the
+  # ill-defined analytic case) and `reset_channel_matches_aer_ground_truth`
+  # (the three discriminating circuits pinned to Aer). CUDA samples the Born
+  # outcome ON DEVICE via the fused Pauli-expectation reduction.
   echo "  OK: CUDA GPU statevector + MPS(gesvdj) + pauliprop(branch) + RBS match CPU"
+  echo "  OK: CUDA Reset channel (on-device sampling) == Aer"
 else
   echo
   echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"

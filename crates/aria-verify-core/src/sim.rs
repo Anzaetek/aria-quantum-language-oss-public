@@ -131,7 +131,17 @@ pub fn forward_z_expectations(ir: &CircuitIR, params: &[f64]) -> Result<Vec<f64>
     for op in &ir.ops {
         let q: Vec<usize> = op.qubits.iter().map(|x| x.0 as usize).collect();
         match op.gate {
-            GateKind::Id | GateKind::Barrier | GateKind::Measure | GateKind::Reset => {}
+            GateKind::Id | GateKind::Barrier | GateKind::Measure => {}
+            // Reset is NOT a no-op: it is a non-unitary channel
+            // (rho -> |0><0|_q (x) Tr_q(rho)) that this pure-state reference
+            // simulator cannot represent. Skipping it meant `aria verify`
+            // silently verified a DIFFERENT circuit than the one submitted —
+            // a soundness hole in the verification layer, not a limitation.
+            GateKind::Reset => {
+                return Err("verify sim: Reset is a non-unitary channel and cannot be \
+                            represented by this pure-state reference simulator"
+                    .to_string())
+            }
             GateKind::H => apply_1q(
                 &mut sv,
                 q[0],

@@ -399,6 +399,7 @@ name = "omega-core"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "ndarray",
  "num-complex",
  "rand 0.10.1",
  "serde",

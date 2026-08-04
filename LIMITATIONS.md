@@ -42,6 +42,35 @@ end-to-end implementation, and which deeper features are deferred.
   statevector backend rather than producing a wrong result. QASM 2.0 export
   decomposes it exactly, so exported circuits run anywhere.
 
+- **Mid-circuit `Reset` semantics.** `reset q` is the non-unitary *channel*
+  `ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ)`: the qubit is discarded and replaced by a fresh
+  |0⟩, and any entanglement it had is **destroyed**, not transferred. The
+  result is a mixed state, so a statevector / MPS / tableau backend implements
+  it by **sampling** — measure `q`, project, apply X if the outcome was 1 —
+  and the ensemble comes from running independent shots. Consequences:
+
+  - **`shots` is required for a reset on an entangled qubit.** Analytic runs
+    (`shots = None`: `--statevector`, `--expectation`) refuse it, because one
+    state vector holds one trajectory and the answer would otherwise depend
+    silently on an RNG draw. A reset on an *unentangled* qubit is
+    deterministic and is still served analytically (the CPU statevector tests
+    reduced purity exactly; the stabilizer and MPS backends use a coarser,
+    conservative test and may refuse some resets that are in fact
+    deterministic).
+  - **`pauliprop`, the `tch` plugin, and `aria-verify`'s reference simulator
+    refuse `Reset`.** They evolve a pure state, or conjugate observables
+    unitarily, and cannot represent the channel. They previously *skipped* it
+    silently, which meant answering a different circuit than the one
+    submitted.
+  - **The OpenCL statevector backend refuses `Reset`**, so the CLI falls back
+    to the CPU statevector backend.
+  - ⚠️ **The Metal statevector backend still carries the old, incorrect
+    implementation.** CPU, MPS, stabilizer and CUDA implement the channel; the
+    Metal mirror has not been ported because it cannot be compiled or run off
+    a Mac. Its `reset_matches_cpu` gate will fail under `ARIA_METAL=1` until
+    the port lands on the Mac box — treat Metal `Reset` results as wrong until
+    then. See `GPU_BACKEND_PLAN.md`.
+
 ## Classical linear-algebra stack (`omega_core`, `aria_runtime::linalg`)
 
 - The QSVT phase angles use a **placeholder heuristic** (`chebyshev::
