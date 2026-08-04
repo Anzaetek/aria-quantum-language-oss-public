@@ -55,6 +55,64 @@
 >    by `expectation_matches_cpu_pauli_string` (was off by ~0.5, now ≤1e-5) and
 >    added a Metal mirror. The full statevector-CUDA suite is now CI-gated.
 
+> **Status (2026-08-05): `Reset` was WRONG everywhere — corrected; Metal
+> PENDING.** This supersedes item 3 above, which described the amplitude
+> *fold* as the intended semantics. It is not. `reset q` is the non-unitary
+> channel `ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ)`: the qubit is discarded and any
+> entanglement it had is **destroyed**, not transferred.
+>
+> Ground truth (Qiskit Aer 0.17.2 exact `DensityMatrix`, `Bell(q0,q1); reset
+> q0`): `ρ = diag(0.5, 0, 0.5, 0)`, `ρ_q1 = I/2`, so `⟨X₁⟩ = ⟨Y₁⟩ = ⟨Z₁⟩ = 0`
+> and `⟨Z₀⟩ = +1`. Every Aer method (statevector / stabilizer /
+> matrix_product_state) agrees.
+>
+> Three backends each shipped a *different* wrong version, and each is wrong in
+> a **different basis** — which is exactly why `reset_matches_cpu` and every
+> other cross-backend "agreement" gate passed: each pair happened to coincide
+> in the basis being checked.
+>
+> | | mechanism | A: measure q1 | B: H q1 then measure | C: reset \|−⟩ |
+> |---|---|---|---|---|
+> | correct | sample→project→flip | ~50/50 | ~50/50 | 0% ones |
+> | statevector / MPS / **CUDA** / **Metal** | coherent fold `[[1,1],[0,0]]` | ~50/50 ✅ | **0% ❌** | **100% ❌** |
+> | stabilizer | post-select outcome 0 | **0% ❌** | ~50/50 ✅ | 0% ✅ |
+> | pauliprop / tch / aria-verify | silent no-op | — | — | — |
+>
+> Sharpest single number: reset a qubit in |−⟩ and measure it. Correct is 0
+> with certainty; the fold cancelled the amplitudes to zero, the
+> `norm_sq > 0.0` guard skipped renormalisation, and the all-zero state sampled
+> as **|1⟩ on all 4000 shots**.
+>
+> Fixed (`218fd15`, `c34a1b3`, `50d7dbd`, `a3e8905`): sample → project → flip,
+> with the randomness redrawn **per shot** (one state vector = one trajectory).
+> CUDA does the Born probability **on device** — `p0 = (1 + ⟨Z_q⟩)/2` via the
+> existing fused Pauli-expectation reduction, then projection + renormalisation
+> + conditional-X fused into a single `apply_1q`; no new kernel. Analytic
+> (`shots = None`) runs refuse a reset on an entangled qubit rather than return
+> an RNG-dependent number; an *unentangled* reset is deterministic and still
+> served. pauliprop / tch / aria-verify-core now refuse instead of no-oping
+> (the aria-verify one was a soundness hole — it verified a different circuit
+> than the one submitted). OpenCL already refused, so it inherits the fix.
+>
+> **Open items — do not close this section until both are done:**
+>
+> 1. ⚠️ **Metal statevector `Reset` is still the old fold — PENDING.** It could
+>    not be ported here: the crate is macOS-gated, so it cannot be compiled or
+>    run off a Mac, and this plan has already been burned once by landing
+>    unverified Metal code (`f11a9f5` found 2/70 failing on the M4). On the Mac
+>    box, mirror the CUDA change in
+>    `omega-backend-statevector-metal/src/lib.rs`: `reset_p0` from `⟨Z_q⟩`, the
+>    fused `apply_1q` for project+renormalise+X, a `reset_rng` parameter through
+>    `apply_ops_fused`, and per-shot trajectories in `execute`. `reset_matches_cpu`
+>    **will fail** under `ARIA_METAL=1` until then — that failure is correct and
+>    is the signal this item is outstanding. Tracked in `LIMITATIONS.md`.
+> 2. **Validate the reset mechanism in Lean 4 — deferred, not scheduled.**
+>    Prove that sample→project→flip implements `ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ)`, i.e.
+>    that averaging the two branches weighted by their Born probabilities gives
+>    the reset channel, alongside the existing
+>    `verification/Verification/Adjoint/PauliExpectation.lean` work. Explicitly
+>    out of scope for the fix that landed; recorded here so it is not lost.
+
 > Active dev repo: **`aria-quantum-language-oss-public`** (per the README banner,
 > all future dev lands here). Rules from `CLAUDE.md` apply: local CI is the
 > single source of truth (`./ci.sh`), **commit often, never push**, every
