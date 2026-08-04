@@ -30,6 +30,8 @@
 //! cross-checks tolerate ~1e-6 round-off (Phase 1 Metal validated the
 //! same threshold against the 386-fixture verify-qiskit corpus).
 
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use thiserror::Error;
 
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
@@ -233,9 +235,13 @@ impl CudaStatevectorBackend {
             .allocate(n)
             .map_err(|e| OmegaError::Backend(format!("cuda alloc psi: {e}")))?;
         let mut psi = CudaState { inner };
-        apply_ops_fused(&mut psi, &circuit.ops, params, |op| {
-            matches!(&op.gate, GateKind::Measure)
-        })?;
+        apply_ops_fused(
+            &mut psi,
+            &circuit.ops,
+            params,
+            |op| matches!(&op.gate, GateKind::Measure),
+            None,
+        )?;
         let mut predictions = Vec::with_capacity(observables.len());
         for obs in observables {
             let mut total = 0.0_f64;
@@ -598,28 +604,85 @@ impl CudaState {
         self.apply_2q(qa, qb, &u)
     }
 
-    /// Reset qubit `q` to |0⟩, matching the CPU `apply_reset` semantics
-    /// exactly: fold each |1⟩ amplitude into its paired |0⟩ slot, zero the
-    /// |1⟩ slot, then renormalise the whole state.
+    /// Reset qubit `q` to |0⟩ — the reset **channel** ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ),
+    /// matching the CPU `apply_reset`.
     ///
-    /// The fold `new0 = old0 + old1, new1 = 0` is the (non-unitary) 1-qubit
-    /// matvec `[[1,1],[0,0]]`; `apply_1q` applies arbitrary 2×2 matrices — the
-    /// same path the adjoint uses for non-unitary derivative gates — so no new
-    /// kernel is needed. The norm is `⟨ψ|I|ψ⟩` (identity Pauli masks
-    /// `(0, 0, 1)`), and a uniform `apply_diagonal(q, inv, inv)` rescales.
+    /// **Sample → project → flip**, with the Born probability computed on the
+    /// device. `u` is a uniform draw in `[0,1)` supplied by the caller's
+    /// trajectory RNG, so the randomness stays with the shot loop that owns it
+    /// (the GPU state object is not the right place for an RNG).
+    ///
+    /// `p0 = P(q reads 0)` comes from the existing fused Pauli-expectation
+    /// reduction: `⟨Z_q⟩ = p0 − p1` and `p0 + p1 = 1`, so
+    /// `p0 = (1 + ⟨Z_q⟩)/2` — Pauli masks `(x_mask = 0, sign_mask = 1<<q,
+    /// y_factor = 1)`. No new kernel, and the only host transfer is that one
+    /// scalar, which the previous implementation already paid for its norm
+    /// readback.
+    ///
+    /// Projection, renormalisation and the conditional X then fuse into a
+    /// *single* `apply_1q`, since `new0 = u00·a0 + u01·a1`, `new1 = u10·a0 +
+    /// u11·a1`:
+    ///
+    /// * outcome 0 → `[[1/√p0, 0], [0, 0]]`  (keep |0⟩, renormalise)
+    /// * outcome 1 → `[[0, 1/√p1], [0, 0]]`  (keep |1⟩, renormalise, and move
+    ///   it into the |0⟩ slot — that *is* the conditional X)
+    ///
+    /// **Do not "fold" the amplitudes.** The previous implementation applied
+    /// `[[1,1],[0,0]]` and renormalised, mirroring the CPU backend's old bug:
+    /// that is a *coherent* fold, which turns entanglement into a fake
+    /// superposition (⟨X₁⟩ = +1 after Bell + reset instead of 0) and
+    /// annihilates a |−⟩ state. See `omega-backend-statevector`'s `apply_reset`
+    /// and `tests/reset_channel.rs`.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
-    pub fn apply_reset(&mut self, q: u32) -> Result<(), CudaError> {
+    pub fn apply_reset(&mut self, q: u32, u: f64) -> Result<(), CudaError> {
+        let p0 = self.reset_p0(q)?;
+        self.apply_reset_outcome(q, p0, u >= p0)
+    }
+
+    /// `P(qubit q reads 0)`, computed on the device from `⟨Z_q⟩`.
+    ///
+    /// Callers use this to decide the reset branch, and analytic (`shots =
+    /// None`) callers use it to detect a *deterministic* reset (`p0` is 0 or 1
+    /// ⇒ the qubit sits in a Z eigenstate) — the only case where a reset has a
+    /// well-defined pure-state answer.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    pub fn reset_p0(&mut self, q: u32) -> Result<f64, CudaError> {
         let one = Complex64::new(1.0, 0.0);
+        // ⟨Z_q⟩ = p0 − p1 and p0 + p1 = 1 ⇒ p0 = (1 + ⟨Z_q⟩)/2. Clamp: the f32
+        // reduction can land a hair outside [0,1] and a negative under the
+        // sqrt below would poison the state.
+        let z_q = self.pauli_expectation(0, 1u32 << q, one)?.re;
+        Ok((0.5 * (1.0 + z_q)).clamp(0.0, 1.0))
+    }
+
+    /// Collapse `q` onto `outcome_one`, renormalise, and move the surviving
+    /// amplitude into the |0⟩ slot — the project/renormalise/conditional-X of
+    /// the reset channel, fused into one `apply_1q`.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    pub fn apply_reset_outcome(
+        &mut self,
+        q: u32,
+        p0: f64,
+        outcome_one: bool,
+    ) -> Result<(), CudaError> {
         let zero = Complex64::new(0.0, 0.0);
-        // Fold |1⟩ → |0⟩ (coherent add), zero |1⟩. Row-major [m00,m01,m10,m11].
-        self.apply_1q(q, &[one, one, zero, zero])?;
-        // norm² = ⟨ψ|I|ψ⟩ (f32 device reduction), then uniform rescale.
-        let norm_sq = self.pauli_expectation(0, 0, one)?.re;
-        if norm_sq > 0.0 {
-            let inv = Complex64::new(1.0 / norm_sq.sqrt(), 0.0);
-            self.apply_diagonal(q, inv, inv)?;
-        }
-        Ok(())
+        let p1 = 1.0 - p0;
+        // A zero-weight branch is unreachable; force the other outcome so the
+        // renormalisation stays finite (matches the CPU backend).
+        let outcome_one = if p0 <= 0.0 {
+            true
+        } else if p1 <= 0.0 {
+            false
+        } else {
+            outcome_one
+        };
+        let inv = Complex64::new(1.0 / if outcome_one { p1 } else { p0 }.sqrt(), 0.0);
+        let m = if outcome_one {
+            [zero, inv, zero, zero]
+        } else {
+            [inv, zero, zero, zero]
+        };
+        self.apply_1q(q, &m)
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
@@ -745,13 +808,56 @@ impl Backend for CudaStatevectorBackend {
         }
 
         let classical_bits = vec![0u8; circuit.num_classical_bits as usize];
-        apply_ops_fused(&mut state, &circuit.ops, params, |op| {
-            // Skip the gate when its classical condition is NOT
-            // satisfied. `GateOp::condition_satisfied` handles both
-            // single-bit `if(c == V)` and multi-bit cregs (post-merge
-            // `Option<(start_bit, num_bits, expected)>` shape).
-            !op.condition_satisfied(&classical_bits)
-        })?;
+
+        // `Reset` is a stochastic CHANNEL (see `CudaState::apply_reset`): one
+        // statevector carries one trajectory, so correct shot statistics need
+        // independent evolutions. Sampling every shot from a single post-reset
+        // state would replay one draw of the reset outcome as certainty.
+        // Mirrors the CPU statevector backend. The device buffer is reused
+        // across shots and re-zeroed via `write_state`.
+        let has_reset = circuit
+            .ops
+            .iter()
+            .any(|op| matches!(op.gate, GateKind::Reset));
+        if let (true, Some(shots)) = (has_reset, config.shots) {
+            let mut rng = match config.seed {
+                Some(s) => StdRng::seed_from_u64(s),
+                None => rand::make_rng::<StdRng>(),
+            };
+            let dim = 1usize << n;
+            let mut zero = vec![Complex64::new(0.0, 0.0); dim];
+            zero[0] = Complex64::new(1.0, 0.0);
+            let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+            for _ in 0..shots {
+                state.write_state(&zero)?;
+                apply_ops_fused(
+                    &mut state,
+                    &circuit.ops,
+                    params,
+                    |op| !op.condition_satisfied(&classical_bits),
+                    Some(&mut rng),
+                )?;
+                let one = state.inner.sample_counts_on_device(1, Some(rng.random()))?;
+                if let Some(k) = one.into_keys().next() {
+                    *counts.entry(k).or_insert(0) += 1;
+                }
+            }
+            return Ok(ExecResult::Counts(counts));
+        }
+
+        apply_ops_fused(
+            &mut state,
+            &circuit.ops,
+            params,
+            |op| {
+                // Skip the gate when its classical condition is NOT
+                // satisfied. `GateOp::condition_satisfied` handles both
+                // single-bit `if(c == V)` and multi-bit cregs (post-merge
+                // `Option<(start_bit, num_bits, expected)>` shape).
+                !op.condition_satisfied(&classical_bits)
+            },
+            None,
+        )?;
 
         // Shot mode skips the full statevector readback — only the
         // per-amplitude probabilities (one f32 per amp = half the
@@ -794,9 +900,13 @@ impl Backend for CudaStatevectorBackend {
         let n = circuit.num_qubits;
         let mut psi = self.allocate(n)?;
         // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
-        apply_ops_fused(&mut psi, &circuit.ops, params, |op| {
-            matches!(&op.gate, GateKind::Measure)
-        })?;
+        apply_ops_fused(
+            &mut psi,
+            &circuit.ops,
+            params,
+            |op| matches!(&op.gate, GateKind::Measure),
+            None,
+        )?;
 
         let mut total = 0.0_f64;
         for (coeff, pauli_string) in &observable.terms {
@@ -833,9 +943,13 @@ impl Backend for CudaStatevectorBackend {
         let n = circuit.num_qubits;
         let mut psi = self.allocate(n)?;
         // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
-        apply_ops_fused(&mut psi, &circuit.ops, params, |op| {
-            matches!(&op.gate, GateKind::Measure)
-        })?;
+        apply_ops_fused(
+            &mut psi,
+            &circuit.ops,
+            params,
+            |op| matches!(&op.gate, GateKind::Measure),
+            None,
+        )?;
 
         let mut out = Vec::with_capacity(observables.len());
         for obs in observables {
@@ -1051,9 +1165,13 @@ impl Backend for CudaStatevectorBackend {
             .allocate(n)
             .map_err(|e| OmegaError::Backend(format!("cuda alloc psi: {e}")))?;
         let mut psi = CudaState { inner };
-        apply_ops_fused(&mut psi, &circuit.ops, params, |op| {
-            matches!(&op.gate, GateKind::Measure)
-        })?;
+        apply_ops_fused(
+            &mut psi,
+            &circuit.ops,
+            params,
+            |op| matches!(&op.gate, GateKind::Measure),
+            None,
+        )?;
 
         let mut predictions = Vec::with_capacity(observables.len());
         for obs in observables {
@@ -1214,11 +1332,18 @@ fn diagonal_factor(
 /// over — diagonal gates commute, Id/Barrier are transparent, the
 /// pending list is flushed by every non-diagonal op).
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+///
+/// `reset_rng` carries the trajectory randomness for `Reset`. `Some(rng)` is a
+/// shot run: each reset samples its Born outcome. `None` is an analytic
+/// (`shots = None`) run, where a reset is only well-defined if it is
+/// deterministic — otherwise the register ends up mixed and one statevector
+/// cannot represent it, so we refuse rather than pick a branch silently.
 pub(crate) fn apply_ops_fused<'a, I>(
     state: &mut CudaState,
     ops: I,
     params: &ParameterBinding,
     mut condition_skip: impl FnMut(&omega_core::circuit::GateOp) -> bool,
+    mut reset_rng: Option<&mut StdRng>,
 ) -> OmegaResult<()>
 where
     I: IntoIterator<Item = &'a omega_core::circuit::GateOp>,
@@ -1238,8 +1363,25 @@ where
         // path never silently treats it as unitary.
         if matches!(&op.gate, GateKind::Reset) {
             flush_pending(state, &mut pending)?;
+            let q = op.qubits[0].0;
+            let p0 = state.reset_p0(q).map_err(OmegaError::from)?;
+            let outcome_one = match reset_rng.as_deref_mut() {
+                Some(rng) => rng.random::<f64>() >= p0,
+                None => {
+                    // Analytic run: only a determined outcome is representable.
+                    if p0 > 1e-6 && p0 < 1.0 - 1e-6 {
+                        return Err(OmegaError::Unsupported(format!(
+                            "cuda: analytic expectation of Reset on qubit {q} is ill-defined — \
+                             the outcome is random (p0 = {p0:.6}), so the reset leaves the \
+                             register in a mixed state that one statevector cannot represent. \
+                             Run with shots (each shot is an independent trajectory)."
+                        )));
+                    }
+                    p0 <= 0.5
+                }
+            };
             state
-                .apply_reset(op.qubits[0].0)
+                .apply_reset_outcome(q, p0, outcome_one)
                 .map_err(OmegaError::from)?;
             continue;
         }
@@ -1671,10 +1813,15 @@ mod tests {
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     #[test]
     fn reset_matches_cpu() {
-        // Mid-circuit Reset on the GPU must reproduce the CPU backend's
-        // deterministic fold-and-renormalise semantics. Reset a qubit out of an
-        // entangled, non-|0⟩ state (Bell + RY), then keep computing so a wrong
-        // reset would propagate into the final amplitudes. f32 tolerance 1e-5.
+        // Mid-circuit Reset on the GPU must reproduce the CPU backend's reset
+        // CHANNEL, not the old coherent fold. Reset a qubit out of an
+        // entangled, non-|0> state (Bell + RY) then keep computing, so a wrong
+        // reset propagates into the final distribution.
+        //
+        // The channel leaves the register MIXED, so there is no analytic
+        // statevector to compare — this used to diff `shots: None` amplitudes,
+        // which both backends now (correctly) refuse. Compare shot
+        // distributions instead: each shot is an independent trajectory.
         use omega_backend_statevector::StatevectorBackend;
         use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
 
@@ -1695,26 +1842,145 @@ mod tests {
         push(&mut circuit, GateKind::H, &[1], &[]);
 
         let params = ParameterBinding::new();
-        let cfg = ExecConfig {
+        let cpu = StatevectorBackend::new();
+        let cuda = CudaStatevectorBackend::new().expect("cuda");
+
+        // Analytic mode is ill-defined for a reset on an entangled qubit and
+        // must be refused by BOTH backends rather than silently answered.
+        let analytic = ExecConfig {
             shots: None,
             ..ExecConfig::default()
         };
-        let cpu = StatevectorBackend::new();
-        let cuda = CudaStatevectorBackend::new().expect("cuda");
-        let cpu_res = cpu.execute(&circuit, &params, &cfg).expect("cpu execute");
-        let cuda_res = cuda.execute(&circuit, &params, &cfg).expect("cuda execute");
-        match (cpu_res, cuda_res) {
-            (ExecResult::Statevector(a), ExecResult::Statevector(b)) => {
-                assert_eq!(a.len(), b.len());
-                let max = a
-                    .iter()
-                    .zip(b.iter())
-                    .map(|(x, y)| (x - y).norm())
-                    .fold(0.0f64, f64::max);
-                assert!(max < 1e-5, "max amp diff {max}");
+        assert!(
+            cpu.execute(&circuit, &params, &analytic).is_err(),
+            "cpu must refuse analytic entangled reset"
+        );
+        assert!(
+            cuda.execute(&circuit, &params, &analytic).is_err(),
+            "cuda must refuse analytic entangled reset"
+        );
+
+        // Shot distributions must agree. Independent RNG streams, so compare
+        // frequencies within a statistical band, not bit-for-bit.
+        const SHOTS: u32 = 8000;
+        let shot_cfg = |seed| ExecConfig {
+            shots: Some(SHOTS),
+            seed: Some(seed),
+            ..ExecConfig::default()
+        };
+        let freq = |r: ExecResult| -> [f64; 4] {
+            let m = r.counts().clone();
+            let mut f = [0.0; 4];
+            for (k, v) in m {
+                f[(k as usize) & 3] = v as f64 / SHOTS as f64;
             }
-            _ => panic!("expected statevectors"),
+            f
+        };
+        let a = freq(cpu.execute(&circuit, &params, &shot_cfg(7)).expect("cpu"));
+        let b = freq(cuda.execute(&circuit, &params, &shot_cfg(11)).expect("cuda"));
+        // 5 sigma on 8000 draws at p<=0.5 is ~0.028; 0.04 keeps the gate sharp
+        // (the old fold misses whole outcomes) without being seed-fragile.
+        for i in 0..4 {
+            assert!(
+                (a[i] - b[i]).abs() < 0.04,
+                "cuda vs cpu reset distribution differs at |{i:02b}>: cpu {:.4} gpu {:.4} \
+                 (full: cpu {a:?} gpu {b:?})",
+                a[i],
+                b[i]
+            );
         }
+        // q0 was reset: it must read 0 on every shot, on both backends.
+        assert!(a[1] + a[3] < 1e-12, "cpu: q0 not reset, {a:?}");
+        assert!(b[1] + b[3] < 1e-12, "gpu: q0 not reset, {b:?}");
+    }
+
+    /// The three circuits that discriminate a real reset CHANNEL from the
+    /// plausible near-misses, pinned to Qiskit Aer's exact `DensityMatrix`
+    /// (qiskit 2.4.1 / aer 0.17.2) for `Bell(q0,q1); reset q0`:
+    ///
+    /// ```text
+    /// rho = diag(0.5, 0, 0.5, 0)   rho_q1 = I/2   <X_1> = <Y_1> = <Z_1> = 0
+    /// ```
+    ///
+    /// | gate | correct | coherent fold | post-selection |
+    /// |---|---|---|---|
+    /// | A  measure q1           | ~50/50 | ~50/50 | 0%     |
+    /// | B  H q1 then measure q1 | ~50/50 | 0%     | ~50/50 |
+    /// | C  reset \|-> then measure | 0%  | 100%   | 0%     |
+    ///
+    /// A and B fail in DIFFERENT bases, so no single gate is sufficient — that
+    /// is exactly why the fold survived cross-backend "agreement" checks. Keep
+    /// all three. Mirrors `omega-backend-statevector/tests/reset_channel.rs`.
+    #[test]
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    fn reset_channel_matches_aer_ground_truth() {
+        use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
+        const SHOTS: u32 = 4000;
+        const BAND: u32 = 250;
+
+        let push = |c: &mut CircuitIR, gate, qubits: &[u32]| {
+            c.ops.push(GateOp {
+                gate,
+                qubits: qubits.iter().map(|&q| Qubit(q)).collect(),
+                params: Default::default(),
+                classical_bit: None,
+                condition: None,
+            });
+        };
+        let cuda = CudaStatevectorBackend::new().expect("cuda");
+        let run = |c: &CircuitIR| -> [u32; 4] {
+            let cfg = ExecConfig {
+                shots: Some(SHOTS),
+                seed: Some(7),
+                ..ExecConfig::default()
+            };
+            let m = cuda
+                .execute(c, &ParameterBinding::new(), &cfg)
+                .expect("cuda execute")
+                .counts()
+                .clone();
+            let mut out = [0u32; 4];
+            for (k, v) in m {
+                out[(k as usize) & 3] += v;
+            }
+            out
+        };
+        let ones = |f: [u32; 4], bit: usize| -> u32 {
+            (0..4).filter(|i| i & bit != 0).map(|i| f[i]).sum()
+        };
+
+        // A — partner maximally mixed in Z (post-selection would give 0).
+        let mut a = CircuitIR::new(2, CircuitType::GateBased);
+        push(&mut a, GateKind::H, &[0]);
+        push(&mut a, GateKind::CX, &[0, 1]);
+        push(&mut a, GateKind::Reset, &[0]);
+        let ka = ones(run(&a), 2);
+        assert!(
+            ka.abs_diff(SHOTS / 2) < BAND,
+            "cuda A: q1 ones {ka}/{SHOTS}, want ~{}",
+            SHOTS / 2
+        );
+
+        // B — and in X (the coherent fold would leave q1 = |+> and give 0).
+        let mut b = a.clone();
+        push(&mut b, GateKind::H, &[1]);
+        let kb = ones(run(&b), 2);
+        assert!(
+            kb.abs_diff(SHOTS / 2) < BAND,
+            "cuda B: q1 ones {kb}/{SHOTS}, want ~{}",
+            SHOTS / 2
+        );
+
+        // C — reset of |-> must read 0 with certainty (the fold read 1 always).
+        let mut c = CircuitIR::new(2, CircuitType::GateBased);
+        push(&mut c, GateKind::X, &[0]);
+        push(&mut c, GateKind::H, &[0]);
+        push(&mut c, GateKind::Reset, &[0]);
+        let kc = ones(run(&c), 1);
+        assert_eq!(kc, 0, "cuda C: reset(|->) must read 0, got {kc} ones");
+
+        // The reset qubit itself is |0> on every trajectory.
+        assert_eq!(ones(run(&a), 1), 0, "cuda: q0 must be |0> after reset");
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
