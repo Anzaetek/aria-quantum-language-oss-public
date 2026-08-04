@@ -259,8 +259,11 @@ $ ARIA_OPENCL_REQUIRE_DEVICE=1 cargo test -p omega-backend-statevector-opencl --
 >     cargo test -p omega-backend-statevector-opencl --features opencl
 > ```
 >
-> Verified on the Linux/CUDA box (NVIDIA ICD, 43 tests). The same `RUSTFLAGS`
-> applies to `ARIA_OPENCL=1 ./ci.sh` — see the note above that stage in `ci.sh`.
+> Both verified on the Linux/CUDA box (NVIDIA ICD, 43 tests, including
+> `device_present_when_required` — i.e. a real device was used, not a silent
+> skip). With `ocl-icd-opencl-dev` installed the plain command above links and
+> `ARIA_OPENCL=1 ./ci.sh` is green with **no** `RUSTFLAGS`; the `RUSTFLAGS` form
+> is only the no-root fallback. See also the note above that stage in `ci.sh`.
 
 Checks: the per-kernel smokes (`apply_1q`, `apply_diagonal`,
 `apply_diagonal_product`, `inner_product`), the end-to-end `execute` smoke,
