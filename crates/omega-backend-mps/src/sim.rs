@@ -101,6 +101,53 @@ impl MpsBackend {
         };
     }
 
+    /// Evolve |0…0⟩ through `circuit` once, returning the final chain and the
+    /// classical register. One call = one trajectory: every `Reset` (and, in
+    /// `Collapse` mode, every mid-circuit `Measure`) draws a fresh outcome from
+    /// `rng`, so callers wanting shot statistics must invoke this per shot.
+    fn evolve_once(
+        &self,
+        circuit: &CircuitIR,
+        params: &ParameterBinding,
+        config: &ExecConfig,
+        rng: &mut StdRng,
+    ) -> Result<(Mps, Vec<u8>)> {
+        let n = circuit.num_qubits as usize;
+        let mut mps = Mps::zero_state(n, self.max_bond_dim);
+        mps.set_svd_fn(self.svd_fn);
+        if let Some(cf) = self.contract_fn {
+            mps.set_contract_fn(cf);
+        }
+        if let Some(eps) = self.adaptive_eps {
+            mps.set_adaptive_eps(eps);
+        }
+        let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
+
+        for op in &circuit.ops {
+            if !op.condition_satisfied(&classical_bits) {
+                continue;
+            }
+            match &op.gate {
+                GateKind::Measure => {
+                    if config.mid_circuit_mode == MidCircuitMode::Collapse {
+                        let q = op.qubits[0].0 as usize;
+                        let outcome = mps.measure_site(q, rng);
+                        if let Some(cbit) = op.classical_bit {
+                            if (cbit as usize) < classical_bits.len() {
+                                classical_bits[cbit as usize] = outcome;
+                            }
+                        }
+                    }
+                }
+                GateKind::Barrier => continue,
+                _ => {
+                    apply_gate_mps(&mut mps, op, params, rng)?;
+                }
+            }
+        }
+        Ok((mps, classical_bits))
+    }
+
     /// Route this backend's bond-compression SVDs through `f` (e.g. the CUDA
     /// `gesvdj` accelerator). Falls back to CPU inside `f` when no GPU is
     /// present, so callers can wire it unconditionally under a `cuda` build.
@@ -136,44 +183,29 @@ impl Backend for MpsBackend {
             ));
         }
 
-        let n = circuit.num_qubits as usize;
-        let mut mps = Mps::zero_state(n, self.max_bond_dim);
-        mps.set_svd_fn(self.svd_fn);
-        if let Some(cf) = self.contract_fn {
-            mps.set_contract_fn(cf);
-        }
-        if let Some(eps) = self.adaptive_eps {
-            mps.set_adaptive_eps(eps);
-        }
-        let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => rand::make_rng::<StdRng>(),
         };
 
-        for op in &circuit.ops {
-            if !op.condition_satisfied(&classical_bits) {
-                continue;
+        // `Reset` is a stochastic CHANNEL, not a gate (see `apply_reset_mps`):
+        // one chain carries one trajectory, so correct shot statistics require
+        // independent evolutions. Sampling every shot from a single post-reset
+        // chain would replay one draw of the reset outcome as certainty.
+        // Mirrors the CPU statevector backend.
+        if let (true, Some(shots)) = (circuit_has_reset(circuit), config.shots) {
+            let mut counts = HashMap::new();
+            for _ in 0..shots {
+                let (mps, _cbits) = self.evolve_once(circuit, params, config, &mut rng)?;
+                self.record_stats(&mps);
+                let envs = mps.right_environments();
+                let outcome = mps.sample_with_envs(&envs, &mut rng);
+                *counts.entry(outcome).or_insert(0) += 1;
             }
-
-            match &op.gate {
-                GateKind::Measure => {
-                    if config.mid_circuit_mode == MidCircuitMode::Collapse {
-                        let q = op.qubits[0].0 as usize;
-                        let outcome = mps.measure_site(q, &mut rng);
-                        if let Some(cbit) = op.classical_bit {
-                            if (cbit as usize) < classical_bits.len() {
-                                classical_bits[cbit as usize] = outcome;
-                            }
-                        }
-                    }
-                }
-                GateKind::Barrier => continue,
-                _ => {
-                    apply_gate_mps(&mut mps, op, params)?;
-                }
-            }
+            return Ok(ExecResult::Counts(counts));
         }
+
+        let (mps, _classical_bits) = self.evolve_once(circuit, params, config, &mut rng)?;
         self.record_stats(&mps);
 
         match config.shots {
@@ -201,6 +233,7 @@ impl Backend for MpsBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        reject_reset_in_analytic_mode(circuit)?;
         let config = ExecConfig {
             shots: None,
             seed: None,
@@ -351,7 +384,7 @@ impl NoisyMpsBackend {
                 }
                 GateKind::Barrier => continue,
                 _ => {
-                    apply_gate_mps(&mut mps, op, params)?;
+                    apply_gate_mps(&mut mps, op, params, rng)?;
                     if self.model.has_gate_channel() {
                         let gate_qubits: Vec<usize> =
                             op.qubits.iter().map(|q| q.0 as usize).collect();
@@ -601,7 +634,39 @@ fn flip_all_readout<R: Rng>(bits: u64, n: usize, readout: &ReadoutError, rng: &m
     flipped
 }
 
-fn apply_gate_mps(mps: &mut Mps, op: &GateOp, params: &ParameterBinding) -> Result<()> {
+/// True when the circuit contains a `Reset`, whose randomness must be redrawn
+/// per shot. See [`apply_reset_mps`].
+fn circuit_has_reset(circuit: &CircuitIR) -> bool {
+    circuit
+        .ops
+        .iter()
+        .any(|op| matches!(op.gate, GateKind::Reset))
+}
+
+/// Analytic (`shots = None`) expectation over a `Reset` circuit is not a
+/// well-defined pure-state quantity — the channel leaves the register mixed and
+/// one chain holds a single trajectory, so the answer would silently depend on
+/// an RNG draw. Refuse instead. Mirrors the CPU statevector backend.
+fn reject_reset_in_analytic_mode(circuit: &CircuitIR) -> Result<()> {
+    if circuit_has_reset(circuit) {
+        return Err(OmegaError::Unsupported(
+            "mps: analytic expectation of a circuit containing Reset is ill-defined \
+             (Reset produces a mixed state); run with shots so each shot is an independent \
+             trajectory"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `rng` is consumed only by [`GateKind::Reset`], a stochastic channel rather
+/// than a gate — see [`apply_reset_mps`].
+fn apply_gate_mps(
+    mps: &mut Mps,
+    op: &GateOp,
+    params: &ParameterBinding,
+    rng: &mut impl Rng,
+) -> Result<()> {
     let resolved: Vec<f64> = op
         .params
         .iter()
@@ -680,7 +745,7 @@ fn apply_gate_mps(mps: &mut Mps, op: &GateOp, params: &ParameterBinding) -> Resu
         }
 
         GateKind::Reset => {
-            apply_reset_mps(mps, op.qubits[0].0 as usize);
+            apply_reset_mps(mps, op.qubits[0].0 as usize, rng);
         }
 
         GateKind::Measure | GateKind::Barrier => {}
@@ -696,22 +761,26 @@ fn apply_gate_mps(mps: &mut Mps, op: &GateOp, params: &ParameterBinding) -> Resu
     Ok(())
 }
 
-/// Reset qubit `q` to |0⟩ in the MPS representation.
+/// Reset qubit `q` to |0⟩ in the MPS representation — the reset **channel**
+/// ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ).
 ///
-/// Applies the non-unitary |0⟩⟨0| + |0⟩⟨1| map and renormalises via global norm.
-fn apply_reset_mps(mps: &mut Mps, q: usize) {
-    let zero = Complex64::new(0.0, 0.0);
-    let one = Complex64::new(1.0, 0.0);
-    // Reset "gate": |0⟩⟨0| + |0⟩⟨1| = [[1, 1], [0, 0]]
-    mps.apply_1q(q, &[one, one, zero, zero]);
-
-    // Renormalise using the global norm (local norm is wrong for entangled states)
-    let norm_sq = mps_norm_sq(mps);
-    if norm_sq > 0.0 {
-        let inv_norm = 1.0 / norm_sq.sqrt();
-        for a in mps.tensors[q].data.iter_mut() {
-            *a *= inv_norm;
-        }
+/// Sample → project → flip, matching the CPU statevector's `apply_reset` and
+/// Qiskit Aer's matrix_product_state method: `measure_site` draws the outcome
+/// from the correct environment-aware marginal and collapses the chain, then X
+/// returns the site to |0⟩. One call = one trajectory, so the caller must
+/// re-evolve per shot (see the `circuit_has_reset` branch in `execute`).
+///
+/// **Do not "fold" the amplitudes.** The previous implementation applied the
+/// non-unitary map `[[1,1],[0,0]]` and renormalised globally, which is a
+/// *coherent* fold, not a reset: on Bell + `reset q0` it left q1 in |+⟩
+/// (⟨X₁⟩ = +1 instead of 0), and on a qubit in |−⟩ the amplitudes cancelled to
+/// zero so the reset qubit sampled as |1⟩ every shot. Pinned by
+/// `tests/reset_channel.rs`.
+fn apply_reset_mps(mps: &mut Mps, q: usize, rng: &mut impl Rng) {
+    if mps.measure_site(q, rng) == 1 {
+        let zero = Complex64::new(0.0, 0.0);
+        let one = Complex64::new(1.0, 0.0);
+        mps.apply_1q(q, &[zero, one, one, zero]); // X
     }
 }
 
