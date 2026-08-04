@@ -350,7 +350,21 @@ impl PauliPropBackend {
             }
 
             // ----- no-ops for the unitary-conjugation picture -----
-            GateKind::Id | GateKind::Barrier | GateKind::Measure | GateKind::Reset => {}
+            GateKind::Id | GateKind::Barrier | GateKind::Measure => {}
+
+            // Reset is NOT a no-op. It is a non-unitary channel
+            // (rho -> |0><0|_q (x) Tr_q(rho)) and this backend evolves
+            // observables by unitary conjugation, which cannot express it.
+            // Silently skipping it answered a DIFFERENT circuit: after
+            // Bell + reset(q0) it reported <Z_0> = 0 where the channel gives
+            // +1. Refuse so the CLI falls back to a backend that models it.
+            GateKind::Reset => {
+                return Err(OmegaError::Unsupported(
+                    "pauliprop: Reset is a non-unitary channel and cannot be represented by \
+                     observable conjugation; use the statevector or MPS backend"
+                        .into(),
+                ));
+            }
 
             ref other => {
                 return Err(OmegaError::Unsupported(format!(

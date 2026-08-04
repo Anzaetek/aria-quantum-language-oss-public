@@ -30,7 +30,10 @@
 //! cross-checks tolerate ~1e-6 round-off (Phase 1 Metal validated the
 //! same threshold against the 386-fixture verify-qiskit corpus).
 
+// Trajectory RNG for `Reset` — only reachable on a real CUDA build.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 use rand::rngs::StdRng;
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 use rand::{RngExt, SeedableRng};
 use thiserror::Error;
 
