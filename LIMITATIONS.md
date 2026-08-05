@@ -159,11 +159,28 @@ whenever `shots` is set and the circuit contains a `Reset`. Verified: Bell +
 `Reset q0` at 512 shots now returns counts identical to the CPU
 (`{0: 262, 2: 250}`) in 0.47 s.
 
-**This is a fallback, not a fix.** Per-shot GPU trajectories were implemented
-first (lease → evolve → sample, reset branch drawn from an RNG) and are
-*correct* — verified at 16 shots against the CPU, same support, no impossible
-outcomes — but they **block at 0% CPU** from a few hundred shots onward, and
-draining the batch `apply_ops_fused` leaves open after a Reset did not resolve
-it. The root cause is not yet identified, and shipping a hang would be worse
-than the bug it replaces. Re-open when the pool/command-buffer interaction is
-understood.
+**This is a fallback, not a fix — but the root cause is now identified.**
+
+Per-shot GPU trajectories were implemented first (lease → evolve → sample, reset
+branch drawn from an RNG) and are *correct*: verified at 16 shots against the
+CPU, same support, no impossible outcomes. They **block at 0% CPU** from a few
+hundred shots onward.
+
+Measured 2026-08-05 with a loop of `lease → apply_h → begin_batch → drop`:
+
+| variant | stalls after |
+|---|---|
+| batch left open | ~32–64 cycles |
+| `end_batch_if_open()` before drop | ~32–64 cycles — **no better** |
+
+So it is **not** the open batch, which was the obvious suspect and the first fix
+attempted. Both variants stall at the same point, which matches Metal's limit on
+**in-flight command buffers** (~64 by default): each iteration leases a state and
+issues GPU work *without waiting for completion*, so buffers accumulate until
+`commandBuffer()` blocks. `end_batch_if_open` ends the encoder; it does not wait
+for the GPU to retire the work.
+
+**The fix**, when this is re-opened: reuse ONE leased state across shots
+(re-initialising rather than re-leasing) and force completion each iteration —
+any call that reads back, e.g. `pauli_expectation`, waits — instead of leasing a
+fresh state per shot. Delegation stands until that is implemented and measured.
