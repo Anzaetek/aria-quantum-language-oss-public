@@ -256,6 +256,22 @@ fi
 # default CI above stays green off-Mac. Set ARIA_METAL=1 on a Mac to assert the
 # GPU statevector / MPS-θ-contraction / pauliprop-branch paths numerically match
 # CPU. Uses --release: the Metal QML/statevector suites are slow in a debug build.
+# Opt-in Qiskit differential cross-check. Independent implementation, so
+# agreement is evidence rather than a shared convention. Needs a venv with
+# qiskit (never system Python) — see tools/qiskit_xcheck/README.md.
+if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
+    echo "== Qiskit differential cross-check =="
+    QK_PY="${ARIA_QISKIT_PY:-./.venv-qiskit/bin/python}"
+    if [ ! -x "$QK_PY" ]; then
+        echo "  (skip) no qiskit venv at $QK_PY — see tools/qiskit_xcheck/README.md"
+    else
+        cargo run -q --release -p omega-xcheck -- 60 > /tmp/aria_xcheck.txt \
+            && "$QK_PY" tools/qiskit_xcheck/compare.py /tmp/aria_xcheck.txt \
+            && echo "  qiskit cross-check OK" \
+            || { echo "  QISKIT CROSS-CHECK FAILED"; exit 1; }
+    fi
+fi
+
 if [ "${ARIA_METAL:-0}" = "1" ]; then
   step "+   Optional: Metal GPU backends"
   # PauliProp GPU branch: integer symplectic on the GPU, f64 coefficients on the
