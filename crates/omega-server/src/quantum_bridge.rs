@@ -20,6 +20,7 @@
 //! graph-state executor (`omega_backend_photonics::mbqc`), returning the
 //! canonical output statevector.
 
+use crate::worker::{governor, CostKind, JobShape, Reservation};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -91,12 +92,16 @@ pub enum OmegaMidCircuitMode {
 pub enum OmegaBackendSel {
     Auto,
     Statevector,
-    Mps { max_bond_dim: u32 },
+    Mps {
+        max_bond_dim: u32,
+    },
     Stabilizer,
     Photonic,
     /// A dynamically-loaded backend plugin, selected by name. Never chosen by
     /// `Auto` resolution — a client must request it explicitly.
-    Plugin { name: String },
+    Plugin {
+        name: String,
+    },
 }
 
 /// Lazily-loaded backend-plugin registry, populated once from
@@ -209,6 +214,88 @@ pub fn translate_to_core_ir(ir: &OmegaCircuitIR) -> CircuitIR {
         });
     }
     core
+}
+
+/// Map a resolved backend to the cost curve the governor should price it with.
+///
+/// `Auto` is resolved first (see [`admit_ir`]) rather than assumed dense —
+/// pricing a 30-qubit Clifford circuit as `2^30 × 16` would refuse a job the
+/// stabilizer backend runs in kilobytes.
+fn cost_kind_for(sel: &OmegaBackendSel) -> CostKind {
+    match sel {
+        OmegaBackendSel::Statevector => CostKind::DenseStatevector,
+        OmegaBackendSel::Mps { max_bond_dim } => CostKind::Mps {
+            max_bond_dim: *max_bond_dim,
+        },
+        OmegaBackendSel::Stabilizer => CostKind::Stabilizer,
+        OmegaBackendSel::Photonic => CostKind::Photonic,
+        OmegaBackendSel::Plugin { .. } => CostKind::Opaque,
+        // resolve_backend never returns Auto; price defensively if it ever does.
+        OmegaBackendSel::Auto => CostKind::DenseStatevector,
+    }
+}
+
+/// Reserve capacity for `ir` or turn the refusal into an HTTP response.
+///
+/// Held for the duration of execution: dropping the returned [`Reservation`]
+/// is what returns the budget, so callers must keep it alive across the run.
+fn shape_for(ir: &OmegaCircuitIR, densifies: bool, batch: usize) -> JobShape {
+    let mut shape = JobShape::new(ir.num_qubits, cost_kind_for(&resolve_backend(ir)));
+    shape.densifies = densifies;
+    shape.batch = batch;
+    shape
+}
+
+/// Shape for `/execute`. `shots: None` ships every amplitude back (and so pays
+/// for the JSON encoding); a shot run samples and returns counts.
+fn execute_shape(ir: &OmegaCircuitIR, shots: Option<u32>) -> JobShape {
+    let base = shape_for(ir, true, 1);
+    match shots {
+        None => base.returning_statevector(),
+        Some(_) => base.with_shots(),
+    }
+}
+
+/// Reserve for a whole batch by pricing **every** row and taking the worst.
+///
+/// Pricing only the widest row was a hole: rows carry independent `backend`
+/// selections, so a 40-qubit Clifford row (cheap, stabilizer) could be picked
+/// as "widest" while a 30-qubit Statevector row in the same request allocated
+/// 16 GiB against that reservation. Width does not imply cost.
+fn admit_batch(
+    circuits: &[OmegaCircuitIR],
+    densifies: bool,
+) -> Result<Reservation, Box<axum::response::Response>> {
+    let worst = circuits
+        .iter()
+        .map(|ir| shape_for(ir, densifies, circuits.len()))
+        // An unpriceable row sorts above every priced one: it must not be
+        // silently out-ranked by a row we happen to have a number for.
+        .max_by_key(|sh| crate::worker::estimate_peak_bytes(sh).unwrap_or(u64::MAX))
+        .expect("caller checked the batch is non-empty");
+    admit_shape(&worst)
+}
+
+fn admit_shape(shape: &JobShape) -> Result<Reservation, Box<axum::response::Response>> {
+    governor().admit(shape).map_err(|rej| {
+        // Boxed: an axum Response is large and this is the cold path.
+        // Busy is the only refusal waiting can fix; everything else is a
+        // property of the request and must not invite a retry storm.
+        let (status, retry_after) = if rej.is_transient() {
+            (StatusCode::TOO_MANY_REQUESTS, Some("1"))
+        } else {
+            (StatusCode::PAYLOAD_TOO_LARGE, None)
+        };
+        let body = Json(serde_json::json!({
+            "error": rej.message(),
+            "capacity_bytes": governor().config().capacity_bytes,
+            "available_bytes": governor().available_bytes(),
+        }));
+        Box::new(match retry_after {
+            Some(secs) => (status, [("Retry-After", secs)], body).into_response(),
+            None => (status, body).into_response(),
+        })
+    })
 }
 
 /// Decide which concrete backend should execute this IR.
@@ -486,6 +573,12 @@ pub async fn execute_quantum_route(
         return resp;
     }
     let num_qubits = req.circuit.num_qubits;
+    // Price and reserve before allocating anything. `_reservation` must stay
+    // alive for the whole execution — dropping it returns the budget.
+    let _reservation = match admit_shape(&execute_shape(&req.circuit, req.shots)) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
     match execute_quantum_ir(&req.circuit, req.shots, req.seed) {
         Ok((result, resolved)) => (
             StatusCode::OK,
@@ -520,6 +613,18 @@ pub async fn execute_pattern_route(
         return resp;
     }
     let n_out = req.pattern.output.len() as u32;
+    // MBQC was executing with NO admission at all. The simulator's state
+    // doubles per activated vertex (`omega-backend-photonics/src/mbqc.rs:148`)
+    // and both `vertices` and `output` are caller-supplied with no ceiling, so
+    // a few KB of JSON — well under the body limit — asked for 2^40 amplitudes.
+    // Price it as the dense array it really builds, on whichever of the two
+    // counts is larger.
+    let width = req.pattern.vertices.len().max(req.pattern.output.len()) as u32;
+    let shape = JobShape::new(width, CostKind::DenseStatevector).returning_statevector();
+    let _reservation = match admit_shape(&shape) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
     let result = execute_pattern_ir(&req.pattern);
     (
         StatusCode::OK,
@@ -578,6 +683,16 @@ pub async fn expectation_quantum_route(
     let observable = match Observable::parse(&req.observable) {
         Ok(o) => o,
         Err(e) => return bad(format!("bad observable '{}': {e}", req.observable)),
+    };
+
+    // Rows run as a sequential loop below, so peak cost is the *widest* row,
+    // not their sum — price that one and hold the reservation for the batch.
+    // Every expectation densifies: MpsBackend::expectation and the stabilizer's
+    // analytic mode both contract to a full statevector, whatever they store
+    // internally. Price all rows, not just the widest.
+    let _reservation = match admit_batch(&circuits, true) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
     };
 
     let mut values = Vec::with_capacity(circuits.len());

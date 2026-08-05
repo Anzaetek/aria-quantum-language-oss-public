@@ -817,6 +817,217 @@ async fn quantum_execute_auto_picks_stabilizer_for_clifford_only() {
 }
 
 // --------------------------------------------------------------------
+// Resource governor — admission control (crate::worker)
+// --------------------------------------------------------------------
+
+#[tokio::test]
+async fn quantum_execute_refuses_a_register_that_would_oom_the_host() {
+    // 40 qubits dense = 2^40 x 16 B = 16 TB. Before the governor this was
+    // allocated first and discovered by the OOM killer, taking every other
+    // tenant on the shared box with it. It must now be refused up front, and
+    // the refusal must state the numbers so the caller can act on it.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 40,
+            "num_classical_bits": 0,
+            "is_photonic": false,
+            "mid_circuit_mode": "Skip",
+            "backend": "Statevector",
+            "ops": [
+                {"gate": "T", "qubits": [0], "params": [], "classical_bit": null, "condition": null}
+            ]
+        },
+        "shots": 8
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/execute", &token, &body))
+        .await
+        .unwrap();
+    // 413, not 400: the request is well-formed, it simply cannot run here.
+    // And not 429 — waiting will never make 16 TB fit, so no retry storm.
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        resp.headers().get("Retry-After").is_none(),
+        "a permanently-too-large job must not invite a retry"
+    );
+    let v = read_body_json(resp.into_body()).await;
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("GB") && err.contains("budget"),
+        "refusal must quote the requirement and the budget, got: {err}"
+    );
+    assert!(
+        v["capacity_bytes"].as_u64().unwrap_or(0) > 0,
+        "response should carry the host budget"
+    );
+}
+
+#[tokio::test]
+async fn quantum_execute_still_admits_a_wide_clifford_circuit() {
+    // The governor must not become a blunt qubit cap. 32 qubits of Clifford
+    // resolves to the stabilizer backend, which is kilobytes -- refusing it
+    // because a *statevector* of that width would be 64 GB would be the
+    // governor being wrong, not safe.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let mut ops = Vec::new();
+    for q in 0..32 {
+        ops.push(serde_json::json!({
+            "gate": "H", "qubits": [q], "params": [],
+            "classical_bit": null, "condition": null
+        }));
+    }
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 32,
+            "num_classical_bits": 0,
+            "is_photonic": false,
+            "mid_circuit_mode": "Skip",
+            "backend": "Auto",
+            "ops": ops
+        },
+        "shots": 16,
+        "seed": 7
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/execute", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "wide Clifford must still run -- the ceiling is dense-only"
+    );
+    let v = read_body_json(resp.into_body()).await;
+    assert_eq!(v["backend"], "stabilizer");
+}
+
+#[tokio::test]
+async fn quantum_expectation_refuses_wide_auto_circuit_that_densifies_via_mps() {
+    // THE hole the first governor had. `resolve_backend` sends non-Clifford
+    // circuits of n >= 20 to MPS under the DEFAULT `backend: "Auto"`, and
+    // `MpsBackend::expectation` contracts to a full statevector
+    // (omega-backend-mps/src/mps.rs:418). Priced by its tensors this was
+    // ~4 MiB; it actually allocates 2^34 x 16 B = 256 GiB.
+    //
+    // Note this test pins the DEFAULT path -- no explicit backend is named.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 34,
+            "num_classical_bits": 0,
+            "is_photonic": false,
+            "mid_circuit_mode": "Skip",
+            "backend": "Auto",
+            // Ry is non-Clifford, so Auto cannot fall through to the stabilizer.
+            "ops": [
+                {"gate": "Ry", "qubits": [0], "params": [0.3], "classical_bit": null, "condition": null}
+            ]
+        },
+        "observable": "Z0"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "an Auto->MPS circuit that densifies must be priced as dense"
+    );
+    let v = read_body_json(resp.into_body()).await;
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(err.contains("GB"), "refusal must quote the cost: {err}");
+}
+
+#[tokio::test]
+async fn quantum_expectation_prices_every_row_not_just_the_widest() {
+    // The batch used to price only the row with the most qubits, but rows carry
+    // independent backends, so "widest" is not "most expensive". A photonic row
+    // is the sharpest case: its cost is combinatorial in PHOTONS (C(m+p-1, p)),
+    // so 26 modes is hundreds of GB while looking narrow next to a 34-qubit
+    // register. It used to be waved through unpriced at a 1 MiB token.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let cheap = serde_json::json!({
+        "num_qubits": 2, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": "Statevector",
+        "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+    });
+    let photonic = serde_json::json!({
+        "num_qubits": 26, "num_classical_bits": 0, "is_photonic": true,
+        "mid_circuit_mode": "Skip", "backend": "Photonic",
+        "ops": [{"gate": "PhaseShifter", "qubits": [0], "params": [0.5], "classical_bit": null, "condition": null}]
+    });
+    let body = serde_json::json!({
+        "circuits": [cheap, photonic],
+        "observable": "Z0"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a costly non-widest row must still be priced"
+    );
+}
+
+#[tokio::test]
+async fn execute_pattern_is_admission_controlled() {
+    // MBQC executed with NO admission at all: the simulator's state doubles per
+    // activated vertex (omega-backend-photonics/src/mbqc.rs:148) and vertices /
+    // output are caller-supplied, so a few KB of JSON asked for 2^40 amplitudes.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let vertices: Vec<u32> = (0..40).collect();
+    let body = serde_json::json!({
+        "pattern": {
+            "vertices": vertices,
+            "edges": [],
+            "layers": [],
+            "output": (0..40).collect::<Vec<u32>>(),
+            "is_photonic": true
+        }
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/execute_pattern", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a 40-vertex MBQC pattern must be refused, not allocated"
+    );
+}
+
+#[tokio::test]
+async fn health_publishes_the_execution_budget() {
+    // A client should be able to size work before submitting rather than
+    // discovering the ceiling by being rejected.
+    let (_token, app) = fresh_router_default(rights::READ);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_body_json(resp.into_body()).await;
+    let exec = &v["execution"];
+    assert!(exec["capacity_bytes"].as_u64().unwrap_or(0) > 0);
+    assert!(exec["max_qubits"].as_u64().unwrap_or(0) > 0);
+    assert!(exec["available_bytes"].as_u64().is_some());
+}
+
+// --------------------------------------------------------------------
 // /v1/quantum/expectation — Pauli expectation over bound circuits
 // --------------------------------------------------------------------
 

@@ -276,6 +276,665 @@ refusal naming the requirement (not an OOM); K concurrent admitted jobs never
 exceed the configured budget; a client disconnect mid-job stops the compute
 (observed via the box going idle, not merely a closed socket).
 
+#### A7 status (2026-08-06) — landed, with named gaps
+
+Implemented in `omega-server/src/worker.rs` (the former stub): cost model,
+byte-weighted admission, 413/429 + `Retry-After`, `/health` budget snapshot,
+cgroup-aware capacity, and guards on `/v1/quantum/execute`, `/expectation`,
+`/execute_pattern` and the registry circuit path.
+
+An adversarial review caught that the **first** version was worse than nothing,
+and the corrections are the substance of what shipped:
+
+- **MPS was priced by its tensors but always densifies.** `MpsBackend::
+  expectation` → `execute(shots: None)` → `to_statevector()`
+  (`omega-backend-mps/src/mps.rs:418`), and `resolve_backend` sends every
+  non-Clifford n ≥ 20 circuit to MPS under the *default* `Auto`. A 34-qubit job
+  priced at ~4 MiB and allocated 256 GiB — i.e. the default path walked past the
+  guard while `/health` advertised headroom. Now priced by what the backend
+  allocates, not by its name.
+- **Photonic cost is combinatorial in photons**, `C(m+p-1, p)` with
+  `p = ceil(m/2)`, so a *mode* ceiling never bounded it: 26 modes ≈ 300 GB was
+  admitted on a 1 MiB token. Now priced exactly.
+- **The batch priced only the widest row**, but rows carry independent backends,
+  so width ≠ cost. Now prices every row and reserves the worst.
+- **`/execute_pattern` (MBQC) had no admission at all** — state doubles per
+  vertex, and vertices are caller-supplied.
+- **`densifies` vs `returns_statevector`** are now distinct: `/expectation`
+  materialises `2^n` internally but returns scalars, so charging it the JSON
+  encoding factor would have over-priced ordinary QML batches ~8×.
+
+Still open, deliberately and in priority order:
+
+1. **The WASM lambda path is unguarded** (`lambda.rs` → `omega-wasm-runtime`'s
+   host `execute_expectation` / `execute_with_shots`). Wasmtime *fuel* bounds
+   guest instructions, not the host-side statevector allocated outside the
+   guest's linear memory. Closing it needs a hook in `omega-wasm-runtime`, so it
+   is a cross-crate change rather than a local one. **Until then the governor's
+   coverage is 4 of 5 execution entry points, and this is the hole.**
+2. **GPU/VRAM is priced against host RAM** — see **A7b** below, which is the
+   plan for closing it properly rather than with a second hardcoded number.
+3. **No bounded queue (A7.5).** `try_acquire` refuses immediately, so a steady
+   trickle of small jobs can starve a large one indefinitely while `Retry-After`
+   promises a retry that never succeeds.
+4. **No per-token quotas (A7.6)** — one tenant can still occupy the whole budget.
+5. **`/health` publishes capacity and live headroom unauthenticated**, which on a
+   multi-tenant box is a side channel revealing neighbours' job sizes and timing.
+6. **`JobShape::gradient` is never set true in production** — no gradient route
+   exists yet (A1). The field and its ceiling arithmetic are ready for it.
+
+### A7b. Memory topology — RAM, VRAM and unified, across DGX / CUDA / Mac
+
+**PLAN ONLY — not implemented.** The governor today has exactly one budget,
+derived from host RAM. That is correct on a CPU-only box and wrong everywhere
+else, in opposite directions depending on the machine. A single number cannot
+express these three machines, so the budget must become **per-pool**.
+
+| platform | topology | pools | if we get it wrong |
+|---|---|---|---|
+| **DGX Spark** (GB10 Grace-Blackwell: CPU+GPU on one package, ~128 GB LPDDR5X) — **the target executor per `REMOTING.md`** | **unified**, on Linux/aarch64 **with CUDA present** | **one** shared pool | The dangerous case. Naive detection sees `nvidia-smi` and assumes discrete: host reports ~128 GB, device reports ~128 GB, governor budgets **256 GB on a 128 GB machine** and cheerfully OOMs it. Unified-ness here is *not* implied by the OS. |
+| **Mac, Apple Silicon** (this box: 24 GB, arm64) | **unified** — CPU and GPU share one physical pool | **one**: system RAM | Charging a Metal job to a *separate* "VRAM budget" double-counts the same way: host + GPU each think they have 12 GB, together they exceed 24 GB. |
+| **Discrete NVIDIA** (RTX, A100, H100) | separate host RAM + device HBM/GDDR | host + one per device | Pricing a GPU job against host RAM is wrong *both* ways: it refuses jobs that fit in VRAM, and admits jobs that exceed it and then CUDA-OOM (which usually takes the process, not just the job). |
+| **DGX A100/H100** (8 discrete GPUs) | discrete, multi-GPU | host + **8** device pools | One global GPU budget lets two jobs land on the same card while another sits idle. Device identity matters, not just device memory. |
+| **Grace-Hopper GH200** | NVLink-C2C coherent; **distinct** capacities (LPDDR5X + HBM3) | host + device, but a device allocation can spill over the link | Treating it as pure-unified over-admits on HBM; pure-discrete forbids legitimate spill. Price against HBM, and record that spill degrades rather than fails. Note this is *not* the same as GB10 — coherent ≠ shared-pool. |
+| CPU-only server | host only | one | current behaviour, already correct |
+
+**The GB10 case is why "unified" cannot be inferred from the OS.** macOS+arm64
+⇒ unified is safe, but Linux+CUDA splits into *both* discrete (A100) and
+unified (GB10) — and the two demand opposite budgets from identical-looking
+probe output. So topology must be *detected*, not assumed, with a safe default:
+
+> **When the topology is uncertain, assume unified.** Assuming discrete on a
+> unified box double-counts and kills it. Assuming unified on a discrete box
+> merely under-uses VRAM — wasteful, recoverable, and visible in `/health`.
+> The asymmetry is the whole argument.
+
+**Design.**
+
+1. **`MemoryPool`**: `Host`, `Device(index)`, or `Unified`. The governor holds
+   one weighted semaphore per pool instead of a single global one.
+2. **`JobShape` gains an execution target.** Admission debits the pool the job
+   will actually allocate from:
+   - CPU backend → `Host`
+   - GPU backend on a discrete machine → `Device(i)` (plus a small host staging
+     charge for the readback buffer, which is real and currently unpriced)
+   - Any backend on a unified machine → `Unified` — **the same pool**, which is
+     the entire point of the distinction
+3. **Detection at boot, no new dependencies:**
+   - *Unified*: `target_os = "macos"` + arm64 (`sysctl hw.optional.arm64`).
+     Capacity is `hw.memsize`; Metal additionally caps a single allocation at
+     `recommendedMaxWorkingSetSize` (~75% of RAM), so the **GPU ceiling is
+     lower than the pool** even though the pool is shared. Both bounds apply.
+   - *NVIDIA*: `nvidia-smi --query-gpu=index,name,memory.total --format=csv`
+     once at boot — same subprocess-at-boot precedent as the existing `sysctl`
+     call. Absent `nvidia-smi` ⇒ no device pools, correct on this Mac.
+     **`memory.total` alone cannot tell GB10 from A100**, so classify with:
+     1. `cudaDeviceProp.integrated == 1` — the canonical answer, available only
+        in a CUDA-linked build; use it when present.
+     2. Otherwise the heuristic: `device_total ≈ host_total` (within a tolerance)
+        on aarch64, or a name matching the Grace-Blackwell/GB10 family ⇒
+        **unified**. Two ~128 GB pools on a 128 GB machine is not two pools.
+     3. Otherwise ⇒ discrete, but only when host and device totals are clearly
+        *disjoint* (e.g. 1 TB host, 80 GB device). Anything ambiguous falls to
+        the safe default above.
+   - *Host*: unchanged, cgroup limit preferred over `/proc/meminfo`.
+   - **Every value overridable**: `OMEGA_MAX_MEM`, `OMEGA_MAX_VRAM`
+     (per-device or `idx:bytes,...`), `OMEGA_MEM_TOPOLOGY=unified|discrete|host`.
+     Detection is a convenience; an operator who knows better must win, and a
+     container may make detection lie.
+4. **f32 vs f64 on device.** The GPU statevector backends are f32 — `2^n × 8`,
+   not `× 16`. Pricing device work at the CPU's 16 B/amplitude over-refuses by
+   2×. `CostKind` must carry the element width, not assume it.
+5. **Fail closed per pool.** If a job targets a device whose capacity could not
+   be determined, refuse rather than fall back to the host budget — falling back
+   is precisely how a 64 GB job reaches a 24 GB card.
+
+**Acceptance** (must not require the hardware to run):
+- Topology detection is a pure function over injected probe output, so DGX,
+  discrete-CUDA, GH200, Apple-unified and CPU-only are all unit-testable on any
+  box. Real hardware only validates the *probe*, not the policy.
+- Unified: a Metal job and a CPU job together cannot exceed system RAM.
+- Discrete: a job larger than device memory is refused even when host RAM is
+  ample; a job that fits VRAM is admitted even when host RAM is busy.
+- Multi-GPU: `K` jobs never oversubscribe any single device.
+- `/health` reports each pool separately, so a caller can see *which* resource
+  is scarce rather than one aggregate number.
+
+### A7c. Operator throttles — use only *part* of the machine
+
+**PLAN ONLY.** A7 answers "will this job kill the box"; A7c answers "please only
+ever use a quarter of it". Different requirement: the box may be shared with
+non-Aria work, or be someone's laptop. Today the only knobs are `OMEGA_MAX_MEM`
+and `OMEGA_MAX_QUBITS`, and the 50% RAM share is **hardcoded**
+(`DEFAULT_MEM_FRACTION`) — the single most obvious thing to want to change is
+the one thing not exposed.
+
+| knob | absolute | fraction | governs |
+|---|---|---|---|
+| Host memory | `OMEGA_MAX_MEM` *(exists)* | `OMEGA_MEM_FRACTION` | admission budget |
+| Device memory | `OMEGA_MAX_VRAM` | `OMEGA_VRAM_FRACTION` | per-device pools (A7b) |
+| CPU | `OMEGA_MAX_THREADS` | `OMEGA_CPU_FRACTION` | rayon pool + concurrent CPU jobs |
+| Concurrency | `OMEGA_MAX_CONCURRENCY` | — | simultaneous jobs, *independent* of bytes |
+| Width | `OMEGA_MAX_QUBITS` *(exists)* | — | cheap pre-pricing reject |
+
+Rules that keep this predictable:
+
+1. **Absolute beats fraction** when both are set, and the result is reported
+   rather than silently resolved.
+2. **Caps compose by `min`, never `max`.** Every applicable cap is a ceiling; a
+   generous one must never widen a strict one. Easy to get backwards, and the
+   failure is silent over-admission.
+3. **On unified memory (A7b), `MEM_FRACTION` and `VRAM_FRACTION` address the
+   same physical pool** and must not multiply. Taking 0.5 of RAM and 0.5 of
+   "VRAM" on a DGX Spark must not yield a 128 GB budget on a 128 GB machine.
+   Where they conflict, `min` wins (rule 2), and `/health` says which applied.
+4. **Human units.** Accept `48G`, `0.5`, `75%` — an operator writing
+   `OMEGA_MAX_MEM=48G` today gets a silent parse failure and the 4 GiB fallback,
+   which is worse than an error.
+5. **`OMEGA_RESOURCE_PROFILE=gentle|balanced|greedy`** as a one-knob preset over
+   the fractions (gentle ≈ 0.25 / 2 threads), because most callers want "don't
+   hog my laptop", not five env vars.
+6. **CPU throttling is real work, not just a number**: size the global rayon
+   pool (`ThreadPoolBuilder::num_threads`) *and* cap concurrent CPU jobs at
+   about `threads / threads_per_job`. Setting one without the other just moves
+   the oversubscription.
+7. **Per-token quotas** (A7 gap 4) are the same mechanism scoped to a token, so
+   build the cap type once and apply it globally or per tenant.
+
+**`/health` must report effective caps and their provenance** — value plus
+whether it came from env, detection, or default. "Why was my job refused?" has
+to be answerable without reading the server's source; a refusal citing a limit
+the operator cannot see is the same dead end as an OOM.
+
+Acceptance: with `OMEGA_CPU_FRACTION=0.25` on a 20-core box the pool is 5
+threads and concurrent CPU jobs cap accordingly; `OMEGA_MEM_FRACTION=0.1`
+refuses a job that the default 0.5 admits; on a simulated unified topology the
+two memory fractions do not compound; `48G`, `0.5` and `75%` all parse, and a
+malformed value is a startup **error**, not a silent fallback.
+
+### A8. Client-side resilience — survive a disconnect, and *say so*
+
+**PLAN ONLY.** Today `remote.rs` does a blocking POST and propagates any error
+straight up (`expectation_remote`, `run_counts_remote`). An SSH tunnel blip
+mid-epoch therefore kills the whole training run, and the caller learns only
+that *something* returned `Err`. Two requirements, and the second is the one
+usually skipped:
+
+1. a transient disconnect must not destroy the run, **and**
+2. the client must always be able to answer "what is happening right now" —
+   silent retrying is its own failure mode, because a dead server and a slow
+   one look identical from the outside.
+
+**Classify the failure before reacting.** Blind retry is wrong for most of
+these, and A7's refusal codes are already designed to carry the distinction:
+
+| condition | retry? | client action |
+|---|---|---|
+| connection refused / reset / DNS / tunnel down | yes, backoff | `Degraded`, keep the run alive |
+| timeout with no response | yes, **only with an idempotency key** | the request may have been executed |
+| `429` + `Retry-After` (governor: busy) | yes, honour the header | `Degraded`; the job *will* fit later |
+| `413` (governor: never fits) | **no** | terminal; retrying cannot help, fix the circuit |
+| `401` / `403` | **no** | terminal; token expired or lacks `EXECUTE` |
+| `400` (bad observable, malformed IR) | **no** | terminal; it is a bug in the caller |
+| `5xx` | yes, bounded | `Degraded`, then terminal after the budget |
+
+**Ambiguous failures are the dangerous ones.** A timeout after the request was
+sent may mean the job ran and the *response* was lost. Retrying then
+double-executes. So submits carry an **idempotency key** and the server
+de-duplicates — the same key A6 needs for resume, built once.
+
+**Design:**
+
+- **Explicit connection state**, not a boolean: `Connected` /
+  `Degraded { attempt, of, next_retry_in, last_error }` / `Terminal { reason }`.
+  Exposed as a field the caller can read *and* a callback it can subscribe to.
+- **Bounded exponential backoff with jitter**, plus a **total budget**. Infinite
+  retry is not resilience; it is a hang with extra steps. When the budget is
+  spent, surface one clear terminal error naming what failed and for how long.
+- **Circuit breaker**: after N consecutive failures stop hammering, report, and
+  probe at a slow interval — a laptop reconnecting should not DoS the DGX.
+- **Status must reach a human**: structured transitions on **stderr**, never
+  stdout (Q8), and a progress line for `aria train` along the lines of
+  `epoch 3/10 batch 12/100 — remote degraded, retry 2/5 in 4s`. "Know wtf the
+  status is" means the line is printed *while degraded*, not after it resolves.
+- **Resume beats restart.** With A6 job IDs, reconnect re-attaches to a job
+  already running rather than resubmitting it. Without A6, at minimum keep local
+  training state checkpointed so a terminal disconnect costs one batch, not the
+  epoch.
+- **Partial batch results.** If a 256-row batch dies at row 200, the client must
+  learn *which* rows completed — the same row-index preservation Q5 requires of
+  the gradient route. Losing 200 good rows because row 201 failed is the
+  expensive version of this bug.
+- **Heartbeats disambiguate slow from dead** (A6): without them a long job is
+  indistinguishable from a hung connection, and every timeout policy is guesswork.
+- **Local fallback is opt-in and loud.** Silently continuing on CPU when the
+  remote vanishes changes performance by orders of magnitude and hides an
+  outage; if offered, it must be requested explicitly and reported on every use.
+
+Acceptance: kill the server mid-batch and the run reports `Degraded` and
+survives its restart; kill it permanently and the run ends with one clear
+terminal error, not a hang; a 413 is never retried; an interrupted submit
+replayed with the same idempotency key executes **once**; the status is
+observable *during* the outage, not only in hindsight.
+
+### A8b. `--wait forever` — the commute mode
+
+**PLAN ONLY.** Scenario: the client is a laptop that will *definitely* go away —
+home → office, a train, a plane — while a mega-batch runs on the DGX. The wanted
+behaviour is "never give up on the connection, but never leave me guessing".
+
+This **refines** A8's "infinite retry is a hang with extra steps". That holds
+for retry that is *silent and default*. Retry that is *explicitly requested and
+continuously reported* is a different thing, and it is the right default for a
+long batch followed from a laptop. So: opt in, and pay for it in loudness.
+
+- `--wait forever` (also `--wait 2h`, and `OMEGA_WAIT`) on the follow/collect
+  path. Default stays bounded; forever is a choice the operator makes.
+- **Forever applies to connectivity, never to logic.** Waiting cannot fix a
+  `413` (too large), `401`/`403` (token), `400` (bad request), or a `410 Gone`
+  (retention expired). Those stay terminal even in this mode, with the reason
+  stated. A mode that waits forever on a bad token is a hang.
+- **Backoff caps and stays there** (~60 s). A laptop asleep for six hours must
+  not wake into an hour-long backoff, and must not hammer the server either.
+- **Wake detection.** Lid-close suspends the process; on resume, a large
+  wall-clock jump means "probe now" rather than serving out the remaining
+  backoff. Without this the commute case reconnects minutes late for no reason.
+
+**Loud means continuously visible, not one line at the start:**
+
+```
+⚠ DISCONNECTED 00:14:32 — batch a1b2c3 · 41,337/100,000 done · retry in 47s
+  last contact 14m ago · server-side work continues · results retained until 18:40
+✓ RECONNECTED after 14m32s — resuming from row 41,339
+```
+
+- Status transitions and the live counter go to **stderr** (Q8), so piping
+  results to a file still shows the state in the terminal.
+- `--status-file FILE` writes the same state as JSON continuously, so a run can
+  be checked from another shell — or after the fact, which is the actual need
+  when you were on a plane.
+- The **final report states the disruption**: total disconnected time, number of
+  reconnects, and whether any row was lost. A run that survived a two-hour
+  outage should say so rather than quietly looking like a clean run.
+- Exit codes distinguish *completed*, *completed with failed rows*, and
+  *terminated while disconnected*.
+
+**Two interactions that decide whether this actually works:**
+
+1. **Server retention must outlive the absence.** `OMEGA_BATCH_TTL` defaulting
+   to hours silently defeats a transatlantic flight: the client returns to
+   `410 Gone`. So the submit response must state the retention deadline up
+   front, `--wait forever` should request an extended/pinned retention, and the
+   client must warn *before* the deadline passes — not discover it afterwards.
+   This is the single most likely way the feature disappoints in practice.
+2. **Token TTL outlives nothing by default.** A long-lived follow can outlast
+   its bearer token, turning a reconnect into a `401` that is (correctly)
+   terminal. Either the follow path refreshes, or `--wait forever` refuses to
+   start when the token expires before the batch plausibly finishes — warned at
+   submit time, not discovered at hour six.
+
+Acceptance: start a batch, sever the network for longer than several backoff
+cycles, and the client keeps reporting elapsed-disconnected the whole time;
+suspend/resume the machine and it probes promptly on wake; restore the network
+and it resumes from the correct row with nothing recomputed; a token or
+retention expiry ends the run with an explicit reason rather than an endless
+wait; the final report names the outage.
+
+### A9. Durable batches — disconnect, reconnect later, don't redo the work
+
+**PLAN ONLY.** The driving scenario: submit a mega-batch of many jobs, the
+server (or the tunnel, or the laptop lid) drops, and hours later a *new* client
+process re-attaches, sees what finished, and collects the rest. Today that is
+total loss — the batch lives only in the HTTP request, so the connection **is**
+the job. A8's retry/backoff keeps a *live* run alive across a blip; it cannot
+help a client that exited, and it cannot survive a server restart. This can.
+
+**Consequence: job state must outlive the connection *and* the process.** The
+server already carries `rusqlite` and an `OMEGA_DB_PATH` (the registry uses it),
+so batch state belongs there rather than in a `HashMap` — which also makes
+"reconnect later" work across a server restart, not just a client one.
+
+**Model.**
+
+- `POST /v1/quantum/batch` → `{batch_id}` **immediately**; work proceeds
+  server-side, decoupled from the caller. Accepts a client **idempotency key**:
+  resubmitting the same mega-batch after a crash returns the *same* `batch_id`
+  instead of re-running 200 completed rows. Without this, the retry that A8
+  performs is exactly what destroys the work.
+- Rows are identified by **index** and completed **incrementally**, each result
+  committed as it lands. A server restart then costs at most the in-flight
+  chunk, not the batch. Chunk size is the checkpoint granularity — state it.
+- `GET /v1/quantum/batch/{id}` → the status the client needs to reason:
+  ```jsonc
+  { "state": "running",        // queued | running | complete | failed | cancelled
+    "total": 100000, "completed": 41337, "failed": 2,
+    "next_pending": 41339,      // resume cursor
+    "started_at": "...", "updated_at": "...",
+    "errors": [{"row": 900, "error": "circuit[900]: bad observable"}] }
+  ```
+- `GET /v1/quantum/batch/{id}/results?from=&to=` → completed rows in **index
+  order** (Q5), so a reconnecting client fetches only what it lacks.
+- `DELETE /v1/quantum/batch/{id}` → cancel remaining work and release
+  reservations. A reconnecting client must be able to *stop* a batch it no
+  longer wants, or an abandoned mega-batch occupies the box forever.
+- WS (A6) becomes an **optimisation over the same state**: push completions as
+  they happen, with the polling endpoints as the fallback. The durable record is
+  the source of truth; the socket is a delivery convenience. That ordering is
+  what makes "reconnect later" work at all.
+
+**Per-row failure must not fail the batch.** Row 900 having a bad observable
+must not discard rows 0–899. Each row carries its own status, and the batch
+completes with `failed: 2` rather than a 400 for the whole submission — a
+deliberate departure from the current expectation route, which aborts everything
+on the first bad row (`quantum_bridge.rs`). That change is the entire point of
+the feature for a mega-batch, and it is why A1's partial-failure semantics
+should be settled here rather than separately.
+
+**Retention is a resource, and A7 governs it.** Stored results occupy space:
+100k rows of `⟨O⟩` is trivial (~800 KB), but 100k × 120 per-row gradients is
+~100 MB per batch, and abandoned batches accumulate.
+- `OMEGA_BATCH_TTL` (default hours, not days) and `OMEGA_MAX_BATCH_RESULTS`.
+- Results are droppable once **acknowledged** by the client (`?ack=true` on
+  fetch), so a well-behaved client bounds the store without waiting for the TTL.
+- Admission accounts for stored results, else a mega-batch evades the governor
+  by parking its output — the same class of bypass A7's review found.
+- Eviction is **loud**: a client asking for evicted rows gets an explicit "410
+  Gone, retention expired", never silence or an empty array that reads as "no
+  results".
+
+**Acceptance** (the scenario, tested end to end): submit 1000 rows; kill the
+server at row ~400; restart it; a **fresh client process** re-attaches by
+`batch_id`, sees `completed ≈ 400` with a correct `next_pending`, and collects
+all 1000 results with **no row computed twice and none missing**. Re-submitting
+with the same idempotency key returns the same `batch_id` and does not restart
+the work. Cancelling mid-run frees the governor reservation.
+
+### A9b. QAS and QML batch shapes — where the naive batch model breaks
+
+**PLAN ONLY.** A9 as written assumes "N rows of the same circuit with different
+parameters". That is the QML *inference* shape. The two workloads actually
+queued for the DGX — architecture search and training — violate it in ways that
+would make the feature useless or actively harmful. Four corrections, the first
+of which is a fix to A7 as already shipped.
+
+> **Architecture search is an external client, and that is a design constraint,
+> not a footnote.** QAS is implemented outside this repository — in a
+> closed-source consumer, and equally in third-party setups that use Aria and
+> know nothing about any particular one. So:
+>
+> - **No search logic in the server.** No TPE, no Hyperband, no pruning policy.
+>   The server supplies *primitives* — heterogeneous rows, per-row cancel,
+>   per-row progress, index-preserving results, durable opt-in — and the client
+>   owns the strategy. Embedding a search policy here would fit one consumer and
+>   obstruct every other.
+> - **The batch API is a public contract** (K3 wire discipline): versioned,
+>   additive, and documented for clients whose source this repo cannot see. It
+>   cannot be quietly reshaped later to suit one caller.
+> - **This repo cannot test the real QAS workload**, because it does not have it.
+>   So CI must carry a *representative synthetic* heterogeneous sweep — varied
+>   qubit counts, depths and backends, one deliberately oversized row, one pruned
+>   mid-flight — and the in-repo `aria tune` (TPE study) serves as the exemplar
+>   consumer proving the primitives suffice for a real search driver.
+> - Corollary: **every requirement below must be justifiable from the API shape
+>   alone**, never from knowledge of any particular client's internals.
+
+**1. Reserve per chunk, not per batch. (Corrects A7.)** Admission currently
+takes **one** reservation for a whole batch, priced at its worst row
+(`admit_batch`). For a 20-row inference batch that is fine. For a 72-config QAS
+sweep it is not: configs are *heterogeneous* — different qubit counts, depths,
+and backends — so the batch is priced at its single largest config and holds
+that reservation for the entire sweep, which may be hours. On a shared box that
+starves every other tenant for the duration, and it over-reserves for all but
+one config.
+→ A durable batch must acquire and **release** its reservation per chunk as it
+executes, not hold a worst-case reservation for its lifetime. The per-batch
+reservation was correct only because batches were short and synchronous; A9
+makes them neither.
+
+**2. The template/parameter-matrix optimisation (A0 item 1) does not apply to
+QAS.** It assumes every row shares one ansatz and differs only in bound
+parameters. QAS rows are *different circuits by construction* — that is the
+search. So QAS keeps paying full topology cost per config, and the transfer
+budget must say so rather than promising a 90× reduction that only materialises
+for QML inference. QML *training* does benefit, since every row there is the
+same ansatz.
+
+**3. Durability must be opt-in per submission, or retention explodes.** A QML
+run is thousands of steps × many epochs, each a forward+gradient. Durably
+storing every step's results is both pointless — the trainer consumes each
+immediately — and a retention blow-up on the order of `steps × P` floats.
+Meanwhile a QAS sweep is exactly what *should* be durable: few trials, long,
+expensive, and painful to redo.
+→ `durable: true` on submit. Training steps stay ephemeral and stream; search
+trials persist. Defaulting everything to durable would turn a training run into
+a disk-filling machine.
+
+**4. Cancellation must be per-row, not just per-batch.** `aria tune` runs TPE
+studies, and any serious search prunes: Hyperband/ASHA kill unpromising trials
+early. A search that can only cancel the *whole* sweep cannot prune, which
+removes most of the point of a search.
+→ `DELETE /v1/quantum/batch/{id}/rows/{i}` (or a bulk form), releasing that
+row's reservation and marking it `cancelled` distinctly from `failed` — a pruned
+trial is not an error, and reports must not conflate the two.
+
+**Two further QAS/QML-specific hazards:**
+
+- **Head-of-line blocking.** One 30-qubit config in a sweep of 28-qubit configs
+  can block the queue behind it while capacity exists for the smaller ones.
+  Execution should be free to proceed out of order when a row does not fit *now*
+  — with results still returned **in index order** (Q5), so out-of-order
+  execution never becomes out-of-order reporting.
+- **Long trials need intra-trial progress.** A QAS trial is itself a full
+  training run of many steps. Batch-level `completed: 3/72` is useless for hours
+  at a time; a trial needs a progress field of its own, or A8b's commute-mode
+  display will show a frozen counter and look hung when it is working.
+
+Acceptance: a heterogeneous 72-config sweep does not hold a worst-case
+reservation for its duration and does not starve a concurrently-submitted small
+job; pruning one trial frees its capacity immediately and reports `cancelled`,
+not `failed`; a training run submitted non-durable leaves no stored results
+behind; a sweep with one oversized config still completes the rest.
+
+### A10. Formal models — TLA+ for the protocols, Lean 4 for the arithmetic
+
+**PLAN ONLY.** The scheduling and admission logic is concurrent, failure-prone,
+and mostly *untestable by example*: starvation, permit leaks after a crash, and
+exactly-once execution across a reconnect are properties about all interleavings,
+not about one run. Tests sample that space; a model checker exhausts it (over a
+small instance). The repo already runs Lean 4 in CI with sorry-free axiom checks
+(`ARIA_LEAN`), so this extends existing practice.
+
+**Tool split by what each is actually good at:**
+- **TLA+ / TLC** — temporal and concurrent behaviour: admission, scheduling,
+  batch lifecycle, crash and reconnect.
+- **Lean 4** — the pure arithmetic the governor depends on, where a proof is
+  cheaper and permanent.
+
+#### Honest scope first — what these will *not* catch
+
+The A7 defect the adversarial review found (MPS priced by tensors while the
+backend densifies) would **not** have been caught by any model here. The
+protocol was fine; the *input* to it was wrong. A model checks that "no admitted
+set exceeds capacity" given the weights it is handed — it cannot know that a
+weight is a lie about what `omega-backend-mps` allocates. That gap stays closed
+by reading the backends and by the differential tests, not by TLA+. Saying so up
+front keeps the models from becoming the same false confidence the under-pricing
+already produced once.
+
+#### `proofs/tla/Governor.tla` — admission and scheduling
+
+State: per-pool capacity, admitted jobs with weights, pending queue.
+Actions: `Submit`, `Admit`, `Reject`, `Release`, `Cancel`, `Crash`.
+
+| property | kind | why it matters |
+|---|---|---|
+| `∀ pool: Σ weight(admitted) ≤ capacity(pool)` | safety | the governor's entire reason to exist |
+| no double `Release` | safety | a permit released twice silently inflates capacity — and crash/retry paths are exactly where that happens |
+| unified pool aliasing: Host and Device charges hit the **same** counter when unified | safety | the A7b double-counting failure, stated as an invariant instead of a table |
+| a job that fits is eventually admitted | **liveness** | this is the one that should fail today |
+| pruned/cancelled rows release capacity | safety | A9b pruning |
+
+The liveness check is the point. A7 uses `try_acquire` with no queue, so a steady
+trickle of small jobs can starve a large one indefinitely while `Retry-After`
+promises a retry that never succeeds (A7 gap 3). TLC under fairness assumptions
+should produce that counterexample trace — turning "I think this can starve"
+into a concrete interleaving, and justifying the bounded queue rather than
+arguing for it from intuition.
+
+#### `proofs/tla/DurableBatch.tla` — A9 lifecycle across failure
+
+State: per-row status, chunk commit point, client connection, server liveness.
+Actions: `SubmitBatch` (with idempotency key), `StartChunk`, `CommitChunk`,
+`ServerCrash`, `ServerRestart`, `ClientDisconnect`, `ClientReconnect`, `Fetch`,
+`Ack`, `Evict`, `CancelRow`.
+
+| property | kind |
+|---|---|
+| **exactly-once**: no row computed twice, no row lost, across arbitrary crash/reconnect | safety — *the* A9 requirement |
+| resubmit with the same idempotency key does not duplicate work | safety |
+| results delivered in index order however execution was ordered (A9b out-of-order) | safety — Q5 |
+| reservations are released on crash (no permit leak across restart) | safety |
+| `next_pending` after restart is consistent with committed chunks | safety — validates the checkpoint-granularity claim |
+| every row eventually reaches a terminal state | liveness |
+
+Model at a small scale (≈5 rows, 2 chunks, ≥2 crashes) — exhaustive over that
+instance, which is where these bugs live, not at scale.
+
+#### Lean 4 — governor arithmetic (`proofs/lean4/QuantumProofs/Governor.lean`)
+
+Small, permanent, and directly motivated: **I already shipped an off-by-one in
+`default_qubit_ceiling`**, which advertised a ceiling one qubit wider than the
+budget allows. That is exactly the class a proof closes for good.
+
+- `to_mib(b) * MiB ≥ b` — permits round **up**. Rounding down would let the
+  admitted set exceed the budget by up to 1 MiB per job; with many jobs that is
+  unbounded.
+- `default_qubit_ceiling c` = the greatest `n` with `cost(n) ≤ c` — the shipped
+  bug, stated as a theorem.
+- Cap composition is `min`, hence `effective ≤ every input cap` (A7c rule 2 —
+  the rule easiest to write backwards, where the failure is silent
+  over-admission).
+- `estimate_peak_bytes` is monotone in `n` and never wraps (the `checked_*`
+  chain is total, or returns `None`).
+- `fock_dim m p = C(m+p-1, p)`, with the iterative form equal to the closed form
+  — a wrong photonic count is a wrong budget on the one backend that cannot be
+  bounded any other way.
+
+#### CI integration (K13)
+
+- Lean: add to the existing `ARIA_LEAN=1` stage, sorry-free-checked like the
+  circulant and noise theorems already are.
+- TLA+: new **opt-in** `ARIA_TLA=1` stage; TLC needs a JVM, so it must **skip
+  cleanly** when absent, exactly like the Qiskit cross-check. The default
+  `./ci.sh` must not acquire a Java dependency.
+- Both record what was checked and at what bound, so "verified" never reads as
+  broader than the instance actually explored.
+
+Sequenced after A9/A9b are specified but **before** they are implemented — the
+models are cheapest as a design instrument, and the starvation counterexample
+should shape the queue design rather than post-rationalise it.
+
+### A11. Timing breakdown — where did the wall clock actually go?
+
+**PLAN ONLY.** With work split across a laptop and a remote box, the first
+question about a slow sweep is *"is this the network, the queue, or the
+simulation?"* — and nothing currently measures it. Without that split, tuning is
+guesswork: the fix for transfer-bound work (A0's template encoding) and the fix
+for compute-bound work (a bigger box) are completely different, and today there
+is no way to tell which you have.
+
+This is also the **measurement infrastructure A0 already assumes**: its
+acceptance criterion is "record bytes-on-the-wire and request count for a 256-row
+forward+gradient step". That cannot be done today. So A11 lands **with or before
+A2**, or the batching win gets asserted rather than demonstrated.
+
+**Phases to separate** (per request, aggregated per batch/epoch):
+
+| phase | who | answers |
+|---|---|---|
+| bind + serialise | client | is JSON encoding the bottleneck? |
+| connect / TLS | client | tunnel setup cost per request → keep-alive value |
+| upload (+ bytes) | client | the A0 payload question, directly |
+| **server queue / admission wait** | server | capacity contention vs real work |
+| **execute** (per row) | server | actual simulation cost |
+| serialise response (+ bytes) | server | the statevector-return blow-up |
+| download | client | |
+| deserialise | client | |
+| **degraded**: backoff + disconnected | client | A8/A8b — time lost to the network being gone |
+
+**Design.**
+
+- **Server → `Server-Timing` header** (a standard, so existing tooling reads it):
+  `admit;dur=0.4, exec;dur=812.5, serialize;dur=31.2`. Batch/row granularity in
+  the JSON body, since a header cannot carry 256 rows.
+- **Client accumulates a `Timing` struct** per call — phase durations plus
+  `bytes_up` / `bytes_down` / `requests` — and aggregates per batch and per run.
+- **Use a monotonic clock for durations**, wall clock only for timestamps. NTP
+  steps otherwise produce negative or absurd intervals, and this feature exists
+  to be trusted.
+- **Distinguish "the machine was asleep" from "the server was slow."** In
+  commute mode (A8b) a suspended laptop shows a huge wall-clock gap with no
+  monotonic progress; counting that as server latency would make every commute
+  look like an outage. Divergence between the two clocks *is* the signal.
+- **Always-on summary, opt-in detail.** A handful of `Instant::now()` calls per
+  request is free; per-row detail sits behind `--timing-detail` so a 100k-row
+  batch does not accumulate 100k records by default.
+- **Report to stderr** (Q8), with `--timing-report FILE` for JSON. The end-of-run
+  summary should lead with the ratio that decides what to do next:
+
+  ```
+  wall 14m02s │ transfer 11m18s (80%) │ exec 2m31s (18%) │ queue 9s │ degraded 4s
+              └─ 256 requests, 1.1 GB up, 2.4 MB down
+  remoting overhead 11m31s (82%) — transfer-bound
+  → batch these rows (1 request instead of 256)
+  ```
+
+  **The headline number is "is remoting a drag, or a detail?"**, so the report
+  must split wall clock into *work you would pay anywhere* (`exec`) and
+  *overhead you pay only because this is remote* (transfer + queue + degraded +
+  connection setup). A percentage against a named verdict —
+  `transfer-bound` / `compute-bound` / `contention-bound` — is the one line
+  someone reads before deciding whether to fix the client, buy a bigger box, or
+  stop worrying. Without that split, an 80%-overhead run and an 8%-overhead run
+  look identical: both are just "slow".
+
+- **Per-row execution time is what a search driver wants**, since it is the cost
+  signal for its own scheduling — expose it in batch results (A9), not only in
+  aggregate.
+
+Acceptance: for a known workload the phases sum to wall clock within a small
+tolerance (nothing unaccounted); a deliberately throttled link shows up as
+transfer, not exec; a suspended-and-resumed client does not report the sleep as
+server latency; and the A0 batching change is demonstrated by a before/after
+byte count rather than a claim.
+
+### C3. Photonics from the Aria surface — **CONFIRMED scope** (2026-08-06)
+
+Promoted from "only if separately prioritized" on explicit instruction. Today
+`examples/aria/*.aria` cannot express photonics at all: `gate_from_name`
+(`aria-core/src/ast/aria.rs:1603-1633`) has no photonic arm and returns
+`Err("unknown gate")`, no `.aria` path reaches the photonics backend, and there
+is no syntax for an input Fock state. Work items:
+
+1. **Grammar**: photonic arms in `gate_from_name` — `beamsplitter` / `bs_rx`,
+   `phaseshifter` / `ps`, and (once B1 lands) `squeeze`, `displace`, `kerr`.
+   Follow K15: `displace(a_re, a_im)` is **Cartesian**.
+2. **Input Fock state**: a way to declare `|1,1⟩`. HOM is meaningless without
+   it, and the DV default for 2 modes is `|1,0⟩`
+   (`omega-backend-photonics/src/sim.rs:88-96`).
+3. **Dispatch**: `--backend photonics` in aria-cli, and a photonic lowering path
+   in `aria-runtime` — today `lower.rs:176` refuses photonic gates while
+   advising "use a photonic backend" the Aria path cannot select.
+4. **Examples**: port `hom_dip` / `mzi` from OPTICQASM to `.aria`, keeping the
+   OPTICQASM originals as the interchange-format examples.
+5. **Ledger (K12)**: `.aria` examples join the verify corpus, so the counts in
+   `TESTING.md` §12 (44 parse) and the 49/49 verify run **both move**. They must
+   be regenerated from an actual run, never hand-edited.
+
+Sequenced after B0/C1 (done) and the A-series; B1's CV gates are only needed for
+item 1's CV half — the DV half (`bs_rx`, `ps`) can land immediately and makes
+HOM/MZI expressible in Aria without waiting on the CV backend.
+
 **Order:** A1 → A2 → A3 (unblocks remote QML training); then **A7** before A6 —
 a shared host wants the guard rails before it gets an easier way to submit long
 jobs. A4 is subsumed by A6/A7; A5 after.
@@ -435,15 +1094,30 @@ C3, if ever done, moves both — and those numbers must be regenerated, not edit
 
 1. ~~**B0**~~ — **DONE** (2026-08-05): silent CV drop closed, `./ci.sh` green
 2. ~~**C1**~~ — **DONE**: DV OPTICQASM examples, HOM + MZI verified against output
-3. **A7** — resource governor: admission control before anything makes it
-   easier to submit big jobs to a shared box
-4. **A1 → A2 → A3** — remote gradient, batching, pyo3 (unblocks remote training)
-5. **A6** — async job protocol over the existing `/v1/ws`
-6. **D4, D1** — verify-and-close the three already-fixed bug docs
-7. **D3** — QASM3 audit against the request's checklist
-8. **A5** — expectation-path device routing + honest `backend_name`
-9. **B1–B6 + C2** — CV backend and its examples, gated on the DGX search
-10. **C3** — photonics from the Aria surface: only if separately prioritized
+3. ~~**A7**~~ — **DONE** (2026-08-06): resource governor, after an adversarial
+   review found the first cut under-priced the default path. Gaps named above.
+4. **A7b** — memory topology: RAM / VRAM / unified across DGX Spark (GB10),
+   discrete CUDA, DGX A100/H100, GH200 and Apple Silicon. Closes A7 gap 2, and
+   is a correctness prerequisite for any GPU-over-the-wire work (A5).
+5. **A7c** — operator throttles (fractional CPU / RAM / VRAM caps). Follows A7b
+   because a VRAM fraction is meaningless until pools exist, and because on
+   unified hardware the two memory fractions must not compound.
+6. **A11 → A1 → A2 → A3** — timing breakdown first (it is the instrument that
+   makes A0/A2's payload claims measurable rather than asserted), then remote
+   gradient, batching and pyo3, which together unblock remote training
+7. **C3** — photonics from the Aria surface (**confirmed**). DV half needs
+   nothing from B1 and can land as soon as A7b clears.
+8. **A10 models → A9 → A6 + A8 + A8b** — model the scheduling and batch
+   lifecycle *before* building them (the starvation counterexample should shape
+   the queue, not post-rationalise it), then durable batches first (state that outlives the
+   connection and the process), then the WS push and client resilience as
+   layers over it. This order matters: build the socket first and "reconnect
+   later" is unimplementable, because there is no durable state to reconnect
+   *to*. A9 also settles the per-row partial-failure semantics A1 needs.
+9. **D4, D1** — verify-and-close the three already-fixed bug docs
+10. **D3** — QASM3 audit against the request's checklist
+11. **A5** — expectation-path device routing + honest `backend_name`
+12. **B1–B6 + C2** — CV backend and its examples, gated on the DGX search
 
 Constraints throughout: `./ci.sh` is the single source of truth and must stay
 green (K13), with external oracles optional and cleanly skipped; no stdout from
