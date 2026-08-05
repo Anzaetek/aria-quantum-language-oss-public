@@ -125,6 +125,39 @@ without approaching the memory budget, which a memory-only limit cannot express.
 (`env:OMEGA_MEM_FRACTION`, `profile`, `detected`, `default`), so "why was my job
 refused?" is answerable without reading the server's source.
 
+## 2b. Timing — is remoting a drag, or a detail?
+
+With work split across two machines, the first question about a slow run is
+*"was that the network, the queue, or the simulation?"* — and the answers point
+at completely different fixes. Transfer-bound work wants batching; compute-bound
+work wants a bigger machine. Without the split, an 80%-overhead run and an
+8%-overhead run look identical: both are just "slow".
+
+Every response carries a standard **`Server-Timing`** header:
+
+```
+Server-Timing: admit;dur=0.412, exec;dur=812.500, serialize;dur=31.204
+```
+
+- `admit` — pricing and reserving capacity. Microseconds; if this is ever large,
+  you are queueing behind other tenants.
+- `exec` — the actual simulation. **This is the work you would pay anywhere**,
+  local or remote.
+- `serialize` — encoding the response. Large for statevector returns.
+
+Batch responses additionally carry a `timing` object with **`row_ms`** — one
+execution time per row, in index order. A batch total tells a search driver
+nothing about *which* trial was expensive; per-row cost is the scheduling
+signal it needs.
+
+**How to read it.** Subtract the server's total from your own wall clock: what
+remains is transfer, connection setup and client-side encoding — the overhead
+you pay *only because this is remote*. If that dominates, batch your rows and
+compress the transport (§3.7); if `exec` dominates, the wire is not your problem.
+
+Durations come from a monotonic clock, so an NTP step cannot produce a negative
+or absurd interval.
+
 ## 3. Known limits today — plan around these
 
 These are **current** constraints. Each is tracked in `FIXES_PLAN.md`; listed
