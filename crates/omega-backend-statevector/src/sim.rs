@@ -139,7 +139,8 @@ impl Backend for StatevectorBackend {
         // Compute <psi|O|psi> = sum_i coeff_i * <psi|P_i|psi>.
         //
         // Linearity of expectation in the operator argument is proved
-        // in `verification/Verification/Adjoint/Linearity.lean` —
+        // in `verification/Verification/Adjoint/Linearity.lean` — NOTE: that
+        // file is a TARGET, not yet written; see `verification/README.md` —
         // theorem `AdjointLinearity.expVal_finset_sum`. That ratifies
         // splitting `O = Σ cₖ Pₖ` into per-Pauli expectations with
         // scalar coefficients, which is exactly this loop.
@@ -928,7 +929,8 @@ fn sample_counts(
 /// The single-qubit closed forms used per-qubit below
 /// (Z: ±1 by bit, X: bit flip, Y: bit flip + i/-i) are proved
 /// against the matrix definition in
-/// `verification/Verification/Adjoint/PauliExpectation.lean` —
+/// `verification/Verification/Adjoint/PauliExpectation.lean` (a TARGET, not
+/// yet written — see `verification/README.md`) —
 /// theorems `expV_Z` / `expV_X` / `expV_Y` / `expV_I`. Each
 /// Pauli is also Hermitian
 /// (`σ?_hermitian`), so the resulting expectation is real (we

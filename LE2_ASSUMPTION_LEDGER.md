@@ -23,6 +23,9 @@ as an unproven assumption with its rationale.
 | A4 | Sampling is from the Born-rule distribution of the ideal state; shot noise is `O(1/√N)` with the declared shot count. | **conformance-checked** — sampled estimators land within `4σ_MC` of the closed-form law (see the `noise` app anchors). |
 | A5 | The Rust **circuit-builder** lowering (`CircuitBuilder` / `.aria` → omega IR) preserves gate order and operands. | **conformance-checked** — the same builder feeds both omega and the oracle; a lowering bug shows as an oracle mismatch. |
 
+| A6 | `Reset` is the **channel** (projective measure, then `X` if the outcome was 1), identical across CPU/CUDA/Metal, and is **refused** in analytic mode on an entangled qubit (the true result is mixed). | **conformance-checked** — `omega-backend-statevector-metal::reset_matches_cpu` asserts agreement up to global phase on unentangled resets (incl. `\|−⟩`, `\|1⟩`) and that BOTH backends refuse the entangled analytic case. **Lean target**: `verification/Verification/Backend/Reset.lean` (4 `sorry`). |
+| A7 | `stabilizer_expectation` returns exactly `0`/`+1`/`−1` per the anticommute / in-group-± trichotomy, and `0` **only** on anticommutation. | **conformance-checked** — 800 random Clifford circuits × random Pauli observables agree four ways (stabilizer/statevector/MPS/pauliprop), 0 disagreements. **Lean**: `gPhase_correct` PROVED (phase table = Aaronson–Gottesman closed form, all 16 pairs); trichotomy + elimination-completeness are targets. |
+
 > A1/A5 together are the LE2 "L1 differential conformance" leg: *the Rust
 > circuit-builder, executed on omega, matches an independent classical
 > computation of the same algorithm.* A divergence is a real bug, not a
