@@ -312,8 +312,9 @@ Still open, deliberately and in priority order:
    guest's linear memory. Closing it needs a hook in `omega-wasm-runtime`, so it
    is a cross-crate change rather than a local one. **Until then the governor's
    coverage is 4 of 5 execution entry points, and this is the hole.**
-2. **GPU/VRAM is priced against host RAM** — see **A7b** below, which is the
-   plan for closing it properly rather than with a second hardcoded number.
+2. ~~GPU/VRAM priced against host RAM~~ — **CLOSED by A7b** (2026-08-06):
+   per-pool budgets with unified/discrete detection, f32 device widths, and
+   fail-closed on an unknown device.
 3. **No bounded queue (A7.5).** `try_acquire` refuses immediately, so a steady
    trickle of small jobs can starve a large one indefinitely while `Retry-After`
    promises a retry that never succeeds.
@@ -1096,9 +1097,10 @@ C3, if ever done, moves both — and those numbers must be regenerated, not edit
 2. ~~**C1**~~ — **DONE**: DV OPTICQASM examples, HOM + MZI verified against output
 3. ~~**A7**~~ — **DONE** (2026-08-06): resource governor, after an adversarial
    review found the first cut under-priced the default path. Gaps named above.
-4. **A7b** — memory topology: RAM / VRAM / unified across DGX Spark (GB10),
-   discrete CUDA, DGX A100/H100, GH200 and Apple Silicon. Closes A7 gap 2, and
-   is a correctness prerequisite for any GPU-over-the-wire work (A5).
+4. ~~**A7b**~~ — **DONE** (2026-08-06): per-pool memory topology. `topology.rs`
+   splits impure probing from a pure `classify`, so DGX Spark (GB10), Apple
+   Silicon, discrete CUDA, 8-GPU DGX and CPU-only are all unit-tested on any
+   box. Safe default: uncertain ⇒ unified.
 5. **A7c** — operator throttles (fractional CPU / RAM / VRAM caps). Follows A7b
    because a VRAM fraction is meaningless until pools exist, and because on
    unified hardware the two memory fractions must not compound.

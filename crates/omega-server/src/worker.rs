@@ -30,6 +30,8 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::topology::{classify, probe_machine, Topology, TopologyOverride};
+
 /// Bytes per amplitude of a dense statevector (`Complex64` = 2×f64).
 pub const BYTES_PER_AMPLITUDE: u64 = 16;
 
@@ -85,6 +87,53 @@ impl CostKind {
     }
 }
 
+/// Where a job executes, and therefore which memory it consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecTarget {
+    Cpu,
+    /// Only constructed on a device-capable build (`--features opencl`, and
+    /// CUDA/Metal when those land). The variant and its pool logic stay
+    /// compiled in regardless so the behaviour is unit-tested everywhere, not
+    /// only on hardware nobody has in CI.
+    #[cfg_attr(not(feature = "opencl"), allow(dead_code))]
+    Device(u32),
+}
+
+impl ExecTarget {
+    /// Bytes per amplitude. The CPU backends are `Complex64` (16 B); the CUDA /
+    /// Metal / OpenCL statevector kernels are f32, i.e. 8 B. Pricing device
+    /// work at the CPU width refuses jobs that would comfortably fit.
+    fn bytes_per_amplitude(&self) -> u64 {
+        match self {
+            ExecTarget::Cpu => BYTES_PER_AMPLITUDE,
+            ExecTarget::Device(_) => BYTES_PER_AMPLITUDE / 2,
+        }
+    }
+}
+
+/// A budgeted memory pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PoolId {
+    /// Host RAM on a machine whose device memory is separate.
+    Host,
+    /// One GPU's own memory.
+    Device(u32),
+    /// CPU and GPU share one physical pool (Apple Silicon, DGX Spark GB10).
+    /// Both kinds of work debit this single budget — charging them separately
+    /// would double-count memory that exists once.
+    Unified,
+}
+
+impl PoolId {
+    fn label(&self) -> String {
+        match self {
+            PoolId::Host => "host".into(),
+            PoolId::Device(i) => format!("device{i}"),
+            PoolId::Unified => "unified".into(),
+        }
+    }
+}
+
 /// The shape of a submitted job, as declared in the request.
 #[derive(Clone, Copy, Debug)]
 pub struct JobShape {
@@ -103,6 +152,10 @@ pub struct JobShape {
     /// This flag is the difference between pricing the representation and
     /// pricing the allocation.
     pub densifies: bool,
+    /// Where this job's memory comes from. Decides which pool is debited and
+    /// the amplitude width: the GPU statevector backends are f32, so pricing
+    /// device work at the CPU's 16 B/amplitude over-refuses by 2x.
+    pub target: ExecTarget,
     /// Whether the *response* carries every amplitude.
     ///
     /// Distinct from `densifies`: `/expectation` materialises a 2^n array
@@ -122,7 +175,15 @@ impl JobShape {
             gradient: false,
             densifies: true,
             returns_statevector: false,
+            target: ExecTarget::Cpu,
         }
+    }
+
+    /// Run this job on a GPU device (f32 amplitudes, device pool).
+    #[cfg_attr(not(feature = "opencl"), allow(dead_code))]
+    pub fn on_device(mut self, index: u32) -> Self {
+        self.target = ExecTarget::Device(index);
+        self
     }
 
     /// `/execute` with `shots: None` — the full statevector crosses the wire.
@@ -152,12 +213,12 @@ impl JobShape {
     }
 }
 
-/// `2^n` amplitudes as bytes, or `None` if the register is too wide to price.
-fn dense_bytes(n: u32) -> Option<u64> {
+/// `2^n` amplitudes at a given element width.
+fn dense_bytes_at(n: u32, bytes_per_amp: u64) -> Option<u64> {
     if n > MAX_PRICEABLE_QUBITS {
         return None;
     }
-    (1u64 << n).checked_mul(BYTES_PER_AMPLITUDE)
+    (1u64 << n).checked_mul(bytes_per_amp)
 }
 
 /// Number of Fock basis states for `modes` modes holding `photons` photons:
@@ -186,9 +247,10 @@ fn fock_dim(modes: u64, photons: u64) -> Option<u64> {
 /// against the loop, where each `ExecResult` drops per iteration.)
 pub fn estimate_peak_bytes(shape: &JobShape) -> Option<u64> {
     let n = shape.num_qubits;
+    let width = shape.target.bytes_per_amplitude();
     let base = match shape.kind {
         CostKind::DenseStatevector => {
-            let sv = dense_bytes(n)?;
+            let sv = dense_bytes_at(n, width)?;
             if shape.returns_statevector {
                 // Re-encoded as a `Vec<[f64;2]>` and then as a
                 // `serde_json::Value` tree (one Value per amplitude, ~120 B)
@@ -214,7 +276,7 @@ pub fn estimate_peak_bytes(shape: &JobShape) -> Option<u64> {
             if shape.densifies {
                 // `to_statevector()` allocates the full 2^n array on top of the
                 // tensors, and `expectation()` always takes that path.
-                let dense = dense_bytes(n)?;
+                let dense = dense_bytes_at(n, width)?;
                 let dense = if shape.returns_statevector {
                     dense.checked_mul(JSON_STATEVECTOR_FACTOR)?
                 } else {
@@ -469,8 +531,33 @@ fn detect_total_memory_bytes() -> Option<u64> {
 /// semaphore's `u32` while still resolving every job worth distinguishing.
 pub struct Governor {
     config: GovernorConfig,
+    /// One budget per physical memory pool. On a unified machine there is
+    /// exactly one entry and *both* CPU and GPU work debit it — which is the
+    /// entire point of distinguishing topologies.
+    pools: Vec<Pool>,
+}
+
+struct Pool {
+    id: PoolId,
+    capacity_bytes: u64,
     budget_mib: u32,
     slots: Arc<Semaphore>,
+}
+
+impl Pool {
+    fn new(id: PoolId, capacity_bytes: u64) -> Self {
+        let budget_mib = to_mib(capacity_bytes);
+        Self {
+            id,
+            capacity_bytes,
+            budget_mib,
+            slots: Arc::new(Semaphore::new(budget_mib as usize)),
+        }
+    }
+
+    fn available_bytes(&self) -> u64 {
+        (self.slots.available_permits() as u64).saturating_mul(1 << 20)
+    }
 }
 
 /// Bytes rounded up to whole MiB, floored at 1 so every admitted job consumes
@@ -487,26 +574,100 @@ pub struct Reservation {
 }
 
 impl Governor {
+    /// Single host pool sized by `config` — the CPU-only shape. Production
+    /// builds go through [`Governor::from_env`]; this is the direct constructor
+    /// used by tests and by embedders that already know their topology.
+    #[allow(dead_code)]
     pub fn new(config: GovernorConfig) -> Self {
-        let budget_mib = to_mib(config.capacity_bytes);
         Self {
+            pools: vec![Pool::new(PoolId::Host, config.capacity_bytes)],
             config,
-            budget_mib,
-            slots: Arc::new(Semaphore::new(budget_mib as usize)),
         }
     }
 
+    /// Build pools from a detected [`Topology`].
+    ///
+    /// `config.capacity_bytes` remains the ceiling on *host* capacity, so an
+    /// operator's `OMEGA_MAX_MEM` still binds; device pools are sized by the
+    /// hardware. On a unified machine there is one pool and one budget, never
+    /// host + device, because that memory exists once.
+    pub fn with_topology(config: GovernorConfig, topology: &Topology) -> Self {
+        let pools = match topology {
+            Topology::HostOnly { host_bytes } => vec![Pool::new(
+                PoolId::Host,
+                config.capacity_bytes.min(*host_bytes).max(1),
+            )],
+            Topology::Unified { total_bytes } => vec![Pool::new(
+                PoolId::Unified,
+                config.capacity_bytes.min(*total_bytes).max(1),
+            )],
+            Topology::Discrete {
+                host_bytes,
+                devices,
+            } => {
+                let mut pools = vec![Pool::new(
+                    PoolId::Host,
+                    config.capacity_bytes.min(*host_bytes).max(1),
+                )];
+                for (idx, bytes) in devices {
+                    pools.push(Pool::new(PoolId::Device(*idx), (*bytes).max(1)));
+                }
+                pools
+            }
+        };
+        Self { config, pools }
+    }
+
     pub fn from_env() -> Self {
-        Self::new(GovernorConfig::from_env())
+        let forced = std::env::var("OMEGA_MEM_TOPOLOGY")
+            .ok()
+            .and_then(|v| TopologyOverride::parse(&v));
+        let classified = classify(&probe_machine(), forced);
+        Self::with_topology(GovernorConfig::from_env(), &classified.topology)
     }
 
     pub fn config(&self) -> GovernorConfig {
         self.config
     }
 
-    /// Bytes of the budget not currently reserved.
+    /// Which pool a job's memory comes from.
+    ///
+    /// On a unified machine every target resolves to the one shared pool — the
+    /// single most important line in this module, since routing device work to
+    /// a separate budget there is what double-counts and kills the box.
+    fn pool_for(&self, target: ExecTarget) -> &Pool {
+        if let Some(p) = self.pools.iter().find(|p| p.id == PoolId::Unified) {
+            return p;
+        }
+        let wanted = match target {
+            ExecTarget::Cpu => PoolId::Host,
+            ExecTarget::Device(i) => PoolId::Device(i),
+        };
+        self.pools
+            .iter()
+            .find(|p| p.id == wanted)
+            // A device we have no pool for must not silently fall back to the
+            // host budget — that is how a 64 GB job reaches a 24 GB card. The
+            // caller checks `has_pool_for` and refuses instead; this arm only
+            // guards against a target that passed that check.
+            .unwrap_or(&self.pools[0])
+    }
+
+    /// Whether this machine has a budget for `target` at all.
+    fn has_pool_for(&self, target: ExecTarget) -> bool {
+        if self.pools.iter().any(|p| p.id == PoolId::Unified) {
+            return true;
+        }
+        let wanted = match target {
+            ExecTarget::Cpu => PoolId::Host,
+            ExecTarget::Device(i) => PoolId::Device(i),
+        };
+        self.pools.iter().any(|p| p.id == wanted)
+    }
+
+    /// Bytes free in the host (or unified) budget.
     pub fn available_bytes(&self) -> u64 {
-        (self.slots.available_permits() as u64).saturating_mul(1 << 20)
+        self.pool_for(ExecTarget::Cpu).available_bytes()
     }
 
     /// Price `shape` and reserve for it, or say precisely why not.
@@ -515,6 +676,14 @@ impl Governor {
     /// an admission problem into an unbounded-queue problem. Refusing with
     /// `Retry-After` keeps the backpressure visible to the client.
     pub fn admit(&self, shape: &JobShape) -> Result<Reservation, Rejection> {
+        // Fail closed: a device with no budget must never fall back to the host
+        // pool. That fallback is exactly how a 64 GB job reaches a 24 GB card.
+        if !self.has_pool_for(shape.target) {
+            return Err(Rejection::Unpriceable {
+                reason: "no memory budget for the requested device",
+            });
+        }
+        let pool = self.pool_for(shape.target);
         let priced = estimate_peak_bytes(shape);
 
         // Most informative refusal first. "needs 16384.00 GB, budget 24.00 GB"
@@ -522,10 +691,10 @@ impl Governor {
         // makes them go looking for why 28. Both are correct, so lead with the
         // one that carries the numbers.
         if let Some(required) = priced {
-            if required > self.config.capacity_bytes {
+            if required > pool.capacity_bytes {
                 return Err(Rejection::ExceedsCapacity {
                     required_bytes: required,
-                    capacity_bytes: self.config.capacity_bytes,
+                    capacity_bytes: pool.capacity_bytes,
                 });
             }
         }
@@ -545,26 +714,26 @@ impl Governor {
         }
 
         match priced {
-            Some(required) => self.reserve(required, to_mib(required)),
+            Some(required) => Self::reserve_in(pool, required, to_mib(required)),
             // Photonics is dimensioned by photon number, and a plugin's
             // profile is opaque; neither can be priced from the request. The
             // ceiling above is the only bound available, so admit rather than
             // break a path that works today — and say so out loud instead of
             // pretending the job was priced.
-            None if !shape.kind.is_priceable() => self.reserve(0, 1),
+            None if !shape.kind.is_priceable() => Self::reserve_in(pool, 0, 1),
             None => Err(Rejection::Unpriceable {
                 reason: "register too wide to represent",
             }),
         }
     }
 
-    fn reserve(&self, required: u64, mib: u32) -> Result<Reservation, Rejection> {
-        let mib = mib.clamp(1, self.budget_mib);
-        match Arc::clone(&self.slots).try_acquire_many_owned(mib) {
+    fn reserve_in(pool: &Pool, required: u64, mib: u32) -> Result<Reservation, Rejection> {
+        let mib = mib.clamp(1, pool.budget_mib);
+        match Arc::clone(&pool.slots).try_acquire_many_owned(mib) {
             Ok(permit) => Ok(Reservation { _permit: permit }),
             Err(_) => Err(Rejection::Busy {
                 required_bytes: required,
-                available_bytes: self.available_bytes(),
+                available_bytes: pool.available_bytes(),
             }),
         }
     }
@@ -585,10 +754,28 @@ impl Governor {
     /// Snapshot for `/health`, so a caller can size work *before* submitting
     /// instead of discovering the ceiling by being rejected.
     pub fn health_snapshot(&self) -> serde_json::Value {
+        // Per pool, so a caller can see WHICH resource is scarce rather than
+        // one aggregate that hides a full GPU behind an idle host.
+        let pools: Vec<serde_json::Value> = self
+            .pools
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "pool": p.id.label(),
+                    "capacity_bytes": p.capacity_bytes,
+                    "available_bytes": p.available_bytes(),
+                })
+            })
+            .collect();
+        let primary = self.pool_for(ExecTarget::Cpu);
         serde_json::json!({
-            "capacity_bytes": self.config.capacity_bytes,
-            "available_bytes": self.available_bytes(),
+            // Kept for compatibility with clients written against the
+            // single-budget shape; `pools` is the complete picture.
+            "capacity_bytes": primary.capacity_bytes,
+            "available_bytes": primary.available_bytes(),
             "max_qubits": self.config.max_qubits,
+            "unified": self.pools.iter().any(|p| p.id == PoolId::Unified),
+            "pools": pools,
         })
     }
 }
@@ -604,6 +791,7 @@ mod tests {
     #[test]
     fn dense_statevector_cost_matches_the_documented_table() {
         // The representation itself, as tabled in the module docs.
+        let dense_bytes = |n| dense_bytes_at(n, BYTES_PER_AMPLITUDE);
         assert_eq!(dense_bytes(28), Some(4 * GB));
         assert_eq!(dense_bytes(30), Some(16 * GB));
         assert_eq!(dense_bytes(32), Some(64 * GB));
@@ -860,6 +1048,129 @@ mod tests {
             .admit(&JobShape::new(30, CostKind::DenseStatevector).with_shots())
             .expect_err("dense width is still governed");
         assert!(matches!(err, Rejection::TooManyQubits { .. }));
+    }
+
+    /// The failure this whole topology split exists to prevent. On a unified
+    /// machine, CPU and GPU work must debit ONE budget — charging them to
+    /// separate pools would let them jointly exceed physical memory.
+    #[test]
+    fn unified_topology_charges_cpu_and_gpu_to_the_same_pool() {
+        let g = Governor::with_topology(
+            GovernorConfig {
+                capacity_bytes: 4 * GB,
+                max_qubits: 40,
+            },
+            &Topology::Unified {
+                total_bytes: 4 * GB,
+            },
+        );
+        // 2 GB of CPU work (25q shot-mode at 16 B/amp = 1 GB... take 26q = 2 GB).
+        let cpu = JobShape::new(26, CostKind::DenseStatevector).with_shots();
+        assert_eq!(estimate_peak_bytes(&cpu), Some(2 * GB));
+        let _held = g.admit(&cpu).expect("2 GB of 4 GB");
+
+        // A GPU job on a unified box competes for the SAME memory. 27q f32
+        // shot-mode = 2^27 * 8 * 2 = 2 GB, which exactly fills the rest...
+        let gpu = JobShape::new(27, CostKind::DenseStatevector)
+            .with_shots()
+            .on_device(0);
+        assert_eq!(estimate_peak_bytes(&gpu), Some(2 * GB));
+        let _held2 = g.admit(&gpu).expect("the remaining 2 GB");
+
+        // ...and nothing more fits, because there is only one pool.
+        let err = g
+            .admit(&JobShape::new(20, CostKind::DenseStatevector).with_shots())
+            .expect_err("unified pool is full; a second budget would be fiction");
+        assert!(matches!(err, Rejection::Busy { .. }), "got {err:?}");
+    }
+
+    /// On a discrete machine the pools are genuinely independent: a full GPU
+    /// must not block host work, and vice versa.
+    #[test]
+    fn discrete_topology_keeps_host_and_device_budgets_independent() {
+        let g = Governor::with_topology(
+            GovernorConfig {
+                capacity_bytes: 64 * GB,
+                max_qubits: 40,
+            },
+            &Topology::Discrete {
+                host_bytes: 64 * GB,
+                devices: vec![(0, 2 * GB)],
+            },
+        );
+        // Fill the small device pool.
+        let gpu = JobShape::new(27, CostKind::DenseStatevector)
+            .with_shots()
+            .on_device(0);
+        let _held = g.admit(&gpu).expect("2 GB fits the 2 GB card");
+        let err = g.admit(&gpu).expect_err("card is full");
+        assert!(matches!(err, Rejection::Busy { .. }));
+
+        // Host work is unaffected — the pools are separate.
+        g.admit(&JobShape::new(26, CostKind::DenseStatevector).with_shots())
+            .expect("host budget is untouched by a full GPU");
+    }
+
+    /// A job larger than device memory must be refused even when host RAM is
+    /// ample — pricing GPU work against host RAM is wrong in both directions.
+    #[test]
+    fn device_job_is_sized_against_the_card_not_the_host() {
+        let g = Governor::with_topology(
+            GovernorConfig {
+                capacity_bytes: 1024 * GB,
+                max_qubits: 40,
+            },
+            &Topology::Discrete {
+                host_bytes: 1024 * GB,
+                devices: vec![(0, 8 * GB)],
+            },
+        );
+        // 31 qubits f32 = 2^31 * 8 = 16 GB: trivial for the host, twice the card.
+        let gpu = JobShape::new(31, CostKind::DenseStatevector).on_device(0);
+        let err = g.admit(&gpu).expect_err("16 GB cannot fit an 8 GB card");
+        match err {
+            Rejection::ExceedsCapacity { capacity_bytes, .. } => {
+                assert_eq!(capacity_bytes, 8 * GB, "must quote the CARD's capacity");
+            }
+            other => panic!("expected ExceedsCapacity against the device, got {other:?}"),
+        }
+        // The same width on the host is fine.
+        g.admit(&JobShape::new(31, CostKind::DenseStatevector))
+            .expect("16 GB (f64: 32 GB) fits a 1 TB host");
+    }
+
+    /// GPU statevector kernels are f32. Pricing device work at the CPU's 16 B
+    /// per amplitude would refuse jobs that fit comfortably.
+    #[test]
+    fn device_work_is_priced_at_f32_width() {
+        let cpu = JobShape::new(30, CostKind::DenseStatevector);
+        let gpu = JobShape::new(30, CostKind::DenseStatevector).on_device(0);
+        assert_eq!(estimate_peak_bytes(&cpu), Some(16 * GB));
+        assert_eq!(
+            estimate_peak_bytes(&gpu),
+            Some(8 * GB),
+            "f32 device amplitudes are half the CPU width"
+        );
+    }
+
+    /// Fail closed: a device with no pool must be refused, never quietly
+    /// charged to the host budget.
+    #[test]
+    fn unknown_device_is_refused_not_charged_to_the_host() {
+        let g = Governor::with_topology(
+            GovernorConfig {
+                capacity_bytes: 1024 * GB,
+                max_qubits: 40,
+            },
+            &Topology::Discrete {
+                host_bytes: 1024 * GB,
+                devices: vec![(0, 8 * GB)],
+            },
+        );
+        let err = g
+            .admit(&JobShape::new(10, CostKind::DenseStatevector).on_device(7))
+            .expect_err("device 7 does not exist here");
+        assert!(matches!(err, Rejection::Unpriceable { .. }), "got {err:?}");
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod pqc;
 mod quantum_bridge;
 mod registry;
 mod routes;
+mod topology;
 mod worker;
 mod ws;
 
