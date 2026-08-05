@@ -166,7 +166,19 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
                 "squeeze" => GateDef::with_params(GateKind::Squeezing, params),
                 "displace" => GateDef::with_params(GateKind::Displacement, params),
                 "kerr" => GateDef::with_params(GateKind::Kerr, params),
-                _ => continue,
+                // Never `continue`: skipping an unknown gate parses the file
+                // "successfully" into a circuit missing an operation, which
+                // then executes and returns confident wrong numbers. Same
+                // defect class as the lowering drop in
+                // `backends::omega::try_to_omega_ir`. `omega-parser`'s
+                // OPTICQASM front end already refuses unknown gates; this one
+                // now matches it.
+                other => {
+                    return Err(format!(
+                        "unknown photonic gate '{other}' in OPTICQASM input \
+                         (supported: ps, bs_rx/bs, squeeze, displace, kerr)"
+                    ))
+                }
             };
 
             circuit.apply(gate, qubits);

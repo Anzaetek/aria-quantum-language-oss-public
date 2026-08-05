@@ -1,0 +1,32 @@
+// Hong-Ou-Mandel dip - the canonical two-photon interference experiment.
+//
+// Two indistinguishable photons enter a balanced (50/50) beam splitter, one in
+// each input mode. They NEVER exit separately: the two "one photon transmitted,
+// one reflected" paths are indistinguishable and interfere destructively, so the
+// coincidence probability is exactly zero and the photons always bunch into the
+// same output mode.
+//
+// Run it:
+//   omega-run examples/circuits/hom_dip.opticqasm --backend photonics --input 1,1
+//
+// Expected output (exact, not approximate):
+//   |2,0>  0.5      both photons in mode 0
+//   |0,2>  0.5      both photons in mode 1
+//   |1,1>  0.0      <- the dip: coincidences vanish
+//
+// Why theta = pi/4 is "balanced": the Rx-convention beam splitter is
+//   [[ cos(theta), -e^{i*phi} sin(theta)],
+//    [ e^{-i*phi} sin(theta),  cos(theta)]]
+// (omega-backend-photonics/src/components.rs). The |1,1> output amplitude is the
+// permanent of that 2x2 matrix, cos^2(theta) - sin^2(theta) = cos(2*theta),
+// which is zero exactly at theta = pi/4. Splitting ratio is |cos theta|^2 :
+// |sin theta|^2 = 50:50 there, hence "balanced".
+//
+// This is a self-verifying example: the dip is an exact zero, so any nonzero
+// |1,1> weight is a bug in the permanent/SLOS path, not numerical noise.
+
+OPTICQASM 1.0;
+photon q[2];
+
+// Balanced beam splitter: theta = pi/4 = 0.7853981633974483, phi = 0.
+bs_rx(0.7853981633974483, 0.0) q[0], q[1];

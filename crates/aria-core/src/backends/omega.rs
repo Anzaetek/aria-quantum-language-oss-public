@@ -179,7 +179,37 @@ fn map_gate_kind(kind: GateKind) -> Option<OmegaGateKind> {
 /// Convert a quantum-core Circuit to omega-functions CircuitIR.
 ///
 /// Flattens register-based qubit addressing into global indices.
+///
+/// # Panics
+///
+/// Panics if `circuit` contains a gate with no omega IR equivalent — in
+/// practice the continuous-variable photonic gates (`Squeezing`,
+/// `Displacement`, `Kerr`), which no backend executes yet.
+///
+/// This infallible wrapper exists for callers whose circuits are gate-model
+/// **by construction** and therefore cannot contain CV gates — the QEC bridge
+/// (`aria_qec::ecc::run::to_omega_core_ir`) builds its circuits from an
+/// encoder/decoder gate set that has no photonic member, so the panic is
+/// unreachable there rather than merely unlikely.
+///
+/// Any caller that can be handed a *user-authored* circuit must use
+/// [`try_to_omega_ir`] and surface the error. Dropping an unmapped gate and
+/// executing the remainder returns confident wrong numbers; that is exactly the
+/// defect this split removes.
 pub fn to_omega_ir(circuit: &Circuit) -> OmegaCircuitIR {
+    try_to_omega_ir(circuit).expect("to_omega_ir: circuit contains a gate with no omega lowering")
+}
+
+/// Convert a quantum-core Circuit to omega-functions CircuitIR, refusing any
+/// gate that has no omega IR equivalent.
+///
+/// Flattens register-based qubit addressing into global indices.
+///
+/// Prefer this over [`to_omega_ir`] wherever the circuit came from user input.
+/// The continuous-variable gates parse and type-check (OPTICQASM emits and
+/// accepts `squeeze` / `displace` / `kerr`) but have no executor, so lowering
+/// must refuse them rather than silently produce a circuit missing its physics.
+pub fn try_to_omega_ir(circuit: &Circuit) -> Result<OmegaCircuitIR, String> {
     // Build global qubit index map
     let mut qubit_map: std::collections::HashMap<Qubit, u32> = std::collections::HashMap::new();
     let mut global_idx = 0u32;
@@ -217,7 +247,22 @@ pub fn to_omega_ir(circuit: &Circuit) -> OmegaCircuitIR {
 
     let mut ops = Vec::new();
     for inst in &circuit.instructions {
-        if let Some(omega_gate) = map_gate_kind(inst.gate.kind) {
+        // An unmapped gate is a hard error, never a skip. `is_photonic` above
+        // is computed from gates including Squeezing/Displacement/Kerr, so
+        // dropping them here would mark the circuit photonic *because* of gates
+        // that are no longer in it, and hand the backend a circuit whose
+        // physics is missing — with no diagnostic anywhere.
+        let Some(omega_gate) = map_gate_kind(inst.gate.kind) else {
+            return Err(format!(
+                "gate {:?} has no omega IR lowering, so this circuit cannot be executed \
+                 (continuous-variable photonic gates — Squeezing, Displacement, Kerr — \
+                 parse and export but have no backend yet). Refusing rather than \
+                 executing the circuit without it. Discrete-variable photonics runs via \
+                 OPTICQASM on `omega-run --backend photonics`.",
+                inst.gate.kind
+            ));
+        };
+        {
             let qubits: Vec<u32> = inst
                 .qubits
                 .iter()
@@ -283,14 +328,14 @@ pub fn to_omega_ir(circuit: &Circuit) -> OmegaCircuitIR {
         OmegaMidCircuitMode::Skip
     };
 
-    OmegaCircuitIR {
+    Ok(OmegaCircuitIR {
         num_qubits: circuit.n_qubits() as u32,
         num_classical_bits: circuit.n_clbits() as u32,
         ops,
         mid_circuit_mode,
         is_photonic,
         backend: OmegaBackend::Auto,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -566,5 +611,44 @@ circuit C {
             OmegaGradMethod::StochasticParameterShift { shots: 256 }
         ));
         assert_eq!(back.observable.terms.len(), 1);
+    }
+
+    /// Continuous-variable gates must be REFUSED by lowering, never dropped.
+    ///
+    /// Regression: `map_gate_kind` returns `None` for Squeezing/Displacement/
+    /// Kerr, and the lowering loop used to be `if let Some(..)` — so a circuit
+    /// using them lowered "successfully" with those gates deleted, and executed
+    /// to confident wrong numbers. Worse, `is_photonic` is computed from the
+    /// very same gate list, so the IR was marked photonic *because* of gates it
+    /// no longer contained. Reached over the wire via `remote.rs`, this was a
+    /// silent wrong answer on a remote server.
+    #[test]
+    fn cv_gates_are_refused_not_silently_dropped() {
+        for kind in [GateKind::Squeezing, GateKind::Displacement, GateKind::Kerr] {
+            let mut circ = Circuit::new("cv");
+            circ.qreg("q", 1);
+            circ.apply(
+                GateDef::with_params(kind, vec![0.5, 0.0]),
+                vec![Qubit::new("q", 0)],
+            );
+
+            let err = try_to_omega_ir(&circ).expect_err(&format!(
+                "{kind:?} must be refused by lowering, not dropped"
+            ));
+            assert!(
+                err.contains("no omega IR lowering"),
+                "{kind:?}: unhelpful error {err:?}"
+            );
+        }
+    }
+
+    /// The gate-model path must be untouched by the refusal above: every gate
+    /// in a normal circuit still lowers, and none are lost.
+    #[test]
+    fn gate_model_circuits_still_lower_completely() {
+        let circ = CircuitBuilder::new("bell", 2, 2).h(0).cx(0, 1).build();
+        let ir = try_to_omega_ir(&circ).expect("gate-model circuit must lower");
+        assert_eq!(ir.ops.len(), circ.instructions.len());
+        assert!(!ir.is_photonic);
     }
 }
