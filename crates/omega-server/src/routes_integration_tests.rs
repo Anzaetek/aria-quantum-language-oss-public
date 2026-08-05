@@ -1006,6 +1006,81 @@ async fn execute_pattern_is_admission_controlled() {
 }
 
 #[tokio::test]
+async fn execute_reports_server_timing_so_clients_can_split_wire_from_compute() {
+    // Without a server-side split, a caller cannot tell "the box was slow" from
+    // "the wire was slow" -- and the fixes are completely different.
+    // Server-Timing is the standard header, so existing tooling reads it.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 2, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+        },
+        "shots": 64, "seed": 7
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/execute", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hdr = resp
+        .headers()
+        .get("Server-Timing")
+        .expect("Server-Timing must be present")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(hdr.contains("admit;dur="), "{hdr}");
+    assert!(hdr.contains("exec;dur="), "{hdr}");
+    assert!(hdr.contains("serialize;dur="), "{hdr}");
+    // Every duration must parse as a number, or downstream tooling chokes.
+    for part in hdr.split(", ") {
+        let (_, dur) = part.split_once(";dur=").expect("name;dur=value");
+        let v: f64 = dur.parse().expect("numeric duration");
+        assert!(v >= 0.0 && v.is_finite(), "bad duration in {hdr}");
+    }
+}
+
+#[tokio::test]
+async fn expectation_batch_reports_per_row_execution_times() {
+    // A batch total tells a search driver nothing about WHICH trial was
+    // expensive. Per-row cost is the scheduling signal it needs, and it cannot
+    // ride in a header for 256 rows.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let row = |theta: f64| {
+        serde_json::json!({
+            "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "Ry", "qubits": [0], "params": [theta],
+                     "classical_bit": null, "condition": null}]
+        })
+    };
+    let body = serde_json::json!({
+        "circuits": [row(0.3), row(0.7), row(1.1)],
+        "observable": "Z0"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_body_json(resp.into_body()).await;
+    let timing = &v["timing"];
+    let rows = timing["row_ms"].as_array().expect("row_ms array");
+    assert_eq!(rows.len(), 3, "one timing per row, in index order");
+    for r in rows {
+        let ms = r.as_f64().expect("numeric row time");
+        assert!(ms >= 0.0 && ms.is_finite(), "bad row time {ms}");
+    }
+    assert!(timing["admit"].as_f64().is_some(), "admit phase missing");
+    assert!(timing["exec"].as_f64().is_some(), "exec phase missing");
+    assert!(timing["total_ms"].as_f64().is_some(), "total missing");
+}
+
+#[tokio::test]
 async fn health_publishes_the_execution_budget() {
     // A client should be able to size work before submitting rather than
     // discovering the ceiling by being rejected.

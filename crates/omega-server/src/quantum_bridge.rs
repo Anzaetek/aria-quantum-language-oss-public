@@ -20,6 +20,7 @@
 //! graph-state executor (`omega_backend_photonics::mbqc`), returning the
 //! canonical output statevector.
 
+use crate::timing::{PhaseTimer, RowTimer};
 use crate::worker::{governor, CostKind, JobShape, Reservation};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
@@ -593,21 +594,32 @@ pub async fn execute_quantum_route(
         return resp;
     }
     let num_qubits = req.circuit.num_qubits;
+    let mut timer = PhaseTimer::new();
     // Price and reserve before allocating anything. `_reservation` must stay
     // alive for the whole execution — dropping it returns the budget.
     let _reservation = match admit_shape(&execute_shape(&req.circuit, req.shots)) {
         Ok(r) => r,
         Err(resp) => return *resp,
     };
+    timer.mark("admit");
     match execute_quantum_ir(&req.circuit, req.shots, req.seed) {
-        Ok((result, resolved)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok((result, resolved)) => {
+            timer.mark("exec");
+            let body = serde_json::json!({
                 "backend": backend_name(&resolved),
                 "result": exec_result_to_json(&result, num_qubits),
-            })),
-        )
-            .into_response(),
+            });
+            timer.mark("serialize");
+            // `Server-Timing` is a standard header, so devtools and existing
+            // tooling read this without bespoke support. It is what lets a
+            // caller tell "the server was slow" from "the wire was slow".
+            (
+                StatusCode::OK,
+                [("Server-Timing", timer.server_timing_header())],
+                Json(body),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -705,6 +717,7 @@ pub async fn expectation_quantum_route(
         Err(e) => return bad(format!("bad observable '{}': {e}", req.observable)),
     };
 
+    let mut timer = PhaseTimer::new();
     // Rows run as a sequential loop below, so peak cost is the *widest* row,
     // not their sum — price that one and hold the reservation for the batch.
     // Every expectation densifies: MpsBackend::expectation and the stabilizer's
@@ -714,25 +727,38 @@ pub async fn expectation_quantum_route(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
+    timer.mark("admit");
 
     let mut values = Vec::with_capacity(circuits.len());
+    // Per-row execution cost. A batch-level total tells a search driver
+    // nothing about which trial was expensive; this is the scheduling signal
+    // it actually needs, and it cannot ride in a header for 256 rows.
+    let mut row_ms = Vec::with_capacity(circuits.len());
     let mut backend: Option<String> = None;
     for (i, ir) in circuits.iter().enumerate() {
+        let row = RowTimer::new();
         match expectation_quantum_ir(ir, &observable) {
             Ok((v, resolved)) => {
                 if backend.is_none() {
                     backend = Some(backend_name(&resolved));
                 }
                 values.push(v);
+                row_ms.push(row.finish_ms());
             }
             Err(e) => return bad(format!("circuit[{i}]: {e}")),
         }
+    }
+    timer.mark("exec");
+    let mut timing_json = timer.to_json();
+    if let Some(map) = timing_json.as_object_mut() {
+        map.insert("row_ms".into(), serde_json::json!(row_ms));
     }
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "backend": backend.unwrap_or_else(|| "statevector".to_string()),
             "values": values,
+            "timing": timing_json,
         })),
     )
         .into_response()

@@ -9,6 +9,7 @@ mod pqc;
 mod quantum_bridge;
 mod registry;
 mod routes;
+mod timing;
 mod topology;
 mod worker;
 mod ws;
