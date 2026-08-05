@@ -127,3 +127,23 @@ so any change would be unverifiable. The fix is to adopt the purity criterion
 (`omega_backend_statevector::sim::reset_is_deterministic_within(..., 1e-4)`),
 which needs a dependency on the CPU crate plus a device readback, and must be
 validated on a CUDA box. Specified as `Reset.lean` T1.
+
+### Reset support, audited across every backend (2026-08-05)
+
+The audit behind the entry above. "Refuses" means an explicit
+`OmegaError::Unsupported`, never a silent skip or a plausible-looking wrong
+number — the failure mode this project keeps finding.
+
+| backend | Reset | verdict |
+|---|---|---|
+| `statevector` (CPU) | channel (measure → conditional `X`), refuses entangled in analytic mode | **reference** |
+| `statevector-metal` | same, via the *same* exported predicate (f32 tolerance) | fixed `a863c82` |
+| `statevector-cuda` | channel, but refuses on `p0 ∈ (0,1)` rather than on entanglement | stricter — see above |
+| `statevector-opencl` | refuses: *"Reset is non-unitary; not yet implemented"* | honest gap |
+| `pauli` (stabilizer) | tableau reset (measure + conditional `X`); always well-defined | ok |
+| `mps` | channel with guard | ok |
+| `pauliprop` | refuses: *"cannot be represented by observable conjugation"* | honest gap |
+| `mps-cuda`, `mps-metal`, `pauliprop-cuda`, `pauliprop-metal` | no Reset path — these are contraction/branch **hooks**; dispatch stays on the CPU crate | n/a |
+
+Only the CUDA criterion diverges, and it errs toward refusing. No backend
+silently skips Reset or returns a value for it.
