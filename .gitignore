@@ -27,3 +27,4 @@ tch-env.sh
 # Compiled Python extension modules (built by maturin)
 **/*.so
 **/*.pyd
+.venv-qiskit/
