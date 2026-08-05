@@ -92,11 +92,38 @@ scarce instead of one aggregate hiding a full GPU behind an idle host.
 
 ### Operator limits
 
-`OMEGA_MAX_MEM` (bytes) and `OMEGA_MAX_QUBITS` override the defaults, which
-derive from detected memory — a cgroup limit when present, so a containerised
-server budgets against its container and not the host.
-`OMEGA_MEM_TOPOLOGY=unified|discrete|host` overrides pool detection when you
-know better than the heuristics; the operator always wins.
+Defaults derive from detected memory — a cgroup limit when present, so a
+containerised server budgets against its container and not the host.
+
+| variable | meaning |
+|---|---|
+| `OMEGA_MAX_MEM` | Absolute budget. **Human units accepted**: `48G`, `8GiB`, `1.5T`, or a plain byte count. |
+| `OMEGA_MEM_FRACTION` | Share of detected memory: `0.25` or `25%`. |
+| `OMEGA_MAX_CONCURRENCY` | Cap on simultaneous jobs, independent of their size. |
+| `OMEGA_CPU_FRACTION` | Share of cores, converted into a job cap. |
+| `OMEGA_RESOURCE_PROFILE` | `gentle` (25%), `balanced` (50%), `greedy` (90%) — one knob instead of five. |
+| `OMEGA_MAX_QUBITS` | Hard width ceiling. |
+| `OMEGA_MEM_TOPOLOGY` | `unified` / `discrete` / `host` — overrides pool detection. |
+
+Three rules govern how these combine:
+
+1. **An absolute setting beats a fraction**, and the resolution is reported.
+2. **Caps compose by `min`, never `max`** — a generous cap never widens a strict
+   one, and no cap can exceed what the hardware actually has.
+3. **On unified memory the host and device shares address the same pool** and do
+   not compound.
+
+**A malformed value is a startup error, not a silent fallback.** Previously
+`OMEGA_MAX_MEM=48G` parsed as garbage and quietly left a 4 GiB budget — which
+looks exactly like a throttle that worked.
+
+Two limits are orthogonal and both apply: **bytes** bound total memory, while
+**concurrency** bounds CPU contention. Many small jobs can saturate the cores
+without approaching the memory budget, which a memory-only limit cannot express.
+
+`GET /health` reports every effective limit *and where it came from*
+(`env:OMEGA_MEM_FRACTION`, `profile`, `detected`, `default`), so "why was my job
+refused?" is answerable without reading the server's source.
 
 ## 3. Known limits today — plan around these
 

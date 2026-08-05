@@ -30,6 +30,10 @@ use std::sync::{Arc, OnceLock};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::limits::{
+    detect_cores, env_bytes, env_count, env_fraction, resolve_concurrency, resolve_memory, Limit,
+    LimitError, Provenance, ResourceProfile,
+};
 use crate::topology::{classify, probe_machine, Topology, TopologyOverride};
 
 /// Bytes per amplitude of a dense statevector (`Complex64` = 2×f64).
@@ -384,19 +388,21 @@ impl Rejection {
 }
 
 /// Governor configuration, resolved once at boot.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GovernorConfig {
     /// Total bytes of concurrent execution allowed across all jobs.
     pub capacity_bytes: u64,
     /// Hard ceiling on declared qubits, applied before pricing so an absurd
     /// request is cheap to reject.
     pub max_qubits: u32,
+    /// Cap on simultaneous jobs, independent of their size. Bytes bound total
+    /// memory; this bounds CPU contention, which many small jobs can cause
+    /// without ever approaching the memory budget.
+    pub max_concurrency: u32,
+    pub capacity_from: Provenance,
+    pub qubits_from: Provenance,
+    pub concurrency_from: Provenance,
 }
-
-/// Default share of detected RAM handed to simulation. The rest is for the
-/// OS, the server itself, and whatever else shares the box — being greedy here
-/// is how a "successful" admission still ends in an OOM kill.
-const DEFAULT_MEM_FRACTION: f64 = 0.5;
 
 /// Conservative fallback when RAM cannot be detected. Deliberately small: an
 /// unnecessary rejection is recoverable, an OOM-killed neighbour is not.
@@ -407,34 +413,84 @@ impl Default for GovernorConfig {
         Self {
             capacity_bytes: FALLBACK_CAPACITY_BYTES,
             max_qubits: 30,
+            max_concurrency: 8,
+            capacity_from: Provenance::Default,
+            qubits_from: Provenance::Default,
+            concurrency_from: Provenance::Default,
         }
     }
 }
 
 impl GovernorConfig {
-    /// Resolve from the environment, falling back to a fraction of detected RAM.
+    /// Resolve from the environment.
     ///
-    /// * `OMEGA_MAX_MEM` — budget in bytes (plain integer).
-    /// * `OMEGA_MAX_QUBITS` — hard qubit ceiling.
+    /// | variable | meaning |
+    /// |---|---|
+    /// | `OMEGA_MAX_MEM` | absolute budget, human units accepted (`48G`, `8GiB`) |
+    /// | `OMEGA_MEM_FRACTION` | share of detected memory (`0.25`, `25%`) |
+    /// | `OMEGA_MAX_CONCURRENCY` | absolute cap on simultaneous jobs |
+    /// | `OMEGA_CPU_FRACTION` | share of cores, converted to a job cap |
+    /// | `OMEGA_RESOURCE_PROFILE` | `gentle` / `balanced` / `greedy` preset |
+    /// | `OMEGA_MAX_QUBITS` | hard width ceiling |
+    ///
+    /// **A malformed value is fatal**, not a silent fallback: `OMEGA_MAX_MEM=48G`
+    /// used to parse as garbage and quietly leave a 4 GiB budget, which looks
+    /// exactly like a throttle that worked.
     pub fn from_env() -> Self {
-        let capacity_bytes = std::env::var("OMEGA_MAX_MEM")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or_else(|| {
-                detect_available_memory_bytes()
-                    .map(|total| (total as f64 * DEFAULT_MEM_FRACTION) as u64)
-                    .unwrap_or(FALLBACK_CAPACITY_BYTES)
-            });
-        let max_qubits = std::env::var("OMEGA_MAX_QUBITS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or_else(|| default_qubit_ceiling(capacity_bytes));
-        Self {
-            capacity_bytes,
-            max_qubits,
+        match Self::try_from_env() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("[governor] {e}");
+                eprintln!("[governor] refusing to start with a resource limit it cannot honour");
+                std::process::exit(2);
+            }
         }
+    }
+
+    /// Fallible form, so the parsing rules are testable without exiting.
+    pub fn try_from_env() -> Result<Self, LimitError> {
+        let profile = match std::env::var("OMEGA_RESOURCE_PROFILE") {
+            Ok(raw) if !raw.trim().is_empty() => match ResourceProfile::parse(&raw) {
+                Some(p) => Some(p),
+                None => {
+                    return Err(LimitError {
+                        var: "OMEGA_RESOURCE_PROFILE".into(),
+                        value: raw,
+                        expected: "one of: gentle, balanced, greedy",
+                    })
+                }
+            },
+            _ => None,
+        };
+
+        let memory = resolve_memory(
+            env_bytes("OMEGA_MAX_MEM")?,
+            env_fraction("OMEGA_MEM_FRACTION")?,
+            profile,
+            detect_available_memory_bytes(),
+            FALLBACK_CAPACITY_BYTES,
+        );
+
+        let concurrency = resolve_concurrency(
+            env_count("OMEGA_MAX_CONCURRENCY")?,
+            env_fraction("OMEGA_CPU_FRACTION")?,
+            profile,
+            detect_cores(),
+        );
+
+        let qubits = match env_count("OMEGA_MAX_QUBITS")? {
+            Some(l) => l,
+            None => Limit::new(default_qubit_ceiling(memory.value), Provenance::Detected),
+        };
+
+        Ok(Self {
+            capacity_bytes: memory.value,
+            max_qubits: qubits.value,
+            max_concurrency: concurrency.value,
+            capacity_from: memory.from,
+            qubits_from: qubits.from,
+            concurrency_from: concurrency.from,
+        })
     }
 }
 
@@ -535,6 +591,8 @@ pub struct Governor {
     /// exactly one entry and *both* CPU and GPU work debit it — which is the
     /// entire point of distinguishing topologies.
     pools: Vec<Pool>,
+    /// Job-count cap, orthogonal to bytes.
+    slots: Arc<Semaphore>,
 }
 
 struct Pool {
@@ -571,6 +629,10 @@ fn to_mib(bytes: u64) -> u32 {
 #[derive(Debug)]
 pub struct Reservation {
     _permit: OwnedSemaphorePermit,
+    /// Held alongside the memory permit: bytes bound total memory, this bounds
+    /// CPU contention. Many small jobs can saturate the cores without ever
+    /// approaching the memory budget.
+    _slot: Option<OwnedSemaphorePermit>,
 }
 
 impl Governor {
@@ -581,6 +643,7 @@ impl Governor {
     pub fn new(config: GovernorConfig) -> Self {
         Self {
             pools: vec![Pool::new(PoolId::Host, config.capacity_bytes)],
+            slots: Arc::new(Semaphore::new(config.max_concurrency.max(1) as usize)),
             config,
         }
     }
@@ -615,7 +678,11 @@ impl Governor {
                 pools
             }
         };
-        Self { config, pools }
+        Self {
+            slots: Arc::new(Semaphore::new(config.max_concurrency.max(1) as usize)),
+            config,
+            pools,
+        }
     }
 
     pub fn from_env() -> Self {
@@ -627,7 +694,7 @@ impl Governor {
     }
 
     pub fn config(&self) -> GovernorConfig {
-        self.config
+        self.config.clone()
     }
 
     /// Which pool a job's memory comes from.
@@ -713,7 +780,9 @@ impl Governor {
             });
         }
 
-        match priced {
+        // Memory first (it is the refusal with the actionable numbers), then
+        // the job-slot cap.
+        let reservation = match priced {
             Some(required) => Self::reserve_in(pool, required, to_mib(required)),
             // Photonics is dimensioned by photon number, and a plugin's
             // profile is opaque; neither can be priced from the request. The
@@ -724,13 +793,27 @@ impl Governor {
             None => Err(Rejection::Unpriceable {
                 reason: "register too wide to represent",
             }),
+        };
+        let mut reservation = reservation?;
+        match Arc::clone(&self.slots).try_acquire_owned() {
+            Ok(slot) => reservation._slot = Some(slot),
+            Err(_) => {
+                return Err(Rejection::Busy {
+                    required_bytes: priced.unwrap_or(0),
+                    available_bytes: pool.available_bytes(),
+                })
+            }
         }
+        Ok(reservation)
     }
 
     fn reserve_in(pool: &Pool, required: u64, mib: u32) -> Result<Reservation, Rejection> {
         let mib = mib.clamp(1, pool.budget_mib);
         match Arc::clone(&pool.slots).try_acquire_many_owned(mib) {
-            Ok(permit) => Ok(Reservation { _permit: permit }),
+            Ok(permit) => Ok(Reservation {
+                _permit: permit,
+                _slot: None,
+            }),
             Err(_) => Err(Rejection::Busy {
                 required_bytes: required,
                 available_bytes: pool.available_bytes(),
@@ -774,8 +857,18 @@ impl Governor {
             "capacity_bytes": primary.capacity_bytes,
             "available_bytes": primary.available_bytes(),
             "max_qubits": self.config.max_qubits,
+            "max_concurrency": self.config.max_concurrency,
+            "jobs_running": self.config.max_concurrency as usize
+                - self.slots.available_permits().min(self.config.max_concurrency as usize),
             "unified": self.pools.iter().any(|p| p.id == PoolId::Unified),
             "pools": pools,
+            // Where each limit came from, so "why was my job refused?" is
+            // answerable without reading the server's source.
+            "limits_from": {
+                "capacity_bytes": self.config.capacity_from.label(),
+                "max_qubits": self.config.qubits_from.label(),
+                "max_concurrency": self.config.concurrency_from.label(),
+            },
         })
     }
 }
@@ -912,6 +1005,7 @@ mod tests {
         let g = Governor::new(GovernorConfig {
             capacity_bytes: 8 * GB,
             max_qubits: 40,
+            ..GovernorConfig::default()
         });
         // 34 qubits sampled: 2^34 x 16 B state + an equal-sized probs/cumulative
         // pair = 512 GB.
@@ -935,6 +1029,7 @@ mod tests {
         let g = Governor::new(GovernorConfig {
             capacity_bytes: 1024 * GB,
             max_qubits: 24,
+            ..GovernorConfig::default()
         });
         let err = g
             .admit(&JobShape::new(30, CostKind::DenseStatevector))
@@ -958,6 +1053,9 @@ mod tests {
         let g = Arc::new(Governor::new(GovernorConfig {
             capacity_bytes: BUDGET_GB * GB,
             max_qubits: 40,
+            // Raised so the byte budget, not the slot cap, is what binds here.
+            max_concurrency: 1024,
+            ..GovernorConfig::default()
         }));
         // 26 qubits = 64M amps x 16 B = 1 GB, shots mode (x2 => 2 GB)... use
         // the analytic-free shot path so the arithmetic stays a round 2 GB.
@@ -1004,10 +1102,14 @@ mod tests {
     /// consume the budget rather than sitting there as decoration.
     #[test]
     fn byte_weighting_expresses_what_a_job_count_limit_cannot() {
-        // Budget 64 MiB so the tiny jobs genuinely fill it.
+        // Budget 64 MiB so the tiny jobs genuinely fill it. Concurrency is
+        // raised out of the way so this isolates the BYTE property — the slot
+        // cap is tested separately.
         let g = Governor::new(GovernorConfig {
             capacity_bytes: 64 << 20,
             max_qubits: 40,
+            max_concurrency: 1024,
+            ..GovernorConfig::default()
         });
         // 16 qubits shot-mode = 65536 amps x 16 B x 2 = 2 MiB.
         let tiny = JobShape::new(16, CostKind::DenseStatevector).with_shots();
@@ -1038,6 +1140,7 @@ mod tests {
         let g = Governor::new(GovernorConfig {
             capacity_bytes: 1024 * GB,
             max_qubits: 24,
+            ..GovernorConfig::default()
         });
         g.admit(&JobShape::new(64, CostKind::Stabilizer).with_shots())
             .expect("64-qubit stabilizer sampling is kilobytes and must be admitted");
@@ -1059,6 +1162,7 @@ mod tests {
             GovernorConfig {
                 capacity_bytes: 4 * GB,
                 max_qubits: 40,
+                ..GovernorConfig::default()
             },
             &Topology::Unified {
                 total_bytes: 4 * GB,
@@ -1092,6 +1196,7 @@ mod tests {
             GovernorConfig {
                 capacity_bytes: 64 * GB,
                 max_qubits: 40,
+                ..GovernorConfig::default()
             },
             &Topology::Discrete {
                 host_bytes: 64 * GB,
@@ -1119,6 +1224,7 @@ mod tests {
             GovernorConfig {
                 capacity_bytes: 1024 * GB,
                 max_qubits: 40,
+                ..GovernorConfig::default()
             },
             &Topology::Discrete {
                 host_bytes: 1024 * GB,
@@ -1161,6 +1267,7 @@ mod tests {
             GovernorConfig {
                 capacity_bytes: 1024 * GB,
                 max_qubits: 40,
+                ..GovernorConfig::default()
             },
             &Topology::Discrete {
                 host_bytes: 1024 * GB,
@@ -1173,6 +1280,29 @@ mod tests {
         assert!(matches!(err, Rejection::Unpriceable { .. }), "got {err:?}");
     }
 
+    /// Bytes bound total memory; the job-slot cap bounds CPU contention. Many
+    /// tiny jobs can saturate the cores while barely touching the byte budget,
+    /// which is exactly the case a memory-only limit cannot express.
+    #[test]
+    fn concurrency_cap_bounds_job_count_independently_of_bytes() {
+        let g = Governor::new(GovernorConfig {
+            capacity_bytes: 64 * GB,
+            max_concurrency: 3,
+            ..GovernorConfig::default()
+        });
+        let tiny = JobShape::new(4, CostKind::DenseStatevector).with_shots();
+        let held: Vec<_> = (0..3)
+            .map(|i| g.admit(&tiny).unwrap_or_else(|e| panic!("job {i}: {e:?}")))
+            .collect();
+        let err = g
+            .admit(&tiny)
+            .expect_err("4th job exceeds the slot cap even though bytes are free");
+        assert!(matches!(err, Rejection::Busy { .. }), "got {err:?}");
+        // Freeing one slot lets exactly one more in.
+        drop(held);
+        g.admit(&tiny).expect("slots return when jobs finish");
+    }
+
     #[test]
     fn default_qubit_ceiling_is_derived_from_the_budget() {
         // 16 GB budget: n=29 needs 8 GB forward + 8 GB adjoint, which fits;
@@ -1182,6 +1312,7 @@ mod tests {
         let g = Governor::new(GovernorConfig {
             capacity_bytes: 16 * GB,
             max_qubits: default_qubit_ceiling(16 * GB),
+            ..GovernorConfig::default()
         });
         let mut s = JobShape::new(29, CostKind::DenseStatevector);
         s.gradient = true;

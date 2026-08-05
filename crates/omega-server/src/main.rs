@@ -3,6 +3,7 @@ use tokio::sync::RwLock;
 
 mod auth;
 mod lambda;
+mod limits;
 mod pki;
 mod pqc;
 mod quantum_bridge;
