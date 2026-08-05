@@ -7,7 +7,7 @@ pub(crate) mod adjoint;
 // — the small set of pure-math functions we need cross-backend.
 pub mod gates;
 pub mod noise;
-mod sim;
+pub mod sim;
 
 // The noise data model is shared across backends (see `omega_core::noise`);
 // re-exported here for the callers that construct it alongside this backend.

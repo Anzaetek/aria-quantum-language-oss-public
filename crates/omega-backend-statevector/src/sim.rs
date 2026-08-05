@@ -459,7 +459,7 @@ fn apply_readout_flip(
 /// Purity `Tr(ρ_q²)` of qubit `q`'s reduced state, where ρ_q is the 2×2 matrix
 /// obtained by tracing out every other qubit. Equals 1 exactly when `q` is
 /// **unentangled** from the rest of the register.
-fn reduced_purity(state: &[Complex64], n: usize, q: usize) -> f64 {
+pub fn reduced_purity(state: &[Complex64], n: usize, q: usize) -> f64 {
     let dim = 1usize << n;
     let mask = 1usize << q;
     let (mut r00, mut r11) = (0.0_f64, 0.0_f64);
@@ -485,8 +485,25 @@ fn reduced_purity(state: &[Complex64], n: usize, q: usize) -> f64 {
 /// If `q` is entangled, reset genuinely decoheres the partners: the result is
 /// mixed, a statevector holds one trajectory, and there is no exact pure-state
 /// answer. That is the case the caller must be refused for.
-fn reset_is_deterministic(state: &[Complex64], n: usize, q: usize) -> bool {
-    (reduced_purity(state, n, q) - 1.0).abs() < 1e-9
+pub fn reset_is_deterministic(state: &[Complex64], n: usize, q: usize) -> bool {
+    reset_is_deterministic_within(state, n, q, 1e-9)
+}
+
+/// [`reset_is_deterministic`] with an explicit tolerance.
+///
+/// The f64 CPU path uses `1e-9`. A **f32** backend (Metal) must not: its
+/// amplitudes come back rounded, so an genuinely unentangled qubit reads a
+/// purity of `1 − O(1e-6)` and `1e-9` rejects it as entangled. The threshold is
+/// not delicate — an unentangled qubit sits within ~1e-6 of 1 while a maximally
+/// entangled one sits at 0.5, five orders of magnitude away — so a device-
+/// appropriate tolerance separates them cleanly without weakening the check.
+pub fn reset_is_deterministic_within(
+    state: &[Complex64],
+    n: usize,
+    q: usize,
+    tol: f64,
+) -> bool {
+    (reduced_purity(state, n, q) - 1.0).abs() < tol
 }
 
 /// Error for an analytic (`shots = None`) expectation whose `Reset` acts on an
