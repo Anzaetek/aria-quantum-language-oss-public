@@ -1372,6 +1372,28 @@ where
                 Some(rng) => rng.random::<f64>() >= p0,
                 None => {
                     // Analytic run: only a determined outcome is representable.
+                    //
+                    // KNOWN DIVERGENCE (recorded 2026-08-05, NOT device-verified
+                    // — this arm cannot be compiled or run on the Mac dev box).
+                    // This refuses whenever the OUTCOME is random; the CPU
+                    // backend (`sim::reset_is_deterministic`) refuses whenever
+                    // the qubit is ENTANGLED, and Metal now matches the CPU.
+                    // They differ on an unentangled superposition:
+                    //
+                    //   |+> unentangled : purity 1, p0 = 0.5
+                    //     CPU/Metal  -> ALLOW (both branches land on |0>(x)rest,
+                    //                   so the RESULT is deterministic even
+                    //                   though the outcome is not)
+                    //     CUDA       -> REFUSE  <-- false rejection
+                    //
+                    // Entangled cases are refused by all three, so this is a
+                    // usability/consistency defect (a valid circuit errors out),
+                    // not a wrong-answer defect. The fix is to adopt the purity
+                    // criterion — `omega_backend_statevector::sim::
+                    // reset_is_deterministic_within(&state.read_state()?, n, q,
+                    // 1e-4)` — which needs a dependency on the CPU crate and a
+                    // device readback, and must be verified ON a CUDA box.
+                    // See LIMITATIONS.md and verification/.../Reset.lean (T1).
                     if p0 > 1e-6 && p0 < 1.0 - 1e-6 {
                         return Err(OmegaError::Unsupported(format!(
                             "cuda: analytic expectation of Reset on qubit {q} is ill-defined — \

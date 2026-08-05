@@ -98,3 +98,32 @@ end-to-end implementation, and which deeper features are deferred.
   assert off-diagonal observables or measurement-protocol post-processing; those
   examples that *have* a closed-form answer use a stronger **classical** oracle
   (see the table in [VERIFICATION.md](VERIFICATION.md)).
+
+## Reset: the CUDA backend is stricter than CPU/Metal
+
+`Reset` in **analytic** mode (`shots = None`) has a well-defined pure-state
+result exactly when the target qubit is **unentangled** — both measurement
+branches then land on `|0⟩ ⊗ rest`, so the outcome being random does not make
+the *result* random.
+
+The CPU and Metal backends use that criterion (reduced purity = 1). The CUDA
+backend instead refuses whenever `p0 ∈ (0, 1)`, i.e. whenever the *outcome* is
+random. The two agree on entangled qubits (all refuse) and on Z-eigenstates
+(all allow), but differ on an unentangled superposition:
+
+| state of `q` | purity | `p0` | CPU / Metal | CUDA |
+|---|---|---|---|---|
+| `\|0⟩`, `\|1⟩` | 1 | 1 or 0 | allow | allow |
+| `\|+⟩`, `\|−⟩` unentangled | 1 | 0.5 | **allow** | **refuse** |
+| Bell | 0.5 | 0.5 | refuse | refuse |
+
+So `H q0; Reset q0` is accepted by CPU and Metal and rejected by CUDA. This is a
+**false rejection** — a valid circuit errors out — not a wrong answer, so it is
+recorded rather than hot-fixed.
+
+**Not fixed here, deliberately.** The CUDA arm is `cfg`-gated to
+`linux/windows + cuda` and cannot be compiled or executed on the macOS dev box,
+so any change would be unverifiable. The fix is to adopt the purity criterion
+(`omega_backend_statevector::sim::reset_is_deterministic_within(..., 1e-4)`),
+which needs a dependency on the CPU crate plus a device readback, and must be
+validated on a CUDA box. Specified as `Reset.lean` T1.
