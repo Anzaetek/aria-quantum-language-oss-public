@@ -239,10 +239,30 @@ fn cost_kind_for(sel: &OmegaBackendSel) -> CostKind {
 ///
 /// Held for the duration of execution: dropping the returned [`Reservation`]
 /// is what returns the budget, so callers must keep it alive across the run.
+/// Where a statevector circuit will actually execute, so the governor debits
+/// the right memory pool and prices at the right element width (device kernels
+/// are f32). Mirrors `exec_statevector`'s routing exactly — if the two ever
+/// disagree, the reservation is against the wrong pool.
+fn exec_target_for(sel: &OmegaBackendSel) -> crate::worker::ExecTarget {
+    #[cfg(feature = "opencl")]
+    {
+        use omega_core::device::DeviceKind;
+        if matches!(sel, OmegaBackendSel::Statevector | OmegaBackendSel::Auto)
+            && DeviceKind::resolve(None) == DeviceKind::OpenCl
+        {
+            return crate::worker::ExecTarget::Device(0);
+        }
+    }
+    let _ = sel;
+    crate::worker::ExecTarget::Cpu
+}
+
 fn shape_for(ir: &OmegaCircuitIR, densifies: bool, batch: usize) -> JobShape {
-    let mut shape = JobShape::new(ir.num_qubits, cost_kind_for(&resolve_backend(ir)));
+    let resolved = resolve_backend(ir);
+    let mut shape = JobShape::new(ir.num_qubits, cost_kind_for(&resolved));
     shape.densifies = densifies;
     shape.batch = batch;
+    shape.target = exec_target_for(&resolved);
     shape
 }
 

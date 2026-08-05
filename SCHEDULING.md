@@ -65,11 +65,38 @@ priced densely there — and the `Auto` selector routes non-Clifford circuits of
 n ≥ 20 to MPS. Photonic cost is combinatorial in photon number, not mode count.
 Pricing follows the allocation in each case.
 
+### Memory pools: unified vs discrete hosts
+
+How many budgets the server keeps depends on the machine, and it detects this
+rather than assuming:
+
+| machine | pools |
+|---|---|
+| CPU-only server | one (host) |
+| Apple Silicon, DGX Spark (GB10) and other **unified**-memory hosts | **one shared pool** — CPU and GPU work debit the same budget, because that memory exists once |
+| Discrete NVIDIA (RTX / A100 / H100) | host, plus one per GPU |
+| DGX A100/H100 (8 GPUs) | host, plus eight |
+
+The asymmetry matters: on a unified box, budgeting host and device separately
+would double-count and OOM the machine, while on a discrete box assuming unified
+merely under-uses VRAM. **So when detection is uncertain, the server assumes
+unified** and says so in `/health`.
+
+GPU work is priced at f32 (8 bytes per amplitude), not the CPU's 16, and a job
+targeting a device is sized against **that device's** memory — not host RAM. A
+device the server has no budget for is refused rather than quietly charged to
+the host.
+
+`GET /health` reports every pool separately, so you can see *which* resource is
+scarce instead of one aggregate hiding a full GPU behind an idle host.
+
 ### Operator limits
 
 `OMEGA_MAX_MEM` (bytes) and `OMEGA_MAX_QUBITS` override the defaults, which
 derive from detected memory — a cgroup limit when present, so a containerised
 server budgets against its container and not the host.
+`OMEGA_MEM_TOPOLOGY=unified|discrete|host` overrides pool detection when you
+know better than the heuristics; the operator always wins.
 
 ## 3. Known limits today — plan around these
 
@@ -103,11 +130,9 @@ here because a client built without knowing them will be surprised.
    lambda route are not admission-controlled. Guest fuel limits guest
    instructions, not the host-side statevector. *Do not send untrusted or
    unbounded-width circuits through it.*
-9. **GPU memory is priced against host memory.** With a GPU device selected, a
-   job can be admitted against host RAM and still exhaust device memory.
-10. **No queue.** Refusal is immediate rather than queued, so a steady stream of
-    small jobs can keep a large one waiting indefinitely. *Back off, and do not
-    treat `Retry-After` as a promise of eventual admission.*
+9. **No queue.** Refusal is immediate rather than queued, so a steady stream of
+   small jobs can keep a large one waiting indefinitely. *Back off, and do not
+   treat `Retry-After` as a promise of eventual admission.*
 
 ## 4. Consequences for architecture search and QML training
 
