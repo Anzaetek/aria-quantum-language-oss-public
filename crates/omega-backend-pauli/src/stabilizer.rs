@@ -39,6 +39,34 @@ impl PauliRow {
     }
 }
 
+/// The Aaronson–Gottesman `g` function: the power of `i` picked up when the
+/// per-qubit Pauli `(x1,z1)` is multiplied by `(x2,z2)`, in the
+/// `i^{xz} X^x Z^z` convention the tableau rows use. Returned mod 4, so
+/// `3 ≡ -1`.
+///
+/// Derived from `P(x,z) = i^{xz} X^x Z^z`:
+/// `g = x1·z1 + x2·z2 + 2·z1·x2 − (x1⊕x2)(z1⊕z2)  (mod 4)`.
+///
+/// **This is the ONLY copy.** There were two: this one, driving the
+/// measurement path (`rowmult` / `row_product` / `measure` / `measure_prob`),
+/// and a free function in `sim.rs` driving expectations. Both had the `X·Z`
+/// and `Z·X` rows inverted; commit 1c3ef82 fixed only the `sim.rs` copy, so
+/// expectations became correct while **measurement sampling stayed broken** —
+/// a 3-qubit Clifford circuit put 1000/1000 shots on zero-probability
+/// bitstrings. `sim.rs` now calls this one. Do not reintroduce a second table.
+pub(crate) fn pauli_mult_phase(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
+    match ((x1, z1), (x2, z2)) {
+        ((false, false), _) | (_, (false, false)) => 0,
+        ((true, false), (false, true)) => 3, // X·Z  => g = -1
+        ((false, true), (true, false)) => 1, // Z·X  => g = +1
+        ((true, false), (true, true)) => 1,  // X·(XZ) = Z
+        ((true, true), (true, false)) => 3,  // (XZ)·X
+        ((false, true), (true, true)) => 3,  // Z·(XZ)
+        ((true, true), (false, true)) => 1,  // (XZ)·Z
+        _ => 0,                              // same: P² = I
+    }
+}
+
 /// Stabilizer tableau for n qubits.
 ///
 /// Contains 2n rows: rows 0..n are destabilizers, rows n..2n are stabilizers.
@@ -223,16 +251,7 @@ impl StabilizerTableau {
     /// Phase contribution from multiplying two single-qubit Paulis.
     /// Returns 0, 1, 2, or 3 (power of i).
     fn pauli_mult_phase(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
-        match ((x1, z1), (x2, z2)) {
-            ((false, false), _) | (_, (false, false)) => 0, // I * P or P * I
-            ((true, false), (false, true)) => 1,            // X * Z = -iY → phase i^3? No...
-            ((false, true), (true, false)) => 3,            // Z * X = iY → phase i^1? No...
-            ((true, false), (true, true)) => 1,             // X * Y = iZ
-            ((true, true), (true, false)) => 3,             // Y * X = -iZ
-            ((false, true), (true, true)) => 3,             // Z * Y = -iX
-            ((true, true), (false, true)) => 1,             // Y * Z = iX
-            _ => 0,                                         // Same operator: P² = I
-        }
+        pauli_mult_phase(x1, z1, x2, z2)
     }
 
     /// Get stabilizer generator k (index 0..n-1).

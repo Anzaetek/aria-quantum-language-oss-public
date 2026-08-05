@@ -14,6 +14,7 @@ use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
 use omega_core::params::ParameterBinding;
 
+use crate::stabilizer::pauli_mult_phase;
 use crate::stabilizer::{PauliRow, StabilizerTableau};
 
 /// Clifford stabilizer simulator.
@@ -336,22 +337,32 @@ fn reset_outcome_is_determined(tab: &StabilizerTableau, q: usize) -> bool {
 ///
 /// where s_k(b) is 1 if the stabilizer S_k gives eigenvalue -1 on |b⟩.
 fn stabilizer_probability(tab: &StabilizerTableau, basis: usize, n: usize) -> f64 {
+    // Fast reject, valid ONLY for DIAGONAL (X-free) stabilizers.
+    //
+    // `(-1)^sign · (-1)^{#Z on set bits}` is the eigenvalue of `S` on `|b⟩`
+    // only when `S` has no X/Y component: otherwise `S|b⟩ ∝ |b ⊕ x_bits⟩ ≠ |b⟩`
+    // and `S` has no eigenvalue on `|b⟩` at all. This loop used to run for
+    // EVERY stabilizer, so a non-diagonal generator with a negative sign
+    // annihilated basis states that carry real probability. Measured: 1576 of
+    // 3000 random Clifford circuits returned a distribution that did not sum
+    // to 1 — e.g. `[0, 0, 0.25, 0, 0.25, 0, 0, 0]` (sum 0.5) where the truth is
+    // uniform 0.25 over four states. The comment below already said the formula
+    // "only works when all stabilizers are diagonal"; nothing acted on it.
+    //
+    // The O(2^n) group enumeration further down is correct in general and is
+    // self-sufficient — this is purely an early-out.
     for k in 0..n {
         let stab = tab.stabilizer(k);
-        // Evaluate the stabilizer on the basis state |b⟩
-        // The eigenvalue is (-1)^{sign} * (-1)^{number of Z/Y on qubits where bit=1}
+        if stab.x.iter().any(|&x| x) {
+            continue; // non-diagonal: no eigenvalue on |b⟩, cannot reject here
+        }
         let mut parity = stab.sign;
         for q in 0..n {
-            let bit = (basis >> q) & 1 == 1;
-            if bit {
-                // Z contributes -1 when bit=1
-                // Y = iXZ also contributes -1 when bit=1 (from the Z part)
-                // X doesn't contribute phase from the bit value
+            if (basis >> q) & 1 == 1 {
                 parity ^= stab.z[q];
             }
         }
-        // If parity is false (eigenvalue +1): (1+1)/2 = 1
-        // If parity is true (eigenvalue -1): (1-1)/2 = 0
+        // Eigenvalue -1 ⇒ |b⟩ is orthogonal to the stabilizer state.
         if parity {
             return 0.0;
         }
@@ -556,32 +567,158 @@ fn mul_pauli_row(x: &mut [bool], z: &mut [bool], sign: &mut bool, row: &PauliRow
     }
 }
 
-/// The Aaronson–Gottesman `g` function: the power of `i` picked up when the
-/// per-qubit Pauli `(x1,z1)` is multiplied by `(x2,z2)`, in the `i^{xz} X^x Z^z`
-/// convention the tableau rows use. Returned mod 4, so `3 ≡ -1`.
-///
-/// Derived from `P(x,z) = i^{xz} X^x Z^z`:
-/// `g = x1·z1 + x2·z2 + 2·z1·x2 − (x1⊕x2)(z1⊕z2)  (mod 4)`.
-///
-/// **The `X·Z` and `Z·X` rows were inverted** — the original returned `+1` for
-/// `X·Z` and `-1` for `Z·X`, and its own comment recorded the doubt
-/// (*"X·Z = iY (wait, X·Z = -iY)"*) without acting on it. The other four rows
-/// already agreed with `g`.
-fn pauli_mult_phase(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
-    match ((x1, z1), (x2, z2)) {
-        ((false, false), _) | (_, (false, false)) => 0,
-        ((true, false), (false, true)) => 3, // X·Z  => g = -1
-        ((false, true), (true, false)) => 1, // Z·X  => g = +1
-        ((true, false), (true, true)) => 1,  // X·(XZ) = Z
-        ((true, true), (true, false)) => 3,  // (XZ)·X
-        ((false, true), (true, true)) => 3,  // Z·(XZ)
-        ((true, true), (false, true)) => 1,  // (XZ)·Z
-        _ => 0,                              // same: P² = I
-    }
-}
 
 #[cfg(test)]
 mod tests {
+    /// **Regression: MEASUREMENT sampling and exact probabilities must agree
+    /// with the dense reference.**
+    ///
+    /// The expectation test below did not cover these paths, which is how the
+    /// duplicate phase table survived: commit 1c3ef82 fixed the copy in
+    /// `sim.rs` (expectations) while `stabilizer.rs` kept an inverted copy
+    /// driving `rowmult` / `measure` / `measure_prob`. A 3-qubit Clifford
+    /// circuit then put **1000/1000 shots on zero-probability bitstrings**
+    /// through the public `execute` API.
+    ///
+    /// Independently, the exact-probabilities fast-reject was applied to
+    /// non-diagonal stabilizers, for which it is invalid: **1576 of 3000**
+    /// random circuits returned an unnormalised distribution.
+    #[test]
+    fn measurement_and_probabilities_agree_with_dense_reference() {
+        use omega_core::executor::{ExecConfig, ExecResult, MidCircuitMode};
+
+        let mut seed = 0xBEEFu64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let be = PauliBackend::new();
+        let analytic = ExecConfig {
+            shots: None,
+            seed: None,
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let mut checked = 0usize;
+        let mut nondiag = 0usize;
+
+        for _ in 0..300 {
+            let n = 2 + (rnd() % 3) as u32;
+            let depth = 4 + (rnd() % 10) as usize;
+            let mut c = CircuitIR::new(n, CircuitType::GateBased);
+            for _ in 0..depth {
+                let q = (rnd() % n as u64) as u32;
+                match rnd() % 6 {
+                    0 => c.ops.push(make_op(GateKind::H, &[q])),
+                    1 => c.ops.push(make_op(GateKind::S, &[q])),
+                    2 => c.ops.push(make_op(GateKind::Sdg, &[q])),
+                    3 => c.ops.push(make_op(GateKind::X, &[q])),
+                    4 => c.ops.push(make_op(GateKind::Z, &[q])),
+                    _ => {
+                        let b = (rnd() % n as u64) as u32;
+                        if q != b {
+                            c.ops.push(make_op(GateKind::CX, &[q, b]));
+                        }
+                    }
+                }
+            }
+            let truth = dense_probabilities(&c);
+
+            // Exact-probabilities mode.
+            if let Ok(ExecResult::Probabilities(p)) =
+                be.execute(&c, &ParameterBinding::new(), &analytic)
+            {
+                checked += 1;
+                let sum: f64 = p.iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 1e-9,
+                    "probabilities sum to {sum}, not 1 (n={n})"
+                );
+                for (i, (a, b)) in p.iter().zip(truth.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() < 1e-9,
+                        "P({i}) = {a} vs dense {b} (n={n})"
+                    );
+                }
+            }
+
+            // Shot sampling must never land on a zero-probability outcome.
+            let shots = ExecConfig {
+                shots: Some(200),
+                seed: Some(7),
+                mid_circuit_mode: MidCircuitMode::Skip,
+            };
+            if let Ok(ExecResult::Counts(m)) = be.execute(&c, &ParameterBinding::new(), &shots) {
+                for (k, cnt) in m {
+                    assert!(
+                        truth[k as usize] > 1e-12,
+                        "{cnt} shots landed on bitstring {k} with true probability {} (n={n})",
+                        truth[k as usize]
+                    );
+                }
+            }
+            // Track that the sweep actually exercises NON-DIAGONAL stabilizers,
+            // the case the fast-reject got wrong. A sweep of only-diagonal
+            // circuits would pass against the broken code.
+            if truth.iter().filter(|&&p| p > 1e-12).count() > 1 {
+                nondiag += 1;
+            }
+        }
+        assert!(checked > 100, "only {checked} circuits reached probabilities mode");
+        assert!(
+            nondiag > 50,
+            "only {nondiag} circuits had a spread support — the sweep is too degenerate \
+             to exercise the non-diagonal path"
+        );
+    }
+
+    /// Dense `|<b|psi>|^2` for a Clifford circuit — an independent oracle.
+    fn dense_probabilities(c: &CircuitIR) -> Vec<f64> {
+        use num_complex::Complex64;
+        let n = c.num_qubits as usize;
+        let dim = 1usize << n;
+        let mut psi = vec![Complex64::new(0.0, 0.0); dim];
+        psi[0] = Complex64::new(1.0, 0.0);
+        let apply1 = |psi: &mut Vec<Complex64>, q: usize, m: [[Complex64; 2]; 2]| {
+            let mut out = vec![Complex64::new(0.0, 0.0); psi.len()];
+            for (i, &a) in psi.iter().enumerate() {
+                if a == Complex64::new(0.0, 0.0) {
+                    continue;
+                }
+                let b = (i >> q) & 1;
+                out[i & !(1 << q)] += m[0][b] * a;
+                out[i | (1 << q)] += m[1][b] * a;
+            }
+            *psi = out;
+        };
+        let z0 = Complex64::new(0.0, 0.0);
+        let one = Complex64::new(1.0, 0.0);
+        let r2 = Complex64::new(std::f64::consts::FRAC_1_SQRT_2, 0.0);
+        for op in &c.ops {
+            let q = op.qubits[0].0 as usize;
+            match op.gate {
+                GateKind::H => apply1(&mut psi, q, [[r2, r2], [r2, -r2]]),
+                GateKind::X => apply1(&mut psi, q, [[z0, one], [one, z0]]),
+                GateKind::Z => apply1(&mut psi, q, [[one, z0], [z0, -one]]),
+                GateKind::S => apply1(&mut psi, q, [[one, z0], [z0, Complex64::new(0.0, 1.0)]]),
+                GateKind::Sdg => apply1(&mut psi, q, [[one, z0], [z0, Complex64::new(0.0, -1.0)]]),
+                GateKind::CX => {
+                    let t = op.qubits[1].0 as usize;
+                    let mut out = psi.clone();
+                    for i in 0..dim {
+                        if (i >> q) & 1 == 1 {
+                            out[i ^ (1 << t)] = psi[i];
+                        }
+                    }
+                    psi = out;
+                }
+                _ => panic!("dense oracle: unexpected gate {:?}", op.gate),
+            }
+        }
+        psi.iter().map(|a| a.norm_sqr()).collect()
+    }
+
     /// **Regression: `stabilizer_expectation` must agree with the exact
     /// statevector on random Clifford circuits, including Y observables.**
     ///
