@@ -124,7 +124,7 @@ fn adjoint_gradient_inner(
             let phi = backend
                 .lease(n)
                 .map_err(|e| OmegaError::Backend(format!("metal lease phi: {e}")))?;
-            crate::apply_ops_fused(&phi, unitary_ops.iter().copied(), params, |_| false)?;
+            crate::apply_ops_fused(&phi, unitary_ops.iter().copied(), params, |_| false, None)?;
             phi
         }
     };

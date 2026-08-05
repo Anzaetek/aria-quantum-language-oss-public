@@ -147,3 +147,23 @@ number — the failure mode this project keeps finding.
 
 Only the CUDA criterion diverges, and it errs toward refusing. No backend
 silently skips Reset or returns a value for it.
+
+### Metal: shots-mode `Reset` delegates to the CPU backend
+
+Metal's shot path evolves the state **once** and samples the final
+distribution — valid for unitary circuits, invalid with `Reset`, which is a
+channel whose true result is a mixture over trajectories.
+
+So `MetalStatevectorBackend::execute` delegates to the CPU statevector backend
+whenever `shots` is set and the circuit contains a `Reset`. Verified: Bell +
+`Reset q0` at 512 shots now returns counts identical to the CPU
+(`{0: 262, 2: 250}`) in 0.47 s.
+
+**This is a fallback, not a fix.** Per-shot GPU trajectories were implemented
+first (lease → evolve → sample, reset branch drawn from an RNG) and are
+*correct* — verified at 16 shots against the CPU, same support, no impossible
+outcomes — but they **block at 0% CPU** from a few hundred shots onward, and
+draining the batch `apply_ops_fused` leaves open after a Reset did not resolve
+it. The root cause is not yet identified, and shipping a hang would be worse
+than the bug it replaces. Re-open when the pool/command-buffer interaction is
+understood.

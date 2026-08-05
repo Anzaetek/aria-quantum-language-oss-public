@@ -816,21 +816,57 @@ impl MetalState {
     /// cannot drift apart.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn apply_reset(&self, q: u32) -> Result<(), MetalError> {
+        self.apply_reset_with(q, None)
+    }
+
+    /// `P(qubit q reads 0)`, computed ON DEVICE from `⟨Z_q⟩` — no readback.
+    ///
+    /// `⟨Z_q⟩ = p0 − p1` and `p0 + p1 = 1`, so `p0 = (1 + ⟨Z_q⟩)/2`. Clamped
+    /// because the f32 reduction can land a hair outside `[0,1]`. Mirrors
+    /// CUDA's `reset_p0`. The trajectory path uses this instead of
+    /// `read_state`, which would pull `2^n` amplitudes to the host **per shot**.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn reset_p0(&self, q: u32) -> Result<f64, MetalError> {
+        let one = Complex64::new(1.0, 0.0);
+        let z_q = self.pauli_expectation(0, 1u32 << q, one)?.re;
+        Ok((0.5 * (1.0 + z_q)).clamp(0.0, 1.0))
+    }
+
+    /// [`Self::apply_reset`] with an explicit trajectory branch.
+    ///
+    /// `branch = None` is the ANALYTIC contract: only a state whose reset has a
+    /// single pure-state answer is representable, so an entangled qubit is
+    /// refused. `branch = Some(outcome_one)` is one **trajectory** — the caller
+    /// has already sampled the outcome, so an entangled reset is fine and the
+    /// guard does not apply. Mirrors CUDA's `reset_rng: Option<&mut StdRng>`.
+    ///
+    /// Without this split the guard fired in SHOTS mode too, where the CPU and
+    /// MPS backends happily run per-shot trajectories: a Bell + `Reset q0` at
+    /// 512 shots returned counts on CPU and an error on Metal, while the error
+    /// text advised "run with shots" — which is what the caller was doing.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn apply_reset_with(&self, q: u32, branch: Option<bool>) -> Result<(), MetalError> {
         let n = self.num_qubits() as usize;
-        // The purity check needs the amplitudes. Reset is already a full-state
-        // non-unitary op that drains the batch, so this readback is on a path
-        // that was never fused anyway.
-        let host = self.read_state();
+        // The purity check needs the amplitudes — but ONLY the analytic path
+        // performs it. A trajectory (`branch = Some(..)`) skips the readback
+        // entirely, so shots mode never pulls `2^n` amplitudes per shot.
+        let host = if branch.is_none() {
+            self.read_state()
+        } else {
+            Vec::new()
+        };
         // f32 tolerance: Metal amplitudes come back rounded, so an unentangled
         // qubit reads purity 1 − O(1e-6) and the CPU's f64 threshold (1e-9)
         // would reject it. A maximally entangled qubit reads 0.5, so 1e-4
         // separates the two by five orders of magnitude.
-        if !omega_backend_statevector::sim::reset_is_deterministic_within(
-            &host,
-            n,
-            q as usize,
-            1e-4,
-        ) {
+        if branch.is_none()
+            && !omega_backend_statevector::sim::reset_is_deterministic_within(
+                &host,
+                n,
+                q as usize,
+                1e-4,
+            )
+        {
             return Err(MetalError::Unsupported(format!(
                 "metal statevector: Reset on qubit {q} is ill-defined here — the qubit is \
                  entangled, so the reset leaves the register in a mixed state that one \
@@ -841,17 +877,37 @@ impl MetalState {
 
         // Deterministic case: P(0) is 0 or 1, so the projective measurement has
         // a forced outcome. Project onto it, renormalise, and X if it was 1.
-        let mask = 1usize << q;
-        let p0: f64 = host
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| i & mask == 0)
-            .map(|(_, a)| a.norm_sqr())
-            .sum();
+        let p0 = match branch {
+            // Already sampled by the caller from an on-device `reset_p0`.
+            Some(_) => self.reset_p0(q)?,
+            None => {
+                let mask = 1usize << q;
+                host.iter()
+                    .enumerate()
+                    .filter(|(i, _)| i & mask == 0)
+                    .map(|(_, a)| a.norm_sqr())
+                    .sum()
+            }
+        };
 
         let one = Complex64::new(1.0, 0.0);
         let zero = Complex64::new(0.0, 0.0);
-        let outcome_is_one = p0 < 0.5;
+        // A caller-supplied branch wins; otherwise (deterministic case) either
+        // branch gives the same state up to global phase, so take p0 >= 1/2.
+        // A zero-weight branch is unreachable — force the other one so the
+        // renormalisation stays finite (matches the CPU and CUDA backends).
+        let outcome_is_one = match branch {
+            Some(b) => {
+                if b && p0 >= 1.0 - 1e-12 {
+                    false
+                } else if !b && p0 <= 1e-12 {
+                    true
+                } else {
+                    b
+                }
+            }
+            None => p0 < 0.5,
+        };
         if outcome_is_one {
             self.apply_diagonal(q, zero, one)?; // keep |1>, kill |0>
         } else {
@@ -1022,13 +1078,42 @@ impl Backend for MetalStatevectorBackend {
         // `apply_diagonal_product` dispatch — saves N-1 round-trips
         // per N-long fusion run (e.g. an HEA layer's 8 Rz fan).
         let classical_bits = vec![0u8; circuit.num_classical_bits as usize];
+        // A circuit with `Reset` is NOT unitary, so "evolve once then sample the
+        // final state" — which is all this backend's shot path does — is
+        // invalid: the true result is a mixture over trajectories. In shots
+        // mode we therefore DELEGATE to the CPU statevector backend, which runs
+        // one trajectory per shot.
+        //
+        // This is a fallback, not a fix, and it is deliberate. I first
+        // implemented per-shot GPU trajectories (lease → evolve → sample, with
+        // the reset branch drawn from an RNG). It is correct — verified at 16
+        // shots against the CPU, same support, no impossible outcomes — but it
+        // BLOCKS at 0% CPU from a few hundred shots onward, and draining the
+        // batch `apply_ops_fused` leaves open after a Reset did not resolve it.
+        // Shipping a hang is worse than the bug it replaces, so the delegation
+        // stands until that is root-caused. See LIMITATIONS.md.
+        //
+        // Before this, the analytic entanglement guard fired in shots mode too:
+        // Bell + `Reset q0` at 512 shots returned counts on the CPU and an
+        // error on Metal, whose text advised "run with shots" — which is what
+        // the caller was already doing.
+        if config.shots.is_some()
+            && circuit
+                .ops
+                .iter()
+                .any(|op| matches!(op.gate, GateKind::Reset))
+        {
+            return omega_backend_statevector::StatevectorBackend::new()
+                .execute(circuit, params, config);
+        }
+
         apply_ops_fused(&state, &circuit.ops, params, |op| {
             // The walker's `condition_skip` predicate returns `true`
             // to skip the op. Since `classical_bits` is all-zeros
             // (no mid-circuit measurement on Metal), any condition
             // requiring a non-zero value should skip.
             !op.condition_satisfied(&classical_bits)
-        })?;
+        }, None)?;
 
         match config.shots {
             None => {
@@ -1096,7 +1181,7 @@ impl Backend for MetalStatevectorBackend {
         // skipped — they're no-ops in the expectation path.
         apply_ops_fused(&psi, &circuit.ops, params, |op| {
             matches!(&op.gate, GateKind::Measure)
-        })?;
+        }, None)?;
 
         let mut total = 0.0_f64;
         for (coeff, pauli_string) in &observable.terms {
@@ -1143,7 +1228,7 @@ impl Backend for MetalStatevectorBackend {
         // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
         apply_ops_fused(&psi, &circuit.ops, params, |op| {
             matches!(&op.gate, GateKind::Measure)
-        })?;
+        }, None)?;
 
         let mut out = Vec::with_capacity(observables.len());
         for obs in observables {
@@ -1236,7 +1321,7 @@ impl Backend for MetalStatevectorBackend {
         let phi = self.lease(n)?;
         apply_ops_fused(&phi, &circuit.ops, params, |op| {
             matches!(&op.gate, GateKind::Measure)
-        })?;
+        }, None)?;
 
         // Predictions: pauli_expectation per observable on the
         // resident on-device |ψ⟩. Mirrors expectation_multi.
@@ -1443,6 +1528,7 @@ pub(crate) fn apply_ops_fused<'a, I>(
     ops: I,
     params: &ParameterBinding,
     mut condition_skip: impl FnMut(&omega_core::circuit::GateOp) -> bool,
+    mut reset_rng: Option<&mut rand::rngs::StdRng>,
 ) -> OmegaResult<()>
 where
     I: IntoIterator<Item = &'a omega_core::circuit::GateOp>,
@@ -1496,8 +1582,21 @@ where
             // `apply_op` so the adjoint dagger never treats Reset as unitary.
             if matches!(&op.gate, GateKind::Reset) {
                 flush(state, &mut pending)?;
+                let q = op.qubits[0].0;
+                // `Some(rng)` = one trajectory (shots mode): sample the branch,
+                // so an entangled reset is fine. `None` = analytic: only a
+                // deterministic reset is representable and `apply_reset_with`
+                // refuses otherwise.
+                let branch = match reset_rng.as_deref_mut() {
+                    Some(rng) => {
+                        use rand::RngExt;
+                        let p0 = state.reset_p0(q).map_err(OmegaError::from)?;
+                        Some(rng.random::<f64>() >= p0)
+                    }
+                    None => None,
+                };
                 state
-                    .apply_reset(op.qubits[0].0)
+                    .apply_reset_with(q, branch)
                     .map_err(OmegaError::from)?;
                 state.inner.begin_batch();
                 continue;
@@ -3791,7 +3890,7 @@ mod tests {
         // Fused: walker.
         let mut got = backend.allocate(n).unwrap();
         got.write_state(&want_init).unwrap();
-        super::apply_ops_fused(&got, &ops, &params, |_| false).unwrap();
+        super::apply_ops_fused(&got, &ops, &params, |_| false, None).unwrap();
 
         let max = max_abs_diff(&want.read_state(), &got.read_state());
         assert!(
@@ -3843,7 +3942,7 @@ mod tests {
                     .first()
                     .map(|p| matches!(p, ParamExpr::Symbol(1)))
                     .unwrap_or(false)
-        })
+        }, None)
         .unwrap();
 
         let max = max_abs_diff(&want.read_state(), &got.read_state());
@@ -3891,7 +3990,7 @@ mod tests {
         // Fused walker.
         let mut got = backend.allocate(n).unwrap();
         got.write_state(&want_init).unwrap();
-        super::apply_ops_fused(&got, &ops, &params, |_| false).unwrap();
+        super::apply_ops_fused(&got, &ops, &params, |_| false, None).unwrap();
 
         let max = max_abs_diff(&want.read_state(), &got.read_state());
         assert!(
@@ -3909,7 +4008,7 @@ mod tests {
         let want = random_state(n, 0xDEADu64);
         state.write_state(&want).unwrap();
         let params = ParameterBinding::new();
-        super::apply_ops_fused(&state, &[], &params, |_| false).unwrap();
+        super::apply_ops_fused(&state, &[], &params, |_| false, None).unwrap();
         let got = state.read_state();
         let max = max_abs_diff(&want, &got);
         assert!(max < 1e-6, "empty op list must not modify state: {max}");
