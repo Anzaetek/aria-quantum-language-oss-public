@@ -380,6 +380,27 @@ impl Registry {
             ..Default::default()
         };
 
+        // Admission control. This path lowers caller-registered Aria source and
+        // executes it directly, so without a reservation it was a second,
+        // unguarded door onto the same statevector allocation the /v1/quantum
+        // routes are governed on.
+        let kind = match ir.circuit_type {
+            omega_core::circuit::CircuitType::GateBased => {
+                crate::worker::CostKind::DenseStatevector
+            }
+            omega_core::circuit::CircuitType::Photonic => crate::worker::CostKind::Photonic,
+        };
+        let base = crate::worker::JobShape::new(ir.num_qubits, kind);
+        // shots == 0 means analytic here, which returns the full statevector.
+        let shape = if shots == 0 {
+            base.returning_statevector()
+        } else {
+            base.with_shots()
+        };
+        let _reservation = crate::worker::governor()
+            .admit(&shape)
+            .map_err(|rej| OmegaError::Backend(rej.message()))?;
+
         use omega_core::executor::Backend;
         let result = match ir.circuit_type {
             omega_core::circuit::CircuitType::GateBased => {

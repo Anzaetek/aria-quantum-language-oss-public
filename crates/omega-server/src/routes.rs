@@ -344,9 +344,13 @@ async fn revoke_token(
 // ---- Existing Handlers (now with rights checks) ----
 
 async fn health() -> impl IntoResponse {
+    // Publish the execution budget so a client can size work *before*
+    // submitting, rather than discovering the ceiling by being rejected.
+    // Unauthenticated, like the rest of /health: it exposes capacity, not data.
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "execution": crate::worker::governor().health_snapshot(),
     }))
 }
 
