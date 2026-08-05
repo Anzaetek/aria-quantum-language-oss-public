@@ -25,6 +25,29 @@ equals the Aaronson–Gottesman closed form on all 16 input pairs, by exhaustive
 case split. It is **falsifiable** — restoring the pre-fix `X·Z`/`Z·X` rows makes
 `decide` reject it, which was checked rather than assumed.
 
+## `set_option autoImplicit false` is load-bearing
+
+Both files disable it, and must keep doing so. Core Lean has no `Real`; with
+`autoImplicit` on (the default) the `Real` in these signatures was silently
+auto-bound as an implicit `Sort` parameter of every axiom:
+
+```
+axiom p0.{u} : {Real : Sort u} → {n : Nat} → State n → Fin n → Real
+```
+
+Instantiating it at `Empty` then *proved* `State n` uninhabited, and every
+target was dischargeable by `.elim` with no physics whatsoever. The files
+typechecked and specified nothing. That is why the carriers are now declared
+explicitly as inhabited abstract types (`R`, `R.one`, …) — an *empty* carrier
+reintroduces exactly the same vacuity.
+
+Regression check (should FAIL to elaborate):
+
+```lean
+theorem states_are_empty {n : Nat} (s : State n) (q : Fin n) : False :=
+  (p0 (Real := Empty) s q).elim   -- error: invalid argument name `Real`
+```
+
 ## Typecheck
 
 ```bash
