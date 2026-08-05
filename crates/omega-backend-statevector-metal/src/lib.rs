@@ -79,6 +79,12 @@ pub enum MetalError {
     /// `2^num_qubits`.
     #[error("state length mismatch: expected {expected}, got {got}")]
     StateLengthMismatch { expected: usize, got: usize },
+    /// The requested operation is not representable on this backend — e.g. an
+    /// analytic `Reset` on an entangled qubit, whose true result is a mixed
+    /// state that one statevector cannot hold. Mirrors the CPU backend's
+    /// `OmegaError::Unsupported` so both refuse the same inputs.
+    #[error("{0}")]
+    Unsupported(String),
     /// MSL kernel failed to compile or pipeline state creation failed.
     /// This shouldn't happen for the shaders we ship; if it does the
     /// build is broken or the OS Metal toolchain is mis-configured.
@@ -790,21 +796,74 @@ impl MetalState {
         self.apply_2q(qa, qb, &u)
     }
 
-    /// Reset qubit `q` to |0⟩, matching the CPU `apply_reset` and the CUDA
-    /// `apply_reset` exactly: fold each |1⟩ amplitude into its paired |0⟩ slot
-    /// (`new0 = old0 + old1, new1 = 0` — the non-unitary 1q matvec
-    /// `[[1,1],[0,0]]`, applied via `apply_1q` like the adjoint's derivative
-    /// gates), zero the |1⟩ slot, then renormalise by `⟨ψ|I|ψ⟩` (identity
-    /// masks `(0,0,1)`) via a uniform `apply_diagonal`.
+    /// Reset qubit `q` to |0⟩ — the **channel**, matching the CPU
+    /// `apply_reset` (projective measure, then `X` if the outcome was 1).
+    ///
+    /// This used to fold each |1⟩ amplitude into its paired |0⟩ slot
+    /// (`new0 = old0 + old1`) and renormalise, described as "matching the CPU
+    /// `apply_reset` exactly". It no longer does: the CPU backend was corrected
+    /// (Reset is a channel, not a coherent fold) and Metal kept the superseded
+    /// semantics. The fold is wrong even on an *unentangled* qubit — on |−⟩ it
+    /// gives `old0 + old1 = 0`, so the `norm_sq > 0` guard silently skipped the
+    /// renormalisation and left the register at zero amplitude.
+    ///
+    /// It also had **no entanglement guard**. `apply_ops_fused` carries no RNG,
+    /// so Metal can only do the deterministic case; on an entangled qubit the
+    /// true post-reset state is *mixed* and no single statevector represents
+    /// it. The CPU refuses that in analytic mode — Metal silently returned a
+    /// pure-state answer. Now both refuse, via the *same* predicate
+    /// (`omega_backend_statevector::sim::reset_is_deterministic`), so the two
+    /// cannot drift apart.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn apply_reset(&self, q: u32) -> Result<(), MetalError> {
+        let n = self.num_qubits() as usize;
+        // The purity check needs the amplitudes. Reset is already a full-state
+        // non-unitary op that drains the batch, so this readback is on a path
+        // that was never fused anyway.
+        let host = self.read_state();
+        // f32 tolerance: Metal amplitudes come back rounded, so an unentangled
+        // qubit reads purity 1 − O(1e-6) and the CPU's f64 threshold (1e-9)
+        // would reject it. A maximally entangled qubit reads 0.5, so 1e-4
+        // separates the two by five orders of magnitude.
+        if !omega_backend_statevector::sim::reset_is_deterministic_within(
+            &host,
+            n,
+            q as usize,
+            1e-4,
+        ) {
+            return Err(MetalError::Unsupported(format!(
+                "metal statevector: Reset on qubit {q} is ill-defined here — the qubit is \
+                 entangled, so the reset leaves the register in a mixed state that one \
+                 statevector cannot represent. Run with shots (each shot is an independent \
+                 trajectory), or reset only unentangled qubits."
+            )));
+        }
+
+        // Deterministic case: P(0) is 0 or 1, so the projective measurement has
+        // a forced outcome. Project onto it, renormalise, and X if it was 1.
+        let mask = 1usize << q;
+        let p0: f64 = host
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i & mask == 0)
+            .map(|(_, a)| a.norm_sqr())
+            .sum();
+
         let one = Complex64::new(1.0, 0.0);
         let zero = Complex64::new(0.0, 0.0);
-        self.apply_1q(q, &[one, one, zero, zero])?;
+        let outcome_is_one = p0 < 0.5;
+        if outcome_is_one {
+            self.apply_diagonal(q, zero, one)?; // keep |1>, kill |0>
+        } else {
+            self.apply_diagonal(q, one, zero)?; // keep |0>, kill |1>
+        }
         let norm_sq = self.pauli_expectation(0, 0, one)?.re;
         if norm_sq > 0.0 {
             let inv = Complex64::new(1.0 / norm_sq.sqrt(), 0.0);
             self.apply_diagonal(q, inv, inv)?;
+        }
+        if outcome_is_one {
+            self.apply_x(q)?;
         }
         Ok(())
     }
@@ -2919,10 +2978,20 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
     fn reset_matches_cpu() {
-        // Mid-circuit Reset on Metal must reproduce the CPU backend's
-        // deterministic fold-and-renormalise semantics. Reset a qubit out of an
-        // entangled, non-|0⟩ state (Bell + RY), then keep computing so a wrong
-        // reset would propagate into the final amplitudes. f32 tolerance 1e-5.
+        // Reset is a CHANNEL (projective measure, then X if the outcome was 1),
+        // not a coherent fold. Metal must agree with the CPU backend on BOTH
+        // halves of that:
+        //
+        //   (a) an UNENTANGLED reset is deterministic and both must produce the
+        //       same state — including the |−⟩ case, where the old coherent
+        //       fold gave `old0 + old1 = 0` and silently skipped the
+        //       renormalise, leaving zero amplitude;
+        //   (b) an ENTANGLED reset in analytic mode is ill-defined (the true
+        //       result is mixed) and both must REFUSE. Metal used to return a
+        //       pure-state answer here while the CPU errored.
+        //
+        // The original version of this test asserted (a) using an entangled
+        // circuit, so it broke as soon as the CPU gained its guard.
         use omega_backend_statevector::StatevectorBackend;
         use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
 
@@ -2935,13 +3004,6 @@ mod tests {
                 condition: None,
             });
         };
-        let mut circuit = CircuitIR::new(2, CircuitType::GateBased);
-        push(&mut circuit, GateKind::H, &[0], &[]);
-        push(&mut circuit, GateKind::CX, &[0, 1], &[]);
-        push(&mut circuit, GateKind::Ry, &[1], &[0.7]);
-        push(&mut circuit, GateKind::Reset, &[0], &[]);
-        push(&mut circuit, GateKind::H, &[1], &[]);
-
         let params = ParameterBinding::new();
         let cfg = ExecConfig {
             shots: None,
@@ -2949,23 +3011,77 @@ mod tests {
         };
         let cpu = StatevectorBackend::new();
         let metal = MetalStatevectorBackend::new().expect("metal");
-        let cpu_res = cpu.execute(&circuit, &params, &cfg).expect("cpu execute");
-        let metal_res = metal
-            .execute(&circuit, &params, &cfg)
-            .expect("metal execute");
-        match (cpu_res, metal_res) {
-            (ExecResult::Statevector(a), ExecResult::Statevector(b)) => {
-                assert_eq!(a.len(), b.len());
-                let max = a
-                    .iter()
-                    .zip(b.iter())
-                    .map(|(x, y)| (x - y).norm())
-                    .fold(0.0f64, f64::max);
-                assert!(max < 1e-5, "max amp diff {max}");
+
+        // (a) Unentangled resets, including |−⟩ (H then Reset) and |1⟩ (X then
+        // Reset) — the two the coherent fold got wrong.
+        for (name, prep) in [
+            ("|+>", vec![(GateKind::H, 0u32, vec![])]),
+            ("|->", vec![(GateKind::X, 0u32, vec![]), (GateKind::H, 0u32, vec![])]),
+            ("|1>", vec![(GateKind::X, 0u32, vec![])]),
+            ("Ry", vec![(GateKind::Ry, 0u32, vec![0.7])]),
+        ] {
+            let mut circuit = CircuitIR::new(2, CircuitType::GateBased);
+            for (g, q, ps) in &prep {
+                push(&mut circuit, g.clone(), &[*q], ps);
             }
-            _ => panic!("expected statevectors"),
+            // Qubit 1 stays in a non-trivial product state so a wrong reset on
+            // qubit 0 cannot be masked by an all-|0> register.
+            push(&mut circuit, GateKind::Ry, &[1], &[0.4]);
+            push(&mut circuit, GateKind::Reset, &[0], &[]);
+            push(&mut circuit, GateKind::H, &[1], &[]);
+
+            let a = match cpu.execute(&circuit, &params, &cfg).expect("cpu") {
+                ExecResult::Statevector(v) => v,
+                _ => panic!("expected statevector"),
+            };
+            let b = match metal.execute(&circuit, &params, &cfg).expect("metal") {
+                ExecResult::Statevector(v) => v,
+                _ => panic!("expected statevector"),
+            };
+            assert_eq!(a.len(), b.len(), "{name}");
+            // Compare UP TO GLOBAL PHASE. Reset ends at |0>, but via a
+            // projective measurement whose branch the CPU picks with an RNG:
+            // on |−⟩ (p0 = 0.5) the outcome-1 branch renormalises to −|0> and
+            // then applies X, so the CPU may return −|0>⊗rest where Metal —
+            // which has no RNG and always takes the p0 ≥ 0.5 branch — returns
+            // +|0>⊗rest. That is a global phase, physically the same state.
+            // An amplitude-wise diff reports ~1.67 for it, which is what the
+            // first version of this assertion did.
+            let overlap: Complex64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| x.conj() * y)
+                .fold(Complex64::new(0.0, 0.0), |acc, z| acc + z);
+            assert!(
+                (overlap.norm() - 1.0).abs() < 1e-4,
+                "{name}: |<cpu|metal>| = {:.6}, expected 1 (equal up to global phase)",
+                overlap.norm()
+            );
+            // Non-degenerate: the state must not be all-zero, which is exactly
+            // what the old fold produced for |−⟩.
+            let norm: f64 = b.iter().map(|z| z.norm_sqr()).sum();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "{name}: metal norm {norm:.6}, expected 1 (a zeroed register would pass a \
+                 pure difference check against an equally-zeroed CPU state)"
+            );
         }
+
+        // (b) Entangled reset in analytic mode: BOTH must refuse.
+        let mut ent = CircuitIR::new(2, CircuitType::GateBased);
+        push(&mut ent, GateKind::H, &[0], &[]);
+        push(&mut ent, GateKind::CX, &[0, 1], &[]);
+        push(&mut ent, GateKind::Reset, &[0], &[]);
+        let cpu_err = cpu.execute(&ent, &params, &cfg).is_err();
+        let metal_err = metal.execute(&ent, &params, &cfg).is_err();
+        assert!(cpu_err, "cpu accepted an entangled analytic Reset");
+        assert!(
+            metal_err,
+            "metal accepted an entangled analytic Reset — it returns a pure state \
+             where the truth is mixed, while the CPU refuses"
+        );
     }
+
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
