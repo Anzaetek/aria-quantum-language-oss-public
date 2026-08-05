@@ -359,9 +359,8 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
     // must fail loudly here rather than panic on `.parse().unwrap()` — the same
     // fail-loud contract every other malformed input in this importer honors.
     fn parse_idx(raw: &str, lineno: usize) -> Result<usize, String> {
-        raw.parse::<usize>().map_err(|_| {
-            format!("'{raw}' at line {lineno} is not a valid non-negative integer")
-        })
+        raw.parse::<usize>()
+            .map_err(|_| format!("'{raw}' at line {lineno} is not a valid non-negative integer"))
     }
     // Reject a bit reference to an undeclared register or an out-of-range index,
     // so `x q[5]` on `qreg q[1]` fails at import instead of producing a circuit

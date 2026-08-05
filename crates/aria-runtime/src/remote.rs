@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use aria_core::ast::Circuit;
-use aria_core::backends::omega::to_omega_ir;
+use aria_core::backends::omega::try_to_omega_ir;
 use omega_core::executor::ExecResult;
 
 use crate::lower::lower;
@@ -73,7 +73,7 @@ pub fn expectation_remote(
         full.entry(s).or_insert(0.0);
     }
     let bound = circuit.bind_params(&full)?;
-    let ir = to_omega_ir(&bound);
+    let ir = try_to_omega_ir(&bound)?;
     let body = serde_json::json!({ "circuit": ir, "observable": observable });
     let v = post_json(remote, "/v1/quantum/expectation", body)?;
     parse_expectation_values(&v)?
@@ -96,7 +96,7 @@ pub fn run_counts_remote(
         full.entry(s).or_insert(0.0);
     }
     let bound = circuit.bind_params(&full)?;
-    let ir = to_omega_ir(&bound);
+    let ir = try_to_omega_ir(&bound)?;
 
     let body = serde_json::json!({ "circuit": ir, "shots": shots, "seed": seed });
     let v = post_json(remote, "/v1/quantum/execute", body)?;

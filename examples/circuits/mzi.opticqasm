@@ -1,0 +1,36 @@
+// Mach-Zehnder interferometer - a single photon, two balanced beam splitters,
+// and a phase shift in one arm.
+//
+// A single photon enters mode 0. The first beam splitter puts it in a
+// superposition of both arms, the phase shifter advances arm 0 by phi, and the
+// second beam splitter recombines them. The photon's exit mode is decided by
+// interference, not by a coin flip: the output is fully deterministic in phi.
+//
+// Run it:
+//   omega-run examples/circuits/mzi.opticqasm --backend photonics --input 1,0
+//
+// Expected output at phi = pi/3 (this file):
+//   |0,1>  0.75     <n_1> = cos^2(phi/2) = cos^2(pi/6) = 3/4
+//   |1,0>  0.25     <n_0> = sin^2(phi/2) = sin^2(pi/6) = 1/4
+//
+// The full transfer, with B the balanced beam splitter and P = diag(e^{i*phi}, 1):
+//   U = B . P . B   =>  |U_10|^2 = cos^2(phi/2),  |U_00|^2 = sin^2(phi/2)
+// Two fixed points worth checking by hand if you edit this file:
+//   phi = 0   -> the photon exits mode 1 with certainty (cos^2(0) = 1)
+//   phi = pi  -> it exits mode 0 with certainty (cos^2(pi/2) = 0)
+// Sweeping phi traces the cos^2(phi/2) fringe, which is the point of the device.
+//
+// Conventions: the phase shifter applies e^{i*phi} to its mode, and the beam
+// splitter is the Rx form documented in hom_dip.opticqasm.
+
+OPTICQASM 1.0;
+photon q[2];
+
+// First balanced beam splitter (theta = pi/4).
+bs_rx(0.7853981633974483, 0.0) q[0], q[1];
+
+// Phase shift in arm 0: phi = pi/3 = 1.0471975511965976.
+ps(1.0471975511965976) q[0];
+
+// Second balanced beam splitter recombines the arms.
+bs_rx(0.7853981633974483, 0.0) q[0], q[1];
