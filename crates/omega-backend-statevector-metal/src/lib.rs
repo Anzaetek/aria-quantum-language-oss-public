@@ -103,7 +103,15 @@ pub enum MetalError {
 
 impl From<MetalError> for OmegaError {
     fn from(e: MetalError) -> Self {
-        OmegaError::Backend(e.to_string())
+        match e {
+            // `Unsupported` means "this backend cannot express that", which is
+            // a different thing from "this backend failed" — callers branch on
+            // it to fall back. Mapping it to `Backend` (as every variant used
+            // to be) made Metal refuse DIFFERENTLY from the CPU for identical
+            // input: CPU returned `Unsupported`, Metal `Backend`.
+            MetalError::Unsupported(msg) => OmegaError::Unsupported(msg),
+            other => OmegaError::Backend(other.to_string()),
+        }
     }
 }
 
@@ -807,6 +815,15 @@ impl MetalState {
     /// gives `old0 + old1 = 0`, so the `norm_sq > 0` guard silently skipped the
     /// renormalisation and left the register at zero amplitude.
     ///
+    /// **Caveat on "the same predicate":** Metal calls the CPU's
+    /// `reset_is_deterministic_within` but with a LOOSER tolerance (`1e-4` vs
+    /// `1e-9`), so the acceptance sets are NOT equal — Metal accepts a qubit at
+    /// purity `1 − 8·10⁻⁶`, which is genuinely entangled, and returns a pure
+    /// state for it (dropping a branch of weight up to `5·10⁻⁵`). Sharing the
+    /// function prevents the *formula* drifting, not the *policy*. An earlier
+    /// comment here claimed the two "cannot drift apart"; that was wrong. The
+    /// gap is recorded in `LE2_ASSUMPTION_LEDGER.md` A6.
+    ///
     /// It also had **no entanglement guard**. `apply_ops_fused` carries no RNG,
     /// so Metal can only do the deterministic case; on an entangled qubit the
     /// true post-reset state is *mixed* and no single statevector represents
@@ -875,8 +892,9 @@ impl MetalState {
             )));
         }
 
-        // Deterministic case: P(0) is 0 or 1, so the projective measurement has
-        // a forced outcome. Project onto it, renormalise, and X if it was 1.
+        // Unentangled case: the two branches agree up to global phase, so the
+        // branch choice is free (p0 need NOT be 0 or 1 — `|+>` is accepted with
+        // p0 = 0.5; requiring p0 ∈ {0,1} is CUDA's stricter, divergent rule).
         let p0 = match branch {
             // Already sampled by the caller from an on-device `reset_p0`.
             Some(_) => self.reset_p0(q)?,

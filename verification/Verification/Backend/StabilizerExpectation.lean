@@ -17,10 +17,18 @@
   2. `pauli_mult_phase` had the `X·Z` and `Z·X` rows inverted against the
      Aaronson–Gottesman `g` function.
 
+  **`autoImplicit` is disabled deliberately.** With it on (the default), the
+  `Real` in these signatures was auto-bound as an implicit `Sort` parameter, so
+  `expectation (Real := Empty) s p` proved `StabState n` uninhabited and the
+  targets below were dischargeable by `.elim` with no physics. `gPhase_correct`
+  was unaffected (Nat/Int only) and remains a real proof.
+
   Witness: a Steane-encoded 2-qubit logical Grover circuit gave
   `⟨Z̄(patch 0)⟩ = 0.000000` while the statevector and Pauli-propagation
   backends both gave `+1.000000`.
 -/
+
+set_option autoImplicit false
 
 namespace Verification.Backend.StabilizerExpectation
 
@@ -63,6 +71,16 @@ theorem gPhase_correct : ∀ a b : P1, gTable a b = gClosed a b := by
   intro ⟨x1, z1⟩ ⟨x2, z2⟩
   cases x1 <;> cases z1 <;> cases x2 <;> cases z2 <;> decide
 
+/-- Abstract carrier for expectation values. **Inhabited on purpose** — an
+    empty carrier would let `expectation` prove `StabState n` uninhabited, which
+    is the vacuity `autoImplicit` introduced by auto-binding the missing `Real`
+    as an implicit `Sort`. -/
+axiom R : Type
+axiom R.zero : R
+axiom R.one : R
+axiom R.negOne : R
+axiom R.inhabited : Inhabited R
+
 /-- An `n`-qubit stabilizer state. -/
 axiom StabState : Nat → Type
 /-- An `n`-qubit Pauli operator (sign + per-qubit letters). -/
@@ -76,16 +94,16 @@ axiom InGroupPlus : {n : Nat} → StabState n → Pauli n → Prop
 axiom InGroupMinus : {n : Nat} → StabState n → Pauli n → Prop
 
 /-- `⟨ψ|P|ψ⟩`. -/
-axiom expectation : {n : Nat} → StabState n → Pauli n → Real
+axiom expectation : {n : Nat} → StabState n → Pauli n → R
 
 /-- **T1 — the trichotomy.** For a stabilizer state and a Pauli, the
     expectation is exactly one of `0`, `+1`, `−1`, determined by membership.
     This is what the backend must compute; the greedy reduction returned `0`
     for members of the group, i.e. it broke the second and third cases. -/
 theorem expectation_trichotomy {n : Nat} (s : StabState n) (p : Pauli n) :
-    (Anticommutes s p → expectation s p = 0)
-    ∧ (InGroupPlus s p → expectation s p = 1)
-    ∧ (InGroupMinus s p → expectation s p = -1) := by
+    (Anticommutes s p → expectation s p = R.zero)
+    ∧ (InGroupPlus s p → expectation s p = R.one)
+    ∧ (InGroupMinus s p → expectation s p = R.negOne) := by
   sorry
 
 /-- **T2 — `0` is reserved for anticommutation.** The precise statement the
@@ -94,7 +112,7 @@ theorem expectation_trichotomy {n : Nat} (s : StabState n) (p : Pauli n) :
     by anticommuting. Any other route to `0` is an implementation failure being
     reported as physics. -/
 theorem zero_only_when_anticommuting {n : Nat} (s : StabState n) (p : Pauli n)
-    (h : expectation s p = 0) :
+    (h : expectation s p = R.zero) :
     Anticommutes s p := by
   sorry
 
