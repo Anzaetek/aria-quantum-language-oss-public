@@ -277,6 +277,44 @@ Remaining (not blocking):
   the `omega-backend-mps-metal` crate header triggers (batched SVD via MLX /
   Accelerate, randomized SVD, or block Lanczos).
 
+## TODO — Metal per-shot trajectories (open, root-caused 2026-08-05)
+
+**Symptom.** `MetalStatevectorBackend::execute` cannot run per-shot GPU
+trajectories: a loop of lease → evolve → sample blocks at 0% CPU from a few
+hundred shots onward. Correct at 16 shots (verified against the CPU: same
+support, no impossible outcomes), so this is a scaling defect, not a logic one.
+
+**Root cause (measured, not guessed).** A loop of
+`lease → apply_h → begin_batch → drop`:
+
+| variant | stalls after |
+|---|---|
+| batch left open | ~32–64 cycles |
+| `end_batch_if_open()` before drop | ~32–64 cycles — **no better** |
+
+Not the open batch, which was the obvious suspect and the first attempted fix.
+Both stall at the same point, matching Metal's default cap on **in-flight
+command buffers** (~64): each iteration issues GPU work without waiting for
+completion, so buffers accumulate until `commandBuffer()` blocks.
+`end_batch_if_open` ends the *encoder*; it does not wait for the GPU to retire
+the work. Explains the 16-works / 512-blocks threshold exactly.
+
+**Fix.**
+1. Reuse ONE leased state across shots (re-initialise to `|0…0⟩` rather than
+   re-leasing), so the pool is not churned per shot.
+2. Force completion each iteration — any readback (`pauli_expectation`,
+   `read_state`) waits — or add an explicit `waitUntilCompleted` after each
+   trajectory.
+3. Re-measure at 16 / 64 / 512 / 4096 shots and confirm the stall is gone
+   before removing the delegation.
+
+**Until then** `execute` delegates shots-mode Reset circuits to the CPU
+statevector backend, which is correct (identical counts at 512 shots, 0.47 s)
+but forfeits the GPU. The trajectory machinery (`apply_reset_with`, the
+`reset_rng` thread through `apply_ops_fused`, on-device `reset_p0`) is kept
+because it is correct — only the `execute` wiring delegates. See
+`LIMITATIONS.md` and `STATUS.md`.
+
 ## Cross-cutting rules
 - **Commit often**, small logical commits, author **Anzaetek Team
   <team@anzaetek.com>**, **never push**.
