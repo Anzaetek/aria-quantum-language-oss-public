@@ -12,6 +12,8 @@
 //!   so a client gets a number back instead of the full statevector.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use aria_core::ast::Circuit;
 use aria_core::backends::omega::try_to_omega_ir;
@@ -39,10 +41,194 @@ fn post_json(
     if let Some(tok) = &remote.token {
         req = req.set("Authorization", &format!("Bearer {tok}"));
     }
-    req.send_json(body)
-        .map_err(|e| format!("omega-server request to {endpoint} failed: {e}"))?
-        .into_json()
-        .map_err(|e| format!("bad response JSON from omega-server: {e}"))
+
+    // Serialise separately from sending so encoding cost is attributable. It is
+    // not always negligible: a batch re-sends every row's full gate list, which
+    // is the payload A0 is about.
+    let t0 = Instant::now();
+    let payload = serde_json::to_string(&body)
+        .map_err(|e| format!("could not encode request for omega-server: {e}"))?;
+    let bytes_up = payload.len() as u64;
+    let serialize_ms = ms_since(t0);
+
+    let t1 = Instant::now();
+    let resp = req
+        .set("Content-Type", "application/json")
+        .send_string(&payload)
+        .map_err(|e| format!("omega-server request to {endpoint} failed: {e}"))?;
+    // The server reports the phases only it can see; without them "slow" cannot
+    // be attributed to the wire or to the simulation.
+    let server_timing = resp.header("Server-Timing").map(|h| h.to_string());
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("could not read omega-server response: {e}"))?;
+    let network_ms = ms_since(t1);
+    let bytes_down = text.len() as u64;
+
+    let t2 = Instant::now();
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("bad response JSON from omega-server: {e}"))?;
+    let deserialize_ms = ms_since(t2);
+
+    stats().record(CallStats {
+        bytes_up,
+        bytes_down,
+        serialize_ms,
+        // `network_ms` covers the whole exchange, including the time the server
+        // spent working. Subtracting the server's own total is what isolates
+        // the wire — see `RemoteStats::summary`.
+        network_ms,
+        deserialize_ms,
+        server_ms: server_timing.as_deref().map(parse_server_timing_total),
+    });
+    Ok(value)
+}
+
+fn ms_since(t: Instant) -> f64 {
+    t.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Sum the durations in a `Server-Timing` header value
+/// (`admit;dur=0.4, exec;dur=812.5`). Unparseable parts are skipped rather than
+/// failing the call: a timing header is diagnostics, never a correctness input.
+fn parse_server_timing_total(header: &str) -> f64 {
+    header
+        .split(',')
+        .filter_map(|part| part.split(";dur=").nth(1))
+        .filter_map(|d| d.trim().parse::<f64>().ok())
+        .sum()
+}
+
+/// One request's measurements.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CallStats {
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub serialize_ms: f64,
+    pub network_ms: f64,
+    pub deserialize_ms: f64,
+    /// Total the server attributed to itself, when it reported one.
+    pub server_ms: Option<f64>,
+}
+
+/// Accumulated cost of talking to a remote server.
+///
+/// Answers the question that decides what to do next: **is remoting a drag, or
+/// a detail?** Without splitting work-you-would-pay-anywhere from
+/// overhead-you-pay-only-because-this-is-remote, an 80%-overhead run and an
+/// 8%-overhead run look identical — both are just "slow", and the fixes are
+/// completely different.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteStats {
+    pub requests: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub serialize_ms: f64,
+    pub network_ms: f64,
+    pub deserialize_ms: f64,
+    pub server_ms: f64,
+}
+
+impl RemoteStats {
+    fn add(&mut self, c: CallStats) {
+        self.requests += 1;
+        self.bytes_up += c.bytes_up;
+        self.bytes_down += c.bytes_down;
+        self.serialize_ms += c.serialize_ms;
+        self.network_ms += c.network_ms;
+        self.deserialize_ms += c.deserialize_ms;
+        self.server_ms += c.server_ms.unwrap_or(0.0);
+    }
+
+    /// Time spent inside the server doing the actual simulation — the work that
+    /// would be paid on any machine, local or remote.
+    pub fn compute_ms(&self) -> f64 {
+        self.server_ms
+    }
+
+    /// Everything paid *only because this is remote*: encoding, the wire, and
+    /// decoding. `network_ms` includes the server's own time, so remove it.
+    pub fn overhead_ms(&self) -> f64 {
+        let wire = (self.network_ms - self.server_ms).max(0.0);
+        wire + self.serialize_ms + self.deserialize_ms
+    }
+
+    pub fn total_ms(&self) -> f64 {
+        self.compute_ms() + self.overhead_ms()
+    }
+
+    /// `transfer-bound` / `compute-bound` / `balanced` — the one word that says
+    /// whether to fix the client, buy a bigger box, or stop worrying.
+    pub fn verdict(&self) -> &'static str {
+        let total = self.total_ms();
+        if total <= 0.0 {
+            return "no remote calls";
+        }
+        let share = self.overhead_ms() / total;
+        if share >= 0.6 {
+            "transfer-bound"
+        } else if share <= 0.25 {
+            "compute-bound"
+        } else {
+            "balanced"
+        }
+    }
+
+    /// Human-readable summary. Callers print this to **stderr** (Q8) so piping
+    /// results to a file still shows the accounting in the terminal.
+    pub fn summary(&self) -> String {
+        if self.requests == 0 {
+            return "remote: no calls".to_string();
+        }
+        let total = self.total_ms();
+        let pct = |v: f64| if total > 0.0 { v / total * 100.0 } else { 0.0 };
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+        format!(
+            "remote: {} request(s) | total {:.1} ms | compute {:.1} ms ({:.0}%) | \
+             overhead {:.1} ms ({:.0}%) | up {:.2} MiB, down {:.2} MiB — {}",
+            self.requests,
+            total,
+            self.compute_ms(),
+            pct(self.compute_ms()),
+            self.overhead_ms(),
+            pct(self.overhead_ms()),
+            mib(self.bytes_up),
+            mib(self.bytes_down),
+            self.verdict(),
+        )
+    }
+}
+
+/// Process-wide accumulator. A library must not print (Q8), so it records and
+/// lets the caller decide when and where to report.
+static STATS: OnceLock<Mutex<RemoteStats>> = OnceLock::new();
+
+fn stats() -> &'static Mutex<RemoteStats> {
+    STATS.get_or_init(|| Mutex::new(RemoteStats::default()))
+}
+
+trait Record {
+    fn record(&self, c: CallStats);
+}
+
+impl Record for Mutex<RemoteStats> {
+    fn record(&self, c: CallStats) {
+        if let Ok(mut g) = self.lock() {
+            g.add(c);
+        }
+    }
+}
+
+/// Snapshot the accumulated remote cost.
+pub fn remote_stats() -> RemoteStats {
+    stats().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Reset the accumulator — for a caller that reports per epoch or per phase.
+pub fn reset_remote_stats() {
+    if let Ok(mut g) = stats().lock() {
+        *g = RemoteStats::default();
+    }
 }
 
 /// Extract the `values` array from a `/v1/quantum/expectation` response.
@@ -169,5 +355,101 @@ mod tests {
     fn parse_expectation_values_rejects_malformed() {
         assert!(parse_expectation_values(&serde_json::json!({ "error": "x" })).is_err());
         assert!(parse_expectation_values(&serde_json::json!({ "values": ["nan"] })).is_err());
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn server_timing_header_total_is_the_sum_of_its_phases() {
+        let h = "admit;dur=0.412, exec;dur=812.500, serialize;dur=31.204";
+        let total = parse_server_timing_total(h);
+        assert!((total - 844.116).abs() < 1e-6, "got {total}");
+        // Diagnostics must never fail a call: junk contributes nothing.
+        assert_eq!(parse_server_timing_total(""), 0.0);
+        assert_eq!(parse_server_timing_total("garbage"), 0.0);
+        assert_eq!(parse_server_timing_total("exec;dur=notanumber"), 0.0);
+        // A partially-valid header still yields what it can.
+        assert!((parse_server_timing_total("a;dur=1.5, junk, b;dur=2.5") - 4.0).abs() < 1e-9);
+    }
+
+    /// The headline split: work you would pay anywhere vs cost incurred only
+    /// because the work is remote.
+    #[test]
+    fn overhead_excludes_server_time_from_the_wire_measurement() {
+        let mut s = RemoteStats::default();
+        s.add(CallStats {
+            bytes_up: 1000,
+            bytes_down: 100,
+            serialize_ms: 2.0,
+            // The round trip took 100 ms, of which the server used 80.
+            network_ms: 100.0,
+            deserialize_ms: 3.0,
+            server_ms: Some(80.0),
+        });
+        assert_eq!(s.compute_ms(), 80.0);
+        // wire = 100 - 80 = 20, plus 2 encode and 3 decode.
+        assert_eq!(s.overhead_ms(), 25.0);
+        assert_eq!(s.total_ms(), 105.0);
+    }
+
+    #[test]
+    fn verdict_names_what_to_do_next() {
+        // Dominated by transfer: batch the rows.
+        let mut t = RemoteStats::default();
+        t.add(CallStats {
+            network_ms: 100.0,
+            server_ms: Some(5.0),
+            ..Default::default()
+        });
+        assert_eq!(t.verdict(), "transfer-bound");
+
+        // Dominated by simulation: the wire is not the problem.
+        let mut c = RemoteStats::default();
+        c.add(CallStats {
+            network_ms: 100.0,
+            server_ms: Some(95.0),
+            ..Default::default()
+        });
+        assert_eq!(c.verdict(), "compute-bound");
+
+        assert_eq!(RemoteStats::default().verdict(), "no remote calls");
+    }
+
+    #[test]
+    fn summary_leads_with_the_numbers_a_reader_acts_on() {
+        let mut s = RemoteStats::default();
+        s.add(CallStats {
+            bytes_up: 4 * 1024 * 1024,
+            bytes_down: 1024,
+            serialize_ms: 1.0,
+            network_ms: 100.0,
+            deserialize_ms: 1.0,
+            server_ms: Some(10.0),
+        });
+        let out = s.summary();
+        assert!(out.contains("1 request"), "{out}");
+        assert!(out.contains("compute"), "{out}");
+        assert!(out.contains("overhead"), "{out}");
+        assert!(out.contains("4.00 MiB"), "{out}");
+        assert!(out.contains("transfer-bound"), "{out}");
+    }
+
+    #[test]
+    fn a_server_that_reports_no_timing_does_not_corrupt_the_split() {
+        // Older servers send no Server-Timing. Compute is then unknown (0) and
+        // everything counts as overhead — pessimistic, but never negative and
+        // never silently attributed to the wrong side.
+        let mut s = RemoteStats::default();
+        s.add(CallStats {
+            network_ms: 50.0,
+            server_ms: None,
+            ..Default::default()
+        });
+        assert_eq!(s.compute_ms(), 0.0);
+        assert_eq!(s.overhead_ms(), 50.0);
+        assert!(s.overhead_ms() >= 0.0);
     }
 }
