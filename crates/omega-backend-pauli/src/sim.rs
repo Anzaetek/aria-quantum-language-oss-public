@@ -473,57 +473,68 @@ fn stabilizer_expectation(tab: &StabilizerTableau, pauli_terms: &[(u32, PauliOp)
         }
     }
 
-    // P commutes with all stabilizers. Check if it's in the stabilizer group.
-    // Try to express P as a product of stabilizer generators using Gaussian elimination.
-    // Build a copy of the stabilizer generators and try to reduce P.
-    let mut target_x = p.x.clone();
-    let mut target_z = p.z.clone();
-    let mut result_sign = false;
+    // P commutes with every stabilizer, so it lies in the group up to sign.
+    // Express it as a product of generators by **Gaussian elimination over the
+    // 2n-column symplectic representation** (columns `0..n` are X bits,
+    // `n..2n` the Z bits).
+    //
+    // This was a single greedy pass with NO pivoting that multiplied by a
+    // generator whenever *any* qubit carried a matching non-trivial Pauli. That
+    // cannot reliably reduce a genuine group element to the identity, and on
+    // failure the code fell through to `return 0.0` under the comment "in the
+    // normalizer but not the group" — a failed ALGORITHM reported as physics.
+    // `<P> = 0` is a legal expectation value, so nothing looked wrong.
+    //
+    // Measured before the fix: a Steane-encoded 2-qubit logical Grover circuit
+    // gave `<Z_bar(patch 0)> = 0.000000` here while the statevector AND
+    // Pauli-propagation backends both gave `+1.000000`.
+    let bit = |x: &[bool], z: &[bool], c: usize| if c < n { x[c] } else { z[c - n] };
 
+    // Row-echelon basis of the stabilizer group keyed by pivot column: each
+    // `pivots[c]`, when present, has its leading 1 exactly at column `c`.
+    let mut pivots: Vec<Option<PauliRow>> = vec![None; 2 * n];
     for k in 0..n {
-        let stab = tab.stabilizer(k);
-
-        // Find a qubit where stab has a non-trivial Pauli
-        // Try to eliminate that qubit from target using this stabilizer
-        let mut should_multiply = false;
-
-        // Check if we need this stabilizer to match target
-        for q in 0..n {
-            let stab_nontrivial = stab.x[q] || stab.z[q];
-            let target_nontrivial = target_x[q] || target_z[q];
-
-            if stab_nontrivial && target_nontrivial {
-                // Check if they match on this qubit
-                if stab.x[q] == target_x[q] && stab.z[q] == target_z[q] {
-                    should_multiply = true;
+        let mut row = tab.stabilizer(k).clone();
+        for c in 0..2 * n {
+            if !bit(&row.x, &row.z, c) {
+                continue;
+            }
+            match &pivots[c] {
+                Some(b) => {
+                    let mut sign = row.sign;
+                    mul_pauli_row(&mut row.x, &mut row.z, &mut sign, b);
+                    row.sign = sign;
+                }
+                None => {
+                    pivots[c] = Some(row);
                     break;
                 }
             }
         }
+    }
 
-        if should_multiply {
-            // Multiply target by this stabilizer
-            let mut phase = 0i32;
-            for q in 0..n {
-                phase += pauli_mult_phase(target_x[q], target_z[q], stab.x[q], stab.z[q]);
-                target_x[q] ^= stab.x[q];
-                target_z[q] ^= stab.z[q];
-            }
-            result_sign ^= stab.sign;
-            let extra_sign = ((phase % 4 + 4) % 4) == 2;
-            result_sign ^= extra_sign;
+    let mut target_x = p.x.clone();
+    let mut target_z = p.z.clone();
+    let mut result_sign = false;
+    for c in 0..2 * n {
+        if !bit(&target_x, &target_z, c) {
+            continue;
+        }
+        match &pivots[c] {
+            Some(b) => mul_pauli_row(&mut target_x, &mut target_z, &mut result_sign, b),
+            // Genuinely outside the group — unreachable for a full-rank
+            // n-generator stabilizer state (the centralizer IS the group up to
+            // phase), but now a real conclusion rather than a fallthrough.
+            None => return 0.0,
         }
     }
 
-    // Check if target has been fully reduced to identity
-    if target_x.iter().any(|&x| x) || target_z.iter().any(|&z| z) {
-        // P is not in the stabilizer group (but commutes with all stabilizers)
-        // This means P is in the normalizer but not the group → ⟨P⟩ = 0
-        return 0.0;
-    }
+    debug_assert!(
+        !target_x.iter().any(|&x| x) && !target_z.iter().any(|&z| z),
+        "elimination left a residue: the reduction is wrong, not the physics"
+    );
 
-    // P = (-1)^result_sign * (product of some stabilizers)
-    // So ⟨ψ|P|ψ⟩ = (-1)^result_sign * 1 = ±1
+    // P = (-1)^result_sign * (product of stabilizers), each +1 on |psi>.
     if result_sign {
         -1.0
     } else {
@@ -531,21 +542,225 @@ fn stabilizer_expectation(tab: &StabilizerTableau, pauli_terms: &[(u32, PauliOp)
     }
 }
 
+/// Multiply the Pauli `(x, z, sign)` in place by `row`, tracking the phase.
+fn mul_pauli_row(x: &mut [bool], z: &mut [bool], sign: &mut bool, row: &PauliRow) {
+    let mut phase = 0i32;
+    for q in 0..row.n {
+        phase += pauli_mult_phase(x[q], z[q], row.x[q], row.z[q]);
+        x[q] ^= row.x[q];
+        z[q] ^= row.z[q];
+    }
+    *sign ^= row.sign;
+    if ((phase % 4) + 4) % 4 == 2 {
+        *sign = !*sign;
+    }
+}
+
+/// The Aaronson–Gottesman `g` function: the power of `i` picked up when the
+/// per-qubit Pauli `(x1,z1)` is multiplied by `(x2,z2)`, in the `i^{xz} X^x Z^z`
+/// convention the tableau rows use. Returned mod 4, so `3 ≡ -1`.
+///
+/// Derived from `P(x,z) = i^{xz} X^x Z^z`:
+/// `g = x1·z1 + x2·z2 + 2·z1·x2 − (x1⊕x2)(z1⊕z2)  (mod 4)`.
+///
+/// **The `X·Z` and `Z·X` rows were inverted** — the original returned `+1` for
+/// `X·Z` and `-1` for `Z·X`, and its own comment recorded the doubt
+/// (*"X·Z = iY (wait, X·Z = -iY)"*) without acting on it. The other four rows
+/// already agreed with `g`.
 fn pauli_mult_phase(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
     match ((x1, z1), (x2, z2)) {
         ((false, false), _) | (_, (false, false)) => 0,
-        ((true, false), (false, true)) => 1, // X·Z = iY (wait, X·Z = -iY)
-        ((false, true), (true, false)) => 3, // Z·X = iY
-        ((true, false), (true, true)) => 1,  // X·Y = iZ
-        ((true, true), (true, false)) => 3,  // Y·X = -iZ
-        ((false, true), (true, true)) => 3,  // Z·Y = -iX
-        ((true, true), (false, true)) => 1,  // Y·Z = iX
+        ((true, false), (false, true)) => 3, // X·Z  => g = -1
+        ((false, true), (true, false)) => 1, // Z·X  => g = +1
+        ((true, false), (true, true)) => 1,  // X·(XZ) = Z
+        ((true, true), (true, false)) => 3,  // (XZ)·X
+        ((false, true), (true, true)) => 3,  // Z·(XZ)
+        ((true, true), (false, true)) => 1,  // (XZ)·Z
         _ => 0,                              // same: P² = I
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// **Regression: `stabilizer_expectation` must agree with the exact
+    /// statevector on random Clifford circuits, including Y observables.**
+    ///
+    /// Two defects lived here. The group-membership test was a single greedy
+    /// pass with no pivoting, described in its own comment as Gaussian
+    /// elimination; when it failed to reduce a genuine group element it fell
+    /// through to `return 0.0` under "in the normalizer but not the group" — a
+    /// failed ALGORITHM reported as physics, invisible because `<P> = 0` is a
+    /// legal expectation. And `pauli_mult_phase` had the `X·Z`/`Z·X` rows
+    /// inverted against the Aaronson–Gottesman `g` function, its own comment
+    /// recording the doubt ("wait, X·Z = -iY") without acting on it.
+    ///
+    /// Measured before the fix: a Steane-encoded 2-qubit logical Grover circuit
+    /// gave `<Z_bar(patch 0)> = 0.000000` here while the statevector and
+    /// Pauli-propagation backends both gave `+1.000000`.
+    ///
+    /// Randomised rather than a fixed case, because the greedy reduction
+    /// succeeded on many inputs — a hand-picked circuit could easily have
+    /// passed against the broken code.
+    #[test]
+    fn expectation_agrees_with_statevector_on_random_clifford_circuits() {
+        use omega_core::executor::PauliOp;
+
+        // xorshift64: deterministic, no dev-dependency.
+        let mut seed = 0xC0FFEEu64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let be = PauliBackend::new();
+        let (mut nonzero, mut with_y) = (0usize, 0usize);
+
+        for _ in 0..400 {
+            let n = 2 + (rnd() % 4) as u32;
+            let depth = 4 + (rnd() % 12) as usize;
+            let mut c = CircuitIR::new(n, CircuitType::GateBased);
+            for _ in 0..depth {
+                let q = (rnd() % n as u64) as u32;
+                match rnd() % 6 {
+                    0 => c.ops.push(make_op(GateKind::H, &[q])),
+                    1 => c.ops.push(make_op(GateKind::S, &[q])),
+                    2 => c.ops.push(make_op(GateKind::Sdg, &[q])),
+                    3 => c.ops.push(make_op(GateKind::X, &[q])),
+                    4 => c.ops.push(make_op(GateKind::Z, &[q])),
+                    _ => {
+                        let b = (rnd() % n as u64) as u32;
+                        if q != b {
+                            c.ops.push(make_op(GateKind::CX, &[q, b]));
+                        }
+                    }
+                }
+            }
+            let terms: Vec<(u32, PauliOp)> = (0..n)
+                .map(|q| {
+                    (
+                        q,
+                        match rnd() % 4 {
+                            0 => PauliOp::I,
+                            1 => PauliOp::X,
+                            2 => PauliOp::Y,
+                            _ => PauliOp::Z,
+                        },
+                    )
+                })
+                .collect();
+            let has_y = terms.iter().any(|(_, p)| matches!(p, PauliOp::Y));
+            let obs = Observable {
+                terms: vec![(1.0, terms)],
+            };
+
+            let got = be
+                .expectation(&c, &ParameterBinding::new(), &obs)
+                .expect("stabilizer expectation");
+            // Exact reference: build the statevector by dense simulation of the
+            // same Clifford circuit and evaluate <psi|P|psi> directly.
+            let want = dense_reference_expectation(&c, &obs);
+
+            assert!(
+                (got - want).abs() < 1e-9,
+                "stabilizer {got} vs exact {want} on {n}q depth-{depth} circuit"
+            );
+            if want.abs() > 1e-9 {
+                nonzero += 1;
+                if has_y {
+                    with_y += 1;
+                }
+            }
+        }
+
+        // Non-degeneracy: agreement on a set of all-zeros proves nothing, and
+        // the Y observables are the ones the phase-table bug corrupted.
+        assert!(nonzero > 20, "only {nonzero} non-trivial expectations sampled");
+        assert!(with_y > 0, "no Y observable produced a non-zero expectation");
+    }
+
+    /// Dense `<psi|P|psi>` for a Clifford circuit — an independent oracle that
+    /// shares no code with the tableau path.
+    fn dense_reference_expectation(c: &CircuitIR, obs: &Observable) -> f64 {
+        use num_complex::Complex64;
+        use omega_core::executor::PauliOp;
+        let n = c.num_qubits as usize;
+        let dim = 1usize << n;
+        let mut psi = vec![Complex64::new(0.0, 0.0); dim];
+        psi[0] = Complex64::new(1.0, 0.0);
+        let apply1 = |psi: &mut Vec<Complex64>, q: usize, m: [[Complex64; 2]; 2]| {
+            let mut out = vec![Complex64::new(0.0, 0.0); psi.len()];
+            for (i, &a) in psi.iter().enumerate() {
+                if a == Complex64::new(0.0, 0.0) {
+                    continue;
+                }
+                let b = (i >> q) & 1;
+                let i0 = i & !(1 << q);
+                let i1 = i | (1 << q);
+                out[i0] += m[0][b] * a;
+                out[i1] += m[1][b] * a;
+            }
+            *psi = out;
+        };
+        let z0 = Complex64::new(0.0, 0.0);
+        let one = Complex64::new(1.0, 0.0);
+        let r2 = Complex64::new(std::f64::consts::FRAC_1_SQRT_2, 0.0);
+        for op in &c.ops {
+            let q = op.qubits[0].0 as usize;
+            match op.gate {
+                GateKind::H => apply1(&mut psi, q, [[r2, r2], [r2, -r2]]),
+                GateKind::X => apply1(&mut psi, q, [[z0, one], [one, z0]]),
+                GateKind::Z => apply1(&mut psi, q, [[one, z0], [z0, -one]]),
+                GateKind::S => apply1(&mut psi, q, [[one, z0], [z0, Complex64::new(0.0, 1.0)]]),
+                GateKind::Sdg => apply1(&mut psi, q, [[one, z0], [z0, Complex64::new(0.0, -1.0)]]),
+                GateKind::CX => {
+                    let t = op.qubits[1].0 as usize;
+                    let mut out = psi.clone();
+                    for i in 0..dim {
+                        if (i >> q) & 1 == 1 {
+                            out[i ^ (1 << t)] = psi[i];
+                        }
+                    }
+                    psi = out;
+                }
+                _ => panic!("reference oracle: unexpected gate {:?}", op.gate),
+            }
+        }
+        let mut total = 0.0;
+        for (coeff, terms) in &obs.terms {
+            let mut acc = Complex64::new(0.0, 0.0);
+            for i in 0..dim {
+                let mut j = i;
+                let mut w = Complex64::new(1.0, 0.0);
+                for (qq, pp) in terms {
+                    let qq = *qq as usize;
+                    let bit = (i >> qq) & 1;
+                    match pp {
+                        PauliOp::I => {}
+                        PauliOp::X => j ^= 1 << qq,
+                        PauliOp::Z => {
+                            if bit == 1 {
+                                w = -w;
+                            }
+                        }
+                        PauliOp::Y => {
+                            j ^= 1 << qq;
+                            w *= if bit == 0 {
+                                Complex64::new(0.0, 1.0)
+                            } else {
+                                Complex64::new(0.0, -1.0)
+                            };
+                        }
+                    }
+                }
+                acc += psi[j].conj() * w * psi[i];
+            }
+            total += coeff * acc.re;
+        }
+        total
+    }
+
     use super::*;
     use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, Qubit};
     use omega_core::params::ParameterBinding;
