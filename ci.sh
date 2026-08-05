@@ -262,10 +262,12 @@ fi
 if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
     echo "== Qiskit differential cross-check =="
     QK_PY="${ARIA_QISKIT_PY:-./.venv-qiskit/bin/python}"
+    XCHECK_FEATS=""
+    [ "$(uname -s)" = "Darwin" ] && XCHECK_FEATS="--features metal"
     if [ ! -x "$QK_PY" ]; then
         echo "  (skip) no qiskit venv at $QK_PY — see tools/qiskit_xcheck/README.md"
     else
-        cargo run -q --release -p omega-xcheck -- 60 > /tmp/aria_xcheck.txt \
+        cargo run -q --release -p omega-xcheck $XCHECK_FEATS -- 60 > /tmp/aria_xcheck.txt \
             && "$QK_PY" tools/qiskit_xcheck/compare.py /tmp/aria_xcheck.txt \
             && echo "  qiskit cross-check OK" \
             || { echo "  QISKIT CROSS-CHECK FAILED"; exit 1; }

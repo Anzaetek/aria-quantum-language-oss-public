@@ -23,6 +23,7 @@ exclude = [
 members = [
     # --- omega-functions runtime (vendored) ---
     "crates/omega-core",
+    "crates/omega-xcheck",
     "crates/omega-parser",
     "crates/omega-backend-statevector",
     "crates/omega-backend-statevector-metal",
