@@ -28,3 +28,6 @@ tch-env.sh
 **/*.so
 **/*.pyd
 .venv-qiskit/
+
+# TLA+ model checker (fetched locally; see tools/tla/check.sh)
+tools/tla/tla2tools.jar

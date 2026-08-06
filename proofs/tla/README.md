@@ -8,7 +8,7 @@ over a small instance.
 
 | model | covers | status |
 |---|---|---|
-| `Governor.tla` | admission control (`crates/omega-server/src/worker.rs`) | **written** |
+| `Governor.tla` | admission control (`crates/omega-server/src/worker.rs`) | **checked** — safety holds, liveness fails as predicted |
 | `DurableBatch.tla` | batch lifecycle across crash/reconnect (planned — `FIXES_PLAN.md` A9/A10) | not yet |
 
 ## What these models do *not* catch
@@ -29,35 +29,85 @@ concurrency, ordering, and failure interleavings.
 
 ## Running them
 
-Needs [TLC](https://lamport.azurewebsites.net/tla/tools.html) (a JVM tool):
+```console
+$ tools/tla/check.sh
+```
+
+The script finds a JDK (probing for a real one — macOS ships a `java` stub that
+only offers to install one) and runs both configurations. It **skips cleanly**
+when the JDK or the jar is missing, rather than failing.
+
+TLC itself is project-local and **not committed** (2.2 MB binary, gitignored):
 
 ```console
-$ java -jar tla2tools.jar -config Governor.cfg Governor.tla
+$ curl -fsSL -o tools/tla/tla2tools.jar \
+    https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 ```
 
 CI does **not** run this by default — `./ci.sh` must not acquire a Java
-dependency (K13: headless, and external tooling skips cleanly). It is opt-in,
-in the same spirit as the Qiskit cross-check.
+dependency (K13: headless, external tooling skips cleanly). Opt-in, in the same
+spirit as the Qiskit cross-check.
+
+`MCGovernor.tla` holds the concrete instance: TLC's `.cfg` format cannot express
+a function literal, so the constants are defined in a module and substituted
+with `<-`.
 
 ## `Governor.tla` — what it says
 
-**Safety (holds).** The admitted set never exceeds a pool's capacity, and a
-completed job returns exactly what it took. These are the properties the
-implementation's byte-weighted semaphore is there to provide.
+**Safety — checked, holds.** 26 distinct states, exhaustive:
 
-**Liveness (fails — and that is the finding).** `EventuallyAdmitted` asserts
-that a job which fits is eventually admitted. It does not hold, because
-admission uses a non-blocking `try_acquire` with **no queue**: a steady trickle
-of small jobs can be admitted ahead of a large one indefinitely, so `Free` never
-simultaneously reaches the large job's weight. The client meanwhile receives
-`429` with `Retry-After`, a header promising a retry that will never succeed.
+```
+Model checking completed. No error has been found.
+67 states generated, 26 distinct states found, 0 states left on queue.
+```
 
-The configured instance is deliberately tiny — three jobs against a 4-unit
-budget, two small (1 each) and one large (3). Starvation needs an interleaving,
-not scale.
+The admitted set never exceeds capacity, and a completed job returns exactly
+what it took — the properties the byte-weighted semaphore exists to provide.
+
+**Liveness — checked, FAILS. That is the finding.**
+
+```
+Error: Temporal properties were violated.
+```
+
+with this lasso (small jobs cycling, `big` never admitted):
+
+```
+State 1  admitted = {}            finished = {}
+State 2  admitted = {s2}          finished = {}          <- Admit
+State 3  admitted = {s1, s2}      finished = {}          <- Admit
+State 4  admitted = {s1}          finished = {s2}        <- Complete
+State 5  admitted = {}            finished = {s1, s2}    <- Complete
+State 6  admitted = {}            finished = {s1}        <- Resubmit
+Back to state 1                                          <- Resubmit
+```
+
+Note *why* weak fairness does not save `big`: `Admit(big)` is enabled at states
+5, 6 and 1 (`Free = 4 >= 3`) but **not** at 2 and 3, so it is never
+*continuously* enabled and `WF` never obliges it to fire. A trickle of small
+work keeps re-closing the window. Meanwhile the client is receiving `429` with
+`Retry-After` — a header promising a retry that will never succeed.
+
+The instance is deliberately tiny: three jobs against a 4-unit budget, two small
+(1 each) and one large (3). Starvation needs an interleaving, not scale.
 
 This is recorded in `FIXES_PLAN.md` as A7 gap 3 ("no bounded queue; large jobs
 are starvable"). The value of having it here is that the fix can be designed
-against a concrete counterexample trace rather than an intuition, and the same
-property can be re-checked once a queue exists — at which point
-`EventuallyAdmitted` should hold and this README should say so.
+against a concrete counterexample rather than an intuition, and the property
+re-checked once a queue exists — at which point `EventuallyAdmitted` should
+hold and this README should say so.
+
+## Why this survives the move to a cluster
+
+The model deliberately says nothing about **how work arrives**. `Admit` is
+enabled by capacity alone, so push scheduling (a coordinator assigns) and pull
+scheduling (a worker steals) produce the same state space here — they differ in
+who *proposes* a job, not in what admission does with it.
+
+That is what should keep A12 (the cluster manager) a moderate change rather than
+a rewrite: adding a node dimension means indexing `admitted`/`Capacity` by node
+and keeping the per-node invariant, while the safety property and the starvation
+result carry over unchanged. The genuinely new properties are the lease
+protocol's — a dead worker's row returns to the pending set, and no row is lost
+or silently executed twice — which is exactly the part worth model-checking
+*before* it is written.
