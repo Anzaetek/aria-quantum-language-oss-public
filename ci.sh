@@ -300,22 +300,48 @@ else
   echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"
 fi
 
-# Opt-in Qiskit differential cross-check. Independent implementation, so
-# agreement is evidence rather than a shared convention. Needs a venv with
-# qiskit (never system Python) — see tools/qiskit_xcheck/README.md.
+# Qiskit differential cross-check. MANDATORY in intent: it is the only
+# INDEPENDENT implementation available, and this project has already shipped a
+# defect that every internal cross-backend agreement gate missed (each pair of
+# backends coincided in the basis being checked).
+#
+# It still SKIPS rather than fails when the venv is absent — a machine without
+# it must be able to run CI — but the skip is LOUD. A silent skip is how a
+# mandatory check quietly stops running: the run stays green and nobody notices
+# the strongest evidence was never gathered. So an absent venv prints a banner
+# and sets ARIA_XCHECK_MISSING, and the final summary repeats it.
+QISKIT_XCHECK_SKIPPED=""
 if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
     echo "== Qiskit differential cross-check =="
     QK_PY="${ARIA_QISKIT_PY:-./.venv-qiskit/bin/python}"
     XCHECK_FEATS=""
     [ "$(uname -s)" = "Darwin" ] && XCHECK_FEATS="--features metal"
     if [ ! -x "$QK_PY" ]; then
-        echo "  (skip) no qiskit venv at $QK_PY — see tools/qiskit_xcheck/README.md"
+        QISKIT_XCHECK_SKIPPED="no venv at $QK_PY"
     else
         cargo run -q --release -p omega-xcheck $XCHECK_FEATS -- 60 > /tmp/aria_xcheck.txt \
             && "$QK_PY" tools/qiskit_xcheck/compare.py /tmp/aria_xcheck.txt \
             && echo "  qiskit cross-check OK" \
             || { echo "  QISKIT CROSS-CHECK FAILED"; exit 1; }
     fi
+else
+    QISKIT_XCHECK_SKIPPED="ARIA_QISKIT_XCHECK not set"
+fi
+
+if [ -n "$QISKIT_XCHECK_SKIPPED" ]; then
+    printf '\n\033[1;33m'
+    echo "!! WARNING — the MANDATORY Qiskit differential cross-check did NOT run"
+    echo "!!   reason: $QISKIT_XCHECK_SKIPPED"
+    echo "!!"
+    echo "!! This is the only INDEPENDENT implementation checked against. Two Aria"
+    echo "!! backends agreeing may only mean they share a convention — and this"
+    echo "!! project has already shipped a defect that every internal agreement"
+    echo "!! gate missed. A green run without it is WEAKER EVIDENCE than it looks."
+    echo "!!"
+    echo "!!   python3 -m venv .venv-qiskit"
+    echo "!!   ./.venv-qiskit/bin/pip install qiskit qiskit-aer"
+    echo "!!   ARIA_QISKIT_XCHECK=1 ARIA_QEC_XCHECK=1 ./ci.sh"
+    printf '\033[0m\n'
 fi
 
 # Metal GPU backends. Default ON on macOS (see the Mac block above), skipped
@@ -527,4 +553,11 @@ else
   echo "  (skipping QEC cross-check — set ARIA_QEC_XCHECK=1 with a qiskit venv to enable)"
 fi
 
-printf '\n\033[1;32mAll CI stages passed.\033[0m\n'
+if [ -n "${QISKIT_XCHECK_SKIPPED:-}" ]; then
+    # Repeat at the very end: the warning above scrolls past in a 3000-line log,
+    # and the last line is what a human (or an agent) actually reads.
+    printf '\n\033[1;32mAll CI stages passed\033[0m \033[1;33m— but WITHOUT the mandatory Qiskit cross-check (%s)\033[0m\n' \
+        "$QISKIT_XCHECK_SKIPPED"
+else
+    printf '\n\033[1;32mAll CI stages passed.\033[0m\n'
+fi

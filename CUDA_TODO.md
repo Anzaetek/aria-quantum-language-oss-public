@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# CUDA — work waiting for a Linux/NVIDIA box
+# CUDA — work waiting for an amd64 Linux + NVIDIA box
 
-Everything here is **unrunnable on the macOS dev machine** (`nvidia-smi` absent,
+Target platform: **x86_64 (amd64) Linux with an NVIDIA GPU.** Everything here is
+**unrunnable on the macOS dev machine** (`nvidia-smi` absent,
 and the CUDA crates are `cfg`-gated to linux/windows). It is written down rather
 than remembered, because this project has already been burned once by landing
 GPU code that was never executed: `f11a9f5` shipped with 2/70 Metal tests
@@ -84,6 +85,23 @@ Record actual numbers, not "passed":
 - `./ci.sh` exit code, with the CUDA stage's `OK:` lines
 - `/health` output showing the detected topology and per-pool capacities
 - GPU model(s), driver, CUDA version, and `nvidia-smi --query-gpu=index,name,memory.total`
+- `uname -m` (expected `x86_64`) — the topology heuristic treats aarch64
+  differently, since that is where GB10/GH200 live
 
 `OPTIONAL_TESTS.md` has the table to update; `FIXES_PLAN.md` A7b has the design
 rationale if a decision looks wrong on real hardware.
+
+## Platform notes for amd64 Linux
+
+- **OpenCL needs the ICD loader dev symlink** `libOpenCL.so`, not just the
+  runtime `libOpenCL.so.1` — `cl-sys` emits `-lOpenCL` and the linker resolves
+  that only against the `.so`. Usually `apt install ocl-icd-opencl-dev`. A
+  CUDA-only box has it at `$CUDA/targets/x86_64-linux/lib/libOpenCL.so`, off the
+  default link path:
+  `RUSTFLAGS="-L native=/usr/local/cuda/targets/x86_64-linux/lib" ARIA_OPENCL=1 ./ci.sh`
+- **The mandatory cross-checks are not Mac-specific** — set up both venvs there
+  too (`PREREQUISITES.md`). CI now prints a loud warning when the Qiskit
+  cross-check did not run, so an absent venv will announce itself.
+- **cgroups**: if the box runs the server in a container, confirm the governor
+  budgets against the container limit and not host RAM. That path exists but has
+  only been exercised by unit tests with injected probe values.
