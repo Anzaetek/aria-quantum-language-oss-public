@@ -32,21 +32,39 @@ Audited on this machine (Apple Silicon, macOS) on 2026-08-06. The short answer:
   then `tools/tla/check.sh`. The script skips cleanly if either the jar or a JDK
   is missing.
 
-## The one thing you might want to install
+## Qiskit — MANDATORY, and now installed
 
-**Qiskit cross-check** (`ARIA_QISKIT_XCHECK=1`, `ARIA_QEC_XCHECK=1`) — an
-independent implementation to differential-test against, so agreement is
-evidence rather than a shared convention. It is **not** installed here:
+The differential cross-checks are **not optional** (`OPTIONAL_TESTS.md`). Both
+are installed here, **each in its own venv** — never system Python:
+
+| venv | used by | contents | size |
+|---|---|---|---|
+| `.venv-qiskit` | `ARIA_QISKIT_XCHECK=1` | qiskit 2.5.1, qiskit-aer 0.17.2, numpy 2.5.1, scipy 1.18.0 | 193 MB |
+| `tools/qec_cross_check/.venv` | `ARIA_QEC_XCHECK=1` | qiskit 2.5.1, PyMatching 2.4.0, stim 1.16.0 | 566 MB |
+
+Two separate environments is deliberate, not an accident: the QEC script
+**self-provisions** its own (`tools/qec_cross_check/run.sh` creates it and
+installs qiskit + stim + PyMatching on first run), so it stays reproducible on a
+fresh machine without anyone remembering an extra step. Both are gitignored via
+`**/.venv*`.
+
+Recreate either from scratch:
 
 ```console
 $ python3 -m venv .venv-qiskit
 $ ./.venv-qiskit/bin/pip install qiskit qiskit-aer
-$ ARIA_QISKIT_XCHECK=1 ./ci.sh
+$ ARIA_QISKIT_XCHECK=1 ./ci.sh        # QEC venv builds itself on first run
+$ ARIA_QEC_XCHECK=1 ./ci.sh
 ```
 
-Use a venv, never system Python — `tools/qiskit_xcheck/README.md` has the
-details. Both stages skip cleanly without it, which is why the default run is
-green on a bare machine.
+No C++ toolchain is needed: `qiskit-aer`, `stim` and `PyMatching` all ship
+prebuilt wheels for Apple Silicon. Nothing compiles from source.
+
+Measured here 2026-08-06, both `CI_EXIT=0`:
+
+- Qiskit: **60 agree, 0 disagree, worst |Δp| = 4.441e-16**
+- QEC vs PyMatching: **100.00% (20000/20000)** shot-for-shot logical-class
+  agreement at d=3 and d=5; logical rates within 3σ
 
 ## Nothing to install for GPUs on this Mac
 
