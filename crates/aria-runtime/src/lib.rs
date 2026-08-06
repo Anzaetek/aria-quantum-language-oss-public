@@ -70,4 +70,7 @@ pub use train::{train_expectation, Optimizer, TrainConfig, TrainResult};
 pub use train_supervised::{train_supervised, Loss, SupervisedConfig, SupervisedResult};
 
 #[cfg(feature = "remote")]
-pub use remote::{expectation_remote, run_counts_remote, Remote};
+pub use remote::{
+    expectation_remote, expectation_remote_batch, remote_stats, reset_remote_stats,
+    run_counts_remote, Remote, RemoteStats,
+};
