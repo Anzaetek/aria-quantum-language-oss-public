@@ -29,6 +29,7 @@ the work — they are called out in place rather than silently inherited.
 | 12 | `aria-torch-requirements` | **LANDED** — tch stage on by default | none |
 | 13 | `ARIA-KEEP-public-final.md` | **CONTRACT** — K1–K14, Q5/Q8/Q9 | binding on everything below |
 | 14 | `PLAN-COMPLIANCE-2026-07-29`, `UPSTREAM_UPDATE_PLAN`, `aria-open-requirements` | historical/superseded | archive note |
+| 15 | `TSIM-PPVM.md` **(new 2026-08-06)** | **OPEN** — two QuEra simulators via the existing bridge protocol | Part E |
 
 Items 4, 5, 7 need verification rather than implementation; 6 and 8 need a
 confirming reproduction before an estimate is honest.
@@ -1001,6 +1002,67 @@ imply distributed simulation.
 Sequenced after A9 (durable batches) and A10 (the models — `Governor.tla` grows
 a node dimension, and the lease/steal protocol is precisely the kind of thing
 worth model-checking before it is written).
+
+## Part E — tsim & ppvm bridges (`fixes/TSIM-PPVM.md`, new 2026-08-06)
+
+Two QuEra simulators, to be reached through the **existing `omega-bridges`
+JSON-over-stdio subprocess protocol** — the request already surveyed the three
+integration surfaces and chose this one. I agree with the choice, and the
+reasoning is worth keeping: a C-ABI plugin's gate-only vtable has no expectation
+entry point and its thread-safety contract is hostile to a Python GIL; HTTP
+impersonation buys nothing because the wire IR is the same closed gate enum.
+
+Verified against the tree: `bloqade.rs` is **34 lines**, the runner protocol
+(`runner.rs`) already does `$OMEGA_BRIDGE_<SLUG>_CMD` → PATH → dev-fallback
+discovery and maps a missing tool to `Unavailable` rather than an error, and
+`python/` already carries three runners to mirror. So the estimate of ~150 lines
+of Rust total is credible.
+
+### E1. ppvm — a *validator*, not a new capability
+
+The request is explicit and correct: **ppvm and `omega-backend-pauliprop` are
+the same algorithm family** (Heisenberg Pauli-sum propagation with coefficient
+truncation). So ppvm's value here is as an **independent numeric reference for
+pauliprop** — precisely the kind of cross-check that has already earned its keep
+twice this session (Qiskit at 4.441e-16, PyMatching at 100% shot-for-shot).
+
+That framing should drive the work: the deliverable is a **differential test**,
+not a backend users select. Ship it the way the Qiskit cross-check is shipped.
+
+Note ppvm is **Rust**, so `ppvm-pauli-sum` could later be a direct git Cargo
+dependency and validate in-process, skipping the subprocess entirely. Start with
+the bridge (cheap, uniform), keep that door open.
+
+### E2. tsim — genuinely new capability
+
+Stabilizer-rank (ZX) decomposition: noisy Clifford+T sampling at scales the MPS
+backend cannot reach. Unlike ppvm this is not duplicated in-tree.
+
+**But the bridge speaks QASM2 + counts only**, and tsim's distinctive value is
+*detector/observable* sampling for QEC. Through this surface it arrives as a
+plain noisy sampler with its headline feature inexpressible. That is worth
+saying out loud rather than discovering later: E2 buys scale, not QEC semantics.
+A detector-aware extension is a separate piece of work, and only worth doing if
+QEC sampling actually lands here.
+
+### Sequencing and acceptance
+
+1. **E1 ppvm bridge + pauliprop differential test.** Highest value per line: it
+   turns an in-tree backend from self-consistent into independently checked.
+   Acceptance: agreement on the qualifying fixture subset, **with the number of
+   qualifying fixtures reported** — a cross-check that silently tests 3 cases is
+   worse than none.
+2. **E2 tsim bridge** as a noisy sampler, documented as such.
+3. Detector-aware tsim: **only** if QEC sampling materialises here.
+
+Constraints carried from the request, all consistent with house rules:
+- Out-of-subset gates **refuse loudly** (`kind: "<slug>-unsupported-gate"`),
+  never silently skip — the same discipline as B0's CV refusal.
+- A missing tool is `Unavailable`, never a hard failure, so the default `./ci.sh`
+  stays green on a machine without JAX or a ppvm build.
+- **A blocked integration ships as a findings note, not a fake-green bridge.**
+- Install friction is real (tsim pulls JAX; ppvm is git-only) — each gets its own
+  venv, as with the two Qiskit ones.
 
 ### C3. Photonics from the Aria surface — **CONFIRMED scope** (2026-08-06)
 
