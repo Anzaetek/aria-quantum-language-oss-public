@@ -57,6 +57,24 @@ pub enum Backend {
     /// returns counts; analog AHS responds with `Unavailable` until
     /// its input shape lands.
     Bloqade,
+    /// QuEra `ppvm` — Heisenberg Pauli-sum propagation with magnitude
+    /// truncation, plus a generalized stabilizer tableau.
+    ///
+    /// **This is the same algorithm family as the in-tree
+    /// `omega-backend-pauliprop`**, so it exists here as an INDEPENDENT
+    /// NUMERIC REFERENCE that validates pauliprop — not as a new capability
+    /// users pick for its own sake. Two implementations of the same idea
+    /// agreeing is real evidence; one implementation agreeing with itself is
+    /// not. See `fixes/TSIM-PPVM.md` and `FIXES_PLAN.md` Part E.
+    Ppvm,
+    /// QuEra `tsim` — ZX stabilizer-rank decomposition sampler, for noisy
+    /// Clifford+T circuits at scales the MPS backend cannot reach.
+    ///
+    /// Reached through the QASM2 + counts bridge protocol, which means tsim's
+    /// distinctive QEC feature — detector and observable sampling — is **not**
+    /// expressible here. It arrives as a plain noisy sampler; a detector-aware
+    /// surface is separate work.
+    Tsim,
     Cirq,
     Qadence,
 }
@@ -69,6 +87,8 @@ impl Backend {
             "qiskit" => Backend::Qiskit,
             "perceval" => Backend::Perceval,
             "bloqade" | "quera" | "aquila" => Backend::Bloqade,
+            "ppvm" => Backend::Ppvm,
+            "tsim" => Backend::Tsim,
             "cirq" | "circ" => Backend::Cirq,
             "qadence" => Backend::Qadence,
             other => return Err(BridgeError::UnknownBackend(other.to_string())),
@@ -83,6 +103,8 @@ impl Backend {
             Backend::Qiskit => cfg!(feature = "bridge-qiskit"),
             Backend::Perceval => cfg!(feature = "bridge-perceval"),
             Backend::Bloqade => cfg!(feature = "bridge-bloqade"),
+            Backend::Ppvm => cfg!(feature = "bridge-ppvm"),
+            Backend::Tsim => cfg!(feature = "bridge-tsim"),
             Backend::Cirq => cfg!(feature = "bridge-cirq"),
             Backend::Qadence => cfg!(feature = "bridge-qadence"),
         }
@@ -90,7 +112,9 @@ impl Backend {
 
     /// All known backend names; useful for `omega-client backends list-bridges`.
     pub fn all_names() -> &'static [&'static str] {
-        &["qiskit", "perceval", "bloqade", "cirq", "qadence"]
+        &[
+            "qiskit", "perceval", "bloqade", "ppvm", "tsim", "cirq", "qadence",
+        ]
     }
 }
 
@@ -145,6 +169,8 @@ pub fn run_qasm2(
         Backend::Qiskit => qiskit::run(qasm, shots, noise),
         Backend::Perceval => perceval::run(qasm, shots, noise),
         Backend::Bloqade => bloqade::run(qasm, shots, noise),
+        Backend::Ppvm => ppvm::run(qasm, shots, noise),
+        Backend::Tsim => tsim::run(qasm, shots, noise),
         Backend::Cirq => cirq::run(qasm, shots, noise),
         Backend::Qadence => qadence::run(qasm, shots, noise),
     }
@@ -220,9 +246,11 @@ pub fn run_opticqasm(
 mod bloqade;
 mod cirq;
 mod perceval;
+mod ppvm;
 mod qadence;
 mod qiskit;
 pub mod qpy;
+mod tsim;
 // `runner` is the shared subprocess plumbing for Python-backed
 // bridges. We compile it unconditionally (rather than feature-gating)
 // so its unit tests run under the default `cargo test --workspace`

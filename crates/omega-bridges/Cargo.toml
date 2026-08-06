@@ -20,6 +20,12 @@ bridge-perceval = []
 # stubbed for now and returns a typed `Unavailable` until the AHS
 # input shape lands.
 bridge-bloqade = []
+# QuEra ppvm — Pauli-sum propagation. Present as an INDEPENDENT VALIDATOR for
+# omega-backend-pauliprop (same algorithm family), not as a new capability.
+bridge-ppvm = []
+# QuEra tsim — ZX stabilizer-rank sampler. New capability; note the bridge
+# carries QASM2 + counts only, so detector/observable sampling is out of reach.
+bridge-tsim = []
 # Reserved for follow-ups so PRs can land each backend as a self-contained
 # commit once the dispatch surface is in place.
 bridge-cirq = []
