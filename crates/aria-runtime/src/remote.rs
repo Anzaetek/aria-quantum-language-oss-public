@@ -254,18 +254,64 @@ pub fn expectation_remote(
     bindings: &HashMap<String, f64>,
     remote: &Remote,
 ) -> Result<f64, String> {
-    let mut full = bindings.clone();
-    for s in circuit.free_symbols() {
-        full.entry(s).or_insert(0.0);
-    }
-    let bound = circuit.bind_params(&full)?;
-    let ir = try_to_omega_ir(&bound)?;
-    let body = serde_json::json!({ "circuit": ir, "observable": observable });
-    let v = post_json(remote, "/v1/quantum/expectation", body)?;
-    parse_expectation_values(&v)?
-        .into_iter()
+    let vals =
+        expectation_remote_batch(circuit, observable, std::slice::from_ref(bindings), remote)?;
+    vals.into_iter()
         .next()
         .ok_or_else(|| "omega-server returned no expectation value".to_string())
+}
+
+/// `⟨O⟩` for **many parameter bindings in one request**.
+///
+/// The server has always accepted a `circuits` batch
+/// (`quantum_bridge::QuantumExpectationReq`); the client was sending one HTTP
+/// request per row anyway. That costs a full round trip each: at 256 rows over
+/// a tunnel with ~20 ms RTT it is ~5 s of pure latency per forward pass, before
+/// any simulation happens.
+///
+/// Results come back **in input order**, one per binding (Q5). The server
+/// preserves that order, and this function does not reorder.
+///
+/// What this does *not* fix: every row still carries its full gate list,
+/// because the wire IR's parameters are concrete `f64` with no symbolic form
+/// (`OmegaGateOp.params`). For a same-ansatz batch that payload dominates —
+/// see `FIXES_PLAN.md` A0, where the template + parameter-matrix encoding is
+/// the ~90x win. Use [`crate::remote::remote_stats`] to see which side you are
+/// paying for rather than guessing.
+pub fn expectation_remote_batch(
+    circuit: &Circuit,
+    observable: &str,
+    bindings: &[HashMap<String, f64>],
+    remote: &Remote,
+) -> Result<Vec<f64>, String> {
+    if bindings.is_empty() {
+        return Ok(Vec::new());
+    }
+    let free: Vec<String> = circuit.free_symbols().into_iter().collect();
+    let mut irs = Vec::with_capacity(bindings.len());
+    for b in bindings {
+        let mut full = b.clone();
+        for s in &free {
+            full.entry(s.clone()).or_insert(0.0);
+        }
+        let bound = circuit.bind_params(&full)?;
+        irs.push(try_to_omega_ir(&bound)?);
+    }
+
+    let body = serde_json::json!({ "circuits": irs, "observable": observable });
+    let v = post_json(remote, "/v1/quantum/expectation", body)?;
+    let values = parse_expectation_values(&v)?;
+    if values.len() != bindings.len() {
+        // Row order and count are the contract (Q5): silently accepting a
+        // short vector would misalign every downstream label.
+        return Err(format!(
+            "omega-server returned {} expectation values for {} circuits — \
+             the batch contract is one value per row, in order",
+            values.len(),
+            bindings.len()
+        ));
+    }
+    Ok(values)
 }
 
 /// Execute `circuit` on a remote omega-server and return measurement counts.
@@ -361,6 +407,24 @@ mod tests {
 #[cfg(test)]
 mod timing_tests {
     use super::*;
+
+    /// The batch contract is one value per row, in input order (Q5). A short
+    /// or long vector must be an error, never silently accepted — misaligning
+    /// rows against their labels is the kind of bug that produces plausible
+    /// numbers forever.
+    #[test]
+    fn batch_length_mismatch_is_refused_not_silently_accepted() {
+        let three = serde_json::json!({ "values": [0.1, 0.2, 0.3] });
+        assert_eq!(parse_expectation_values(&three).unwrap().len(), 3);
+        // The guard itself lives in expectation_remote_batch; this pins the
+        // shape it depends on so a server change cannot quietly slip past.
+        let empty = serde_json::json!({ "values": [] });
+        assert_eq!(parse_expectation_values(&empty).unwrap().len(), 0);
+        let junk = serde_json::json!({ "nope": 1 });
+        assert!(parse_expectation_values(&junk).is_err());
+        let not_numbers = serde_json::json!({ "values": ["a"] });
+        assert!(parse_expectation_values(&not_numbers).is_err());
+    }
 
     #[test]
     fn server_timing_header_total_is_the_sum_of_its_phases() {
