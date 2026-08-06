@@ -1088,6 +1088,59 @@ every iteration. So a single mechanism cannot serve both uses.
 3. Both remain legitimate as **CI-time** cross-checks today. That is where the
    Qiskit and PyMatching checks live, and it is already proving its worth.
 
+### E3. Porting tsim: use formal methods, not hope
+
+E0 established that in-loop validation with tsim requires porting ZX
+stabilizer-rank decomposition from Python/JAX to Rust. That port is the risky
+part, and the risk is specific: **a hand port validated only against the
+original inherits the oracle problem.** If the port and the original are wrong
+the same way, every differential test agrees. This session has now produced four
+separate instances of confident output with nothing behind it — a subtle
+sampling algorithm is exactly where the fifth would hide.
+
+Sibling tooling exists for precisely this shape of problem:
+
+| tool | what it gives |
+|---|---|
+| `../leanlift` | *"Lift a function into a Lean 4 model and prove it's the same function — by bit-exact differential execution."* Plus `verify-creusot.sh` (deductive) and `verify-kani.sh` (bounded model checking) for Rust-level properties. |
+| `../lean4-skills` | Lean 4 tooling/plugins; pulled 2026-08-06 (105 files changed, so it is moving). |
+| `../le-harnais-v0` | Harness with its own `lean/`, `ci.sh` and skills; a working example of the pattern. |
+
+This repo already runs Lean 4 in CI with sorry-free axiom checks
+(`ARIA_LEAN=1`, the circulant / noise / HHL-QSVT theorems, plus
+`verification/Verification/Backend/PauliAlgebra.lean`), so this extends
+established practice rather than importing a new discipline.
+
+**Approach — port kernel by kernel, verifying each before moving on:**
+
+1. **Specify the core in Lean first**, from the method paper
+   (arXiv:2604.01059), not from the Python source: the stabilizer decomposition
+   of magic states, the sum over stabilizer terms, and the sampling step.
+   Writing the spec from the paper is what keeps it an *independent* statement
+   rather than a transcription of whatever the implementation happens to do.
+2. **Port one kernel at a time to Rust**, and use `leanlift` to prove the Rust
+   function agrees with its Lean model by bit-exact differential execution.
+   Do not proceed to the next kernel until the current one is lifted.
+3. **Creusot/Kani for the Rust-level obligations** a Lean equivalence proof does
+   not cover: no overflow in the rank/index arithmetic, bounds on the term
+   vector, termination of the decomposition loop.
+4. **Keep the Python bridge as a second oracle** during the port — belt and
+   braces — but the Lean model is the authority. If they disagree, the bug is
+   not automatically in the Rust.
+
+**The honest limit, same one recorded for the TLA+ models.** A proof that the
+Rust matches the Lean model is only as strong as the model. A Lean spec that
+misstates the algorithm yields a proof that is *valid and useless*. So the spec
+must be checked independently: against the paper's stated properties, and
+against tsim's own outputs on cases where the answer is known analytically.
+Formal methods raise the floor here; they do not remove the need for a
+cross-check.
+
+**Do this only if in-loop tsim validation is actually wanted.** It is a
+multi-week project. If tsim stays a CI-time cross-check (E2), the Python bridge
+is sufficient and none of this is needed — and that should be the default
+assumption until someone needs otherwise.
+
 ### Sequencing and acceptance
 
 1. **E1 ppvm bridge + pauliprop differential test.** Highest value per line: it
