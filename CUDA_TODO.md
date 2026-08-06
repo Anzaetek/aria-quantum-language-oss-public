@@ -1,7 +1,27 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# CUDA — work waiting for an amd64 Linux + NVIDIA box
+# CUDA — work waiting for a Linux + NVIDIA box
 
-Target platform: **x86_64 (amd64) Linux with an NVIDIA GPU.** Everything here is
+**Two target platforms, and they exercise different code:**
+
+| platform | hardware | why it matters here |
+|---|---|---|
+| **linux/amd64** | discrete NVIDIA (RTX, A100, H100, DGX A100/H100) | the **Discrete** topology path: host pool + one pool per GPU |
+| **linux/arm64** | Grace-Blackwell **GB10 (DGX Spark)**, Grace-Hopper **GH200** | the **Unified** path — and the heuristic that decides it |
+
+**arm64 is the higher-risk target**, and currently the least tested. The
+topology classifier treats `aarch64` specially: a single device whose
+`memory.total` is within 25% of host RAM is read as *one shared pool seen
+twice*, which is the GB10 signature. That branch has **never run on real
+hardware** — only against synthetic probe values in unit tests.
+
+Get it wrong on a GB10 and the governor budgets host and device separately, i.e.
+hands out roughly **twice the machine's memory**, and the OOM killer enforces
+the difference. Get it wrong the other way on a GH200 (which is coherent but has
+*distinct* LPDDR5X + HBM3 capacities, so it should classify **Discrete**) and
+you merely under-use HBM. The asymmetry is why the code defaults to Unified when
+unsure — but a default is not a substitute for measuring.
+
+Everything here is
 **unrunnable on the macOS dev machine** (`nvidia-smi` absent,
 and the CUDA crates are `cfg`-gated to linux/windows). It is written down rather
 than remembered, because this project has already been burned once by landing
@@ -85,11 +105,30 @@ Record actual numbers, not "passed":
 - `./ci.sh` exit code, with the CUDA stage's `OK:` lines
 - `/health` output showing the detected topology and per-pool capacities
 - GPU model(s), driver, CUDA version, and `nvidia-smi --query-gpu=index,name,memory.total`
-- `uname -m` (expected `x86_64`) — the topology heuristic treats aarch64
-  differently, since that is where GB10/GH200 live
+- `uname -m` — **`x86_64` vs `aarch64` changes which classifier branch runs**,
+  so always report it alongside the `/health` topology
 
 `OPTIONAL_TESTS.md` has the table to update; `FIXES_PLAN.md` A7b has the design
 rationale if a decision looks wrong on real hardware.
+
+## linux/arm64 specifics (GB10 / GH200)
+
+- **Report the raw probe, not just the verdict**: `nvidia-smi
+  --query-gpu=index,name,memory.total --format=csv,noheader,nounits` plus
+  `MemTotal` from `/proc/meminfo`. If the classifier is wrong, those two numbers
+  are what shows why, and they are what the 25% tolerance is tuned against.
+- **GB10 must classify `Unified`; GH200 must classify `Discrete`.** Check
+  `GET /health` → `"unified"`. A wrong answer here is the one failure mode that
+  can take the box down rather than merely waste capacity.
+- **The clean fix is to stop guessing.** Detection prefers
+  `cudaDeviceProp.integrated` when a CUDA-linked build can ask for it; this
+  server does not link CUDA, so it falls back to the heuristic. Populating
+  `cuda_integrated` on an arm64 CUDA build removes the guesswork entirely and is
+  worth doing while you are on the hardware.
+- Toolchain: expect to build for `aarch64-unknown-linux-gnu`. libtorch's
+  auto-fetch in `tools/setup-libtorch.sh` covers `Darwin/arm64` and
+  `Linux/x86_64` only — **`Linux/aarch64` has no URL**, so the tch stage will
+  print its SKIP there until one is added.
 
 ## Platform notes for amd64 Linux
 
