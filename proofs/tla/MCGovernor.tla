@@ -30,14 +30,15 @@
 (* inference row is enough to keep the 64 GB trial out, so a steady stream *)
 (* of them starves the search indefinitely.                                *)
 (***************************************************************************)
-EXTENDS Governor
+EXTENDS Governor, Platforms
 
 MCJobs == {"qml1", "qml2", "sweep"}
 
-\* Execution budget in GB: half of the box's 128 GB unified memory.
-MCCapacity == 64
+\* Execution budget in GB. Swap this line to model another platform — the
+\* spec and every property stay exactly as they are (see Platforms.tla).
+MCCapacity == BudgetSpark
 
 \* 2^n * 16 bytes, in GB: 28 qubits -> 4, 30 qubits -> 16.
-MCWeight == [j \in MCJobs |-> IF j = "sweep" THEN 64 ELSE 4]
+MCWeight == [j \in MCJobs |-> IF j = "sweep" THEN MCCapacity ELSE 4]
 
 =========================================================================

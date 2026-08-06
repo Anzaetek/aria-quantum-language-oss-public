@@ -30,10 +30,12 @@ EXTENDS Naturals, FiniteSets, Sequences, TLC
 
 CONSTANTS
     Jobs,        \* set of job identifiers
-    Weight,      \* [Jobs -> Nat]  bytes (in MiB) each job needs
-    Capacity     \* Nat            pool budget, same units
+    Weight,      \* [Jobs -> Nat]  memory each job needs, in GB
+    Capacity,    \* Nat            execution budget, same units
+    Governed     \* BOOLEAN        FALSE models NO resource management
 
 ASSUME CapacityIsPositive == Capacity \in Nat /\ Capacity > 0
+ASSUME GovernedIsBoolean == Governed \in BOOLEAN
 ASSUME WeightsArePositive ==
     /\ Weight \in [Jobs -> Nat]
     /\ \A j \in Jobs : Weight[j] > 0
@@ -64,11 +66,17 @@ Init ==
     /\ finished = {}
 
 (* A job is admitted only if it fits in what is free RIGHT NOW. This is
-   `try_acquire_many_owned` — no queue, no reservation, no fairness. *)
+   `try_acquire_many_owned` — no queue, no reservation, no fairness.
+
+   With `Governed = FALSE` the capacity check disappears entirely: that is the
+   server BEFORE admission control, where any submitted job simply starts. It is
+   modelled so the governor can be shown NECESSARY rather than merely correct —
+   `NeverExceedsCapacity` fails immediately without it. A safety property that
+   holds in both the guarded and unguarded worlds would be proving nothing. *)
 Admit(j) ==
     /\ j \notin admitted
     /\ j \notin finished
-    /\ Weight[j] <= Free
+    /\ (Governed => Weight[j] <= Free)
     /\ admitted' = admitted \cup {j}
     /\ UNCHANGED finished
 

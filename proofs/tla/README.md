@@ -70,6 +70,33 @@ Four extra qubits is **sixteen times** the memory. That ratio is why admission
 control is not optional: an inference row fits trivially, and a search trial
 needs the entire budget.
 
+### Is the governor necessary, or just correct?
+
+The same spec runs with `Governed <- FALSE`, which removes the capacity check —
+the server *before* admission control, where any submitted job simply starts:
+
+| configuration | `NeverExceedsCapacity` |
+|---|---|
+| `Governed <- TRUE` (`MCSafety.cfg`) | **holds** |
+| `Governed <- FALSE` (`MCUngoverned.cfg`) | **violated** |
+
+That pair is the point. A safety property holding only in the guarded world
+shows the governor *does something*; a property that held in both would be
+proving arithmetic, not code.
+
+### Adding a platform
+
+Budgets live in `Platforms.tla` — DGX Spark (GB10) 64, GH200 96 GB → 48,
+GH200 144 GB → 72, H100 80 GB → 40, H100 NVL → 47, GB300 → 144, laptop → 12,
+each half of usable memory. **Adding a platform is one line there plus a
+three-line `.cfg`**; the spec and every property stay unchanged, because the
+governor depends on capacity and nothing else about the hardware. For a discrete
+platform the number is the *device* pool; the host pool is a separate budget
+with identical rules.
+
+Checked across laptop (12), H100 (40), GH200 (72) and GB300 (144): governed safe
+and ungoverned violated at every size.
+
 **Safety — checked, holds.** Exhaustive over 22 states:
 
 ```
