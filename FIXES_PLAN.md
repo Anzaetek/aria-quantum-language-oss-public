@@ -1079,10 +1079,36 @@ every iteration. So a single mechanism cannot serve both uses.
   with `PauliSum` / `GeneralizedTableau` and an `overlap_with_zero()` entry
   point for the overlap that expectation values are built from. So the
   in-process tier needs **no Python, no subprocess, and no port** — which makes
-  the bridge genuinely scaffolding rather than the destination. Two things to
-  confirm when starting: whether it builds on aarch64-darwin (the dev box) and
-  what its truncation knob is called, since matching pauliprop's truncation is
-  what makes the comparison meaningful rather than approximate. The bridge remains the cheap way to get a
+  the bridge genuinely scaffolding rather than the destination.
+
+  **Both open questions resolved 2026-08-07 by probing, not reading:**
+
+  1. **Builds on `aarch64-darwin`** — a throwaway crate with the git dependency
+     compiled clean in 13 s (`ppvm-traits`, `ppvm-pauli-word`,
+     `ppvm-pauli-sum` at `661fc66f`). No system deps, no build-script surprises.
+     Probed in a scratch crate so a failure could not break the workspace.
+  2. **Truncation is a pluggable `Strategy`** (`sum/data.rs::truncate` →
+     `ppvm_traits::traits::Strategy`), documented as covering
+     "coefficient-magnitude, max-weight, combinations". Expectation comes from
+     `PauliSum::overlap` (`sum/trace.rs:31`).
+
+  **That lines up with pauliprop almost exactly.** In-tree,
+  `PauliSum::truncate(coeff_min, max_weight, max_freq)`
+  (`omega-backend-pauliprop/src/pauli.rs:123`) drops on coefficient magnitude,
+  Pauli weight, and PauliPropagation.jl's `max_freq` split-frequency axis, and
+  accumulates discarded L1 mass into `dropped_mass` as an error budget.
+
+  So the differential test is configured by matching a ppvm `Strategy` to
+  `coeff_min` + `max_weight`. Two caveats decide whether a disagreement *means*
+  anything, and both must be settled before reporting numbers:
+
+  * **If ppvm has no `max_freq` equivalent, compare only where that axis does
+    not bind.** Two implementations truncating on different axes disagree for
+    reasons unrelated to correctness — which would make the cross-check
+    actively misleading rather than merely weak.
+  * **Derive the tolerance from `dropped_mass`, do not pick one.** A difference
+    inside pauliprop's own truncation error budget is not a defect, and
+    reporting it as one trains people to ignore the check. The bridge remains the cheap way to get a
   first number, but **the destination for ppvm is a direct dependency**, not the
   subprocess. Re-sequence accordingly: bridge first only if it is genuinely
   faster to stand up, and treat it as scaffolding rather than the deliverable.
