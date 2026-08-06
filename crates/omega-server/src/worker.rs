@@ -339,6 +339,15 @@ pub enum Rejection {
     TooManyQubits { num_qubits: u32, max_qubits: u32 },
     /// Cost could not be determined and the governor refuses to gamble. → 413.
     Unpriceable { reason: &'static str },
+    /// The ledger had room but the MACHINE does not. → 429.
+    ///
+    /// The ledger counts what the governor admitted; it cannot see a job's
+    /// classical side (dataset, optimizer state, autograd tape) or anything
+    /// else sharing the box. When the two disagree, the machine wins.
+    MachinePressure {
+        required_bytes: u64,
+        measured_available_bytes: u64,
+    },
 }
 
 impl Rejection {
@@ -374,6 +383,17 @@ impl Rejection {
                 "circuit declares {num_qubits} qubits, above this host's ceiling of \
                  {max_qubits} (OMEGA_MAX_QUBITS)."
             ),
+            Rejection::MachinePressure {
+                required_bytes,
+                measured_available_bytes,
+            } => format!(
+                "circuit needs {} and the execution budget has room, but the MACHINE only has \
+                 {} actually available — the budget cannot see memory it did not hand out \
+                 (a job's dataset, optimizer state, or other processes on this host). \
+                 Refusing rather than trusting the ledger. Retry shortly.",
+                gb(*required_bytes),
+                gb(*measured_available_bytes)
+            ),
             Rejection::Unpriceable { reason } => format!(
                 "refusing to admit a job whose resource cost cannot be determined ({reason}). \
                  The governor fails closed rather than risk the host."
@@ -383,7 +403,10 @@ impl Rejection {
 
     /// `true` when waiting could help — the caller should retry.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Rejection::Busy { .. })
+        matches!(
+            self,
+            Rejection::Busy { .. } | Rejection::MachinePressure { .. }
+        )
     }
 }
 
@@ -399,6 +422,13 @@ pub struct GovernorConfig {
     /// memory; this bounds CPU contention, which many small jobs can cause
     /// without ever approaching the memory budget.
     pub max_concurrency: u32,
+    /// Fixed value for the machine-pressure probe instead of asking the OS.
+    ///
+    /// Admission consults live free memory, which would otherwise make every
+    /// test depend on whatever else is running on the box — the same
+    /// non-determinism that makes a resource guard hard to trust. Tests inject
+    /// a known value; production leaves this `None` and measures.
+    pub machine_available_override: Option<u64>,
     pub capacity_from: Provenance,
     pub qubits_from: Provenance,
     pub concurrency_from: Provenance,
@@ -414,6 +444,11 @@ impl Default for GovernorConfig {
             capacity_bytes: FALLBACK_CAPACITY_BYTES,
             max_qubits: 30,
             max_concurrency: 8,
+            // Tests build configs from `..default()`; a huge value keeps the
+            // machine probe out of their way so they exercise the LEDGER,
+            // which is what they are about. The pressure check has its own
+            // tests with injected values.
+            machine_available_override: Some(u64::MAX / 4),
             capacity_from: Provenance::Default,
             qubits_from: Provenance::Default,
             concurrency_from: Provenance::Default,
@@ -484,6 +519,8 @@ impl GovernorConfig {
         };
 
         Ok(Self {
+            // Production measures; only tests inject.
+            machine_available_override: None,
             capacity_bytes: memory.value,
             max_qubits: qubits.value,
             max_concurrency: concurrency.value,
@@ -580,6 +617,26 @@ fn detect_total_memory_bytes() -> Option<u64> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+/// Fraction of *measured* free memory a single job may claim.
+///
+/// Not 1.0: the measurement is a snapshot, the job's own classical side lands
+/// after admission, and something else on the box may allocate meanwhile. The
+/// margin is what makes the check a guard rather than a race.
+const MACHINE_HEADROOM_FRACTION: f64 = 0.8;
+
+/// Would admitting a job of `required` bytes over-commit the machine, given
+/// what the OS says is actually free?
+///
+/// Pure so the policy is testable without a loaded box. `None` measurement
+/// means the platform would not say — fall back to the ledger rather than
+/// invent a number, and say so rather than silently trusting it.
+pub fn exceeds_machine_headroom(required: u64, measured_available: Option<u64>) -> bool {
+    match measured_available {
+        None => false,
+        Some(avail) => (required as f64) > (avail as f64) * MACHINE_HEADROOM_FRACTION,
     }
 }
 
@@ -762,6 +819,25 @@ impl Governor {
                 return Err(Rejection::ExceedsCapacity {
                     required_bytes: required,
                     capacity_bytes: pool.capacity_bytes,
+                });
+            }
+        }
+
+        // The ledger says it fits. Now ask the MACHINE, which can disagree:
+        // the governor never sees a job's classical side (dataset, optimizer
+        // state, autograd tape) nor anything else sharing the box. A TLA+ check
+        // of the ledger-only policy found exactly this — two QML rows priced at
+        // 8 GB against a 64 GB budget, reported as 56 GB of headroom, while the
+        // machine held 68 GB. Admission was satisfied and the box was over.
+        if let Some(required) = priced {
+            let measured = self
+                .config
+                .machine_available_override
+                .or_else(crate::topology::detect_available_memory_now);
+            if exceeds_machine_headroom(required, measured) {
+                return Err(Rejection::MachinePressure {
+                    required_bytes: required,
+                    measured_available_bytes: measured.unwrap_or(0),
                 });
             }
         }
@@ -1301,6 +1377,50 @@ mod tests {
         // Freeing one slot lets exactly one more in.
         drop(held);
         g.admit(&tiny).expect("slots return when jobs finish");
+    }
+
+    /// The gap a TLA+ check found in the ledger-only policy: two QML rows
+    /// priced at 8 GB against a 64 GB budget report 56 GB of headroom while
+    /// the machine holds 68 GB, because the governor never sees a job's
+    /// dataset or optimizer state. Admission satisfied, box over budget.
+    ///
+    /// The measurement is the second opinion.
+    #[test]
+    fn machine_pressure_overrides_a_ledger_that_says_there_is_room() {
+        const GB64: u64 = 64 << 30;
+        // Ledger view: plenty free. Machine view: almost nothing.
+        assert!(
+            exceeds_machine_headroom(16 * GB, Some(4 * GB)),
+            "16 GB must be refused when only 4 GB is actually available"
+        );
+        // Comfortably within the measured headroom: admit.
+        assert!(!exceeds_machine_headroom(4 * GB, Some(GB64)));
+        // Right at the margin: 0.8 * 10 = 8, so 8 fits and 9 does not.
+        assert!(!exceeds_machine_headroom(8 * GB, Some(10 * GB)));
+        assert!(exceeds_machine_headroom(9 * GB, Some(10 * GB)));
+    }
+
+    /// A platform that will not report memory must fall back to the ledger,
+    /// not to a guess. Refusing everything would be worse than the gap.
+    #[test]
+    fn unmeasurable_machine_falls_back_to_the_ledger() {
+        assert!(!exceeds_machine_headroom(1024 * GB, None));
+    }
+
+    #[test]
+    fn machine_pressure_is_retryable_and_says_both_numbers() {
+        let r = Rejection::MachinePressure {
+            required_bytes: 16 * GB,
+            measured_available_bytes: 4 * GB,
+        };
+        // Memory frees up; this is a wait, not a permanent no.
+        assert!(r.is_transient());
+        let m = r.message();
+        assert!(m.contains("16.00 GB") && m.contains("4.00 GB"), "{m}");
+        assert!(
+            m.contains("MACHINE"),
+            "must distinguish ledger from machine: {m}"
+        );
     }
 
     #[test]
