@@ -32,10 +32,12 @@ CONSTANTS
     Jobs,        \* set of job identifiers
     Weight,      \* [Jobs -> Nat]  memory each job needs, in GB
     Capacity,    \* Nat            execution budget, same units
-    Governed     \* BOOLEAN        FALSE models NO resource management
+    Governed,    \* BOOLEAN        FALSE models NO resource management
+    Classical    \* [Jobs -> Nat]  memory the job's CLASSICAL side holds
 
 ASSUME CapacityIsPositive == Capacity \in Nat /\ Capacity > 0
 ASSUME GovernedIsBoolean == Governed \in BOOLEAN
+ASSUME ClassicalIsNat == Classical \in [Jobs -> Nat]
 ASSUME WeightsArePositive ==
     /\ Weight \in [Jobs -> Nat]
     /\ \A j \in Jobs : Weight[j] > 0
@@ -57,7 +59,20 @@ SumWeights(S) ==
     ELSE LET pick == CHOOSE y \in S : TRUE
          IN Weight[pick] + SumWeights(S \ {pick})
 
+RECURSIVE SumClassical(_)
+SumClassical(S) ==
+    IF S = {} THEN 0
+    ELSE LET pick == CHOOSE y \in S : TRUE
+         IN Classical[pick] + SumClassical(S \ {pick})
+
+(* What the GOVERNOR counts: the quantum statevector, and nothing else. *)
 Used == SumWeights(admitted)
+
+(* What the MACHINE actually holds: the statevector PLUS the job's classical
+   side — feature batches, optimizer state, the autograd tape. A QML step is
+   not only its circuit, and a QAS driver keeps per-trial bookkeeping too.
+   `omega-server` prices `2^n * 16` and is blind to all of it. *)
+ActualUsed == Used + SumClassical(admitted)
 
 Free == Capacity - Used
 
@@ -110,8 +125,17 @@ Spec == Init /\ [][Next]_vars
 --------------------------------------------------------------------------
 (* SAFETY — these must hold. *)
 
-(* The reason this module exists. *)
+(* The reason this module exists — as the governor sees it. *)
 NeverExceedsCapacity == Used <= Capacity
+
+(* The property that actually keeps the box alive: TOTAL resident memory,
+   including what the governor does not price, stays within budget.
+   
+   With `Classical` all-zero this is identical to `NeverExceedsCapacity`. Give
+   the jobs a classical footprint and it can FAIL WHILE THE GOVERNOR REPORTS
+   HEADROOM — admission is satisfied, the machine is not. A budget is only as
+   good as what it counts. *)
+MachineNeverExhausted == ActualUsed <= Capacity
 
 (* A job cannot be both holding a reservation and done: that would mean its
    permit was released while still counted, or counted after release. *)

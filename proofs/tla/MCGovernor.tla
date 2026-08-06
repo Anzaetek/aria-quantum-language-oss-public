@@ -41,4 +41,18 @@ MCCapacity == BudgetSpark
 \* 2^n * 16 bytes, in GB: 28 qubits -> 4, 30 qubits -> 16.
 MCWeight == [j \in MCJobs |-> IF j = "sweep" THEN MCCapacity ELSE 4]
 
+\* Classical footprint, in GB. A QML inference row carries a feature batch and
+\* optimizer state alongside its circuit; a QAS trial carries per-trial
+\* bookkeeping. The governor prices NONE of it.
+\*
+\* MCClassicalNone models the idealisation the governor implicitly assumes:
+\* that a job is nothing but its statevector.
+\*
+\* MCClassicalReal gives each 4 GB inference row a 30 GB classical side. That
+\* is a LOADED DATASET plus optimizer state plus the autograd tape — ordinary
+\* for a QML step with a torch/JAX optimizer and a training set resident in
+\* memory, and it dwarfs the 4 GB circuit the governor actually prices.
+MCClassicalNone == [j \in MCJobs |-> 0]
+MCClassicalReal == [j \in MCJobs |-> IF j = "sweep" THEN 0 ELSE 30]
+
 =========================================================================
