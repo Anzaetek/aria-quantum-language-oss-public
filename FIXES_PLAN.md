@@ -1066,7 +1066,23 @@ every iteration. So a single mechanism cannot serve both uses.
 
 - **ppvm is already Rust** (`ppvm-pauli-sum`, `ppvm-tableau`). So the in-process
   tier is available *without porting anything*: take it as a git Cargo
-  dependency and call it directly. The bridge remains the cheap way to get a
+  dependency and call it directly.
+
+  **Verified 2026-08-07** against the upstream repo rather than assumed — it is
+  public and git-only (no crates.io), and documents exactly this usage:
+
+  ```toml
+  [dependencies]
+  ppvm-pauli-sum = { git = "https://github.com/QuEraComputing/ppvm" }
+  ```
+
+  with `PauliSum` / `GeneralizedTableau` and an `overlap_with_zero()` entry
+  point for the overlap that expectation values are built from. So the
+  in-process tier needs **no Python, no subprocess, and no port** — which makes
+  the bridge genuinely scaffolding rather than the destination. Two things to
+  confirm when starting: whether it builds on aarch64-darwin (the dev box) and
+  what its truncation knob is called, since matching pauliprop's truncation is
+  what makes the comparison meaningful rather than approximate. The bridge remains the cheap way to get a
   first number, but **the destination for ppvm is a direct dependency**, not the
   subprocess. Re-sequence accordingly: bridge first only if it is genuinely
   faster to stand up, and treat it as scaffolding rather than the deliverable.
