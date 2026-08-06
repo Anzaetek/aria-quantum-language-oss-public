@@ -66,6 +66,13 @@ Not needed here, recorded so the Mac-centric list above does not mislead:
   `$CUDA/targets/<arch>/lib/libOpenCL.so`, off the default link path.
 - **A JDK** for TLA+: `apt install openjdk-17-jdk`.
 
+## The optional test matrix
+
+`OPTIONAL_TESTS.md` is the durable record of every opt-in stage — what it
+needs, what it buys, and what has actually been run on this box. Consult it
+before a release: a stage that has not run recently should be visible rather
+than quietly forgotten.
+
 ## Summary
 
 ```console
