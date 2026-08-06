@@ -4,12 +4,20 @@
 //! decomposition samples noisy Clifford+T circuits at scales the MPS backend
 //! cannot reach, and nothing in this repository implements that method.
 //!
-//! **Known limit, stated rather than discovered later.** The bridge protocol
-//! carries QASM2 in and counts out. tsim's distinctive value for QEC —
-//! *detector* and *observable* sampling — has no expression in that shape, so
-//! through this surface tsim is a plain noisy sampler. A detector-aware
-//! extension is separate work, and only worth doing if QEC sampling actually
-//! lands here. See `fixes/TSIM-PPVM.md`.
+//! **tsim is a strong QEC tool; the limitation is this surface, not the tool.**
+//! It carries the full Stim v1.13 instruction set with its noise channels and —
+//! the part that matters for QEC — detectors and observables, which is what
+//! magic-state distillation/cultivation and surface-code studies need.
+//!
+//! The bridge protocol, however, carries QASM2 in and counts out. Detector and
+//! observable records have no expression in that shape, so *through this door*
+//! tsim arrives as a plain noisy sampler with its most useful QEC feature
+//! unreachable.
+//!
+//! So for QEC investigation, drive tsim directly through its own API rather than
+//! through here; extending this protocol with a detector/observable response is
+//! scoped work worth doing only if QEC sampling becomes recurring in this repo.
+//! See `docs/BRIDGES.md` and `fixes/TSIM-PPVM.md`.
 //!
 //! Runner: `python/tsim_runner.py` via the `omega-bridge-tsim-runner` wrapper.
 //! tsim pulls JAX, so it gets its own venv; a missing install is
