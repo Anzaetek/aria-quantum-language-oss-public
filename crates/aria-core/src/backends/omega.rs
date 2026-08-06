@@ -9,6 +9,7 @@
 //! 2. QASM: `ast::to_qasm()` → omega-parser (already works)
 
 use crate::ast::nodes::*;
+use crate::ast::ParamExpr;
 
 /// Omega-compatible gate kind (mirrors omega_core::circuit::GateKind).
 /// We define our own copy so aria-core has no hard dependency on omega-core.
@@ -44,12 +45,58 @@ pub enum OmegaGateKind {
     Reset,
 }
 
+/// One gate parameter on the wire: a bound number, or a free symbol.
+///
+/// Before this existed the wire carried `Vec<f64>` only, and lowering
+/// materialised every free symbol as a `0.0` placeholder. Two consequences,
+/// both bad and both now fixed:
+///
+/// * **A remote gradient was impossible.** With no symbols on the wire the
+///   circuit reaching `Backend::adjoint_gradient` had no free parameters —
+///   there was no θ to differentiate, so the endpoint could only ever have
+///   returned zeros, convincingly.
+/// * **A batch had to re-send its whole gate list per row**, since the only way
+///   to vary a parameter was to bake a different number into a fresh copy of
+///   the circuit. For a same-ansatz batch that payload dominates the wire.
+///
+/// `#[serde(untagged)]` keeps this **backward compatible in both directions**:
+/// a bare JSON number still deserialises as `Concrete`, and a `Concrete`
+/// serialises back to a bare number — so an older client and a newer server
+/// (and the reverse) still understand each other. Only circuits that actually
+/// use symbols carry the new form.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum OmegaParam {
+    /// A bound value. Wire form: `0.5`
+    Concrete(f64),
+    /// A free parameter, by name. Wire form: `{"symbol": "theta"}`
+    Symbol { symbol: String },
+}
+
+impl OmegaParam {
+    /// The bound value, or `None` for a free symbol.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            OmegaParam::Concrete(v) => Some(*v),
+            OmegaParam::Symbol { .. } => None,
+        }
+    }
+
+    /// The symbol name, if this parameter is free.
+    pub fn symbol_name(&self) -> Option<&str> {
+        match self {
+            OmegaParam::Symbol { symbol } => Some(symbol),
+            OmegaParam::Concrete(_) => None,
+        }
+    }
+}
+
 /// A flattened gate operation for omega-functions.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OmegaGateOp {
     pub gate: OmegaGateKind,
     pub qubits: Vec<u32>,
-    pub params: Vec<f64>,
+    pub params: Vec<OmegaParam>,
     pub classical_bit: Option<u32>,
     /// Conditional execution: (classical_bit_index, expected_value).
     /// Gate only executes if classical_bits[bit] == value.
@@ -271,24 +318,33 @@ pub fn try_to_omega_ir(circuit: &Circuit) -> Result<OmegaCircuitIR, String> {
 
             let classical_bit = inst.clbits.first().and_then(|c| clbit_map.get(c).copied());
 
-            // Symbolic params get materialized as 0.0 placeholders; the
-            // caller (e.g. SampleRequest / OmegaGradientRequest) supplies
-            // the real bindings in `param_values`.
-            let params_f64: Vec<f64> = if inst.gate.kind == GateKind::CP {
+            // A free symbol travels AS a symbol. It used to be flattened to a
+            // 0.0 placeholder, which silently discarded the only information a
+            // remote gradient needs and forced every batch row to re-send its
+            // whole circuit.
+            let to_param = |p: &ParamExpr| match p.try_as_f64() {
+                Some(v) => OmegaParam::Concrete(v),
+                None => match p {
+                    ParamExpr::Symbol(name) => OmegaParam::Symbol {
+                        symbol: name.clone(),
+                    },
+                    // An expression that is neither bound nor a bare symbol
+                    // (e.g. `2*theta`) has no wire form yet; keep the previous
+                    // behaviour rather than inventing one.
+                    _ => OmegaParam::Concrete(0.0),
+                },
+            };
+            let params_f64: Vec<OmegaParam> = if inst.gate.kind == GateKind::CP {
                 // CP(λ) → CU3(0, 0, λ): controlled phase as controlled-U1.
                 let lam = inst
                     .gate
                     .params
                     .first()
-                    .and_then(|p| p.try_as_f64())
-                    .unwrap_or(0.0);
-                vec![0.0, 0.0, lam]
+                    .map(&to_param)
+                    .unwrap_or(OmegaParam::Concrete(0.0));
+                vec![OmegaParam::Concrete(0.0), OmegaParam::Concrete(0.0), lam]
             } else {
-                inst.gate
-                    .params
-                    .iter()
-                    .map(|p| p.try_as_f64().unwrap_or(0.0))
-                    .collect()
+                inst.gate.params.iter().map(&to_param).collect()
             };
             let condition = inst
                 .condition
@@ -493,9 +549,9 @@ mod tests {
         let omega = to_omega_ir(&circ);
         assert_eq!(omega.ops.len(), 2);
         assert_eq!(omega.ops[0].gate, OmegaGateKind::Rx);
-        assert_eq!(omega.ops[0].params, vec![1.5]);
+        assert_eq!(omega.ops[0].params, vec![OmegaParam::Concrete(1.5)]);
         assert_eq!(omega.ops[1].gate, OmegaGateKind::Rz);
-        assert_eq!(omega.ops[1].params, vec![0.7]);
+        assert_eq!(omega.ops[1].params, vec![OmegaParam::Concrete(0.7)]);
     }
 
     #[test]
@@ -611,6 +667,63 @@ circuit C {
             OmegaGradMethod::StochasticParameterShift { shots: 256 }
         ));
         assert_eq!(back.observable.terms.len(), 1);
+    }
+
+    /// The wire must stay readable by clients written before symbols existed,
+    /// and must keep reading what they send. `#[serde(untagged)]` gives both
+    /// directions: a bare number decodes as Concrete and re-encodes as a bare
+    /// number, so only circuits that actually use symbols change shape.
+    #[test]
+    fn concrete_params_stay_bare_numbers_on_the_wire() {
+        let p = OmegaParam::Concrete(0.5);
+        assert_eq!(serde_json::to_string(&p).unwrap(), "0.5");
+        // ...and a bare number sent by an older client still decodes.
+        let back: OmegaParam = serde_json::from_str("0.5").unwrap();
+        assert_eq!(back, OmegaParam::Concrete(0.5));
+        assert_eq!(back.as_f64(), Some(0.5));
+    }
+
+    #[test]
+    fn symbols_round_trip_and_are_distinguishable_from_values() {
+        let p = OmegaParam::Symbol {
+            symbol: "theta".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, r#"{"symbol":"theta"}"#);
+        let back: OmegaParam = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back.symbol_name(), Some("theta"));
+        assert_eq!(back.as_f64(), None, "a free symbol has no value yet");
+    }
+
+    /// The whole point of carrying symbols: a free parameter must survive
+    /// lowering. It used to be flattened to a 0.0 placeholder, which discarded
+    /// the only information a remote gradient needs — leaving an endpoint that
+    /// could return zeros very convincingly.
+    #[test]
+    fn free_symbols_survive_lowering_instead_of_becoming_zero() {
+        let mut circ = Circuit::new("ansatz");
+        circ.qreg("q", 1);
+        circ.apply(
+            GateDef::with_exprs(GateKind::RY, vec![ParamExpr::symbol("theta")]),
+            vec![Qubit::new("q", 0)],
+        );
+        let ir = try_to_omega_ir(&circ).expect("lowers");
+        assert_eq!(ir.ops.len(), 1);
+        assert_eq!(
+            ir.ops[0].params[0],
+            OmegaParam::Symbol {
+                symbol: "theta".into()
+            },
+            "a free symbol must reach the wire as a symbol, not as 0.0"
+        );
+    }
+
+    #[test]
+    fn bound_params_still_lower_to_concrete_values() {
+        let circ = CircuitBuilder::new("bound", 1, 0).ry(0, 0.25).build();
+        let ir = try_to_omega_ir(&circ).expect("lowers");
+        assert_eq!(ir.ops[0].params[0], OmegaParam::Concrete(0.25));
     }
 
     /// Continuous-variable gates must be REFUSED by lowering, never dropped.
