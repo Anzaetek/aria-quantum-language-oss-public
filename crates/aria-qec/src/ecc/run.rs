@@ -27,7 +27,7 @@ use super::codes::{QECCode, SurfaceCode};
 use super::mwpm::{decode_mwpm_correction, Correction};
 use aria_core::ast::nodes::{Circuit, GateDef, GateKind, Instruction, Qubit};
 use aria_core::ast::CircuitBuilder;
-use aria_core::backends::omega::{to_omega_ir, OmegaGateKind};
+use aria_core::backends::omega::{to_omega_ir, OmegaGateKind, OmegaParam};
 
 use omega_core::circuit::{
     CircuitIR, CircuitType, GateKind as OGate, GateOp, ParamExpr, Qubit as OQubit,
@@ -136,11 +136,28 @@ pub fn to_omega_core_ir(circuit: &Circuit) -> CircuitIR {
     let mirror = to_omega_ir(circuit);
     let mut ir = CircuitIR::new(mirror.num_qubits, CircuitType::GateBased);
     ir.num_classical_bits = mirror.num_classical_bits;
+    // Wire symbols are names; omega-core keys parameters by SymbolId. Assign
+    // ids in first-appearance order so one name used by several gates stays ONE
+    // parameter. QEC circuits are bound by construction and should carry no
+    // symbols at all, but mapping them properly costs nothing and avoids
+    // silently collapsing a symbol to 0.0 if that ever changes.
+    let mut symbol_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for op in &mirror.ops {
+        let params: Vec<ParamExpr> = op
+            .params
+            .iter()
+            .map(|p| match p {
+                OmegaParam::Concrete(v) => ParamExpr::Concrete(*v),
+                OmegaParam::Symbol { symbol } => {
+                    let next = symbol_ids.len() as u32;
+                    ParamExpr::Symbol(*symbol_ids.entry(symbol.clone()).or_insert(next))
+                }
+            })
+            .collect();
         ir.add_op(GateOp {
             gate: map_gate(&op.gate),
             qubits: op.qubits.iter().map(|q| OQubit(*q)).collect(),
-            params: op.params.iter().map(|p| ParamExpr::Concrete(*p)).collect(),
+            params: params.into(),
             classical_bit: op.classical_bit,
             // quantum-core conditions are single-bit `(bit, value)`; omega uses
             // `(start_bit, num_bits, expected)`.

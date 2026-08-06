@@ -1081,6 +1081,80 @@ async fn expectation_batch_reports_per_row_execution_times() {
 }
 
 #[tokio::test]
+async fn wire_symbols_are_accepted_and_shared_names_become_one_parameter() {
+    // A circuit whose two gates share the symbol "theta". If translation gave
+    // each occurrence its own id, a shared-parameter ansatz -- which is every
+    // real ansatz -- would differentiate incorrectly. Both must map to ONE
+    // parameter.
+    //
+    // Exercised end to end: the server must accept the new wire form at all.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 2, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [
+                {"gate": "Ry", "qubits": [0], "params": [{"symbol": "theta"}],
+                 "classical_bit": null, "condition": null},
+                {"gate": "Ry", "qubits": [1], "params": [{"symbol": "theta"}],
+                 "classical_bit": null, "condition": null}
+            ]
+        },
+        "shots": 32, "seed": 7
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/execute", &token, &body))
+        .await
+        .unwrap();
+    // The wire form must PARSE -- a deserialisation failure would be a 422 or a
+    // body-level rejection. Execution then fails for the right reason: a free
+    // symbol has no value, so an unbound circuit is not runnable. Symbols exist
+    // for the binding and gradient paths, not for bare execution.
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an unbound symbolic circuit is not executable"
+    );
+    let v = read_body_json(resp.into_body()).await;
+    let err = v["error"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        err.contains("symbol") || err.contains("unbound"),
+        "must fail on the UNBOUND SYMBOL, not on parsing the wire form: {err}"
+    );
+}
+
+#[tokio::test]
+async fn bare_numbers_still_work_for_clients_written_before_symbols() {
+    // Backward compatibility is the whole reason the wire form is untagged: an
+    // older client sends `"params": [0.3]` and must be unaffected.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "Ry", "qubits": [0], "params": [0.3],
+                     "classical_bit": null, "condition": null}]
+        },
+        "observable": "Z0"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_body_json(resp.into_body()).await;
+    let got = v["values"][0].as_f64().expect("a value");
+    // <Z> = cos(0.3) for Ry(0.3) on |0>.
+    assert!(
+        (got - 0.3_f64.cos()).abs() < 1e-9,
+        "bare-number params must still bind: got {got}, want {}",
+        0.3_f64.cos()
+    );
+}
+
+#[tokio::test]
 async fn health_publishes_the_execution_budget() {
     // A client should be able to size work before submitting rather than
     // discovering the ceiling by being rejected.

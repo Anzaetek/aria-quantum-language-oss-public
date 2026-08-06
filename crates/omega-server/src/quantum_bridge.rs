@@ -74,11 +74,26 @@ pub enum OmegaGateKind {
     Reset,
 }
 
+/// One gate parameter: a bound number, or a free symbol.
+///
+/// `#[serde(untagged)]` keeps the wire backward compatible — a bare number
+/// still decodes as `Concrete`, so an older client talking to this server (and
+/// the reverse) is unaffected. Only circuits that use symbols carry the new
+/// form. Without symbols on the wire there is nothing for a gradient to
+/// differentiate with respect to, and a batch must re-send its whole gate list
+/// per row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OmegaParam {
+    Concrete(f64),
+    Symbol { symbol: String },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OmegaGateOp {
     pub gate: OmegaGateKind,
     pub qubits: Vec<u32>,
-    pub params: Vec<f64>,
+    pub params: Vec<OmegaParam>,
     pub classical_bit: Option<u32>,
     pub condition: Option<(u32, u64)>,
 }
@@ -192,10 +207,25 @@ pub fn translate_to_core_ir(ir: &OmegaCircuitIR) -> CircuitIR {
     };
     let mut core = CircuitIR::new(ir.num_qubits, circuit_type);
     core.num_classical_bits = ir.num_classical_bits;
+    // Wire symbols are names; omega-core keys parameters by `SymbolId`. Assign
+    // ids in first-appearance order and register them, so the SAME name in two
+    // gates maps to ONE parameter — which is what makes a shared-parameter
+    // ansatz differentiable at all.
+    let mut symbol_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for op in &ir.ops {
         let qubits: SmallVec<[Qubit; 3]> = op.qubits.iter().map(|&q| Qubit(q)).collect();
-        let params: SmallVec<[ParamExpr; 3]> =
-            op.params.iter().map(|&p| ParamExpr::Concrete(p)).collect();
+        let params: SmallVec<[ParamExpr; 3]> = op
+            .params
+            .iter()
+            .map(|p| match p {
+                OmegaParam::Concrete(v) => ParamExpr::Concrete(*v),
+                OmegaParam::Symbol { symbol } => {
+                    let next = symbol_ids.len() as u32;
+                    let id = *symbol_ids.entry(symbol.clone()).or_insert(next);
+                    ParamExpr::Symbol(id)
+                }
+            })
+            .collect();
         core.add_op(GateOp {
             gate: op.gate.to_core(),
             qubits,
@@ -805,7 +835,7 @@ mod tests {
             ops: vec![OmegaGateOp {
                 gate: OmegaGateKind::Ry,
                 qubits: vec![0],
-                params: vec![theta],
+                params: vec![OmegaParam::Concrete(theta)],
                 classical_bit: None,
                 condition: None,
             }],
