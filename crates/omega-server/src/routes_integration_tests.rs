@@ -1155,6 +1155,98 @@ async fn bare_numbers_still_work_for_clients_written_before_symbols() {
 }
 
 #[tokio::test]
+async fn gradient_route_differentiates_a_symbolic_circuit() {
+    // d/dtheta <Z> for Ry(theta)|0> is -sin(theta). This is the whole point of
+    // putting symbols on the wire: before that the circuit reaching the adjoint
+    // had no free parameters and this endpoint could only have returned zeros.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "Ry", "qubits": [0], "params": [{"symbol": "theta"}],
+                     "classical_bit": null, "condition": null}]
+        },
+        "observable": "Z0",
+        "param_values": [["theta", 0.7]]
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/gradient", &token, &body))
+        .await
+        .unwrap();
+    let st = resp.status();
+    let v = read_body_json(resp.into_body()).await;
+    assert_eq!(st, StatusCode::OK, "body: {v}");
+    let g = &v["gradients"][0][0];
+    assert_eq!(g[0].as_str(), Some("theta"), "labelled by NAME, not by id");
+    let got = g[1].as_f64().expect("a derivative");
+    let want = -(0.7_f64).sin();
+    assert!(
+        (got - want).abs() < 1e-9,
+        "d<Z>/dtheta at 0.7: got {got}, want {want}"
+    );
+}
+
+#[tokio::test]
+async fn gradient_refuses_a_circuit_with_nothing_to_differentiate() {
+    // A circuit with no free symbols must be REFUSED, not answered with an
+    // empty gradient that reads as "all derivatives are zero" — the exact
+    // failure mode the wire change was made to remove.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "Ry", "qubits": [0], "params": [0.7],
+                     "classical_bit": null, "condition": null}]
+        },
+        "observable": "Z0",
+        "param_values": []
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/gradient", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v = read_body_json(resp.into_body()).await;
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(err.contains("no free parameters"), "{err}");
+}
+
+#[tokio::test]
+async fn gradient_batch_returns_one_row_per_circuit_in_order() {
+    // Q5: index preservation. Two bindings of the same ansatz, distinguishable
+    // by their derivatives, must come back in submission order.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let circ = serde_json::json!({
+        "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": "Statevector",
+        "ops": [{"gate": "Ry", "qubits": [0], "params": [{"symbol": "theta"}],
+                 "classical_bit": null, "condition": null}]
+    });
+    let body = serde_json::json!({
+        "circuits": [circ.clone(), circ],
+        "observable": "Z0",
+        "param_values": [["theta", 0.25]]
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/gradient", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_body_json(resp.into_body()).await;
+    let rows = v["gradients"].as_array().expect("gradients array");
+    assert_eq!(rows.len(), 2, "one gradient per circuit");
+    for r in rows {
+        let got = r[0][1].as_f64().expect("derivative");
+        assert!((got - -(0.25_f64).sin()).abs() < 1e-9, "got {got}");
+    }
+}
+
+#[tokio::test]
 async fn health_publishes_the_execution_budget() {
     // A client should be able to size work before submitting rather than
     // discovering the ceiling by being rejected.
