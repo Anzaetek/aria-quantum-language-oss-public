@@ -49,13 +49,13 @@ TypeOK ==
     /\ finished \subseteq Jobs
     /\ admitted \cap finished = {}
 
-Used == LET S == admitted IN
-        IF S = {} THEN 0
-        ELSE LET f[x \in SUBSET Jobs] ==
-                 IF x = {} THEN 0
-                 ELSE LET j == CHOOSE j \in x : TRUE
-                      IN Weight[j] + f[x \ {j}]
-             IN f[S]
+RECURSIVE SumWeights(_)
+SumWeights(S) ==
+    IF S = {} THEN 0
+    ELSE LET pick == CHOOSE y \in S : TRUE
+         IN Weight[pick] + SumWeights(S \ {pick})
+
+Used == SumWeights(admitted)
 
 Free == Capacity - Used
 
@@ -96,8 +96,8 @@ Next ==
 
 (* Weak fairness on completion and admission: work that can proceed does. *)
 Spec == Init /\ [][Next]_vars
-        /\ \A j \in Jobs : WF_vars(Complete(j))
-        /\ \A j \in Jobs : WF_vars(Admit(j))
+        /\ \A c \in Jobs : WF_vars(Complete(c))
+        /\ \A a \in Jobs : WF_vars(Admit(a))
 
 --------------------------------------------------------------------------
 (* SAFETY — these must hold. *)
