@@ -125,6 +125,38 @@ The wire type already exists on the language side (`OmegaGradientRequest`,
 
 - Route accepting `OmegaGradientRequest`, **batched like `/expectation`**
   (`circuits: [...]`), returning `d⟨O⟩/dθ` per circuit in input order.
+> **BLOCKER discovered 2026-08-06, before writing the route.** A gradient route
+> over the current wire IR **cannot compute a gradient at all**, because the
+> wire cannot express what to differentiate *with respect to*.
+>
+> `OmegaGateOp.params` is `Vec<f64>`, and `translate_to_core_ir`
+> (`quantum_bridge.rs:198`) maps every one to `ParamExpr::Concrete`. Zero
+> `Symbol` occurrences survive translation. So the circuit reaching
+> `Backend::adjoint_gradient` has **no free parameters**: there is no θ, and the
+> adjoint has nothing to differentiate. `OmegaGradientRequest.param_values`
+> carries `(String, f64)` symbol *names* that nothing on the wire binds to.
+>
+> Implementing the route without fixing this would produce an endpoint that
+> returns empty or zero gradients very convincingly — the same shape of defect
+> as the CV silent-drop and the MPS under-pricing: confident output, no physics.
+>
+> **Two ways forward, and the choice belongs to whoever owns the wire format:**
+>
+> 1. **Carry symbols on the wire.** Extend `OmegaGateOp.params` from `Vec<f64>`
+>    to a `ParamExpr`-like sum (`Concrete(f64) | Symbol(name)`). Additive JSON,
+>    but it changes a format downstream clients pin (K3), and it is the *same*
+>    change A0 item 1 needs for the template + parameter-matrix encoding — so
+>    doing it once unlocks both the ~90× payload win and gradients.
+> 2. **Positional differentiation.** Keep params concrete and have the client
+>    name what to differentiate by position (`gate_index`, `param_index`).
+>    Requires no format change and is strictly less expressive: it cannot
+>    express one symbol shared across several gates, which every real ansatz
+>    does.
+>
+> **Recommendation: option 1**, because A0 needs it regardless and option 2's
+> limitation (no shared parameters) rules out the ansätze this is for. A1 is
+> therefore **blocked on a wire-format decision**, not on implementation effort.
+
 - **Wire shape, specified.** `OmegaGradientRequest` (`omega.rs:371-376`) carries
   exactly **one** circuit, so batching needs a container. Mirror
   `QuantumExpectationReq` (`quantum_bridge.rs:534-546`) exactly, so the two
