@@ -84,6 +84,41 @@ That pair is the point. A safety property holding only in the guarded world
 shows the governor *does something*; a property that held in both would be
 proving arithmetic, not code.
 
+### The governor prices the circuit, not the job
+
+**A finding, not a hypothetical.** `MCClassical.cfg` gives each QML row a
+classical footprint — a loaded dataset, optimizer state, the autograd tape —
+alongside its circuit, and checks *total* resident memory rather than only what
+the governor counts:
+
+```
+Error: Invariant MachineNeverExhausted is violated.
+  admitted = {"qml1", "qml2"}
+```
+
+Two 4 GB rows with a 30 GB classical side each. The governor prices 8 GB against
+a 64 GB budget and reports 56 GB of headroom; the machine holds 68 GB and is over
+budget. `NeverExceedsCapacity` **holds throughout** — admission is satisfied
+while the box dies.
+
+`worker.rs` prices `2^n * 16` and nothing else. A QML step is not only its
+circuit, and a QAS driver keeps per-trial bookkeeping of its own. For a batched
+QML workload the unpriced side can be several times the statevector, so the
+budget's headroom figure is not just imprecise, it is misleading.
+
+Three ways to close it, none yet implemented:
+
+1. **Let the client declare it** — an optional `classical_bytes` on submit,
+   added to the priced weight. Simple, and honest about who knows the number.
+2. **Reserve headroom** — treat only a fraction of the pool as the circuit
+   budget. Crude but needs nothing from the caller.
+3. **Measure it** — sample process RSS and refuse when the machine, not the
+   ledger, is close to full. Most accurate, most machinery.
+
+Until then, the honest statement is: **the governor bounds simulation memory, not
+process memory.** With `Classical` all-zero the two invariants are identical,
+which is exactly the idealisation the shipped code assumes.
+
 ### Adding a platform
 
 Budgets live in `Platforms.tla` — DGX Spark (GB10) 64, GH200 96 GB → 48,
