@@ -909,6 +909,67 @@ transfer, not exec; a suspended-and-resumed client does not report the sleep as
 server latency; and the A0 batching change is demonstrated by a before/after
 byte count rather than a claim.
 
+### A12. Optional cluster manager — same protocol, resources per node
+
+**PLAN ONLY.** Scale the executor from one box to several without changing the
+client at all. A coordinator speaks **exactly the protocol a single server
+speaks**, so a caller cannot tell the difference and nothing in `remote.rs`,
+`aria-py` or a third-party client needs to know a cluster exists. If the client
+has to be cluster-aware, the design has failed.
+
+**Pull, not push — because admission authority must stay on the node.** The
+coordinator does not assign rows. Idle workers **steal** them from the batch's
+pending set, and a worker takes a row only if **its own governor** admits it
+(A7/A7b/A7c, unchanged). Push scheduling would require the coordinator to model
+every node's live capacity, which is stale the moment it is read and wrong the
+moment a job finishes early. Pull makes each node the authority on its own
+memory, which is the only place that fact is ever correct.
+
+**Nodes are heterogeneous, and that changes what a refusal means.** A cluster
+may hold a DGX Spark (unified ~128 GB), a discrete-GPU box, and a spare laptop.
+A row that fits one may fit none of the others. So:
+
+- **413 only if *no* node could ever run it** — the ceiling is the max over
+  nodes, not the min, and not the coordinator's own memory.
+- **429 while some node could run it but none is free** — the existing
+  distinction survives, which is what keeps client retry logic (A8) correct.
+- The refusal should name the largest node, so "needs 64 GB; the largest node
+  has 24 GB" is actionable rather than mysterious.
+
+**Rows are the unit of work, so A9 is a prerequisite.** Durable batches already
+give per-row identity, status, incremental commit and a resume cursor — exactly
+the stealable work item. Building cluster support before A9 would mean inventing
+that twice.
+
+**Failure handling turns exactly-once into at-least-once + idempotency.** A
+worker that dies mid-row must not swallow it:
+
+- rows are **leased**, not assigned; a lease expires and the row returns to the
+  pending set;
+- so a row can execute **twice** (slow worker plus re-lease), which is fine for
+  a pure circuit evaluation but must be stated, and the result write must be
+  idempotent — last writer wins, same value;
+- a worker heartbeats while running so a long row is not mistaken for a dead one
+  (the same signal A6 needs, built once).
+
+**Observability has to gain a node dimension or it becomes useless.**
+`/health` aggregates per-node pools rather than summing them into one fictional
+budget — a cluster with 4×24 GB cannot run a 96 GB job, and an aggregate number
+would imply it can. A11's timing gains a `node` attribution, so "which node was
+slow" is answerable; without it a cluster turns every performance question into
+a guess.
+
+**Explicitly out of scope:** cross-node parallelism *within* one circuit
+(distributed statevector). That is a different and much harder problem —
+communication-bound rather than embarrassingly parallel. This is a work
+distributor for many independent circuits, which is exactly the shape of
+architecture search and batched QML inference, and it should say so rather than
+imply distributed simulation.
+
+Sequenced after A9 (durable batches) and A10 (the models — `Governor.tla` grows
+a node dimension, and the lease/steal protocol is precisely the kind of thing
+worth model-checking before it is written).
+
 ### C3. Photonics from the Aria surface — **CONFIRMED scope** (2026-08-06)
 
 Promoted from "only if separately prioritized" on explicit instruction. Today
@@ -1119,7 +1180,10 @@ C3, if ever done, moves both — and those numbers must be regenerated, not edit
 9. **D4, D1** — verify-and-close the three already-fixed bug docs
 10. **D3** — QASM3 audit against the request's checklist
 11. **A5** — expectation-path device routing + honest `backend_name`
-12. **B1–B6 + C2** — CV backend and its examples, gated on the DGX search
+12. **A12** — optional cluster manager (same protocol, per-node resources,
+    work stealing). After A9/A10, since rows are the stealable unit and the
+    lease protocol is worth model-checking first.
+13. **B1–B6 + C2** — CV backend and its examples, gated on the DGX search
 
 Constraints throughout: `./ci.sh` is the single source of truth and must stay
 green (K13), with external oracles optional and cleanly skipped; no stdout from
