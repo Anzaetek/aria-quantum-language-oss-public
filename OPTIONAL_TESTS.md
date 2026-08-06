@@ -1,5 +1,5 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Optional test stages — the full matrix
+# Test stages beyond the default run
 
 `./ci.sh` runs 9 core stages plus tch, Metal and OpenCL by default. Several
 further stages exist but are **opt-in**, because they need tooling the default
@@ -9,13 +9,22 @@ This file is the durable record of what those stages are, what they need, and
 what is set up on the development box — so a stage that has not run recently is
 visible rather than quietly forgotten.
 
+> **The Qiskit differential cross-check is MANDATORY**, not optional. It is the
+> only independent implementation available, and this project has already
+> shipped a defect that every *internal* agreement gate missed. Open question
+> recorded in the todo list: the stage currently **skips cleanly** when the venv
+> is absent, which for a mandatory check is the wrong default — a machine
+> without it still reports green. Making it truly mandatory means `ci.sh` must
+> fail rather than skip, which cuts against K13's clean-skip rule for external
+> tooling. That is a policy decision about what a green CI is allowed to mean.
+
 Audited 2026-08-06 on Apple Silicon / macOS. `PREREQUISITES.md` covers install
 details; this covers *what each stage buys you*.
 
 | stage | enable with | needs | status here | last result |
 |---|---|---|---|---|
-| Qiskit differential cross-check | `ARIA_QISKIT_XCHECK=1` | `.venv-qiskit` with `qiskit`, `qiskit-aer` | **NOT SET UP** | aria vs Qiskit `4.441e-16`; stabilizer vs CPU `4.441e-16`; Metal vs CPU `1.857e-7` (f32) — recorded in `STATUS.md`, not re-run this session |
-| QEC encoded-demo cross-check | `ARIA_QEC_XCHECK=1` | same venv | **NOT SET UP** | — |
+| **Qiskit differential cross-check — MANDATORY** | `ARIA_QISKIT_XCHECK=1` | `.venv-qiskit` with `qiskit`, `qiskit-aer` | **INSTALLED** (qiskit 2.5.1 / aer 0.17.2) | **60 agree, 0 disagree, worst |Δp| = 4.441e-16** — re-measured 2026-08-06, `CI_EXIT=0` |
+| QEC encoded-demo cross-check | `ARIA_QEC_XCHECK=1` | same venv | **INSTALLED** | — |
 | Lean 4 proof tree | `ARIA_LEAN=1` | `elan` + `lake`, warm mathlib cache | **READY** | 8281 jobs, exit 0 |
 | TLA+ models | `tools/tla/check.sh` | JDK + `tla2tools.jar` | **READY** | safety holds (26 states); liveness violated — starvation, *expected* |
 | CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here** | untested on this box |

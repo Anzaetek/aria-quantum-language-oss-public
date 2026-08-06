@@ -180,8 +180,10 @@ here because a client built without knowing them will be surprised.
 5. **No per-row cancellation.** A batch can only be abandoned wholesale, so
    pruning individual trials mid-flight is not possible server-side. *Drive
    pruning by submitting trials in small batches you can simply stop issuing.*
-6. **No gradient endpoint.** Training loops are local-only; the wire carries
-   scores, not derivatives.
+6. **Gradients are available** (`POST /v1/quantum/gradient`) but require
+   **symbolic** parameters on the wire: `"params": [{"symbol": "theta"}]` plus
+   `param_values`. A circuit with only concrete numbers has nothing to
+   differentiate and is refused rather than answered with an empty gradient.
 7. **Every row carries its full circuit.** There is no template + parameter
    matrix, so a batch re-sends the whole gate list per row. For same-ansatz
    workloads this dominates the payload. *Over a tunnel, prefer fewer, larger
@@ -212,8 +214,9 @@ here because a client built without knowing them will be surprised.
 
 - Rows share an ansatz, so batching helps most here; group a data batch into one
   request rather than one request per row.
-- Gradients are not available remotely (§3.6): training runs locally, or scores
-  remotely and differentiates locally.
+- Gradients are available remotely (§3.6). Send the ansatz with symbolic
+  parameters and the bindings in `param_values`; derivatives come back labelled
+  by name, one row per circuit, in order.
 - Do not rely on the server to retain anything between steps. It does not.
 
 **Both**: assume the connection can drop and the work is lost. Until durable

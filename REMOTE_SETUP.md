@@ -246,8 +246,9 @@ Honest list, so nothing surprises you mid-project:
 
 - **Execution is synchronous.** No job IDs, no polling; a dropped connection
   loses the work in flight.
-- **No gradient endpoint.** Remote is score-only today, so training loops run
-  locally.
+- **Gradients need symbolic parameters.** `POST /v1/quantum/gradient` works, but
+  the circuit must carry `{"symbol": "theta"}` params plus `param_values`; a
+  fully-concrete circuit has nothing to differentiate and is refused.
 - **A batch fails wholesale** if any row is invalid.
 - **`aria train` does not target a remote server**; `aria run` and expectation
   calls do.

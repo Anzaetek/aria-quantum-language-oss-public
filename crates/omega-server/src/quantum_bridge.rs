@@ -200,6 +200,17 @@ impl OmegaGateKind {
 
 /// Translate the quantum-core wire IR into omega-core's `CircuitIR`.
 pub fn translate_to_core_ir(ir: &OmegaCircuitIR) -> CircuitIR {
+    translate_with_symbols(ir).0
+}
+
+/// Translate, and also return the wire-name -> `SymbolId` map.
+///
+/// The gradient route needs it in both directions: to bind `param_values` given
+/// by name, and to label the returned derivatives by name again. A caller must
+/// never have to guess which id an id-keyed result refers to.
+pub fn translate_with_symbols(
+    ir: &OmegaCircuitIR,
+) -> (CircuitIR, std::collections::HashMap<String, u32>) {
     let circuit_type = if ir.is_photonic {
         CircuitType::Photonic
     } else {
@@ -244,7 +255,14 @@ pub fn translate_to_core_ir(ir: &OmegaCircuitIR) -> CircuitIR {
                 .map(|(start_bit, expected)| (start_bit, 1, expected)),
         });
     }
-    core
+    // Register the names in the circuit's symbol table. Without this the ops
+    // carry ParamExpr::Symbol(id) but the circuit reports no parameters, so the
+    // adjoint finds nothing to differentiate and returns an EMPTY gradient —
+    // which reads as "all derivatives are zero" rather than as an error.
+    for (name, id) in &symbol_ids {
+        core.symbols.insert(*id, name.clone());
+    }
+    (core, symbol_ids)
 }
 
 /// Map a resolved backend to the cost curve the governor should price it with.
@@ -656,6 +674,144 @@ pub async fn execute_quantum_route(
         )
             .into_response(),
     }
+}
+
+#[derive(Deserialize)]
+pub struct QuantumGradientReq {
+    /// A single circuit, XOR `circuits` — mirrors `QuantumExpectationReq` field
+    /// for field so the two routes stay learnable as a pair.
+    #[serde(default)]
+    pub circuit: Option<OmegaCircuitIR>,
+    #[serde(default)]
+    pub circuits: Option<Vec<OmegaCircuitIR>>,
+    pub observable: String,
+    /// Bindings for the circuit's free symbols, by name.
+    #[serde(default)]
+    pub param_values: Vec<(String, f64)>,
+}
+
+/// `POST /v1/quantum/gradient` — `d⟨O⟩/dθ` for one bound circuit or a batch.
+///
+/// Returns one gradient per circuit, **in input order** (Q5), each a list of
+/// `[symbol_name, value]`. Names, not ids: a caller cannot be expected to guess
+/// the server's internal numbering.
+///
+/// Requires the `EXECUTE` right.
+pub async fn gradient_quantum_route(
+    Extension(claims): Extension<TokenClaims>,
+    State(_state): State<SharedState>,
+    Json(req): Json<QuantumGradientReq>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_rights(&claims, rights::EXECUTE) {
+        return resp;
+    }
+    let mut timer = PhaseTimer::new();
+    let bad = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+
+    let circuits: Vec<OmegaCircuitIR> = match (req.circuit, req.circuits) {
+        (Some(c), None) => vec![c],
+        (None, Some(cs)) => cs,
+        (Some(_), Some(_)) => return bad("provide either `circuit` or `circuits`, not both".into()),
+        (None, None) => return bad("provide `circuit` or `circuits`".into()),
+    };
+    if circuits.is_empty() {
+        return bad("`circuits` is empty".into());
+    }
+    let observable = match Observable::parse(&req.observable) {
+        Ok(o) => o,
+        Err(e) => return bad(format!("bad observable '{}': {e}", req.observable)),
+    };
+
+    // A gradient holds the backward state alongside the forward one, so it is
+    // priced with `gradient = true` rather than as a plain expectation.
+    let mut shape = shape_for(&circuits[0], true, circuits.len());
+    shape.gradient = true;
+    let _reservation = match admit_shape(&shape) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    timer.mark("admit");
+
+    let backend = omega_backend_statevector::StatevectorBackend::new();
+    let mut gradients = Vec::with_capacity(circuits.len());
+    for (i, ir) in circuits.iter().enumerate() {
+        let (core, symbol_ids) = translate_with_symbols(ir);
+        if symbol_ids.is_empty() {
+            // Refuse rather than return an empty gradient that reads as "all
+            // derivatives are zero". A circuit with no free symbols has nothing
+            // to differentiate, and saying so is the whole lesson of the wire
+            // change that made this route possible.
+            return bad(format!(
+                "circuit[{i}] has no free parameters — send symbolic params                  (e.g. \"params\": [{{\"symbol\": \"theta\"}}]) to differentiate against"
+            ));
+        }
+        let mut binding = ParameterBinding::new();
+        for (name, value) in &req.param_values {
+            match symbol_ids.get(name) {
+                Some(id) => binding.bind(*id, *value),
+                None => {
+                    return bad(format!(
+                        "circuit[{i}]: no free parameter named '{name}' in this circuit"
+                    ))
+                }
+            }
+        }
+        // Every symbol must be bound: an unbound one would silently evaluate as
+        // whatever the backend defaults to.
+        for (name, id) in &symbol_ids {
+            if !req.param_values.iter().any(|(n, _)| n == name) {
+                let _ = id;
+                return bad(format!(
+                    "circuit[{i}]: parameter '{name}' is free but has no value in `param_values`"
+                ));
+            }
+        }
+
+        match backend.adjoint_gradient(&core, &binding, &observable) {
+            Ok(Some(grads)) => {
+                // Map ids back to the names the caller used.
+                let by_id: std::collections::HashMap<u32, &String> =
+                    symbol_ids.iter().map(|(n, i)| (*i, n)).collect();
+                let named: Vec<(String, f64)> = grads
+                    .into_iter()
+                    .map(|(id, v)| {
+                        (
+                            by_id
+                                .get(&id)
+                                .map(|s| (*s).clone())
+                                .unwrap_or_else(|| format!("sym{id}")),
+                            v,
+                        )
+                    })
+                    .collect();
+                gradients.push(named);
+            }
+            Ok(None) => {
+                return bad(format!(
+                    "circuit[{i}]: this circuit is not differentiable by the adjoint method                      (non-unitary ops such as Reset or mid-circuit measurement)"
+                ))
+            }
+            Err(e) => return bad(format!("circuit[{i}]: {e}")),
+        }
+    }
+    timer.mark("exec");
+
+    (
+        StatusCode::OK,
+        [("Server-Timing", timer.server_timing_header())],
+        Json(serde_json::json!({
+            "backend": "statevector",
+            "gradients": gradients,
+            "timing": timer.to_json(),
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
