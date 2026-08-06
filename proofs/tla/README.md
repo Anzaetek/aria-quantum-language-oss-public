@@ -54,48 +54,42 @@ with `<-`.
 
 ## `Governor.tla` — what it says
 
-**Safety — checked, holds.** 26 distinct states, exhaustive:
+**The question:** can a shared box be driven into memory exhaustion by the jobs
+people actually submit?
+
+**The scenario** (`MCGovernor.tla`): one 128 GB box, half its memory given to
+simulation, so a 64 GB execution budget. Three jobs, sized by the real cost
+model (`2^n * 16` bytes):
+
+| job | qubits | needs |
+|---|---|---|
+| `qml1`, `qml2` | 28 | 4 GB each — inference rows, submitted often |
+| `sweep` | 32 | 64 GB — one architecture-search trial |
+
+Four extra qubits is **sixteen times** the memory. That ratio is why admission
+control is not optional: an inference row fits trivially, and a search trial
+needs the entire budget.
+
+**Safety — checked, holds.** Exhaustive over 22 states:
 
 ```
 Model checking completed. No error has been found.
-67 states generated, 26 distinct states found, 0 states left on queue.
 ```
 
-The admitted set never exceeds capacity, and a completed job returns exactly
-what it took — the properties the byte-weighted semaphore exists to provide.
+Admitted jobs never exceed 64 GB, and a finished job gives its memory back. No
+interleaving of submissions and completions exhausts the box.
 
-**Liveness — checked, FAILS. That is the finding.**
+**Liveness — checked, FAILS.**
 
 ```
 Error: Temporal properties were violated.
 ```
 
-with this lasso (small jobs cycling, `big` never admitted):
-
-```
-State 1  admitted = {}            finished = {}
-State 2  admitted = {s2}          finished = {}          <- Admit
-State 3  admitted = {s1, s2}      finished = {}          <- Admit
-State 4  admitted = {s1}          finished = {s2}        <- Complete
-State 5  admitted = {}            finished = {s1, s2}    <- Complete
-State 6  admitted = {}            finished = {s1}        <- Resubmit
-Back to state 1                                          <- Resubmit
-```
-
-Note *why* weak fairness does not save `big`: `Admit(big)` is enabled at states
-5, 6 and 1 (`Free = 4 >= 3`) but **not** at 2 and 3, so it is never
-*continuously* enabled and `WF` never obliges it to fire. A trickle of small
-work keeps re-closing the window. Meanwhile the client is receiving `429` with
-`Retry-After` — a header promising a retry that will never succeed.
-
-The instance is deliberately tiny: three jobs against a 4-unit budget, two small
-(1 each) and one large (3). Starvation needs an interleaving, not scale.
-
-This is recorded in `FIXES_PLAN.md` as A7 gap 3 ("no bounded queue; large jobs
-are starvable"). The value of having it here is that the fix can be designed
-against a concrete counterexample rather than an intuition, and the property
-re-checked once a queue exists — at which point `EventuallyAdmitted` should
-hold and this README should say so.
+One 4 GB inference row is enough to keep the 64 GB trial out. Admission uses a
+non-blocking `try_acquire` with **no queue**, so a steady stream of small work
+starves the search indefinitely while the client receives `429` with a
+`Retry-After` promising a retry that never succeeds. That is A7 gap 3 as a
+reproducible trace, and the design input for a bounded queue.
 
 ## Why this survives the move to a cluster
 
