@@ -26,6 +26,15 @@ WASM_GUESTS=(vqe omega_app)
 
 step() { printf '\n\033[1;34m== %s ==\033[0m\n' "$1"; }
 
+# Stages that did NOT run, collected for the final line.
+#
+# An inline "(skipping ...)" scrolls away in a 3000-line log, and the last line
+# is what a human — or an agent reading the tail — actually acts on. A green
+# summary that does not say what was skipped is how coverage quietly erodes:
+# every run looks identical whether 12 stages ran or 6.
+SKIPPED_STAGES=()
+skipped() { SKIPPED_STAGES+=("$1"); echo "  (skipping $1)"; }
+
 step "1/9  Format check (Aria crates)"
 cargo fmt "${FMT_CRATES[@]}" -- --check
 
@@ -246,7 +255,7 @@ if [ "${ARIA_TCH:-1}" = "1" ]; then
   fi
 else
   echo
-  echo "  (skipping tch backend — ARIA_TCH=0)"
+  skipped "tch backend — ARIA_TCH=0"
 fi
 
 # --- Mac GPU stages default ON -----------------------------------------------
@@ -297,7 +306,7 @@ if [ "${ARIA_CUDA:-0}" = "1" ]; then
   echo "  OK: CUDA Reset channel (on-device sampling) == Aer"
 else
   echo
-  echo "  (skipping CUDA backends — set ARIA_CUDA=1 on a CUDA box to enable)"
+  skipped "CUDA backends — set ARIA_CUDA=1 on a CUDA box"
 fi
 
 # Qiskit differential cross-check. MANDATORY in intent: it is the only
@@ -370,7 +379,7 @@ if [ "${ARIA_METAL:-0}" = "1" ]; then
   echo "  OK: Metal GPU statevector + MPS(θ-contraction) + pauliprop(branch) + RBS match CPU"
 else
   echo
-  echo "  (skipping Metal backends — not macOS; on a Mac this runs by default)"
+  skipped "Metal backends — not macOS"
 fi
 
 # OpenCL GPU statevector backend. Default ON on macOS (Apple ships
@@ -403,7 +412,7 @@ if [ "${ARIA_OPENCL:-0}" = "1" ]; then
   echo "  OK: OpenCL statevector kernels + adjoint + pauli(odd-Y) match CPU"
 else
   echo
-  echo "  (skipping OpenCL backend — set ARIA_OPENCL=1 on a host with an OpenCL ICD; on a Mac this runs by default)"
+  skipped "OpenCL backend — set ARIA_OPENCL=1 on a host with an OpenCL ICD"
 fi
 
 # Optional: Lean 4 proof tree (opt-in; needs a warm mathlib cache via elan/lake).
@@ -532,7 +541,7 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
   fi
 else
   echo
-  echo "  (skipping Lean proof tree — set ARIA_LEAN=1 to enable; needs lake + mathlib cache)"
+  skipped "Lean proof tree — set ARIA_LEAN=1 (needs lake + mathlib cache)"
 fi
 
 # Optional: QEC encoded-demo cross-check against Qiskit (opt-in; needs a Python
@@ -550,14 +559,23 @@ if [ "${ARIA_QEC_XCHECK:-0}" = "1" ]; then
   fi
 else
   echo
-  echo "  (skipping QEC cross-check — set ARIA_QEC_XCHECK=1 with a qiskit venv to enable)"
+  skipped "QEC cross-check (MANDATORY) — set ARIA_QEC_XCHECK=1 with a qiskit venv"
 fi
 
 if [ -n "${QISKIT_XCHECK_SKIPPED:-}" ]; then
-    # Repeat at the very end: the warning above scrolls past in a 3000-line log,
-    # and the last line is what a human (or an agent) actually reads.
-    printf '\n\033[1;32mAll CI stages passed\033[0m \033[1;33m— but WITHOUT the mandatory Qiskit cross-check (%s)\033[0m\n' \
-        "$QISKIT_XCHECK_SKIPPED"
+    SKIPPED_STAGES+=("Qiskit cross-check (MANDATORY) — $QISKIT_XCHECK_SKIPPED")
+fi
+
+if [ ${#SKIPPED_STAGES[@]} -eq 0 ]; then
+    printf '\n\033[1;32mAll CI stages passed — nothing skipped.\033[0m\n'
 else
-    printf '\n\033[1;32mAll CI stages passed.\033[0m\n'
+    printf '\n\033[1;32mAll CI stages that ran passed\033[0m'
+    printf '\033[1;33m — but %d stage(s) did NOT run:\033[0m\n' "${#SKIPPED_STAGES[@]}"
+    for sk in "${SKIPPED_STAGES[@]}"; do
+        case "$sk" in
+            *MANDATORY*) printf '\033[1;31m  !! %s\033[0m\n' "$sk" ;;
+            *)           printf '\033[1;33m   - %s\033[0m\n' "$sk" ;;
+        esac
+    done
+    printf '\033[1;33m   A green run is only as strong as what actually ran.\033[0m\n'
 fi
