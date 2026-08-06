@@ -1045,6 +1045,49 @@ saying out loud rather than discovering later: E2 buys scale, not QEC semantics.
 A detector-aware extension is a separate piece of work, and only worth doing if
 QEC sampling actually lands here.
 
+### E0. No Python in a validation loop — this reshapes E1 and E2
+
+**Directive 2026-08-06:** these emulators may also be used **for validation**,
+and house doctrine is Rust core, Python at the edge only — no Python VM inside a
+training or scoring loop. That is not a detail; it decides what each bridge can
+ever be used for.
+
+The bridge protocol spawns a **subprocess per call**. That is fine for a
+one-shot differential check and unacceptable inside a loop: process spawn plus
+interpreter start dominates, and it puts a Python VM on the critical path of
+every iteration. So a single mechanism cannot serve both uses.
+
+**Two tiers, and each emulator lands in a different one:**
+
+| use | mechanism | acceptable? |
+|---|---|---|
+| One-shot / CI differential check | subprocess bridge | **yes** — it runs once, off the hot path |
+| In-loop validation (per step, per row, per trial) | must be **in-process Rust** | subprocess is **not** acceptable |
+
+- **ppvm is already Rust** (`ppvm-pauli-sum`, `ppvm-tableau`). So the in-process
+  tier is available *without porting anything*: take it as a git Cargo
+  dependency and call it directly. The bridge remains the cheap way to get a
+  first number, but **the destination for ppvm is a direct dependency**, not the
+  subprocess. Re-sequence accordingly: bridge first only if it is genuinely
+  faster to stand up, and treat it as scaffolding rather than the deliverable.
+- **tsim is Python on JAX/XLA.** There is no in-process Rust path, so tsim
+  **cannot** be used for in-loop validation as it stands. Using it that way
+  requires porting the method (ZX stabilizer-rank decomposition) to Rust/C++ —
+  a real project, not a wrapper. Until then tsim is restricted to one-shot CI
+  cross-checks, and that restriction should be stated where someone would
+  otherwise reach for it.
+
+**Consequences to honour rather than discover:**
+
+1. A validator invoked per training step must not spawn a process. If ppvm's
+   direct dependency is not ready, in-loop validation waits — it does not
+   silently fall back to the subprocess.
+2. A tsim port is a **separate, scoped project** with its own justification. It
+   should not be smuggled in as "part of the bridge work", and it is only worth
+   it if in-loop stabilizer-rank validation is actually needed.
+3. Both remain legitimate as **CI-time** cross-checks today. That is where the
+   Qiskit and PyMatching checks live, and it is already proving its worth.
+
 ### Sequencing and acceptance
 
 1. **E1 ppvm bridge + pauliprop differential test.** Highest value per line: it

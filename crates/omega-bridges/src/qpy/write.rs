@@ -133,10 +133,9 @@ pub fn gate_kind_to_qiskit_name(gate: &GateKind) -> Option<&'static str> {
         // Rbs has no canonical Qiskit gate class (XXPlusYY/XXMinusYY use
         // a different generator and phase convention) — decompose before
         // export rather than encode a near-miss.
-        GateKind::PhaseShifter
-        | GateKind::BeamSplitterRx
-        | GateKind::Rbs
-        | GateKind::Custom(_) => return None,
+        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Rbs | GateKind::Custom(_) => {
+            return None
+        }
     })
 }
 
