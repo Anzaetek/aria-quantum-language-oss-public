@@ -24,13 +24,18 @@ details; this covers *what each stage buys you*.
 | stage | enable with | needs | status here | last result |
 |---|---|---|---|---|
 | **Qiskit differential cross-check — MANDATORY** | `ARIA_QISKIT_XCHECK=1` | `.venv-qiskit` with `qiskit`, `qiskit-aer` | **INSTALLED** (qiskit 2.5.1 / aer 0.17.2) | **60 agree, 0 disagree, worst |Δp| = 4.441e-16** — re-measured 2026-08-06, `CI_EXIT=0` |
-| QEC encoded-demo cross-check | `ARIA_QEC_XCHECK=1` | same venv | **INSTALLED** | — |
+| **QEC cross-check — MANDATORY** | `ARIA_QEC_XCHECK=1` | same venv + `pymatching` | **INSTALLED** | **100.00% (20000/20000)** shot-for-shot logical-class agreement vs PyMatching 2.4.0 at d=3 and d=5; logical rates within 3σ (aria 0.0367 vs pymatching 0.0367) — measured 2026-08-06, `CI_EXIT=0` |
 | Lean 4 proof tree | `ARIA_LEAN=1` | `elan` + `lake`, warm mathlib cache | **READY** | 8281 jobs, exit 0 |
 | TLA+ models | `tools/tla/check.sh` | JDK + `tla2tools.jar` | **READY** | safety holds (26 states); liveness violated — starvation, *expected* |
 | CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here** | untested on this box |
 | Deep harnesses | `ARIA_DEEP=1` | none (just slow) | available | `spectra_noise`, `spectra_scaling_noise` skipped in the default `all` |
 
 ## Why each one is worth running
+
+**QEC cross-check** — differential-tests the exact MWPM decoder against
+**PyMatching**, shot for shot rather than only in aggregate. Aggregate logical
+rates can agree while individual decodings differ, so the 100% shot-for-shot
+class agreement is the stronger claim.
 
 **Qiskit cross-check** — the only *independent implementation* available. When
 Aria and Qiskit agree to 1e-16, that is evidence; when two Aria backends agree,
