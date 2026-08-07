@@ -1014,17 +1014,20 @@ mod tests {
     }
 
     /// Photonic cost is combinatorial in PHOTONS, so a mode ceiling does not
-    /// bound it. 26 modes sits under a typical ceiling yet is ~300 GB.
+    /// bound it. 26 modes sits under a typical ceiling yet is ~766 GB.
     #[test]
     fn photonic_fock_space_is_priced_not_waved_through() {
         assert_eq!(fock_dim(4, 2), Some(10)); // C(5,2)
         assert_eq!(fock_dim(1, 5), Some(1));
         let modest = estimate_peak_bytes(&JobShape::new(4, CostKind::Photonic)).unwrap();
         assert!(modest < (1 << 20), "4 modes must stay tiny, got {modest}");
-        // 26 modes -> 13 photons -> C(38,13) ~ 2.3e9 states.
+        // 26 modes -> 13 photons -> C(38,13) = 5.41e9 states, ~766 GB.
         let big = estimate_peak_bytes(&JobShape::new(26, CostKind::Photonic)).unwrap();
+        // 766 GB, not the ~300 GB an earlier comment claimed: C(38,13) is
+        // 5.41e9 states, not 2.3e9. Understating a memory cost inside a
+        // governor is the dangerous direction, so the figure is pinned here.
         assert!(
-            big > 100 * GB,
+            big > 700 * GB,
             "26-mode photonics is hundreds of GB and must be priced, got {big}"
         );
     }
