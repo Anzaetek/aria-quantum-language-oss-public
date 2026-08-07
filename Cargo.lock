@@ -2447,6 +2447,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-backend-cv"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+]
+
+[[package]]
 name = "omega-backend-mps"
 version = "0.1.0"
 dependencies = [
