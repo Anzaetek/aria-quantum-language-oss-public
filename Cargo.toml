@@ -25,6 +25,7 @@ members = [
     "crates/omega-core",
     "crates/omega-xcheck",
     "crates/omega-parser",
+    "crates/omega-backend-cv",
     "crates/omega-backend-statevector",
     "crates/omega-backend-statevector-metal",
     "crates/omega-backend-statevector-cuda",

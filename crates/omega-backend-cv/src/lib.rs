@@ -1,0 +1,362 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Continuous-variable photonics on a **truncated Fock space**.
+//!
+//! A CV mode lives in an infinite-dimensional Hilbert space. Simulating it
+//! means cutting the ladder at some `cutoff`, and that cut is not a detail —
+//! it is the dominant source of error and the thing this module is most careful
+//! about.
+//!
+//! # Why truncation is the first thing built, not the last
+//!
+//! `fixes/PLAN-CV-BACKEND.md` R6 asks for a stated truncation policy, and the
+//! reason is specific: clipping the top of the ladder **loses norm**. A state
+//! that has leaked probability still returns perfectly plausible expectation
+//! values — they are simply wrong, and nothing about them looks wrong. That is
+//! the failure mode piquasso users are said to learn the hard way, and it is
+//! the same shape as several defects already found in this repository:
+//! confident output with nothing behind it.
+//!
+//! So [`FockState`] tracks its own norm loss and [`FockState::expect_n`]
+//! **refuses** rather than returning a number from a leaking state.
+//!
+//! # What is here, and what is not
+//!
+//! Present: the Fock-space representation, photon-number readout, and the
+//! truncation policy — all verifiable *today* against closed-form states.
+//!
+//! Absent: the gates. `Displacement` and `Squeezing` on a truncated space are
+//! built from the Fréchet derivative of a matrix exponential of ladder
+//! operators, which is where a subtle sign or ordering error would hide. Those
+//! land next, and land against the anchors this module already checks:
+//! displaced vacuum gives `⟨n⟩ = |α|²`, squeezed vacuum gives `⟨n⟩ = sinh²r`.
+//! Building the measuring stick before the thing being measured is deliberate.
+
+use num_complex::Complex64;
+
+/// A single CV mode truncated at `cutoff` Fock levels: `|0⟩ .. |cutoff-1⟩`.
+#[derive(Clone, Debug)]
+pub struct FockState {
+    amps: Vec<Complex64>,
+    /// Probability mass discarded by truncation, accumulated.
+    ///
+    /// Mirrors `omega-backend-mps`'s `discarded_weight`: an explicit error
+    /// budget beats an implicit assumption that truncation was harmless.
+    lost_norm: f64,
+}
+
+/// Refuse a readout once this much probability has leaked past the cutoff.
+///
+/// 1e-6 is strict on purpose. A CV expectation value is not obviously wrong
+/// when the state has leaked — it is just wrong — so the check has to fire
+/// before the error reaches the answer, not after.
+pub const DEFAULT_LEAK_TOLERANCE: f64 = 1e-6;
+
+/// Why a readout was refused.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CvError {
+    /// Truncation discarded more probability than the caller allows.
+    TruncationLeak { lost: f64, tolerance: f64 },
+    /// The cutoff is too small to represent the requested state at all.
+    CutoffTooSmall { cutoff: usize, needed: usize },
+    /// A parameter has no finite representation (NaN, or a magnitude the
+    /// truncated ladder cannot express).
+    Unrepresentable { what: &'static str },
+}
+
+impl std::fmt::Display for CvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CvError::TruncationLeak { lost, tolerance } => write!(
+                f,
+                "truncation lost {lost:.3e} of the probability mass (tolerance {tolerance:.3e}) — \
+                 the Fock cutoff is too low for this state. Expectation values from a leaking \
+                 state look plausible and are wrong, so this is refused rather than reported. \
+                 Raise the cutoff or reduce the squeezing/displacement magnitude."
+            ),
+            CvError::CutoffTooSmall { cutoff, needed } => write!(
+                f,
+                "cutoff {cutoff} cannot represent this state; it needs at least {needed} levels"
+            ),
+            CvError::Unrepresentable { what } => {
+                write!(
+                    f,
+                    "parameter is not representable on the truncated space: {what}"
+                )
+            }
+        }
+    }
+}
+
+impl FockState {
+    /// Vacuum `|0⟩` at the given cutoff.
+    pub fn vacuum(cutoff: usize) -> Result<Self, CvError> {
+        if cutoff == 0 {
+            return Err(CvError::CutoffTooSmall { cutoff, needed: 1 });
+        }
+        let mut amps = vec![Complex64::new(0.0, 0.0); cutoff];
+        amps[0] = Complex64::new(1.0, 0.0);
+        Ok(Self {
+            amps,
+            lost_norm: 0.0,
+        })
+    }
+
+    pub fn cutoff(&self) -> usize {
+        self.amps.len()
+    }
+
+    pub fn amplitudes(&self) -> &[Complex64] {
+        &self.amps
+    }
+
+    /// Probability mass lost to truncation so far.
+    pub fn lost_norm(&self) -> f64 {
+        self.lost_norm
+    }
+
+    /// Build from unnormalised Fock amplitudes, recording what the cutoff cut.
+    ///
+    /// `tail_mass` is the probability the caller knows lies **beyond** the
+    /// cutoff. Passing it explicitly is what makes the leak measurable: a
+    /// closed-form state knows its own tail, and a state built by applying
+    /// gates accumulates it as it goes.
+    pub fn from_amplitudes(amps: Vec<Complex64>, tail_mass: f64) -> Result<Self, CvError> {
+        if amps.is_empty() {
+            return Err(CvError::CutoffTooSmall {
+                cutoff: 0,
+                needed: 1,
+            });
+        }
+        if !tail_mass.is_finite() || tail_mass < 0.0 {
+            return Err(CvError::Unrepresentable {
+                what: "tail mass is not a finite non-negative number",
+            });
+        }
+        if amps.iter().any(|a| !a.re.is_finite() || !a.im.is_finite()) {
+            return Err(CvError::Unrepresentable {
+                what: "amplitude is not finite",
+            });
+        }
+        Ok(Self {
+            amps,
+            lost_norm: tail_mass,
+        })
+    }
+
+    /// Squared norm of the represented (in-cutoff) part.
+    pub fn norm_sqr(&self) -> f64 {
+        self.amps.iter().map(|a| a.norm_sqr()).sum()
+    }
+
+    /// Mean photon number `⟨n⟩`, or a refusal if truncation has leaked.
+    ///
+    /// The leak check comes **first**. Returning a number and letting the
+    /// caller consult `lost_norm` afterwards would be the same mistake as a
+    /// governor reporting headroom it does not have: the plausible answer gets
+    /// used and the caveat does not.
+    pub fn expect_n(&self, tolerance: f64) -> Result<f64, CvError> {
+        if self.lost_norm > tolerance {
+            return Err(CvError::TruncationLeak {
+                lost: self.lost_norm,
+                tolerance,
+            });
+        }
+        let norm = self.norm_sqr();
+        if norm <= 0.0 {
+            return Err(CvError::Unrepresentable {
+                what: "state has zero norm",
+            });
+        }
+        // Normalise against the represented mass: the cut tail is accounted for
+        // by the leak check above, not by silently renormalising it away.
+        let n: f64 = self
+            .amps
+            .iter()
+            .enumerate()
+            .map(|(k, a)| k as f64 * a.norm_sqr())
+            .sum();
+        Ok(n / norm)
+    }
+
+    /// Coherent state `|α⟩` in the Fock basis: `e^{-|α|²/2} α^n / √(n!)`.
+    ///
+    /// Closed form, so it needs no gate machinery — which is precisely why it
+    /// can serve as the anchor that *validates* the gate machinery later.
+    /// Analytic result: `⟨n⟩ = |α|²`.
+    pub fn coherent(alpha: Complex64, cutoff: usize) -> Result<Self, CvError> {
+        if cutoff == 0 {
+            return Err(CvError::CutoffTooSmall { cutoff, needed: 1 });
+        }
+        if !alpha.re.is_finite() || !alpha.im.is_finite() {
+            return Err(CvError::Unrepresentable {
+                what: "alpha is not finite",
+            });
+        }
+        let n2 = alpha.norm_sqr();
+        let mut amps = vec![Complex64::new(0.0, 0.0); cutoff];
+        // Recurrence rather than powers/factorials: alpha^n and n! both
+        // overflow long before the amplitude does, and the ratio is stable.
+        let mut term = Complex64::new((-0.5 * n2).exp(), 0.0);
+        amps[0] = term;
+        for (k, slot) in amps.iter_mut().enumerate().skip(1) {
+            term *= alpha / (k as f64).sqrt();
+            *slot = term;
+        }
+        let kept: f64 = amps.iter().map(|a| a.norm_sqr()).sum();
+        // Total mass is 1 for a true coherent state, so whatever is missing
+        // fell past the cutoff.
+        let tail = (1.0 - kept).max(0.0);
+        Self::from_amplitudes(amps, tail)
+    }
+
+    /// Squeezed vacuum `S(r)|0⟩` in the Fock basis (real `r`, zero phase).
+    ///
+    /// Only even levels are populated:
+    /// `c_{2m} = √(cosh r)⁻¹ · √((2m)!)/(2^m m!) · (−tanh r)^m`.
+    /// Analytic result: `⟨n⟩ = sinh²r`.
+    pub fn squeezed_vacuum(r: f64, cutoff: usize) -> Result<Self, CvError> {
+        if cutoff == 0 {
+            return Err(CvError::CutoffTooSmall { cutoff, needed: 1 });
+        }
+        if !r.is_finite() {
+            return Err(CvError::Unrepresentable {
+                what: "squeezing parameter is not finite",
+            });
+        }
+        let t = r.tanh();
+        let mut amps = vec![Complex64::new(0.0, 0.0); cutoff];
+        // Recurrence on the even sub-ladder:
+        //   c_0 = 1/√(cosh r),  c_{2m} = c_{2m-2} · (−t) · √((2m−1)/(2m))
+        let mut c = 1.0 / r.cosh().sqrt();
+        amps[0] = Complex64::new(c, 0.0);
+        let mut m = 1usize;
+        while 2 * m < cutoff {
+            let two_m = 2 * m;
+            c *= -t * (((two_m - 1) as f64) / (two_m as f64)).sqrt();
+            amps[two_m] = Complex64::new(c, 0.0);
+            m += 1;
+        }
+        let kept: f64 = amps.iter().map(|a| a.norm_sqr()).sum();
+        let tail = (1.0 - kept).max(0.0);
+        Self::from_amplitudes(amps, tail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R5 anchor: displaced vacuum has `⟨n⟩ = |α|²`.
+    ///
+    /// This is the measuring stick for the displacement gate that does not
+    /// exist yet — built first on purpose, so the gate is checked against
+    /// something independent of how the gate is written.
+    #[test]
+    fn coherent_state_mean_photon_number_is_alpha_squared() {
+        for (re, im) in [(0.5, 0.0), (1.0, 0.0), (0.0, 1.5), (1.2, -0.7)] {
+            let alpha = Complex64::new(re, im);
+            // Cutoff generous relative to |alpha|^2 so the tail is negligible.
+            let st = FockState::coherent(alpha, 60).expect("builds");
+            let got = st.expect_n(DEFAULT_LEAK_TOLERANCE).expect("no leak");
+            let want = alpha.norm_sqr();
+            assert!(
+                (got - want).abs() < 1e-9,
+                "alpha={alpha}: <n> = {got}, want |alpha|^2 = {want}"
+            );
+        }
+    }
+
+    /// R5 anchor: squeezed vacuum has `⟨n⟩ = sinh²r`.
+    #[test]
+    fn squeezed_vacuum_mean_photon_number_is_sinh_squared() {
+        for r in [0.1, 0.3, 0.5, 0.8] {
+            let st = FockState::squeezed_vacuum(r, 200).expect("builds");
+            let got = st.expect_n(DEFAULT_LEAK_TOLERANCE).expect("no leak");
+            let want = r.sinh().powi(2);
+            assert!(
+                (got - want).abs() < 1e-9,
+                "r={r}: <n> = {got}, want sinh^2 r = {want}"
+            );
+        }
+    }
+
+    /// Squeezed vacuum populates only EVEN Fock levels. A gate implementation
+    /// that leaks amplitude into odd levels is wrong in a way `⟨n⟩` alone can
+    /// hide, so pin the structure as well as the number.
+    #[test]
+    fn squeezed_vacuum_populates_only_even_levels() {
+        let st = FockState::squeezed_vacuum(0.6, 40).expect("builds");
+        for (k, a) in st.amplitudes().iter().enumerate() {
+            if k % 2 == 1 {
+                assert!(a.norm() < 1e-15, "odd level {k} populated: {a}");
+            }
+        }
+        assert!(st.amplitudes()[0].norm() > 0.5, "vacuum component missing");
+    }
+
+    /// R6, the property this module exists for: a state that has leaked past
+    /// the cutoff must REFUSE to report `⟨n⟩`, not return a plausible number.
+    #[test]
+    fn a_leaking_state_refuses_to_report_a_number() {
+        // |alpha|^2 = 100 mean photons against a cutoff of 10: the ladder is
+        // cut far below where the state lives.
+        let st = FockState::coherent(Complex64::new(10.0, 0.0), 10).expect("builds");
+        assert!(
+            st.lost_norm() > 0.5,
+            "this state should have leaked badly, lost {}",
+            st.lost_norm()
+        );
+        let err = st
+            .expect_n(DEFAULT_LEAK_TOLERANCE)
+            .expect_err("must refuse, not answer");
+        match err {
+            CvError::TruncationLeak { lost, .. } => assert!(lost > 0.5),
+            other => panic!("expected TruncationLeak, got {other:?}"),
+        }
+        // And the refusal must say what to do about it.
+        let msg = st.expect_n(DEFAULT_LEAK_TOLERANCE).unwrap_err().to_string();
+        assert!(msg.contains("cutoff"), "{msg}");
+    }
+
+    /// The dangerous case, made explicit: a leaking state's `⟨n⟩` is not
+    /// obviously wrong. Here it under-reports by ~90%, which is exactly why
+    /// the refusal above is a refusal and not a warning.
+    #[test]
+    fn a_leaking_state_would_have_returned_a_plausible_but_wrong_number() {
+        let st = FockState::coherent(Complex64::new(10.0, 0.0), 10).expect("builds");
+        // Bypass the guard to see what the caller would have been told.
+        let unguarded = st.expect_n(f64::INFINITY).expect("guard bypassed");
+        let truth = 100.0_f64;
+        assert!(
+            unguarded < 0.2 * truth,
+            "expected a badly wrong value, got {unguarded} vs {truth}"
+        );
+        assert!(
+            unguarded.is_finite() && unguarded > 0.0,
+            "and it is finite and positive — i.e. it looks like an answer: {unguarded}"
+        );
+    }
+
+    #[test]
+    fn vacuum_has_no_photons_and_no_leak() {
+        let st = FockState::vacuum(8).expect("builds");
+        assert_eq!(st.lost_norm(), 0.0);
+        assert!(st.expect_n(DEFAULT_LEAK_TOLERANCE).unwrap().abs() < 1e-15);
+    }
+
+    #[test]
+    fn degenerate_inputs_are_refused_not_papered_over() {
+        assert!(matches!(
+            FockState::vacuum(0),
+            Err(CvError::CutoffTooSmall { .. })
+        ));
+        assert!(matches!(
+            FockState::coherent(Complex64::new(f64::NAN, 0.0), 8),
+            Err(CvError::Unrepresentable { .. })
+        ));
+        assert!(matches!(
+            FockState::squeezed_vacuum(f64::INFINITY, 8),
+            Err(CvError::Unrepresentable { .. })
+        ));
+    }
+}
