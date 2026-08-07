@@ -100,6 +100,16 @@ wrong answer, and it could not be fixed from the Mac because the arm is
 
 ## 5. Reporting back
 
+**Run `./tools/cuda-report.sh` and paste the output** — it collects everything
+below, so the handoff does not depend on remembering which numbers matter. Add
+`--with-ci` to also run `ARIA_CUDA=1 ARIA_QISKIT_XCHECK=1 ARIA_QEC_XCHECK=1
+./ci.sh`.
+
+It deliberately reports the **raw probe** (`nvidia-smi memory.total` plus
+`/proc/meminfo MemTotal`) alongside the verdict: if the classifier gets the
+topology wrong, those two numbers are what shows why, and they are what the 25%
+tolerance is tuned against.
+
 Record actual numbers, not "passed":
 
 - `./ci.sh` exit code, with the CUDA stage's `OK:` lines
