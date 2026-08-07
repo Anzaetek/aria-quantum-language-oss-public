@@ -1102,10 +1102,28 @@ every iteration. So a single mechanism cannot serve both uses.
   `coeff_min` + `max_weight`. Two caveats decide whether a disagreement *means*
   anything, and both must be settled before reporting numbers:
 
-  * **If ppvm has no `max_freq` equivalent, compare only where that axis does
-    not bind.** Two implementations truncating on different axes disagree for
-    reasons unrelated to correctness — which would make the cross-check
-    actively misleading rather than merely weak.
+  * **ppvm has no `max_freq` equivalent — confirmed.** Its strategies are
+    `NoStrategy`, `MaxPauliWeight`, `CoefficientThreshold`, `MaxLossWeight` and
+    `CombinedStrategy` (`ppvm-pauli-sum/src/strategy.rs`); there is no
+    split-frequency axis. So the comparison must **hold `max_freq` non-binding
+    on the pauliprop side** (`None`, or high enough never to fire). Two
+    implementations truncating on different axes disagree for reasons unrelated
+    to correctness, which would make the cross-check actively misleading rather
+    than merely weak.
+
+    That gives the configuration mapping outright:
+
+    | pauliprop | ppvm |
+    |---|---|
+    | `coeff_min` | `CoefficientThreshold` |
+    | `max_weight` | `MaxPauliWeight` |
+    | both together | `CombinedStrategy(CoefficientThreshold, MaxPauliWeight)` |
+    | `max_freq` | **no equivalent — must not bind** |
+
+    Which also bounds what the check can claim: it validates pauliprop's
+    coefficient/weight truncation, **not** its `max_freq` axis. That axis stays
+    covered only by in-tree tests, and the cross-check's write-up should say so
+    rather than implying full coverage.
   * **Derive the tolerance from `dropped_mass`, do not pick one.** A difference
     inside pauliprop's own truncation error budget is not a defect, and
     reporting it as one trains people to ignore the check. The bridge remains the cheap way to get a
