@@ -18,9 +18,9 @@ the work — they are called out in place rather than silently inherited.
 | 1 | `REMOTING.md` §6 (5 gaps) | **OPEN** — confirmed | Part A |
 | 2 | `PLAN-CV-BACKEND.md` (R0–R6) | **OPEN** — confirmed, with a scope correction | Part B |
 | 3 | Photonic examples (DV + CV) | **OPEN** — zero photonic examples exist | Part C |
-| 4 | `ARIA_BUG_mps_fixed_bond_no_truncation_error` (×2) | **LIKELY FIXED** — `MpsState::discarded_weight` accumulates per-SVD (`mps.rs:80,183,298`) | verify, then close |
-| 5 | `ARIA_BUG_mps_svd_instability_normal_equations` (×2) | **LIKELY FIXED** — bond SVD is Jacobi (`svd::truncated_svd_flat`), not normal equations (`mps.rs:44,117`) | verify, then close |
-| 6 | `ARIA_BUG_noise_ignored_non_statevector_backend` | **LIKELY FIXED** — MPS has trajectory-noise Monte-Carlo (`omega-backend-mps/src/sim.rs:295-335`, analytic parity tests at :1206+); omega-cli refuses loudly on backends that can't carry it (`main.rs:937-944`); the bug doc itself is marked FIXED UPSTREAM ✅ | verify, then close |
+| 4 | `ARIA_BUG_mps_fixed_bond_no_truncation_error` (×2) | **CLOSED 2026-08-07** — verified by passing tests: `svd::discarded_weight_equals_dropped_singular_squares`, `svd::discarded_weight_is_zero_when_nothing_truncated`, `sim::under_provisioned_bond_reports_discarded_weight`, `sim::exact_bond_reports_negligible_discarded_weight` | none |
+| 5 | `ARIA_BUG_mps_svd_instability_normal_equations` (×2) | **CLOSED 2026-08-07** — one-sided Hestenes Jacobi on `A` (never `A†A`); verified by `svd::test_svd_reconstruction`, `test_svd_identity`, `test_svd_rank1`, and `sim::deep_brickwork_is_unitary_at_exact_bond_dimension` | none |
+| 6 | `ARIA_BUG_noise_ignored_non_statevector_backend` | **CLOSED 2026-08-07** — MPS carries trajectory noise, verified against *analytic* values by `sim::noise_mps_depolarizing_matches_analytic`, `noise_mps_amplitude_damping_matches_analytic`, `noise_mps_per_qubit_amplitude_damping`. Only stabilizer **sampling** noise remains unimplemented, and it is refused loudly — a false rejection, not a wrong answer | none |
 | 7 | `ARIA_REQ_qasm3_interchange` | **PARTIAL** — QASM3 paths exist (`aria-core/src/ast/qasm.rs`, `omega-parser/src/lower.rs`, CLI) | audit vs the request's checklist |
 | 8 | `ARIA_REQ_ibm_calibration_noise_import` | **OPEN (probable)** | Part D, after 6 |
 | 9 | `CI-LIBTORCH-DYLD-FIX.md` + `0001-*.patch` | **SUPERSEDED** — CI now fetches libtorch and exports `DYLD_LIBRARY_PATH` via `tch-env.sh` | close as done |
@@ -31,8 +31,15 @@ the work — they are called out in place rather than silently inherited.
 | 14 | `PLAN-COMPLIANCE-2026-07-29`, `UPSTREAM_UPDATE_PLAN`, `aria-open-requirements` | historical/superseded | archive note |
 | 15 | `TSIM-PPVM.md` **(new 2026-08-06)** | **OPEN** — two QuEra simulators via the existing bridge protocol | Part E |
 
-Items 4, 5, 7 need verification rather than implementation; 6 and 8 need a
-confirming reproduction before an estimate is honest.
+Items 4, 5 and 6 were **verified and closed on 2026-08-07** by running the named
+tests rather than reasoning from the code — three bug documents that had been
+implying open defects for over a week. Item 7 (QASM3) still needs an audit
+against its checklist; item 8 (IBM calibration import) is **not** blocked by 6,
+since the noise model on statevector/MPS is now confirmed trustworthy.
+
+Worth noting *why* these looked open for so long: a fixed bug leaves no trace
+unless someone closes the report. The verification cost was three `cargo test`
+invocations.
 
 ---
 
