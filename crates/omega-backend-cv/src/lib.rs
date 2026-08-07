@@ -42,6 +42,14 @@ pub struct FockState {
     /// Mirrors `omega-backend-mps`'s `discarded_weight`: an explicit error
     /// budget beats an implicit assumption that truncation was harmless.
     lost_norm: f64,
+    /// Photon-number-weighted discarded mass, `Σ_{k ≥ cutoff} k·p_k`.
+    ///
+    /// **This, not `lost_norm`, is the error budget for `⟨n⟩`.** The
+    /// cross-check against piquasso measured why: the discarded tail sits at
+    /// high `k`, so losing mass `p` at level `k` removes `k·p` from the
+    /// numerator. Guarding on raw mass underestimates the damage — at
+    /// `r = 0.3, cutoff 20` by a factor of ~20.
+    lost_n_weight: f64,
 }
 
 /// Refuse a readout once this much probability has leaked past the cutoff.
@@ -105,6 +113,7 @@ impl FockState {
         Ok(Self {
             amps,
             lost_norm: 0.0,
+            lost_n_weight: 0.0,
         })
     }
 
@@ -117,8 +126,16 @@ impl FockState {
     }
 
     /// Probability mass lost to truncation so far.
+    ///
+    /// A **lower bound** on the resulting `⟨n⟩` error — see
+    /// [`Self::lost_n_weight`], which is the bound that actually applies.
     pub fn lost_norm(&self) -> f64 {
         self.lost_norm
+    }
+
+    /// Photon-weighted lost mass — the error budget for `⟨n⟩`.
+    pub fn lost_n_weight(&self) -> f64 {
+        self.lost_n_weight
     }
 
     /// Build from unnormalised Fock amplitudes, recording what the cutoff cut.
@@ -128,6 +145,19 @@ impl FockState {
     /// closed-form state knows its own tail, and a state built by applying
     /// gates accumulates it as it goes.
     pub fn from_amplitudes(amps: Vec<Complex64>, tail_mass: f64) -> Result<Self, CvError> {
+        // Unknown weighting: assume the tail sits just past the cutoff, which
+        // is the smallest it could be. Constructors that know their tail
+        // exactly use `from_amplitudes_weighted`.
+        let k0 = amps.len() as f64;
+        Self::from_amplitudes_weighted(amps, tail_mass, tail_mass * k0)
+    }
+
+    /// As [`Self::from_amplitudes`], with the photon-weighted tail supplied.
+    pub fn from_amplitudes_weighted(
+        amps: Vec<Complex64>,
+        tail_mass: f64,
+        tail_n_weight: f64,
+    ) -> Result<Self, CvError> {
         if amps.is_empty() {
             return Err(CvError::CutoffTooSmall {
                 cutoff: 0,
@@ -144,9 +174,15 @@ impl FockState {
                 what: "amplitude is not finite",
             });
         }
+        if !tail_n_weight.is_finite() || tail_n_weight < 0.0 {
+            return Err(CvError::Unrepresentable {
+                what: "weighted tail is not a finite non-negative number",
+            });
+        }
         Ok(Self {
             amps,
             lost_norm: tail_mass,
+            lost_n_weight: tail_n_weight,
         })
     }
 
@@ -162,9 +198,12 @@ impl FockState {
     /// governor reporting headroom it does not have: the plausible answer gets
     /// used and the caveat does not.
     pub fn expect_n(&self, tolerance: f64) -> Result<f64, CvError> {
-        if self.lost_norm > tolerance {
+        // Guard on the WEIGHTED tail: that is what bounds the error in this
+        // answer. Guarding on raw mass would pass states whose <n> is already
+        // wrong by orders of magnitude more than the mass suggests.
+        if self.lost_n_weight > tolerance {
             return Err(CvError::TruncationLeak {
-                lost: self.lost_norm,
+                lost: self.lost_n_weight,
                 tolerance,
             });
         }
@@ -246,9 +285,20 @@ impl FockState {
         }
         let kept: f64 = amps.iter().map(|a| a.norm_sqr()).sum();
         // Total mass is 1 for a true coherent state, so whatever is missing
-        // fell past the cutoff.
+        // fell past the cutoff. Extend the recurrence beyond the cutoff to get
+        // the PHOTON-WEIGHTED tail too, which is what bounds the <n> error.
         let tail = (1.0 - kept).max(0.0);
-        Self::from_amplitudes(amps, tail)
+        let mut w = 0.0;
+        let mut t = term;
+        for k in cutoff..(cutoff + 512) {
+            t *= alpha / (k as f64).sqrt();
+            let p = t.norm_sqr();
+            w += (k as f64) * p;
+            if p < 1e-300 {
+                break;
+            }
+        }
+        Self::from_amplitudes_weighted(amps, tail, w)
     }
 
     /// Squeezed vacuum `S(r)|0⟩` in the Fock basis (real `r`, zero phase).
@@ -280,7 +330,23 @@ impl FockState {
         }
         let kept: f64 = amps.iter().map(|a| a.norm_sqr()).sum();
         let tail = (1.0 - kept).max(0.0);
-        Self::from_amplitudes(amps, tail)
+        // Continue the even sub-ladder past the cutoff for the weighted tail.
+        let mut w = 0.0;
+        let mut cc = c;
+        let mut mm = m;
+        while 2 * mm < cutoff + 512 {
+            let two_m = 2 * mm;
+            cc *= -t * (((two_m - 1) as f64) / (two_m as f64)).sqrt();
+            let p = cc * cc;
+            if two_m >= cutoff {
+                w += (two_m as f64) * p;
+            }
+            if p < 1e-300 {
+                break;
+            }
+            mm += 1;
+        }
+        Self::from_amplitudes_weighted(amps, tail, w)
     }
 }
 
@@ -540,6 +606,64 @@ mod tests {
                 .expect("no leak at cutoff 200");
             assert!((n - r.sinh().powi(2)).abs() < 1e-9, "r={r}: {n}");
         }
+    }
+
+    /// The fix for what the piquasso cross-check exposed: raw lost mass
+    /// UNDERESTIMATES the `⟨n⟩` error, so the guard now uses the
+    /// photon-weighted tail instead.
+    ///
+    /// This asserts the weighted budget actually **bounds** piquasso's measured
+    /// error, where raw mass did not. Without it the fix could silently be
+    /// cosmetic — a different number that is still too small.
+    #[test]
+    fn weighted_tail_bounds_the_error_where_raw_mass_does_not() {
+        // (r, piquasso <n> at cutoff 20)
+        let fixtures = [
+            (0.3_f64, 0.092_732_609_049_771_14_f64),
+            (0.5, 0.271_539_533_552_898_34),
+            (0.8, 0.787_422_536_949_700_4),
+        ];
+        for (r, pq_n) in fixtures {
+            let st = FockState::squeezed_vacuum(r, 20).expect("builds");
+            let err = (pq_n - r.sinh().powi(2)).abs();
+            let mass = st.lost_norm();
+            let weighted = st.lost_n_weight();
+
+            // The property that matters: the weighted budget is an UPPER bound
+            // on the actual error, so refusing on it refuses before the answer
+            // is wrong by more than the tolerance.
+            assert!(
+                weighted >= err,
+                "r={r}: weighted budget {weighted:.3e} must bound the error {err:.3e}"
+            );
+            // And it is strictly larger than raw mass — i.e. the fix changed
+            // something rather than renaming it.
+            assert!(
+                weighted > mass,
+                "r={r}: weighted {weighted:.3e} should exceed raw mass {mass:.3e}"
+            );
+        }
+    }
+
+    /// At r=0.3 the raw mass (3.6e-12) was 20x SMALLER than the error
+    /// (7.1e-11), which is what made it unusable as a guard. Pin the specific
+    /// case so a regression to mass-based guarding is caught by name.
+    #[test]
+    fn the_case_that_exposed_the_underestimate_is_now_bounded() {
+        let st = FockState::squeezed_vacuum(0.3, 20).expect("builds");
+        let err = (0.092_732_609_049_771_14_f64 - 0.3_f64.sinh().powi(2)).abs();
+        assert!(err > 1e-11 && err < 1e-9, "the known error, {err:.3e}");
+        assert!(
+            st.lost_norm() < err,
+            "raw mass {:.3e} is still below the error {err:.3e} — that is the \
+             underestimate, kept here as documentation",
+            st.lost_norm()
+        );
+        assert!(
+            st.lost_n_weight() >= err,
+            "but the weighted budget {:.3e} must bound it",
+            st.lost_n_weight()
+        );
     }
 
     #[test]
