@@ -334,7 +334,7 @@ and the corrections are the substance of what shipped:
   guard while `/health` advertised headroom. Now priced by what the backend
   allocates, not by its name.
 - **Photonic cost is combinatorial in photons**, `C(m+p-1, p)` with
-  `p = ceil(m/2)`, so a *mode* ceiling never bounded it: 26 modes ≈ 300 GB was
+  `p = ceil(m/2)`, so a *mode* ceiling never bounded it: 26 modes ≈ 766 GB was
   admitted on a 1 MiB token. Now priced exactly.
 - **The batch priced only the widest row**, but rows carry independent backends,
   so width ≠ cost. Now prices every row and reserves the worst.
@@ -1226,6 +1226,98 @@ Constraints carried from the request, all consistent with house rules:
 - **A blocked integration ships as a findings note, not a fake-green bridge.**
 - Install friction is real (tsim pulls JAX; ppvm is git-only) — each gets its own
   venv, as with the two Qiskit ones.
+
+## Part F — Photonic performance and GPU acceleration
+
+**PLAN ONLY.** Answers three questions asked 2026-08-07, with measured figures
+rather than estimates.
+
+### F0. Do we have GPU acceleration for photonics? **No.**
+
+GPU crates exist for `statevector` (Metal / CUDA / OpenCL), `mps` (Metal /
+CUDA) and `pauliprop` (Metal / CUDA). **Neither photonic backend has any** —
+`omega-backend-photonics` (DV) and `omega-backend-cv` are CPU-only with no
+feature flags for it. That is the honest answer, and it is the gap this part
+plans.
+
+### F1. Memory first, because it decides what a GPU could even help with
+
+| model | dimension | figure |
+|---|---|---|
+| DV photonics (permanents / SLOS) | `C(m+p-1, p)` states, `p = ceil(m/2)` | 16 modes → 490 k states, 0.05 GB · **20 modes → 20.0 M, 2.4 GB** · 26 modes → 5.41 G, **766 GB** |
+| CV truncated Fock | `cutoff^modes × 16 B` | 6 modes / cutoff 8 → 262 k amps, **4 MB** · 8/8 → 0.25 GB · **10/8 → 16 GB** |
+
+Two conclusions follow immediately, and they point in opposite directions:
+
+* **CV at the planned envelope is tiny.** `PLAN-CV-BACKEND`'s target
+  (`n_modes ≤ 6`, `cutoff ≤ 8`) is **4 MB**. A GPU would be pure overhead —
+  kernel launch and transfer dominate a 262 k-element state. **Do not
+  GPU-accelerate CV for the search grid.** It becomes interesting only past
+  ~9 modes, where the state crosses ~2 GB.
+* **DV is the one with a cliff.** Between 20 and 26 modes it goes 2.4 GB →
+  766 GB. GPU memory does not rescue that; only a better algorithm does. So the
+  useful GPU target for DV is the **permanent evaluation** at moderate sizes,
+  not the state.
+
+*(Correction recorded: an earlier note put 26 modes at ~300 GB from
+`C(38,13) ≈ 2.3e9`. The true value is `5,414,950,296` ≈ 766 GB — 2.4× worse.
+Understating a memory cost inside a resource governor is the dangerous
+direction, so the figure is now pinned by a test.)*
+
+### F2. Benchmark against Perceval and piquasso — measure before optimising
+
+Both references are already available: a Perceval bridge exists
+(`bridge-perceval`), and piquasso 8.0.1 is installed in `.venv-piquasso` for the
+CV cross-check. So the comparison costs setup, not integration.
+
+What to measure, and against what:
+
+| our backend | reference | shapes |
+|---|---|---|
+| `omega-backend-photonics` (DV) | **Perceval** (Quandela) | HOM, MZI, then 8/12/16/20 modes — the run that finds our cliff |
+| `omega-backend-cv` | **piquasso** `PureFockSimulator` | the search grid: 3–6 modes × cutoff 4–8 |
+
+Report **wall time and peak RSS together**. Time alone is misleading here: a
+backend that is 2× faster while holding 4× the memory is worse on a shared box,
+and A7's governor prices memory, not speed. Reuse A11's phase split so
+"Perceval is slower" cannot be confused with "the Python bridge subprocess is
+slower" — the bridge spawns a process per call, which would otherwise dominate
+every small shape.
+
+**Expected outcome worth stating in advance**, so a surprise is legible: for the
+CV grid we should be *comparable* to piquasso, not dramatically faster — both
+are dense truncated-Fock statevector evolution, and the arithmetic is the same.
+A large win would more likely indicate a measurement error or a different
+truncation than a real advantage. That is the honest prior, and the same
+discipline the QML docs already apply to classical baselines.
+
+### F3. If GPU work is justified, where it should go
+
+Only after F2 says so. In priority order:
+
+1. **DV permanents on GPU.** The inner loop is a sum over permutations /
+   Ryser-style evaluation — regular, parallel, and the actual bottleneck at
+   12–20 modes. Highest value if DV matters.
+2. **CV beyond ~9 modes.** A dense `cutoff^modes` statevector is exactly the
+   shape the existing `statevector` GPU kernels already handle; the work is
+   qudit-generalising `apply_1q`/`apply_2q` to `d = cutoff` rather than new
+   physics. Reuse before rewrite.
+3. **Not the search grid.** Repeated for emphasis: 4 MB does not want a GPU.
+
+**Platform coverage should mirror the existing fleet rather than invent one**:
+Metal (Apple Silicon, unified), CUDA (discrete + GB10/GH200), OpenCL
+(cross-vendor fallback). Each new GPU backend inherits obligations already
+established elsewhere in this repo, and skipping them is how the Metal Reset
+defect happened:
+
+* numeric parity against the CPU backend as a CI gate, not a manual check;
+* f32 device width priced correctly in the governor (A7b) — a photonic GPU
+  backend must set `ExecTarget::Device` or its memory lands against the wrong
+  pool;
+* `Unsupported` refused loudly for gates the device path lacks, never silently
+  skipped;
+* **verified on the hardware it claims to support** — `f11a9f5` shipped 2/70
+  failing Metal tests because the work was checked on a CUDA box.
 
 ### C3. Photonics from the Aria surface — **CONFIRMED scope** (2026-08-06)
 
