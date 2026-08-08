@@ -24,8 +24,25 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
 FIXTURE = HERE / "piquasso_fixture.jsonl"
 GENERATOR = HERE / "piquasso_ref.py"
+
+# Interpreter discovery, in order. `.venv-piquasso` at the repo root is the
+# pre-existing environment (FIXES_PLAN.md); prefer it over creating a second
+# 400 MB copy of the same wheels. `sys.executable` last, so running this script
+# with an interpreter that already has piquasso just works.
+CANDIDATE_PYTHONS = [
+    REPO / ".venv-piquasso" / "bin" / "python",
+    HERE / ".venv" / "bin" / "python",
+]
+
+
+def pick_python():
+    for cand in CANDIDATE_PYTHONS:
+        if cand.is_file():
+            return str(cand)
+    return sys.executable
 
 # Regeneration must be bit-comparable at this level. This is NOT the physics
 # tolerance (the Rust side owns that, bounded by the backend's own leak metric);
@@ -57,7 +74,7 @@ def main():
 
     try:
         proc = subprocess.run(
-            [sys.executable, str(GENERATOR)],
+            [pick_python(), str(GENERATOR)],
             capture_output=True, text=True, check=True,
         )
     except FileNotFoundError:
