@@ -1,8 +1,24 @@
 //! Decomposition of arbitrary unitaries into optical components.
 //!
-//! Implements:
-//! - Reck decomposition (triangular): N(N-1)/2 beam splitters + N phase shifters
-//! - Clements decomposition (symmetric): same count but better loss tolerance
+//! Implements the **Reck** decomposition (triangular): `N(N-1)/2` beam splitters
+//! plus `N` phase shifters.
+//!
+//! > Reck, Zeilinger, Bernstein & Bertani, "Experimental realization of any
+//! > discrete unitary operator", Phys. Rev. Lett. 73, 58 (1994).
+//!
+//! **There is deliberately no Clements decomposition here.** This module used to
+//! export `clements_decompose`, documented as "the Clements (symmetric) scheme"
+//! under a header advertising "same count but better loss tolerance", whose body
+//! was `reck_decompose(unitary)`. It had zero callers and advertised a property
+//! it did not have, so it is gone rather than left as a trap for the next reader.
+//!
+//! Implementing Clements properly is worthwhile — it achieves **half the optical
+//! depth** and is more loss-tolerant (Clements, Humphreys, Metcalf, Kolthammer &
+//! Walmsley, Optica 3(12), 1460-1465 (2016), arXiv:1603.08788) — but it is a
+//! real algorithm that deserves its own change and its own verification,
+//! including an assertion that its depth is genuinely lower than Reck's. Without
+//! that assertion a second silent delegation could reappear and nothing would
+//! notice, which is exactly how the first one survived.
 
 use num_complex::Complex64;
 
@@ -12,8 +28,21 @@ use crate::components::PhotonicOp;
 /// using the Reck (triangular) decomposition.
 pub fn reck_decompose(unitary: &[Vec<Complex64>]) -> Vec<PhotonicOp> {
     let m = unitary.len();
-    if m <= 1 {
+    if m == 0 {
         return vec![];
+    }
+    if m == 1 {
+        // A 1x1 unitary is a pure phase [e^{i*phi}]. Returning an empty op list
+        // here used to silently recompose it to the identity, dropping the
+        // phase. There are no beam splitters to apply, but the phase shifter is
+        // still real.
+        let (re, im) = (unitary[0][0].re, unitary[0][0].im);
+        let phi = im.atan2(re);
+        return if phi.abs() < 1e-15 {
+            vec![]
+        } else {
+            vec![PhotonicOp::PhaseShifter { mode: 0, phi }]
+        };
     }
 
     let mut u: Vec<Vec<Complex64>> = unitary.to_vec();
@@ -121,12 +150,6 @@ pub fn reck_decompose(unitary: &[Vec<Complex64>]) -> Vec<PhotonicOp> {
     }
 
     ops
-}
-
-/// Decompose using the Clements (symmetric) scheme.
-/// For now, delegates to Reck.
-pub fn clements_decompose(unitary: &[Vec<Complex64>]) -> Vec<PhotonicOp> {
-    reck_decompose(unitary)
 }
 
 #[cfg(test)]
