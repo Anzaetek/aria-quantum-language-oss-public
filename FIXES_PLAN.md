@@ -1686,3 +1686,281 @@ green (K13), with external oracles optional and cleanly skipped; no stdout from
 libraries (Q8); tolerances stated numerically (Q9); batch index preservation
 (Q5); assumption-ledger discipline (K12). Note the ledger counts do **not** move
 for C1/C2 — the verify corpus enumerates `examples/aria/*.aria` only.
+
+## Part I — Polarization in OPTICQASM (PBS / HWP), new 2026-08-08
+
+Requested so the Quandela-style Grover can be expressed: add `pbs` (and the
+`hwp` it needs) to OPTICQASM and cascade the change through parser, lowering,
+backend, CLI, governor and the Perceval bridge.
+
+### I0. Two measurements this plan rests on
+
+Taken 2026-08-08, not assumed:
+
+* **`HWP_perceval(θ) = i · BSrx(2θ, 0) · PS(π on the V sub-mode)`**, agreeing to
+  **1.5e-16**. A half-wave plate needs **no new simulation primitive**: it is
+  ops we already have, times a global phase.
+
+  > **This line was WRONG in the first draft and the correction is the whole
+  > point.** It originally read `HWP(θ) = BSrx(2θ,0)·PS(π)`, "agreeing to
+  > 1e-16" — measured against the **i-less textbook** matrix while this same
+  > section argued that Perceval's `i` is a correctness issue. Both cannot hold:
+  > `det(BSrx) = +1` and `det(PS(π)) = −1`, so any such product has `det = −1`,
+  > while Perceval's HWP has `det = +1`. Measured: the i-less formula differs
+  > from Perceval by **1.0**, and placing that HWP mid-circuit in a 4-mode MZI
+  > moves single-photon output probabilities by **0.413**.
+  >
+  > Two further details the first draft omitted, each of which silently breaks
+  > the identity: `PS(π)` must target the **V** sub-mode (on H the error is
+  > 1.65), and it must come **after** the beam splitter. The "1.41" quoted for
+  > the reversed order is θ-dependent, not a constant.
+
+* **omega's `bs_rx` is Perceval's `BS.Ry`, NOT `BS`.** Measured: `0.000e+00`
+  against `BS.Ry(2θ)`, up to `1.0` against `BS(2θ)`. See I0b — this is a live
+  defect in the bridge, not a planning note.
+* **Perceval 1.2.4's conventions are not the textbook ones**, read directly off
+  `compute_unitary()`:
+  * `PBS` is 4×4 over **2 spatial modes**, ordering `[a_H, a_V, b_H, b_V]`,
+    mapping `out_aH = in_bH`, `out_bH = in_aH`, `out_aV = in_aV`,
+    `out_bV = in_bV`. It **swaps H and transmits V** — the opposite of the
+    common "transmits H, reflects V" phrasing.
+  * `HWP(θ)` returns `i · [[cos2θ, sin2θ], [sin2θ, −cos2θ]]`.
+
+The `i` matters. It is unobservable on a lone element, but a polarization
+element acts on a **subset** of the modes of a larger interferometer, where a
+global factor on that block becomes a **relative** phase between paths. A Grover
+mesh is precisely a device built out of such relative phases, so this is a
+correctness issue, not bookkeeping. This project has already shipped one defect
+of exactly this shape (`pauli_mult_phase`, in two copies).
+
+* **PBS's swap block IS expressible**: `PS(π) · BSrx(π/2, ·)` gives the exact
+  swap to 1e-16. `det = −1` works out because `PS(π)` supplies it. The first
+  draft asserted "PBS is a permutation" with **no measurement at all** while
+  claiming I0 "shows both new elements decompose" — it showed one, against the
+  wrong reference.
+
+### I0b. PREREQUISITE — a live bridge defect that must be fixed first
+
+`perceval_runner.py:279-282` maps omega `bs_rx(θ,φ)` to Perceval `BS(theta=2θ)`,
+the **Rx** convention. omega's matrix is Perceval's **Ry**. Measured error at
+`θ=0.6`: **0.798**; at 50/50: **1.0**.
+
+It has survived because the only photonic cross-backend fixture is the HOM dip,
+which is **phase-insensitive** — an amplitude-only test standing over a phase
+error. For plain BS meshes there is also a mode-local gauge (a phase `i` per
+coupled pair) that makes Fock distributions agree anyway, which is why nothing
+downstream complained either.
+
+**Mode doubling destroys that gauge**: a spatial BS becomes a coupler on
+distance-2 optical pairs while PBS demands an exact, ungauged swap on those same
+pairs. Measured on `spatialBS → PBS → spatialBS` with one photon, the two
+conventions give `[0,0,1,0]` versus `[1,0,0,0]` — **a distribution difference of
+1.0**.
+
+Consequence for sequencing: if this is not fixed first, I4's end-to-end Kwiat
+check can fail *even when the new code is correct*, and the natural response
+would be to "fix" correct code to match a wrong baseline. Fix is one token
+(`BS` → `BS.Ry`) plus a **matrix-level** fixture — an amplitude-only fixture is
+what let this through in the first place.
+
+### I1. Mode model — the decision that shapes everything else
+
+| option | what it is | cost |
+|---|---|---|
+| **A — mode doubling (recommended)** | polarization is an indexing convention: `m` spatial modes become `2m` optical modes, `(s, p) -> 2s + p`, `p=0` is H. Polarization elements lower to existing `PhaseShifter` / `BeamSplitterRx`. | parser + lowering only; **zero change to slos / permanent / sim** |
+| B — first-class polarization DOF | new `PhotonicOp` variants, new indexing through SLOS and the permanent | rewrites the simulation core to express the *same* matrix |
+
+**Take A.** Linear optics on `m` spatial modes × 2 polarizations *is* a `2m`-mode
+linear unitary; B rewrites the core to produce a matrix A already produces. I0
+shows both new elements decompose into existing ops, so A is not a shortcut —
+it is the accurate model.
+
+**Corrections to the first draft's cost analysis**, from review:
+
+* **"zero change to slos / permanent / sim" was two-thirds right.** `slos.rs`
+  and `permanent.rs` are genuinely layout-agnostic (`Vec<u32>` occupations,
+  arbitrary index submatrices), and — contrary to the doc comment at
+  `components.rs:36` claiming "two **adjacent** modes" —
+  `apply_beam_splitter_rx` operates on arbitrary row pairs, so a PBS on optical
+  modes `(0,2)` is fine. **That stale doc comment should be fixed**; taken at
+  face value it says option A is impossible.
+* **`sim.rs` is NOT zero-change, and hides a live bug.** `encode_fock`
+  (`sim.rs:322-331`) nibble-packs Fock states into a `u64` and **silently
+  `break`s past 16 modes** — beyond that, distinct states collide onto the same
+  counts key with no error at all. Doubling halves the usable width to **8
+  spatial modes** in shots mode. That silent collision is a defect today,
+  independent of polarization.
+* The first draft's own I1 table said "zero change to sim" while I3.4 demanded a
+  `decode_fock_string` change, which lives in `sim.rs:347`. Contradictory.
+
+**On the governor — the first draft aimed this at the wrong file.** Pricing is
+`fock_dim(modes, photons)` = `C(m+p−1,p)` (`worker.rs:230-242`) with
+`modes = shape.num_qubits` taken straight from the IR, and the photonic path is
+**exempt from the qubit ceiling** (`worker.rs:215`), so pricing is the only
+guard and the exhaustion risk is real. **But no `worker.rs` change is needed**:
+if `photon q[N] pol;` lowers to an IR with `num_qubits == 2N`, the governor is
+automatically correct. The real invariant to protect is therefore *double at
+lowering*, pinned by a test asserting a `pol` declaration prices as `2N` — not,
+as first written, "compute on 2m in the governor".
+
+### I1b. Convention policy — MATCH THE REFERENCE IMPLEMENTATIONS (decided)
+
+**Aria adopts Perceval's conventions for DV and piquasso's for CV, verbatim,
+including the parts that differ from textbook statements.** Where they differ
+from ours, ours moves.
+
+Rationale: a third convention would mean every cross-check carries a fudge
+factor, and a fudge factor is indistinguishable from a bug once someone forgets
+why it is there. The bridge already has one such factor
+(`theta_perceval = 2·theta_omega`) and it is precisely where the `BS`/`BS.Ry`
+defect (I0b) hid. Matching outright means the cross-check compares raw matrices
+with nothing in between, so a disagreement is a defect by construction.
+
+The consequences, which must be **documented at the point of use**, not only
+here — a convention recorded solely in a design doc is a convention nobody
+applies:
+
+| element | adopted (Perceval / piquasso) | differs from textbook how |
+|---|---|---|
+| `hwp(θ)` | `i · [[cos2θ, sin2θ],[sin2θ, −cos2θ]]` | carries a global `i`; `det = +1` not `−1` |
+| `pbs` | swaps **H** between spatial modes, transmits **V** | usually stated the other way round |
+| `bs_rx(θ,φ)` | Perceval `BS.Ry(2θ)` | the name says Rx; the matrix is Ry. **Rename or document loudly** — see I0b |
+| CV `displace` | Aria stays **Cartesian** `(re, im)` per K15 | piquasso is polar `(r, φ)`; converted in exactly ONE place (`piquasso_ref.py`) |
+
+The `bs_rx` row is the uncomfortable one: the gate is *named* for a convention
+it does not implement. Renaming it is a breaking change to existing `.opticqasm`
+files; leaving it means the name lies. Recommend keeping the name (files exist)
+and stating the matrix explicitly in the grammar docs and every example header,
+since the matrix is what the examples already document.
+
+### I2. Grammar (`opticqasm.pest`)
+
+* `photon_decl` gains an optional marker: `photon q[2] pol;` — declaring `2N`
+  optical modes. Without it, behaviour is unchanged, so every existing file
+  keeps working.
+* New gate names `pbs`, `hwp` (and `qwp` if the wave-plate pair is worth
+  completing). **Note `gate_name` already falls through to `ident`**, so these
+  parse *today* and fail only at lowering — check that failure is loud and names
+  the gate, per K11. A silently-ignored polarization element is the worst
+  outcome available here.
+* Polarization elements take **spatial** mode refs (`pbs q[0], q[1];`), matching
+  Perceval, where `HWP().m == 1` and `PBS().m == 2` are spatial. Lowering
+  expands to sub-modes; the surface stays readable.
+
+### I3. The cascade
+
+1. `crates/omega-parser/src/opticqasm.pest` — grammar
+2. `crates/omega-parser/src/{opticqasm.rs, ast.rs, lower.rs}` — parse -> AST -> `PhotonicOp`
+3. `crates/aria-core/src/ast/opticqasm.rs` — mirror
+4. `crates/omega-backend-photonics` — no new sim code under option A, **but**
+   `decode_fock_string` must label polarization (`|1H,0V,...>`) or every output
+   becomes unreadable at doubled mode count
+5. `crates/omega-cli` — `--input` takes `2N` occupations; the ordering must be
+   documented at the point of use, not only in a design doc
+6. **Governor pricing** — `2m` per I1. Highest-risk item.
+7. `crates/omega-bridges/python/perceval_runner.py` — `_build_opticqasm_circuit`
+   gains `pbs` / `hwp` with the I0 conventions pinned **in a test**, alongside
+   the existing `theta_perceval = 2 * theta_omega` mapping
+8. `crates/omega-bridges/tests/cross_backend.rs` — polarization fixtures
+
+### I3b. Polarized INPUT — unsolved in the first draft, and it blocks the example
+
+The first draft discussed gates at length and said nothing adequate about how a
+polarized input is specified. It is not a documentation gap; the bridge contract
+does not currently admit one:
+
+* `perceval_runner.py:161` requires `input_fock` to be a flat int list with
+  `len == num_modes`, and line 186 reads outputs as `sample[i] for i in
+  range(num_modes)`. Perceval's PBS/HWP are **polarized components on spatial
+  modes** (`HWP().m == 1`), so Perceval would see `N` modes where omega has
+  `2N`: the length check rejects the input and polarized output `BasicState`s
+  break the flat key loop.
+* Two possible designs, and the plan must pick one rather than discover it
+  mid-implementation:
+  1. **Runner expands `pbs`/`hwp` itself** into plain `2N`-mode unitaries, so
+     Perceval never sees a polarized component and the flat contract survives.
+     Keeps the protocol unchanged. **Recommended.**
+  2. Runner builds a genuinely polarized `N`-mode processor, and the protocol
+     grows a polarization-aware input/output encoding.
+* Design 1 also sidesteps a limit of design 2: `--input` occupation numbers
+  (`omega-cli/src/main.rs:68`) can express **H/V basis** inputs, which is all
+  the Kwiat example needs, but not diagonal or circular polarization.
+* Separately: the **server** path builds `PhotonicsBackend::new()` with no input
+  plumbing at all (`quantum_bridge.rs:438-440`), so polarized examples are
+  **CLI-only** until that is addressed. Worth stating before someone tries one
+  over the remote API.
+
+### I4. Validation, and what would make it worthless
+
+* Pin the conventions in tests that read the **matrix**, not in comments that
+  drift. **The first draft's pin was one-sided** and would not have caught its
+  own defect: pinning *Perceval's* HWP `i` passes happily against an omega
+  implementation built from the (wrong) i-less formula. The pin that bites is:
+  read **omega's lowered `2N`-mode unitary** for a lone `hwp` and assert
+  equality with Perceval's polarized matrix, `i` included.
+* End-to-end: Kwiat 4-element Grover, aria vs Perceval on the same source.
+* **Mutation-test the check before trusting it**: swapping the H/V convention
+  must fail it. If a swapped convention still passes, the fixture is agreeing
+  for the wrong reason — the failure mode that has recurred throughout this
+  project (vacuous TLA+ liveness, the phase-blind CV comparison, a Qiskit corpus
+  that could not reach the defects it was meant to catch).
+* A Grover mesh that returns the marked item is **not** evidence on its own:
+  a wrong global phase on an HWP block can leave the marked-item probability
+  intact while corrupting the others. Compare the **full** output distribution.
+* **Sequencing is not optional.** Fix I0b first. Until then the end-to-end
+  distribution check fails both when the implementation is wrong *and* when it
+  is right, and a check with that property verifies nothing.
+
+### I4b. Live defects found while scoping this — all independent of polarization
+
+Recorded so they are fixed as defects rather than absorbed into a feature:
+
+1. **`perceval_runner.py:281` uses the wrong Perceval component** (`BS` where
+   omega means `BS.Ry`). Measured error up to 1.0. See I0b.
+2. **`sim.rs:322` `encode_fock` silently truncates past 16 modes** — distinct
+   Fock states collide onto one counts key with no error raised.
+3. **`decompose.rs:126` `clements_decompose` delegates to Reck** while the
+   module header advertises Clements' "better loss tolerance". The function's
+   own doc says "For now, delegates to Reck", so it is a labelled delegation
+   under a misleading header rather than a covert stub — but a QFT-as-multiport
+   example built on it would inherit a false claim.
+4. **Grammar/lowering asymmetry**: the grammar advertises `bs` and `bs_ry`
+   (`opticqasm.pest:17`) that lowering rejects, while the Perceval runner
+   supports a `bs_ry` omega can never emit. `bs_ry` therefore has **zero**
+   cross-backend coverage.
+5. **`cross_backend.rs:602` references `hom_effect.opticqasm`**; the file is
+   `hom_dip.opticqasm`.
+
+### I4c. What the review confirmed as SOUND
+
+Not everything was wrong, and knowing which parts held matters for how much of
+the plan to rework:
+
+* Mode doubling needs **no** adjacency work — `apply_beam_splitter_rx` takes
+  arbitrary mode pairs; `slos.rs` and `permanent.rs` are layout-agnostic.
+* Unknown gates **do** fail loudly and by name (`"unknown photonic gate: pbs"`,
+  `lower.rs:470`). Nothing is silently dropped, so `pbs`/`hwp` parsing today and
+  failing at lowering is safe.
+* Perceval's PBS permutation and HWP `i` readings (I0 b and c) are correct.
+* The governor exhaustion risk is real; only the *location* of the fix was
+  misidentified.
+
+### I5. What this unlocks, with exact references
+
+* **Grover, 4 elements, one query** — Kwiat, Mitchell, Schwindt & White,
+  *"Grover's search algorithm: an optical approach"*, **J. Mod. Opt. 47(2–3),
+  257–266 (2000)**. Quandela ships this as a Perceval notebook
+  (`2-mode_Grover_algorithm`), so the reference implementation already exists
+  and is runnable — this is the cheapest independent check available.
+* Mesh-based examples (QFT as a multiport) need **no** polarization and are
+  tracked separately: Reck, Zeilinger, Bernstein & Bertani, **PRL 73, 58
+  (1994)**; Clements, Humphreys, Metcalf, Kolthammer & Walmsley, **Optica 3(12),
+  1460–1465 (2016)**, arXiv:1603.08788.
+
+### I6. Related defect found while scoping
+
+`omega-backend-photonics/src/decompose.rs:126` — `clements_decompose` is
+documented as "the Clements (symmetric) scheme" and its module header claims
+"better loss tolerance", but the body is `reck_decompose(unitary)`. It is a stub
+advertising a property it does not have. Either implement Clements or rename it;
+a QFT-as-multiport example would otherwise be built on a claim that is false.

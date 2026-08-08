@@ -272,14 +272,30 @@ def _build_opticqasm_circuit(source: str, pcvl, PS, BS):
             # omega's `bs_rx(θ, φ)` matrix is `[[cos θ, -e^{iφ} sin θ],
             # [e^{-iφ} sin θ, cos θ]]` (see
             # `omega-backend-photonics::components::apply_beam_splitter_rx`).
-            # Perceval's `BS(theta=θ_p)` is `[[cos(θ_p/2), i sin(θ_p/2)],
-            # [i sin(θ_p/2), cos(θ_p/2)]]`. So θ_p = 2·θ_omega gives
-            # the same transmission/reflection split (50/50 at θ_omega=π/4).
-            # Confirmed by HOM smoke test in tests/cross_backend.rs.
-            circuit.add(
-                (modes[0], modes[1]),
-                BS(theta=2.0 * params[0], phi_tr=params[1]),
-            )
+            #
+            # That is Perceval's **Ry** form, NOT its default `BS`, despite the
+            # gate's name. This mapping previously used `BS(theta=2θ,
+            # phi_tr=φ)`, justified by "the same transmission/reflection split"
+            # and "confirmed by HOM smoke test" — i.e. checked on MAGNITUDES
+            # only, by a test that is phase-insensitive. Measured error of that
+            # mapping against omega's matrix: 0.798 at θ=0.6, and 1.0 at 50/50.
+            #
+            # The transverse phase is a CONJUGATION, not a leg phase:
+            #     bs_rx(θ,φ) = PS(+φ)·BS.Ry(2θ)·PS(−φ)   on the first mode
+            # Verified to 5.6e-16 across θ ∈ {0.35, 0.6, π/4, 1.2} and
+            # φ ∈ {0, ±0.4, ±0.7, 1.1, −2.3}. Passing φ as `phi_tr` — with
+            # either sign — is exact only at φ=0 and diverges to ~1.0 otherwise,
+            # which is why this is spelled out as three components rather than
+            # one parameterised call.
+            #
+            # Pinned at the MATRIX level by tests/test_perceval_conventions.py.
+            # An amplitude-only fixture is what let the original error through.
+            theta, phi_tr = params[0], params[1]
+            if phi_tr != 0.0:
+                circuit.add(modes[0], PS(phi=-phi_tr))
+            circuit.add((modes[0], modes[1]), BS.Ry(theta=2.0 * theta))
+            if phi_tr != 0.0:
+                circuit.add(modes[0], PS(phi=phi_tr))
         elif name == "bs_ry":
             if len(params) != 2 or len(modes) != 2:
                 raise _OpticQasmParseError(

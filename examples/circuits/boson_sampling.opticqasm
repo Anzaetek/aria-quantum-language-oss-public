@@ -1,0 +1,55 @@
+// Boson sampling on 3 modes with 2 photons - the case where the PERMANENT
+// actually carries the physics.
+//
+// The HOM dip and the MZI are both solvable by hand, which is what makes them
+// good first tests and poor last ones: a 2x2 permanent is just ad - bc with a
+// plus sign, so an implementation could get the general permanent badly wrong
+// and still pass both. This circuit uses an unbalanced, asymmetric mesh so that
+// several output configurations have genuinely different amplitudes, and the
+// 2-photon amplitudes are permanents of 2x2 SUBMATRICES chosen by the output
+// occupation - which is the code path boson sampling actually exercises.
+//
+// Run it with aria:
+//   omega-run examples/circuits/boson_sampling.opticqasm \
+//     --backend photonics --input 1,1,0
+//
+// Run the SAME circuit through Perceval (Quandela) - see
+// docs/PHOTONICS_EXAMPLES.md for the full recipe and the convention mapping.
+// The short version, given the bridge is installed:
+//   printf '{"qasm":%s,"shots":200000,"input_fock":[1,1,0]}' \
+//     "$(python3 -c 'import json,sys;print(json.dumps(open(sys.argv[1]).read()))' \
+//        examples/circuits/boson_sampling.opticqasm)" \
+//     | crates/omega-bridges/python/omega-bridge-perceval-runner
+//
+// Photon number is conserved, so the only reachable outputs are the six
+// 2-photon configurations over 3 modes: |2,0,0> |0,2,0> |0,0,2> |1,1,0>
+// |1,0,1> |0,1,1>. Their probabilities must sum to 1 - a cheap invariant that
+// catches a mis-indexed submatrix immediately, since a wrong column selection
+// almost never sums back to unity.
+//
+// Conventions are the ones documented in hom_dip.opticqasm: the beam splitter
+// is the Rx form and `ps` applies e^{i*phi} to its mode. Perceval's BS uses a
+// half-angle, so theta_perceval = 2 * theta_omega; that factor is applied in
+// perceval_runner.py and is exactly the kind of mapping this example is here to
+// keep honest.
+
+OPTICQASM 1.0;
+photon q[3];
+
+// Deliberately NOT balanced: theta = 0.6 gives a ~68/32 split, so transmission
+// and reflection carry different weights and a swapped pair of matrix entries
+// changes the answer. At 50/50 it often would not.
+bs_rx(0.6, 0.0) q[0], q[1];
+
+// A non-zero transverse phase on the second splitter. With phi_tr = 0
+// everywhere the mesh stays real, and a dropped complex conjugate anywhere in
+// the permanent would go unnoticed.
+bs_rx(0.9, 0.4) q[1], q[2];
+
+// Phase on the middle mode, so the two interfering paths through mode 1 pick up
+// a relative phase rather than merely a magnitude.
+ps(1.1) q[1];
+
+// Final mixing back across the first pair, making every output mode reachable
+// from every input mode.
+bs_rx(0.35, -0.7) q[0], q[1];
