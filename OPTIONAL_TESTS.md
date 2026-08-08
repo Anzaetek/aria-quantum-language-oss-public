@@ -30,6 +30,57 @@ details; this covers *what each stage buys you*.
 | CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here** — see `CUDA_TODO.md` | untested on this box |
 | Deep harnesses | `ARIA_DEEP=1` | none (just slow) | available | `spectra_noise`, `spectra_scaling_noise` skipped in the default `all` |
 
+## The Qiskit corpus has a hole — and it is the shape of the bugs
+
+**Recorded 2026-08-08 after the cross-check passed 60/60 while three real
+defects were live.**
+
+`omega-xcheck` generates random circuits from **six Clifford gates**
+(`H, S, Sdg, X, Z, CX`), and hardcodes two things on every case
+(`crates/omega-xcheck/src/main.rs:8,20`):
+
+```rust
+classical_bit: None, condition: None
+mid_circuit_mode: MidCircuitMode::Skip
+```
+
+So the sampled space contains **no measurement, no classical conditions, no
+Reset, and no non-Clifford rotations**. All three defects found on 2026-08-08
+live outside it:
+
+| defect | why the corpus missed it |
+|---|---|
+| expectation silently skipped feedforward | no conditionals generated |
+| MCM sampled once per run, not per shot | `Skip` mode; no measurement generated |
+| QASM export dropped `if(c==V)` | no conditionals to export |
+
+`4.441e-16` over 60 cases was **genuine agreement over a region where nothing
+was wrong**. That is not a broken check — it is a check whose *corpus* does not
+span the feature space, which reads identically to a thorough one from the
+summary line.
+
+**What the corpus needs**, in rough order of what it would have caught:
+
+1. **Mid-circuit measurement with `MidCircuitMode::Collapse`**, compared on
+   *distributions* over many shots rather than on an analytic vector — the
+   defect was in the sampling, so an analytic comparison is structurally blind
+   to it.
+2. **Classically-conditioned gates** (`when c == v`), including the case where
+   the condition is **sometimes false**. A condition that is always true hides a
+   dropped guard: both engines agree because both lost the same thing.
+3. **`Reset`**, already covered by `tests/reset_channel.rs` against Aer, but not
+   in the random corpus.
+4. **Non-Clifford rotations** (`Rx/Ry/Rz/U3` at generic angles). Six Clifford
+   gates cannot exercise a phase-convention error.
+5. **Round-trip through QASM**, so an export defect surfaces — but comparing
+   *Aria native* against *Qiskit-on-Aria's-export*, not just both engines on the
+   same text, since a lossy export makes them agree.
+
+Item 5 is the one worth emphasising: a differential test conducted **through**
+an export can agree precisely because the export dropped the same thing on both
+sides. The 2026-08-08 QASM defect was found only by comparing Aria's native
+execution against Qiskit running Aria's exported text.
+
 ## Why each one is worth running
 
 **QEC cross-check** — differential-tests the exact MWPM decoder against
