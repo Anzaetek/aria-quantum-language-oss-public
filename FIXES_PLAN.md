@@ -2199,3 +2199,226 @@ dangling.
 
 Correct the prose in both files rather than deleting it — the wrong explanation
 should stay visible next to the measurement that overturned it.
+
+## Part K — N-way correctness matrix (task #16), new 2026-08-08
+
+> "a few correctness tests with ppvm / tsim / mps / pauli-prop / qiskit /
+> qiskit-mps with the SAME QASM — correctness is key"
+
+One corpus of QASM, every engine that can run it, one report. The value is not
+in adding another green tick; it is that **a defect surviving one engine rarely
+survives seven**. The risk is the opposite: a matrix is the easiest possible
+place to hide a check that never ran.
+
+### K1. Inventory — and the capability classes that make the matrix SPARSE
+
+| engine | kind | runs qubit QASM? | output |
+|---|---|---|---|
+| `statevector` | in-tree, dense | yes | counts / probs / expectation |
+| `noisy-statevector` | in-tree, dense + channels | yes | counts |
+| `mps` / `noisy-mps` | in-tree, tensor | yes | counts / expectation |
+| `pauli` | in-tree, **stabilizer** | **Clifford only** | counts / expectation |
+| `pauliprop` | in-tree, Heisenberg | yes | **expectation ONLY — no sampling** |
+| `photonics` | in-tree, Fock | **no** — photonic circuits, not qubit QASM | counts |
+| `metal-` / `opencl-` / `cuda-statevector` | in-tree, GPU | yes, platform-gated | counts |
+| Qiskit (Aer) | bridge | yes | counts |
+| ppvm | bridge | **general qubit QASM** (no swap/ccx) | **counts — it is a SAMPLER** |
+| tsim | bridge | general qubit QASM, incl. arbitrary rotations | counts |
+| Perceval / Bloqade | bridge | **qubit QASM2** (already Qiskit-anchored) | counts |
+
+> **The ppvm row was WRONG in the first draft** ("Pauli-sum, expectation-ish"),
+> and it propagated into the lane structure below. `ppvm_runner.py:9-28` states
+> the reason plainly: ppvm has two engines, and the bridge deliberately uses
+> `GeneralizedTableau` via `sample_stim` because
+> `PauliSum.overlap_with_zero()` "returns one number and could not honour
+> `shots` without lying about what it measured". `src/ppvm.rs:34` returns
+> `Counts`. **There is no expectation path in the bridge protocol at all**, and
+> ppvm *already runs in a Qiskit-anchored counts comparison today* —
+> `cross_backend.rs:576` (`ppvm_matches_qiskit_within_threshold`, L2 ≤ 0.0025
+> at 4M shots).
+>
+> Consequence: putting ppvm in an "expectation lane" would have (a) removed it
+> from the lane it already occupies and (b) silently required a whole new runner
+> mode plus an observable wire format. If a pauliprop↔ppvm **expectation**
+> cross-check is wanted — which is Part E's actual motivation — that is new
+> protocol work and must be scoped as such, not assumed.
+>
+> Perceval and Bloqade were also mis-rowed as non-qubit; both already run qubit
+> QASM2 in Qiskit-anchored arms.
+
+**Three different reasons a cell is empty**, and they must not look alike:
+
+1. **Cannot express** — `pauli` on a non-Clifford circuit, `photonics` on qubit
+   QASM. A *correct* refusal.
+2. **Not installed** — a bridge venv is absent. Environmental.
+3. **Not implemented / crashed** — a real gap.
+
+Collapsing these into "skipped" is how a matrix reports coverage it does not
+have. Each cell records **which** of the three, and the report prints the counts
+separately.
+
+### K2. Common currency — the part that decides whether this is comparable at all
+
+Engines return counts, probabilities, or expectation values. Comparing them
+needs one currency, and the choice has teeth:
+
+* **Counts → distribution over bitstrings.** Use **L2**, as
+  `cross_backend.rs` already does, with the σ-derived per-arm thresholds it
+  already carries (including a documented 2.5σ-flake → 5σ fix). L2's null scale
+  is `√(Σ 2pₖ(1−pₖ)/n) ≤ √(2/n)` — **dimension-free**.
+
+  > **The first draft proposed TVD at a `~1/√shots` threshold. That is
+  > quantitatively wrong**, and wrong in the same genre as J2's unquantified
+  > "conservative threshold". Null-hypothesis TVD grows like **√d**:
+  > `E[TVD] ≈ Σₖ √(pₖ(1−pₖ)/(πn)) ≈ √(d/(πn))`. Measured, two-sample
+  > multinomial at n=8192:
+  >
+  > | d | measured null TVD | `1/√n` | `√(d/πn)` |
+  > |---|---|---|---|
+  > | 2 | 0.0062 | 0.0110 | 0.0088 |
+  > | 8 | 0.0162 | 0.0110 | 0.0176 |
+  > | 64 | 0.0490 | 0.0110 | 0.0499 |
+  > | 1024 | 0.1970 | 0.0110 | 0.1995 |
+  >
+  > A `c/√shots` threshold is **~2× too tight** on a 2-outcome Bell circuit and
+  > **18× too loose** at d=1024 — vacuous exactly where a wide circuit could
+  > hide a defect. So: keep L2. If TVD is wanted anyway, the threshold must be
+  > computed per circuit from the anchor's empirical distribution as
+  > `k·Σₖ√(p̂ₖ(1−p̂ₖ)/(πn))`, not from shots alone.
+
+* **`pauliprop` is genuinely expectation-only** (`sim.rs:758` — `execute()`
+  unconditionally returns `Unsupported`), so it needs an expectation lane. But
+  see K3: that lane currently has **no independent anchor**.
+* **Analytic vs stochastic must not share a tolerance.** `statevector` vs
+  Qiskit `Statevector` is a 1e-15 comparison; `statevector` vs Aer at 8k shots
+  is a 1e-2 comparison. One number for both is wrong twice.
+
+### K3. Reference choice — anchor, do not compare all pairs
+
+With `N` engines, all-pairs is `O(N²)` cells, most of them uninformative, and a
+single bad engine reddens a whole row and column.
+
+**Anchor on Qiskit** (the only fully independent implementation available) and
+compare every engine to it, plus the analytic truth where a circuit has one.
+Report pairwise only for engines Qiskit cannot reach.
+
+> **The anchor does NOT currently reach the expectation lane, and the first
+> draft did not say so.** `qiskit_runner.py:66-79` supports modes
+> `execute` / `qpy_to_qasm2` / `qasm2_to_qpy` — no expectation, no statevector
+> output — and `tools/qiskit_xcheck/compare.py` compares probabilities and
+> counts, never expectations. With ppvm correctly moved back to the counts lane
+> (K1), the expectation lane reduces to `pauliprop` vs `statevector` vs `mps`:
+> **all in-tree**. That is exactly the weak-evidence configuration this section
+> warns about — the one that let the `Reset` defect through — so the plan would
+> have recommended anchoring while building the one lane that cannot anchor.
+>
+> Either add an expectation mode to the Qiskit runner (new protocol work, scope
+> it) or state plainly that the expectation lane is internal-consistency only
+> and carries less weight than the counts lane.
+
+Rationale from this repo's own history: the `Reset` defect survived every
+*internal* cross-backend gate because each pair coincided in the basis being
+checked. Pairwise agreement among our own engines is weak evidence; agreement
+with an outside implementation is strong.
+
+### K4. The traps — each one has already bitten this project
+
+1. **Do NOT route through Aria's QASM export.** Part H is still open: export
+   drops `if(c==V)`. A differential test conducted *through* a lossy export
+   agrees because both sides lost the same thing. Feed every engine the **same
+   source text**; compare Aria's *native* execution against the others.
+2. **Conditionals must sometimes be FALSE.** An always-true condition hides a
+   dropped guard — both engines agree while one ignores the guard entirely.
+3. **The corpus has holes today.** Measured over the 11 shared fixtures:
+   `measure` in **10/11**, **`if(` in 0/11**, no `reset`. Gate coverage is otherwise
+   good (h, cx, rz, ry, rx, u1/u2/u3, s/sdg, sx/sxdg, swap, cz, cy, crz, ccx,
+   barrier, t, tdg, p). So the corpus **cannot currently reach** the exact defect
+   class fixed in `11888a9`/`ae6da5c`. Extend it before trusting the matrix.
+
+   > The first draft said `measure` in **11/11**. It is **10/11** —
+   > `09_unitary_only.qasm` has no measure statement; the word appears only in
+   > its comment ("No creg, no measure — the runner must synthesise a full-width
+   > measurement"), and a bare `grep -l measure` matched the comment. A claim
+   > stated as measured that was really a grep hitting prose: the exact failure
+   > this document keeps cataloguing, committed while cataloguing it.
+   >
+   > The fixture is operationally relevant too, not just a counting slip:
+   > no-measure and partial-measure circuits are precisely where **counts-keying
+   > conventions diverge** — in-tree engines return `u64` keys over the full
+   > register while bridges return creg-width LSB-first strings. That conversion
+   > is unstated work in K5.
+
+6. **The corpus identity is not stable.** `crosscheck_corpus()`
+   (`cross_backend.rs:92-109`) *prefers* a private `../verify-qiskit` tree
+   (369 files) when checked out, falling back to the 11 vendored fixtures. The
+   hole analysis above describes the **fallback**, which is what is active on
+   this machine. On another operator's box the matrix would silently run a
+   different, unaudited corpus and report the same green. Pin which corpus ran,
+   and print it.
+4. **An all-Clifford corpus makes `pauli` agree trivially.** Non-Clifford
+   rotations are what give a stabilizer backend a chance to be wrong.
+5. **Report the QUALIFYING COUNT per engine**, not just failures. "17/17 agree"
+   over a matrix where five engines ran two circuits each is worse than no
+   matrix, because it reads as coverage.
+
+### K5. Shape
+
+**Build on `crates/omega-bridges/tests/cross_backend.rs`, not on
+`omega-xcheck`.** The first draft called this "an extension rather than a new
+harness" of omega-xcheck. That understates it badly, and it names the wrong base.
+
+* `omega-xcheck/src/main.rs` generates random circuits from a **six-gate**
+  vocabulary (h/s/sdg/x/z/cx) plus a hardcoded 8-circuit feedforward set, over a
+  bespoke `C …`/`M …` line protocol that `compare.py`'s gate dictionaries mirror
+  exactly. It has **no QASM ingestion**, no mps/pauliprop/noisy dispatch, and no
+  bridge invocation. Reaching the corpus gate set (u2/u3/sx/ccx/crz/p…) means
+  rewriting emitter and parser — a new harness in all but name.
+* `cross_backend.rs` **already is** the skeleton described here: a corpus walker
+  (`crosscheck_corpus`), a Qiskit-anchored loop, capability filtering via runner
+  gate-set introspection (the `{"mode":"gates"}` query), a skip taxonomy, and
+  the vacuous-pass guard. Adding in-tree engines there via `omega-parser` plus
+  the `Backend` trait is the short path.
+
+Unstated work either way: **counts-key conversion**. In-tree engines key counts
+by `u64` over the full register; bridges return creg-width LSB-first strings.
+These diverge exactly on the partial-measure and no-measure fixtures.
+
+Output: one row per (circuit, engine) with `status ∈ {agree, disagree,
+cannot-express, not-installed, error}`, the metric and its threshold, and a
+summary that prints **per-engine qualifying counts** and fails on any
+`disagree` or `error`.
+
+> **`cannot-express` cannot be populated from the bridge taxonomy as it
+> stands.** `runner.rs:234-247` maps only kinds ending `-not-installed` to
+> `BridgeError::Unavailable`; every other structured failure — **including
+> `ppvm-unsupported-gate` and `tsim-unsupported-gate`** — collapses into
+> `BridgeError::Backend` with the kind as a string prefix in the message. So
+> distinguishing "cannot express" from "error" means string-sniffing, extending
+> `BridgeError`, or relying on the up-front gates introspection — which only
+> tsim and ppvm implement (qiskit/perceval/bloqade runners have no `"gates"`
+> mode). Perceval limits already surface as a skip-with-continue
+> (`cross_backend.rs:331`), i.e. the code **already commits** the
+> cannot-express-looks-like-not-installed collapse K1 warns against. Fixing the
+> taxonomy is part of this work, not a precondition someone else met.
+>
+> In-tree engines map cleanly: `OmegaError::Unsupported` → `cannot-express`, and
+> both `pauli` and `pauliprop` refuse with typed errors.
+
+Gate it behind `ARIA_NWAY=1` alongside the existing cross-checks, and route the
+skip through `skipped()` so an absent matrix announces itself in the final
+summary line rather than passing silently.
+
+### K6. Order
+
+1. Extend the shared corpus with conditionals (including sometimes-false) and
+   `reset` — **before** building the matrix, so it is not built against a corpus
+   that cannot fail.
+2. Fix the bridge error taxonomy so `cannot-express` is typed, not sniffed.
+3. Counts lane: statevector / mps / noisy-mps / pauli / tsim / **ppvm** /
+   perceval / bloqade / Qiskit — extending `cross_backend.rs`, which already
+   anchors several of these.
+4. Expectation lane: pauliprop / statevector / mps — **and label it
+   internal-consistency only** until the Qiskit runner gains an expectation
+   mode, per K3.
+4. GPU rows behind their existing platform flags.
+5. Only then wire the CI stage.
