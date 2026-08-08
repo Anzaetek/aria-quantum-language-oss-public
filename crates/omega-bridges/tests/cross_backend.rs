@@ -659,3 +659,83 @@ fn count_l2_matches_hand_computed_value() {
         "got {l2}, expected ~{expected}"
     );
 }
+
+/// Report WHICH corpus ran, and assert the vendored one still covers the
+/// defect classes it was extended to reach.
+///
+/// Two distinct problems this guards.
+///
+/// **1. The corpus identity is not stable.** `crosscheck_corpus()` *prefers* a
+/// private `../verify-qiskit/fixtures` tree when it is checked out, falling
+/// back to the 11+ vendored fixtures otherwise. So two operators can run "the
+/// cross-backend tests", see the same green, and have exercised entirely
+/// different circuits — one of them unaudited by anything in this repository.
+/// The label was already computed and returned; nothing printed it.
+///
+/// **2. The vendored corpus had holes exactly the shape of shipped defects.**
+/// Measured before this was extended: `measure` in 10/11 fixtures, but
+/// **`if(` in 0/11 and `reset` in 0/11**. So it could not reach the defect
+/// class fixed in `11888a9` (expectation silently skipped feedforward) or
+/// `ae6da5c` (mid-circuit measurement sampled once per run, not per shot).
+/// A matrix built on that corpus would have been green by construction.
+#[test]
+fn corpus_identity_is_reported_and_covers_the_defect_classes() {
+    let (label, files) = crosscheck_corpus();
+
+    let strip = |s: &str| -> String {
+        s.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut with_if = 0usize;
+    let mut with_reset = 0usize;
+    let mut with_measure = 0usize;
+    for path in &files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let src = strip(&raw);
+        if src.contains("if") && src.contains("==") {
+            with_if += 1;
+        }
+        if src.contains("reset") {
+            with_reset += 1;
+        }
+        if src.contains("measure") {
+            with_measure += 1;
+        }
+    }
+
+    eprintln!("cross-backend corpus: {label} ({} files)", files.len());
+    eprintln!("  measure: {with_measure}   conditionals: {with_if}   reset: {with_reset}");
+
+    assert!(!files.is_empty(), "corpus is empty — nothing would be compared");
+
+    if label != "tests/fixtures/crosscheck" {
+        // Not a failure: the private corpus is larger and legitimate. But it is
+        // NOT audited here, so a green run against it means something different
+        // and must say so rather than read as identical coverage.
+        eprintln!(
+            "  NOTE: running the PRIVATE corpus, which this repository does not \
+             audit. The coverage assertions below are skipped."
+        );
+        return;
+    }
+
+    // Vendored corpus only: keep the holes closed.
+    assert!(
+        with_if >= 2,
+        "the vendored corpus needs at least 2 conditional fixtures (found {with_if}). \
+         One must have a SOMETIMES-FALSE condition and one an always-true control: \
+         an always-true condition alone cannot distinguish 'honours the guard' from \
+         'ignores the guard', because both produce the identical distribution \
+         (measured: both {{\"1\": 20000}} on Aer)."
+    );
+    assert!(
+        with_reset >= 1,
+        "the vendored corpus needs at least one reset fixture (found {with_reset}); \
+         without it the corpus cannot reach the ae6da5c defect class"
+    );
+}
