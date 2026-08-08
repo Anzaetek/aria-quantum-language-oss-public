@@ -2552,6 +2552,37 @@ would have produced a confidently wrong anchor:
 > exactly `0.00e+00` for a `t`→`tdg` mutation). Before trusting a test, ask what
 > symmetry its fixture has.
 
+### K9. The CI crate list is a hand-maintained gate, and it had holes
+
+Found while checking that the step-3 regression tests would actually run.
+
+`ci.sh` tests a **typed list of crates**, not the workspace. Measured
+2026-08-09: of 68 workspace members, 12 are never named in `ci.sh` at all, and
+several more are named only for a single `--test` target. Concretely:
+
+* **`omega-backend-pauli` was not in `OMEGA_CORE`.** Only `--test
+  reset_channel` ran, invoked by name. Its entire remaining suite never
+  executed in CI — including `feedforward_creg_keying.rs`, the regression for
+  the wrong-register defect found in step 3. A regression test that CI does not
+  run is a comment.
+* `omega-backend-photonics`, `omega-backend-cv`, `omega-tensor`: full suites,
+  never run. All four are green today (verified), so they were added to
+  `OMEGA_CORE` in this commit.
+
+**Why not just use `cargo test --workspace`?** Because it is **RED on a clean
+checkout**, and has been for some time: `omega-wasm-cli` has 8 tests that read
+`examples/circuits/vqe_ansatz_2q.qasm`, a file which **has never been tracked
+in git** (`git log` on the path is empty, and it is not gitignored). Verified
+pre-existing by stashing all local work and re-running at `9203010` — same 8
+failures.
+
+So there are two separate problems, and conflating them is how the hole stayed
+open: the *list* is incomplete, and the *workspace* is not green. Fixing the
+list is done here. Making `--workspace` viable means either restoring that
+fixture or marking those tests `#[ignore]` with a reason — deliberate work,
+not a silent edit, because inventing a fixture to turn 8 tests green is exactly
+how a test starts passing for the wrong reason.
+
 **Found while planning: `pauliprop` ignored classical conditions entirely.**
 Zero references to `condition` in the whole crate, against 3 call sites in
 statevector, 2 in MPS, 1 in Pauli. A guarded gate ran **unconditionally and
