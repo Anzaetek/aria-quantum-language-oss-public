@@ -64,9 +64,21 @@ impl Backend for StatevectorBackend {
         // would replay one draw of the reset outcome for every shot and report
         // it as certainty. Mirrors `NoisyStatevectorBackend`'s per-trajectory
         // loop. See `apply_reset` and `tests/reset_channel.rs`.
-        if let (true, Some(shots)) = (circuit_has_reset(circuit), config.shots) {
-            let by_creg =
-                config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0;
+        // Any STOCHASTIC evolution needs one independent trajectory per shot,
+        // not one trajectory replayed `shots` times. Reset is stochastic; so is
+        // a collapse-mode mid-circuit measurement, which this predicate used to
+        // miss — it tested `circuit_has_reset` alone.
+        //
+        // The consequence was severe and silent: `H q0; measure q0 -> c0;
+        // when c0 == 1 { X q1 }` returned |00> on 4000/4000 shots, i.e. a
+        // superposition measured with certainty. Qiskit/Aer on the same circuit
+        // gives {'00': 1995, '11': 2005}. A coin that always lands the same way.
+        //
+        // `stochastic_evolution` is the noisy backend's predicate, which had
+        // been correct all along (`collapses(..) || circuit_has_reset(..)`);
+        // reuse it rather than keep a second, weaker copy in step.
+        if let (true, Some(shots)) = (stochastic_evolution(circuit, config), config.shots) {
+            let by_creg = collapses(circuit, config);
             let mut counts: HashMap<u64, u32> = HashMap::new();
             for _ in 0..shots {
                 let (state, cbits) = evolve_once(circuit, params, config, &mut rng, false)?;
@@ -350,7 +362,9 @@ impl Backend for NoisyStatevectorBackend {
             // Per-trajectory Monte-Carlo when a channel acts during evolution
             // OR when mid-circuit measurement collapses the state (the latter is
             // inherently stochastic per shot, so it can't reuse one evolution).
-            Some(shots) if self.model.has_gate_channel() || stochastic_evolution(circuit, config) => {
+            Some(shots)
+                if self.model.has_gate_channel() || stochastic_evolution(circuit, config) =>
+            {
                 // One independent trajectory per shot — this is what turns a
                 // per-gate channel (amplitude damping, depolarizing, …) into the
                 // right shot statistics instead of one branch drawn once and
@@ -498,12 +512,7 @@ pub fn reset_is_deterministic(state: &[Complex64], n: usize, q: usize) -> bool {
 /// not delicate — an unentangled qubit sits within ~1e-6 of 1 while a maximally
 /// entangled one sits at 0.5, five orders of magnitude away — so a device-
 /// appropriate tolerance separates them cleanly without weakening the check.
-pub fn reset_is_deterministic_within(
-    state: &[Complex64],
-    n: usize,
-    q: usize,
-    tol: f64,
-) -> bool {
+pub fn reset_is_deterministic_within(state: &[Complex64], n: usize, q: usize, tol: f64) -> bool {
     (reduced_purity(state, n, q) - 1.0).abs() < tol
 }
 
