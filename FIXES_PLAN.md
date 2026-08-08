@@ -1319,6 +1319,108 @@ defect happened:
 * **verified on the hardware it claims to support** — `f11a9f5` shipped 2/70
   failing Metal tests because the work was checked on a CUDA box.
 
+## Part G — Embedding as a native library (`.dylib` / `.so` / `.dll`)
+
+**PLAN. Reframes two request documents** (`PLAN-PYTHON-LIBS`,
+`PLAN-PYTHON-FREE-THREADING`) around what is actually wanted: a library a
+downstream can **embed as a native shared object with reasonable ease** — not a
+Python package, and not a new binding layer.
+
+### G0. Most of this already exists — verified 2026-08-07
+
+`crates/omega-ffi` is already `crate-type = ["cdylib", "rlib"]` and builds today
+to a **2.8 MB `.dylib`**, exporting 15 `extern "C"` functions:
+
+```
+omega_runtime_new/free · omega_circuit_from_source · omega_circuit_num_qubits
+omega_circuit_num_params · omega_circuit_is_photonic · omega_execute
+omega_result_num_counts · omega_result_get_counts[_n]
+omega_result_statevector_len · omega_result_get_statevector[_n]
+omega_result_free · omega_api_version
+```
+
+**The dependency situation is already what the request asks for.** Transitively,
+38 external crates, all load-bearing infrastructure rather than hobby projects:
+
+| purpose | crates |
+|---|---|
+| maths | `ndarray`, `num-complex`, `num-traits`, `matrixmultiply`, `rawpointer` |
+| parallelism | `rayon`, `crossbeam-*`, `either` |
+| parsing | `pest` family, `ucd-trie` |
+| wire format | `serde`, `serde_json`, `itoa` |
+| plumbing | `libc`, `libloading`, `cfg-if`, `smallvec`, `thiserror`, `rand`, `getrandom`, `memchr` |
+
+**No `pyo3` in that tree.** The pyo3 path lives in `bindings/aria-py`, a
+separate crate, so an embedder taking `omega-ffi` never pulls a Python
+interpreter or its dependency weight. The C-ABI round trip is also already
+proven end to end by the plugin ABI (`omega-backend-refplugin`, CI stage 6b),
+including a version handshake (`omega_backend_abi_version`).
+
+**So the question is not "build an embeddable library" — it is "does the surface
+we already ship cover what an embedder needs".** That is a much smaller,
+much cheaper question, and it should be answered before anything is built.
+
+### G1. Free-threading is probably moot under this framing
+
+`PLAN-PYTHON-FREE-THREADING` targets the GIL. **But the GIL only constrains work
+that runs *inside* a Python interpreter.** If the deliverable is a `.dylib` the
+caller loads, then:
+
+* the simulation runs in Rust, on Rust threads (`rayon`), with no interpreter
+  involved and no GIL to contend for;
+* Python — if present at all — sits at the edge, calling in and getting numbers
+  back, which is exactly the standing rule from Part E0.
+
+A free-threaded CPython build (3.13+) is an **experimental** interpreter
+configuration, with an ecosystem where many C extensions do not yet work. Taking
+a dependency on it would violate the stated constraint ("no experimental APIs
+unless critical") to solve a problem the dylib framing removes.
+
+**Recommendation: defer free-threading, and state why.** Revisit only if a
+concrete workload is shown to need Python *in* the loop — at which point the
+right response is probably to move that work into Rust rather than to adopt an
+experimental interpreter.
+
+### G2. What actually needs doing
+
+Small, and mostly about contract rather than capability:
+
+1. **Audit the exported surface against a real embedder's needs.** The current
+   15 functions cover: build a circuit from source, inspect it, execute, read
+   counts or statevector, free. Likely gaps to check — **expectation values**
+   (the whole remote/QML path returns scalars, and there is no
+   `omega_expectation`), **gradients** (now that the route exists server-side),
+   **parameter binding** (`num_params` is exposed but no setter is visible), and
+   **noise configuration**. Answer this by asking an embedder, not by guessing.
+2. **Version the ABI explicitly.** `omega_api_version` exists; give it the same
+   documented compatibility contract the plugin ABI has, so an embedder can
+   refuse a mismatched library rather than crash inside it.
+3. **Ship a C header.** Hand-written or `cbindgen`; hand-written is fine at 15
+   functions and adds no build dependency.
+4. **Document the ownership rules.** Every `_free` pairing, which pointers the
+   caller owns, what happens on error. A C ABI with unclear ownership is a
+   memory-safety hazard for the *consumer*, and that is the part a Rust
+   implementation cannot enforce for them.
+5. **Keep the dependency budget as an explicit constraint**, not an accident.
+   Record the current 38 and treat additions to the *embed path* as requiring
+   justification. This is the property the request is really asking to preserve.
+
+### G3. What to refuse
+
+* **A second binding layer.** `omega-ffi` and `bindings/aria-py` already exist;
+  a third surface would multiply the ABI-compatibility burden without adding
+  reach.
+* **Experimental interpreter builds**, per G1, unless a workload demonstrably
+  requires them.
+* **Vendoring the world into the embed path.** Any dependency added to
+  `omega-ffi` is a dependency every embedder inherits, and they cannot opt out.
+
+**Acceptance:** a third party loads the `.dylib`/`.so`, calls
+`omega_api_version`, builds and runs a circuit, and reads results back — with a
+header, documented ownership, and no Python anywhere in the process. Most of
+that works today; the deliverable is proving it from outside the workspace and
+closing whatever the audit in G2.1 finds.
+
 ### C3. Photonics from the Aria surface — **CONFIRMED scope** (2026-08-06)
 
 Promoted from "only if separately prioritized" on explicit instruction. Today
