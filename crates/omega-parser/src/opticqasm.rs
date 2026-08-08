@@ -34,7 +34,14 @@ pub fn parse_opticqasm(input: &str) -> Result<OpticQasmProgram, String> {
                             let mut it = stmt_inner.into_inner();
                             let name = it.next().unwrap().as_str().to_string();
                             let size: u32 = it.next().unwrap().as_str().parse().unwrap();
-                            statements.push(OpticQasmStmt::PhotonDecl { name, size });
+                            // The `pol` marker is an optional trailing rule, so
+                            // its presence is simply whether anything is left.
+                            let polarized = it.next().is_some();
+                            statements.push(OpticQasmStmt::PhotonDecl {
+                                name,
+                                size,
+                                polarized,
+                            });
                         }
                         Rule::gate_app => {
                             let app = parse_gate_app(stmt_inner)?;

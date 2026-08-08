@@ -10,9 +10,16 @@ statement = {
   | gate_app
 }
 
-photon_decl = { "photon" ~ ident ~ "[" ~ integer ~ "]" ~ ";" }
+// `photon q[N];`      -> N optical modes, no polarization.
+// `photon q[N] pol;`  -> N SPATIAL modes, each carrying H and V, so 2N optical
+//                        modes indexed (s, p) -> 2s + p with p=0 meaning H.
+// The marker is optional, so every pre-existing file keeps its meaning.
+photon_decl = { "photon" ~ ident ~ "[" ~ integer ~ "]" ~ pol_marker? ~ ";" }
+pol_marker  = { "pol" }
 
-gate_app = { gate_name ~ "(" ~ param_list ~ ")" ~ mode_list ~ ";" }
+// `pbs` takes no parameters, unlike every other gate, so the parameter list is
+// optional. Without this it would have to be written `pbs() q[0], q[1];`.
+gate_app = { gate_name ~ ("(" ~ param_list ~ ")")? ~ mode_list ~ ";" }
 
 gate_name  = @{ "ps" | "bs_rx" | "bs_ry" | "bs" | ident }
 param_list = { param ~ ("," ~ param)* }

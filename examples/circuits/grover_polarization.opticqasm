@@ -1,0 +1,87 @@
+// Grover's search over 4 elements, in ONE query, with a single photon.
+//
+// Reference:
+//   P. G. Kwiat, J. R. Mitchell, P. D. D. Schwindt and A. G. White,
+//   "Grover's search algorithm: an optical approach",
+//   Journal of Modern Optics 47(2-3), 257-266 (2000).
+//   doi:10.1080/09500340008244040
+//
+// Quandela ship this as a Perceval notebook ("2-mode Grover's search
+// algorithm"), which is why it is the example chosen here: an independent
+// reference implementation already exists and is runnable, so this is not a
+// self-graded exercise.
+//
+// Run it with aria:
+//   omega-run examples/circuits/grover_polarization.opticqasm \
+//     --backend photonics --input 1,0,0,0 --shots 20000
+//
+// The `--input` list is over OPTICAL modes, which for a `pol` register is
+// 2 * (spatial modes) in the order [q0_H, q0_V, q1_H, q1_V]. So `1,0,0,0` is
+// one HORIZONTALLY polarized photon in spatial mode 0.
+//
+// WHY THIS IS ONE QUERY, NOT TWO. The classical bound for finding a marked
+// item among 4 is 2.25 queries on average; Grover needs floor(pi/4 * sqrt(4))
+// = 1. The optical version gets there by encoding the 4 database entries in
+// the 4 (spatial x polarization) modes of a single photon, so the "oracle" is
+// one pass through one set of wave plates. It is not a speedup over a real
+// quantum computer -- with 4 modes for 4 items the resource cost is linear, as
+// Kwiat et al. state plainly. It is a faithful demonstration of the
+// interference, which is what makes it a good correctness test.
+//
+// CONVENTIONS, which differ from the usual textbook statements and are pinned
+// by tests rather than trusted from comments:
+//   * `hwp(theta)` is i * [[cos 2t, sin 2t], [sin 2t, -cos 2t]] -- Perceval's
+//     convention, INCLUDING the global i. That i is not ignorable: a wave plate
+//     acts on a subset of the interferometer's modes, so a global factor on
+//     that block is a RELATIVE phase between interfering paths. Dropping it
+//     moves 4-mode output probabilities by up to 0.413.
+//   * `pbs` SWAPS H between the two spatial modes and TRANSMITS V. This is the
+//     opposite of the common "transmits H, reflects V" phrasing.
+// Both are pinned in crates/omega-backend-photonics/tests/polarization_conventions.rs
+// and crates/omega-bridges/python/tests/test_perceval_conventions.py.
+//
+// This file marks element |10>, i.e. optical mode 2 = (spatial 1, H). Verified,
+// not asserted: aria and Perceval BOTH return |0,0,1,0> with probability 1.
+//
+// A CAVEAT ON WHAT THAT AGREEMENT PROVES. The output is deterministic, so this
+// end-to-end check has limited power to discriminate phase errors -- several
+// wrong circuits also concentrate on one mode. The real convention checks are
+// the MATRIX-level ones in polarization_conventions.rs and
+// test_perceval_conventions.py; this example demonstrates the algorithm and
+// confirms the two stacks compose the same way, which is a weaker claim.
+
+OPTICQASM 1.0;
+photon q[2] pol;
+
+// ---- Preparation: equal superposition over all four modes ----------------
+// hwp(pi/8) rotates H into an equal H/V superposition (2*theta = pi/4), and
+// the balanced beam splitter spreads that across both spatial modes. After
+// this the photon is equally likely in any of the 4 modes -- the "database".
+hwp(0.39269908169872414) q[0];
+bs_rx(0.7853981633974483, 0.0) q[0], q[1];
+
+// ---- Oracle: mark element |10> -------------------------------------------
+// The oracle flips the sign of exactly one mode. hwp(pi/4) maps H <-> V, and
+// combined with the pbs below it routes the marked amplitude onto the path
+// that picks up the sign flip. Changing these two angles selects which of the
+// four elements is marked.
+hwp(0.7853981633974483) q[1];
+pbs q[0], q[1];
+
+// ---- Inversion about the mean --------------------------------------------
+// The standard Grover diffusion step, realised optically: recombine, flip
+// about the average with a pi/4 plate, and recombine again.
+bs_rx(0.7853981633974483, 0.0) q[0], q[1];
+hwp(0.7853981633974483) q[0];
+bs_rx(0.7853981633974483, 0.0) q[0], q[1];
+
+// ---- Read-out -------------------------------------------------------------
+// A final pbs separates H from V so each of the 4 (spatial, polarization)
+// modes is a distinct detector. The marked element should dominate.
+//
+// IMPORTANT for anyone checking this: "the marked item has the highest
+// probability" is NOT sufficient evidence that the circuit is right. A wrong
+// global phase on a wave-plate block can leave the marked amplitude intact
+// while corrupting the other three. Compare the FULL distribution against
+// Perceval -- docs/PHOTONICS_EXAMPLES.md gives the command.
+pbs q[0], q[1];

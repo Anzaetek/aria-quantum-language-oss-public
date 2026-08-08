@@ -19,6 +19,11 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Test-only: the polarization convention test lowers real OPTICQASM source and
+# reads the resulting mode unitary. Going through the parser is the point —
+# testing a hand-built op list would not catch a lowering bug, which is where
+# the polarization expansion actually lives.
+omega-parser = { path = "../omega-parser" }
 
 [[bench]]
 name = "photonics_bench"
