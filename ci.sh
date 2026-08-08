@@ -19,8 +19,23 @@ ARIA_CRATES=(-p aria-core -p aria-runtime -p aria-cli -p aria-verify-core \
 FMT_CRATES=(-p aria-runtime -p aria-cli -p aria-verify-core -p aria-qec -p aria-verify \
   -p aria-tune "${APP_CRATES[@]}")
 # Pure-Rust omega crates the default Aria build links against.
+#
+# This list is a HAND-MAINTAINED GATE, and it had holes. `omega-backend-pauli`
+# was absent, so only its `reset_channel` target ever ran (invoked by name
+# below) and its whole remaining suite -- including the creg-keying regression
+# added with the N-way matrix -- never executed in CI. Same for
+# `omega-backend-photonics` and `omega-backend-cv`: full suites, never run.
+#
+# The general problem is worth stating because it will recur: a crate is
+# covered here only if someone remembered to type it. `cargo test --workspace`
+# would have no holes, but it is currently RED on a clean checkout
+# (`omega-wasm-cli` reads `examples/circuits/vqe_ansatz_2q.qasm`, which has
+# never been tracked in git), so switching to it is its own piece of work --
+# tracked in FIXES_PLAN.md K9 rather than done silently here.
 OMEGA_CORE=(-p omega-core -p omega-backend-statevector -p omega-backend-mps \
-  -p omega-backend-pauliprop -p omega-parser -p omega-backend-refplugin)
+  -p omega-backend-pauliprop -p omega-parser -p omega-backend-refplugin \
+  -p omega-backend-pauli -p omega-backend-photonics -p omega-backend-cv \
+  -p omega-tensor)
 # WASM guests loaded into omega-wasm-runtime by the application harnesses.
 WASM_GUESTS=(vqe omega_app)
 
