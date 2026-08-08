@@ -56,6 +56,159 @@ fn curated_fixtures() -> Vec<(&'static str, PathBuf)> {
         .collect()
 }
 
+/// Every `*.qasm` under a directory tree, sorted for a stable report
+/// order. Used by the gate-set-filtered arms below.
+#[allow(dead_code)]
+fn walk_qasm(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "qasm") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The QASM2 corpus the gate-set-filtered arms scan.
+///
+/// Prefers the private `verify-qiskit/fixtures/` tree (369 files) when
+/// the operator has it checked out beside this repo; that is the
+/// corpus the crate docs and the Perceval/Bloqade thresholds refer to.
+/// It is **not vendored into this repository** (see
+/// `crates/omega-cli/tests/bridge_smoke.rs`, which hit the same wall),
+/// so the fallback is the self-contained corpus under
+/// `tests/fixtures/crosscheck/`. Returns `(label, path, source)`.
+#[allow(dead_code)]
+fn crosscheck_corpus() -> (&'static str, Vec<PathBuf>) {
+    let private = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("verify-qiskit")
+        .join("fixtures");
+    if private.is_dir() {
+        let files = walk_qasm(&private);
+        if !files.is_empty() {
+            return ("verify-qiskit/fixtures", files);
+        }
+    }
+    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("crosscheck");
+    ("tests/fixtures/crosscheck", walk_qasm(&vendored))
+}
+
+/// Gate names a QASM2 source applies, plus any construct the shared
+/// lowering refuses outright (`gate`, `opaque`, `if`) reported under
+/// its own keyword. Declarations, `barrier`, and `measure`/`reset`
+/// (which every backend handles structurally) are not gates and are
+/// skipped.
+///
+/// Deliberately the same shallow scan the Python converter does — it
+/// only has to be *conservative*: a name this misses that the
+/// converter then refuses simply shows up as a skipped fixture, never
+/// as a wrong number.
+#[allow(dead_code)]
+fn gates_used(qasm: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for raw_line in qasm.lines() {
+        let line = raw_line.split("//").next().unwrap_or("");
+        for stmt in line.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            let head: String = stmt
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if head.is_empty() {
+                continue;
+            }
+            match head.as_str() {
+                "OPENQASM" | "include" | "qreg" | "creg" | "barrier" | "measure" | "reset" => {}
+                other => {
+                    out.insert(other.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Ask a runner which QASM2 gate names it can lower (`{"mode":"gates"}`).
+///
+/// The gate set lives in `python/qasm2_stim.py`; querying it here
+/// instead of duplicating the list in Rust means the fixture filter
+/// can never claim a coverage number the converter disagrees with.
+#[allow(dead_code)]
+fn runner_gate_set(slug: &str) -> std::collections::BTreeSet<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(wrapper(slug))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {slug} runner for gate-set query: {e}"));
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(br#"{"mode":"gates"}"#)
+        .expect("write gate-set query");
+    let out = child.wait_with_output().expect("wait for gate-set query");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let resp: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "{slug} runner returned non-JSON for the gate-set query: {e} \
+             (stdout: {stdout}, stderr: {})",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert!(
+        resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        "{slug} runner refused the gate-set query: {resp}"
+    );
+    resp.get("gates")
+        .and_then(|v| v.as_array())
+        .expect("gate-set response missing `gates`")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Corpus entries whose every gate is inside `gate_set`. Returns
+/// `(corpus_label, selected, total)` so the test can report coverage.
+#[allow(dead_code)]
+fn fixtures_within_gate_set(
+    gate_set: &std::collections::BTreeSet<String>,
+) -> (&'static str, Vec<PathBuf>, usize) {
+    let (label, all) = crosscheck_corpus();
+    let total = all.len();
+    let selected = all
+        .into_iter()
+        .filter(|path| {
+            let Ok(qasm) = std::fs::read_to_string(path) else {
+                return false;
+            };
+            gates_used(&qasm).iter().all(|g| gate_set.contains(g))
+        })
+        .collect();
+    (label, selected, total)
+}
+
 #[allow(dead_code)]
 fn runner_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python")
@@ -298,6 +451,132 @@ fn bloqade_matches_qiskit_within_threshold() {
              Skipping rather than passing vacuously."
         );
     }
+}
+
+/// Shared body for the two QuEra stim-dialect arms (tsim, ppvm).
+///
+/// Both bridges lower QASM2 through the same `python/qasm2_stim.py`
+/// converter and both *sample*, so they share a threshold, a shot
+/// count, and a skip policy. The only per-backend input is the slug
+/// and the gate set the runner reports, which drives the fixture
+/// filter.
+///
+/// ## Why 4M shots and not Bloqade's 1M
+///
+/// Bloqade's arm gets away with 1M because its side is exact
+/// (probability × shots): the only binomial noise is Qiskit's, so
+/// `Var(Δp) = p(1-p)/N`. tsim and ppvm are Monte-Carlo samplers, so
+/// *both* sides carry that variance and `Var(Δp) = 2p(1-p)/N`.
+///
+/// The tightest case is a two-outcome fixture (Bell, GHZ) where
+/// `L2 = √2·|Δp|` with `p = 1/2`. At N shots, `sd(Δp) = √(0.5/N)`, so
+/// the threshold sits at `0.0025 / (√2 · √(0.5/N))` standard
+/// deviations. N = 1M puts that at only 2.5σ — a ~1.2% false-failure
+/// rate per fixture, which over a multi-fixture corpus is a flaky
+/// test, not a gate. N = 4M puts it at 5σ (≈ 6e-7 per fixture), which
+/// is the same safety margin Bloqade's 1M buys. Measured cost at 4M
+/// shots on a 3-qubit fixture: qiskit 1.5 s, ppvm 2.7 s, tsim 6.9 s.
+///
+/// Note the dispatcher does not forward a seed (`RunnerRequest` has no
+/// seed field), so these runs are genuinely random every invocation —
+/// the margin above is what keeps that honest rather than lucky.
+#[cfg(feature = "bridge-qiskit")]
+#[allow(dead_code)]
+fn quera_stim_bridge_matches_qiskit(backend: Backend, slug: &str) {
+    const THRESHOLD: f64 = 0.0025;
+    const SHOTS: u32 = 4_000_000;
+
+    if !venv_python("qiskit").exists() {
+        eprintln!(
+            "Qiskit venv missing at {} — skipping cross-backend harness. \
+             Build with `make -C crates/omega-bridges/python qiskit-venv`.",
+            venv_python("qiskit").display()
+        );
+        return;
+    }
+    if !venv_python(slug).exists() {
+        eprintln!(
+            "{slug} venv missing at {} — skipping cross-backend harness. \
+             Build with `make -C crates/omega-bridges/python {slug}-venv`.",
+            venv_python(slug).display()
+        );
+        return;
+    }
+    force_runner_env("qiskit");
+    force_runner_env(slug);
+
+    let gate_set = runner_gate_set(slug);
+    let (corpus, fixtures, total) = fixtures_within_gate_set(&gate_set);
+    eprintln!(
+        "\n{slug}_matches_qiskit_within_threshold: {} of {total} fixtures in \
+         {corpus} are inside the {slug} gate set ({})",
+        fixtures.len(),
+        gate_set.iter().cloned().collect::<Vec<_>>().join(" ")
+    );
+    assert!(
+        !fixtures.is_empty(),
+        "no {slug}-compatible fixtures found in {corpus} — corpus missing or filter broken"
+    );
+
+    let mut report: Vec<(String, f64)> = Vec::new();
+    for path in &fixtures {
+        let qasm = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let label = path.file_name().unwrap().to_string_lossy().to_string();
+
+        let (qk_counts, qk_total) =
+            run_or_skip(Backend::Qiskit, &qasm, SHOTS, &format!("{label} qiskit"))
+                .expect("Qiskit must succeed when its venv is present");
+        let (other_counts, other_total) =
+            match run_or_skip(backend, &qasm, SHOTS, &format!("{label} {slug}")) {
+                Some(x) => x,
+                None => continue,
+            };
+
+        let l2 = count_l2(&qk_counts, &other_counts, qk_total, other_total);
+        report.push((label.clone(), l2));
+        assert!(
+            l2 <= THRESHOLD,
+            "{label}: L2 = {l2:.5e} exceeds {slug} threshold {THRESHOLD}"
+        );
+    }
+    for (label, l2) in &report {
+        eprintln!("  {label:<40} L2 = {l2:.4e}");
+    }
+    // Vacuous-pass guard, mirroring the Perceval / Bloqade arms: both
+    // venvs present but every run Unavailable would otherwise pass
+    // silently with nothing compared.
+    if report.is_empty() {
+        eprintln!(
+            "\nNo fixtures successfully exercised both backends — every \
+             {slug} run was Unavailable. Check the venv build; see \
+             crates/omega-bridges/python/requirements-{slug}.txt. \
+             Skipping rather than passing vacuously."
+        );
+    }
+}
+
+/// tsim arm: QuEra's ZX-calculus stabilizer-rank sampler
+/// (`bloqade-tsim`), fed the extended-Stim text that
+/// `python/qasm2_stim.py` lowers QASM2 into. Restricted to the
+/// fixtures whose gates are inside the converter's tsim set — which
+/// includes SWAP and CCX/CCZ, since tsim's `shorthand_to_stim`
+/// expands those into Clifford+T.
+#[cfg(all(feature = "bridge-qiskit", feature = "bridge-tsim"))]
+#[test]
+fn tsim_matches_qiskit_within_threshold() {
+    quera_stim_bridge_matches_qiskit(Backend::Tsim, "tsim");
+}
+
+/// ppvm arm: QuEra's generalized stabilizer tableau, sampled through
+/// `ppvm.sample_stim`. Same lowering as the tsim arm, smaller gate
+/// set — ppvm's executor rejects SWAP and has no CCX/CCZ sugar, so
+/// fixtures using those are filtered out here and only exercised on
+/// the tsim side.
+#[cfg(all(feature = "bridge-qiskit", feature = "bridge-ppvm"))]
+#[test]
+fn ppvm_matches_qiskit_within_threshold() {
+    quera_stim_bridge_matches_qiskit(Backend::Ppvm, "ppvm");
 }
 
 /// OPTICQASM ↔ Perceval round-trip — confirm the photonic bridge

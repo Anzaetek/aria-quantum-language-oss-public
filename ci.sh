@@ -309,6 +309,27 @@ else
   skipped "CUDA backends — set ARIA_CUDA=1 on a CUDA box"
 fi
 
+# Bridge cross-checks (opt-in; needs the per-backend venvs).
+#
+# The omega-bridges cross-backend arms — perceval, bloqade, and now tsim/ppvm —
+# assert L2 vs Qiskit under 0.0025 on a shared QASM2 corpus. NOTHING INVOKED
+# THEM: ci.sh had no bridges stage at all, so those arms had only ever run by
+# hand. An arm that skips silently in a CI that never calls it is not a gate,
+# and a fresh checkout reported green having compared nothing — the same failure
+# this script fixes one layer up for the Qiskit stage.
+#
+# Each arm auto-skips when its venv is absent and carries a vacuous-pass guard
+# (every case Unavailable => fail, not pass), so enabling this cannot turn a
+# missing toolchain into a false green.
+if [ "${ARIA_BRIDGE_XCHECK:-0}" = "1" ]; then
+  step "+   Bridge cross-checks (perceval / bloqade / tsim / ppvm)"
+  cargo test -p omega-bridges --features bridge-qiskit,bridge-tsim,bridge-ppvm \
+    --test cross_backend -- --nocapture
+  echo "  OK: bridge arms agree with Qiskit within L2 0.0025 (or skipped with a reason)"
+else
+  skipped "bridge cross-checks — set ARIA_BRIDGE_XCHECK=1 with the backend venvs"
+fi
+
 # Qiskit differential cross-check. MANDATORY in intent: it is the only
 # INDEPENDENT implementation available, and this project has already shipped a
 # defect that every internal cross-backend agreement gate missed (each pair of

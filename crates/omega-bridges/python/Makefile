@@ -9,8 +9,14 @@
 #   make qiskit-venv      # create .venv-qiskit and install Qiskit + qiskit-aer
 #   make perceval-venv    # create .venv-perceval and install Perceval
 #   make bloqade-venv     # create .venv-bloqade and install Bloqade (QuEra Aquila)
-#   make all              # all three
+#   make tsim-venv        # create .venv-tsim and install bloqade-tsim (QuEra)
+#   make ppvm-venv        # create .venv-ppvm and install ppvm (QuEra, git)
+#   make all              # all five
 #   make clean            # remove all venvs
+#
+# tsim and ppvm both require Python >= 3.10, which the macOS system
+# `python3` (3.9) is not. Pass a newer interpreter explicitly:
+#   make tsim-venv PY=python3.12
 #
 # After install, expose the runners on PATH (or via env var):
 #   export OMEGA_BRIDGE_QISKIT_CMD="$(pwd)/omega-bridge-qiskit-runner"
@@ -22,9 +28,10 @@
 
 PY ?= python3
 
-.PHONY: all qiskit-venv perceval-venv bloqade-venv clean check-qiskit check-perceval check-bloqade
+.PHONY: all qiskit-venv perceval-venv bloqade-venv tsim-venv ppvm-venv clean \
+	check-qiskit check-perceval check-bloqade check-tsim check-ppvm
 
-all: qiskit-venv perceval-venv bloqade-venv
+all: qiskit-venv perceval-venv bloqade-venv tsim-venv ppvm-venv
 
 qiskit-venv: .venv-qiskit/.installed
 
@@ -49,6 +56,26 @@ bloqade-venv: .venv-bloqade/.installed
 	./.venv-bloqade/bin/pip install --upgrade pip
 	./.venv-bloqade/bin/pip install -r requirements-bloqade.txt
 	@touch .venv-bloqade/.installed
+
+tsim-venv: .venv-tsim/.installed
+
+.venv-tsim/.installed: requirements-tsim.txt
+	$(PY) -m venv .venv-tsim
+	./.venv-tsim/bin/pip install --upgrade pip
+	./.venv-tsim/bin/pip install -r requirements-tsim.txt
+	@touch .venv-tsim/.installed
+
+# ppvm ships as a maturin mixed Rust/Python wheel from a git
+# subdirectory, so this target compiles a Rust crate. The repo already
+# pins a toolchain (rust-toolchain.toml), so no extra setup — just a
+# slower first build than a pure-Python venv.
+ppvm-venv: .venv-ppvm/.installed
+
+.venv-ppvm/.installed: requirements-ppvm.txt
+	$(PY) -m venv .venv-ppvm
+	./.venv-ppvm/bin/pip install --upgrade pip
+	./.venv-ppvm/bin/pip install -r requirements-ppvm.txt
+	@touch .venv-ppvm/.installed
 
 # Smoke check: round-trip a Bell-state QASM through the runner and
 # inspect the counts. Skips with a clear message if the venv is missing.
@@ -77,5 +104,19 @@ check-bloqade:
 	@printf '{"qasm":"OPENQASM 2.0; include \\"qelib1.inc\\"; qreg q[2]; creg c[2]; h q[0]; cx q[0],q[1]; measure q -> c;","shots":1024}' \
 		| ./omega-bridge-bloqade-runner
 
+check-tsim:
+	@if [ ! -x ./.venv-tsim/bin/python ]; then \
+		echo "tsim venv not built — run 'make tsim-venv PY=python3.12' first."; exit 2; \
+	fi
+	@printf '{"qasm":"OPENQASM 2.0; include \\"qelib1.inc\\"; qreg q[2]; creg c[2]; h q[0]; t q[0]; cx q[0],q[1]; measure q -> c;","shots":1024,"seed":7}' \
+		| ./omega-bridge-tsim-runner
+
+check-ppvm:
+	@if [ ! -x ./.venv-ppvm/bin/python ]; then \
+		echo "ppvm venv not built — run 'make ppvm-venv PY=python3.12' first."; exit 2; \
+	fi
+	@printf '{"qasm":"OPENQASM 2.0; include \\"qelib1.inc\\"; qreg q[2]; creg c[2]; h q[0]; t q[0]; cx q[0],q[1]; measure q -> c;","shots":1024,"seed":7}' \
+		| ./omega-bridge-ppvm-runner
+
 clean:
-	rm -rf .venv-qiskit .venv-perceval .venv-bloqade
+	rm -rf .venv-qiskit .venv-perceval .venv-bloqade .venv-tsim .venv-ppvm
