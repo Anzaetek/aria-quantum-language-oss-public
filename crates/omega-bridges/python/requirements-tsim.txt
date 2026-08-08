@@ -1,0 +1,18 @@
+# QuEra `bloqade-tsim` — ZX-calculus stabilizer-rank sampler.
+#   https://github.com/QuEraComputing/tsim   https://tsim.mintlify.app/
+# Apache-2.0, PyPI, beta (0.1.x). Requires Python >= 3.10; the repo's
+# default `python3` on macOS is often 3.9, so pass a newer interpreter:
+#   make -C crates/omega-bridges/python tsim-venv PY=python3.12
+#
+# Pulls jax / jaxlib / equinox / pyzx-param / stim transitively. Those
+# are CPU wheels on every platform this bridge is tested on; the GPU
+# jaxlib variants are an operator choice, not a requirement — tsim
+# samples 4M shots of a 3-qubit circuit in ~7 s on CPU.
+#
+# Pinned loosely: 0.1.x is pre-1.0 and the tag dialect the runner emits
+# (`S[T]`, `I[R_Z(theta=<c>*pi)]`, `I[U3(...)]`) is the *canonical*
+# form tsim's own printer produces, so it is the surface least likely
+# to churn. If a future release changes it, the cross-backend arm in
+# tests/cross_backend.rs fails loudly rather than drifting.
+bloqade-tsim>=0.1.5,<0.2
+numpy>=1.26

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Wrapper for tsim_runner.py that resolves the bundled venv.
+#
+# Discovery order for the Python interpreter:
+# 1. $OMEGA_BRIDGE_TSIM_PYTHON (full path to a python binary).
+# 2. $(dirname $0)/.venv-tsim/bin/python (the `make tsim-venv` default).
+# 3. python3 on PATH (assumes the system Python has tsim installed).
+#
+# Read JSON request from stdin, emit JSON response on stdout. Errors
+# from the runner itself are reported with `{"ok":false,"error":...}`;
+# wrapper-level errors (missing python entirely) come back here as
+# non-zero exit so the Rust caller surfaces `Unavailable`.
+
+set -euo pipefail
+
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+runner="${self_dir}/tsim_runner.py"
+
+if [ ! -f "${runner}" ]; then
+  echo "tsim_runner.py not found alongside the wrapper at ${runner}" >&2
+  exit 2
+fi
+
+py="${OMEGA_BRIDGE_TSIM_PYTHON:-${self_dir}/.venv-tsim/bin/python}"
+if [ ! -x "${py}" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    py=python3
+  else
+    echo "no usable python (set OMEGA_BRIDGE_TSIM_PYTHON or run 'make tsim-venv')" >&2
+    exit 2
+  fi
+fi
+
+exec "${py}" "${runner}"

@@ -24,6 +24,11 @@
 //! Today the crate ships:
 //! - `bridge-qiskit`: subprocess runner (Python venv).
 //! - `bridge-perceval`: subprocess runner (Python venv).
+//! - `bridge-bloqade`: subprocess runner (Python venv), gate mode.
+//! - `bridge-tsim`: subprocess runner (Python venv). QuEra's
+//!   ZX-calculus stabilizer-rank sampler.
+//! - `bridge-ppvm`: subprocess runner (Python venv). QuEra's
+//!   generalized-stabilizer-tableau sampler.
 //!
 //! Cirq / qadence are **deferred** — their feature flags stay reserved
 //! so the dispatch surface doesn't churn, but the implementations only
@@ -88,7 +93,7 @@ impl Backend {
             "perceval" => Backend::Perceval,
             "bloqade" | "quera" | "aquila" => Backend::Bloqade,
             "ppvm" => Backend::Ppvm,
-            "tsim" => Backend::Tsim,
+            "tsim" | "bloqade-tsim" => Backend::Tsim,
             "cirq" | "circ" => Backend::Cirq,
             "qadence" => Backend::Qadence,
             other => return Err(BridgeError::UnknownBackend(other.to_string())),
@@ -271,6 +276,11 @@ mod tests {
         assert_eq!(Backend::parse("bloqade").unwrap(), Backend::Bloqade);
         assert_eq!(Backend::parse("quera").unwrap(), Backend::Bloqade);
         assert_eq!(Backend::parse("aquila").unwrap(), Backend::Bloqade);
+        assert_eq!(Backend::parse("tsim").unwrap(), Backend::Tsim);
+        assert_eq!(Backend::parse("TSim").unwrap(), Backend::Tsim);
+        assert_eq!(Backend::parse("bloqade-tsim").unwrap(), Backend::Tsim);
+        assert_eq!(Backend::parse("ppvm").unwrap(), Backend::Ppvm);
+        assert_eq!(Backend::parse("PPVM").unwrap(), Backend::Ppvm);
         assert_eq!(Backend::parse("cirq").unwrap(), Backend::Cirq);
         assert_eq!(Backend::parse("circ").unwrap(), Backend::Cirq);
         assert_eq!(Backend::parse("qadence").unwrap(), Backend::Qadence);
@@ -371,7 +381,7 @@ mod tests {
         }
         // And the surface should be non-empty (regression guard
         // against accidental list-truncation).
-        assert!(Backend::all_names().len() >= 5);
+        assert!(Backend::all_names().len() >= 7);
     }
 
     #[test]

@@ -48,6 +48,8 @@ opencl = [
 # matching the soft-fail design from `../QuetzalcoatlProto/backend/backend.py`.
 bridge-qiskit = ["omega-bridges/bridge-qiskit"]
 bridge-perceval = ["omega-bridges/bridge-perceval"]
+bridge-tsim = ["omega-bridges/bridge-tsim"]
+bridge-ppvm = ["omega-bridges/bridge-ppvm"]
 
 [dependencies]
 omega-core = { path = "../omega-core" }

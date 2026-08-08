@@ -1,0 +1,19 @@
+# QuEra `ppvm` — Pauli Propagation Virtual Machine.
+#   https://github.com/QuEraComputing/ppvm
+#   https://queracomputing.github.io/ppvm/
+# Apache-2.0, v0.1.0. NOT on PyPI: the Python bindings ship from the
+# repo's `ppvm-python/` subdirectory as a maturin mixed Rust/Python
+# wheel, so this is a git install and building it needs a Rust
+# toolchain (the repo already requires one — see rust-toolchain.toml).
+#
+# Requires Python >= 3.10; the repo's default `python3` on macOS is
+# often 3.9, so pass a newer interpreter:
+#   make -C crates/omega-bridges/python ppvm-venv PY=python3.12
+#
+# Unpinned upstream ref: v0.1.0 has no tags to pin to, so this tracks
+# the default branch. The bridge is validated by the cross-backend arm
+# in tests/cross_backend.rs, which fails loudly if an upstream change
+# breaks the lowering — that gate, not a version pin, is what keeps
+# the numbers honest.
+ppvm @ git+https://github.com/QuEraComputing/ppvm.git#subdirectory=ppvm-python
+numpy>=1.26
