@@ -136,7 +136,7 @@ impl Backend for PhotonicsBackend {
             }
             Some(shots) => {
                 // Sample from the distribution
-                let counts = sample_from_distribution(&distribution, shots, config.seed);
+                let counts = sample_from_distribution(&distribution, shots, config.seed)?;
                 Ok(ExecResult::Counts(counts))
             }
         }
@@ -291,13 +291,18 @@ fn evaluate_observable_against_distribution(
     total
 }
 
+/// Largest mode count the u64 nibble encoding can represent without collision.
+const MAX_ENCODABLE_MODES: usize = 16;
+/// Largest photon count per mode the 4-bit nibble can hold.
+const MAX_PHOTONS_PER_MODE: u32 = 15;
+
 /// Sample from a Fock-state probability distribution.
 /// Returns counts keyed by a hash of the Fock state (encoded as bitstring).
 fn sample_from_distribution(
     distribution: &[(slos::FockState, f64)],
     shots: u32,
     seed: Option<u64>,
-) -> HashMap<u64, u32> {
+) -> Result<HashMap<u64, u32>> {
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
@@ -317,15 +322,43 @@ fn sample_from_distribution(
         *last = 1.0;
     }
 
-    // Encode Fock states as u64: pack photon counts into nibbles
-    // (supports up to 16 modes with up to 15 photons each)
+    // Encode Fock states as u64: pack photon counts into nibbles, so at most
+    // 16 modes with at most 15 photons each.
+    //
+    // Both limits are checked UP FRONT and refused, because exceeding either
+    // used to be silent: modes past 16 were dropped with a bare `break` and
+    // counts above 15 were masked with `& 0xF`. Either way, distinct Fock
+    // states collapse onto the same key and the caller receives a plausible
+    // histogram that is quietly wrong — the worst failure available, and worse
+    // than an error, since nothing downstream can detect it.
+    //
+    // This got sharper with polarization: a `pol` register uses TWO optical
+    // modes per spatial mode, so the 16-mode ceiling is reached at 8 spatial
+    // modes.
+    for (i, state) in distribution.iter().enumerate() {
+        if state.0.len() > MAX_ENCODABLE_MODES {
+            return Err(OmegaError::InvalidCircuit(format!(
+                "shots-mode photonic sampling encodes Fock states in a u64 \
+                 (4 bits per mode), so it supports at most {MAX_ENCODABLE_MODES} \
+                 modes; this circuit has {}. Note a polarized register uses two \
+                 optical modes per spatial mode. Run without --shots for the \
+                 analytic distribution, which has no such limit.",
+                state.0.len()
+            )));
+        }
+        if let Some(&n) = state.0.iter().find(|&&n| n > MAX_PHOTONS_PER_MODE) {
+            return Err(OmegaError::InvalidCircuit(format!(
+                "shots-mode photonic sampling allows at most \
+                 {MAX_PHOTONS_PER_MODE} photons per mode (4-bit nibble \
+                 encoding); configuration {i} has {n}"
+            )));
+        }
+    }
+
     let encode_fock = |state: &slos::FockState| -> u64 {
         let mut val = 0u64;
         for (i, &n) in state.iter().enumerate() {
-            if i >= 16 {
-                break;
-            }
-            val |= (n as u64 & 0xF) << (i * 4);
+            val |= (n as u64) << (i * 4);
         }
         val
     };
@@ -340,7 +373,7 @@ fn sample_from_distribution(
         *counts.entry(key).or_insert(0) += 1;
     }
 
-    counts
+    Ok(counts)
 }
 
 /// Format a Fock-state-encoded u64 back to a readable string.

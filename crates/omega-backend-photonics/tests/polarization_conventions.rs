@@ -195,3 +195,38 @@ fn polarization_gates_refuse_unpolarized_registers() {
         );
     }
 }
+
+/// Shots-mode Fock encoding packs 4 bits per mode into a u64. Exceeding 16
+/// modes used to silently `break`, collapsing distinct states onto one key and
+/// returning a plausible but wrong histogram. It must REFUSE instead.
+///
+/// Polarization sharpens this: a `pol` register uses two optical modes per
+/// spatial mode, so the ceiling arrives at 8 spatial modes.
+#[test]
+fn shots_mode_refuses_beyond_the_encodable_mode_count() {
+    use omega_core::executor::{Backend, ExecConfig};
+    use omega_core::params::ParameterBinding;
+    use omega_backend_photonics::sim::PhotonicsBackend;
+
+    // 9 spatial modes with polarization = 18 optical modes > 16.
+    let ir = lower_to_ir("OPTICQASM 1.0;\nphoton q[9] pol;\nps(0.3) q[0];\n").expect("lower");
+    assert_eq!(ir.num_qubits, 18);
+
+    let backend = PhotonicsBackend::with_input({
+        let mut v = vec![0u32; 18];
+        v[0] = 1;
+        v
+    });
+    let cfg = ExecConfig {
+        shots: Some(16),
+        ..Default::default()
+    };
+    let err = backend
+        .execute(&ir, &ParameterBinding::default(), &cfg)
+        .expect_err("must refuse: 18 modes cannot be encoded in u64 nibbles");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("at most 16") && msg.contains("18"),
+        "error must state the limit and the actual count, got: {msg}"
+    );
+}
