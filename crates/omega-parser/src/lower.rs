@@ -64,6 +64,9 @@ struct LowerCtx {
     ops: Vec<GateOp>,
     /// Gate definitions from QASM (name -> params, qubit_names, body)
     gate_defs: HashMap<String, GateDef>,
+    /// OPTICQASM registers declared `pol`. Mode refs into these name a
+    /// **spatial** mode, which expands to optical modes `2s` (H) and `2s+1` (V).
+    polarized_regs: std::collections::HashSet<String>,
 }
 
 impl LowerCtx {
@@ -75,6 +78,7 @@ impl LowerCtx {
             symbols: HashMap::new(),
             next_symbol_id: 0,
             symbol_names: HashMap::new(),
+            polarized_regs: std::collections::HashSet::new(),
             num_qubits: 0,
             num_classical_bits: 0,
             ops: Vec::new(),
@@ -458,15 +462,162 @@ impl LowerCtx {
         Ok(())
     }
 
+    /// Optical mode indices `(H, V)` for a **spatial** mode reference.
+    ///
+    /// Refuses on a non-`pol` register rather than guessing: silently treating
+    /// `q[0]` as a spatial mode in an unpolarized register would apply a wave
+    /// plate to two unrelated optical modes and produce a plausible wrong
+    /// answer, which is the worst available outcome.
+    fn polarization_submodes(&self, m: &ModeRef, gate: &str) -> Result<(u32, u32), String> {
+        if !self.polarized_regs.contains(&m.reg) {
+            return Err(format!(
+                "`{gate}` needs a polarized register: declare `photon {}[N] pol;` \
+                 (a polarization element has no meaning on modes that carry no \
+                 polarization)",
+                m.reg
+            ));
+        }
+        let (start, optical) = self
+            .qregs
+            .get(&m.reg)
+            .ok_or_else(|| format!("undefined photon register: {}", m.reg))?;
+        let spatial = optical / 2;
+        if m.index >= spatial {
+            return Err(format!(
+                "spatial mode index {} out of range ({} declared)",
+                m.index, spatial
+            ));
+        }
+        Ok((start + 2 * m.index, start + 2 * m.index + 1))
+    }
+
+    fn push_photonic(&mut self, gate: GateKind, qubits: &[u32], params: &[f64]) {
+        self.ops.push(GateOp {
+            gate,
+            qubits: qubits.iter().map(|q| Qubit(*q)).collect(),
+            params: params.iter().map(|p| ParamExpr::Concrete(*p)).collect(),
+            classical_bit: None,
+            condition: None,
+        });
+    }
+
+    /// Half-wave plate on one spatial mode's `(H, V)` pair.
+    ///
+    /// Aria adopts **Perceval's** convention verbatim (FIXES_PLAN.md I1b):
+    ///
+    /// ```text
+    ///   HWP(θ) = i · BSrx(2θ, 0) · PS(π on V)
+    /// ```
+    ///
+    /// The global `i` is deliberate and is NOT droppable. A wave plate acts on
+    /// a *subset* of a larger interferometer's modes, so a global factor on
+    /// that 2×2 block becomes a **relative** phase between interfering paths.
+    /// Dropping it changes single-photon output probabilities by up to 0.413 in
+    /// a 4-mode MZI — measured, not estimated. The textbook i-less matrix has
+    /// `det = −1` against Perceval's `+1`, so the two are not the same operator
+    /// and no amount of "it's only a global phase" makes them agree here.
+    ///
+    /// Ops compose as `U -> Op·U`, so the FIRST op pushed is the RIGHTMOST
+    /// factor: `PS(π on V)` goes first.
+    fn lower_half_wave_plate(&mut self, app: &OpticGateApp) -> Result<(), String> {
+        if app.modes.len() != 1 {
+            return Err(format!(
+                "hwp acts on 1 spatial mode; got {}",
+                app.modes.len()
+            ));
+        }
+        let theta = match app.params.as_slice() {
+            [OpticParam::Num(t)] => *t,
+            [OpticParam::Symbol(_)] => {
+                return Err(
+                    "hwp does not accept a symbolic angle yet: the expansion into \
+                     phase shifters is built at lowering time and would need the \
+                     bound value"
+                        .to_string(),
+                )
+            }
+            other => return Err(format!("hwp takes (theta); got {} params", other.len())),
+        };
+
+        let (h, v) = self.polarization_submodes(&app.modes[0], "hwp")?;
+
+        self.push_photonic(GateKind::PhaseShifter, &[v], &[std::f64::consts::PI]);
+        self.push_photonic(GateKind::BeamSplitterRx, &[h, v], &[2.0 * theta, 0.0]);
+        // The global `i`, as a phase of π/2 on BOTH sub-modes.
+        self.push_photonic(GateKind::PhaseShifter, &[h], &[std::f64::consts::FRAC_PI_2]);
+        self.push_photonic(GateKind::PhaseShifter, &[v], &[std::f64::consts::FRAC_PI_2]);
+        Ok(())
+    }
+
+    /// Polarizing beam splitter across two spatial modes.
+    ///
+    /// **Swaps H between the two spatial modes and transmits V** — Perceval's
+    /// convention, pinned in `test_perceval_conventions.py`. Note this is the
+    /// opposite of the common "transmits H, reflects V" phrasing, which is why
+    /// it is pinned against a read of the actual matrix rather than described
+    /// in a comment.
+    ///
+    /// The swap of two modes is `PS(π) · BSrx(π/2, π)`. The phase shifter is
+    /// not cosmetic: `det(swap) = −1` while `det(BSrx) = +1`, so it supplies
+    /// the sign. V is untouched, hence no ops on the V sub-modes at all.
+    fn lower_polarizing_beam_splitter(&mut self, app: &OpticGateApp) -> Result<(), String> {
+        if app.modes.len() != 2 {
+            return Err(format!(
+                "pbs acts on 2 spatial modes; got {}",
+                app.modes.len()
+            ));
+        }
+        if !app.params.is_empty() {
+            return Err(format!(
+                "pbs takes no parameters; got {}",
+                app.params.len()
+            ));
+        }
+
+        let (a_h, _a_v) = self.polarization_submodes(&app.modes[0], "pbs")?;
+        let (b_h, _b_v) = self.polarization_submodes(&app.modes[1], "pbs")?;
+
+        self.push_photonic(
+            GateKind::BeamSplitterRx,
+            &[a_h, b_h],
+            &[std::f64::consts::FRAC_PI_2, std::f64::consts::PI],
+        );
+        self.push_photonic(GateKind::PhaseShifter, &[b_h], &[std::f64::consts::PI]);
+        Ok(())
+    }
+
     fn lower_opticqasm_stmt(&mut self, stmt: &OpticQasmStmt) -> Result<(), String> {
         match stmt {
-            OpticQasmStmt::PhotonDecl { name, size } => {
+            OpticQasmStmt::PhotonDecl {
+                name,
+                size,
+                polarized,
+            } => {
                 let start = self.num_qubits;
-                self.qregs.insert(name.clone(), (start, *size));
-                self.num_qubits += size;
+                // A polarized register occupies TWO optical modes per spatial
+                // mode. The doubling happens here and nowhere else: the
+                // governor prices photonic admission from `num_qubits`, so
+                // doubling at lowering keeps admission correct with no change
+                // to the governor. See FIXES_PLAN.md I1.
+                let optical = if *polarized { size * 2 } else { *size };
+                self.qregs.insert(name.clone(), (start, optical));
+                if *polarized {
+                    self.polarized_regs.insert(name.clone());
+                }
+                self.num_qubits += optical;
                 Ok(())
             }
             OpticQasmStmt::GateApp(app) => {
+                // Polarization elements are not new primitives: they expand
+                // into the phase shifters and beam splitters already
+                // implemented, acting on polarization sub-modes. Handled before
+                // the ordinary path because they emit MULTIPLE ops.
+                match app.name.as_str() {
+                    "hwp" => return self.lower_half_wave_plate(app),
+                    "pbs" => return self.lower_polarizing_beam_splitter(app),
+                    _ => {}
+                }
+
                 let gate = match app.name.as_str() {
                     "ps" => GateKind::PhaseShifter,
                     "bs_rx" => GateKind::BeamSplitterRx,

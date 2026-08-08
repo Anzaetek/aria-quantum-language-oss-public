@@ -2531,6 +2531,7 @@ dependencies = [
  "criterion",
  "num-complex",
  "omega-core",
+ "omega-parser",
  "rand 0.10.1",
  "smallvec",
  "thiserror 2.0.18",

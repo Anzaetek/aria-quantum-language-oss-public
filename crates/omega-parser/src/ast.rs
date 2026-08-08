@@ -105,7 +105,23 @@ pub struct OpticQasmProgram {
 
 #[derive(Clone, Debug)]
 pub enum OpticQasmStmt {
-    PhotonDecl { name: String, size: u32 },
+    PhotonDecl {
+        name: String,
+        /// Declared size. When `polarized`, this counts **spatial** modes and
+        /// the register occupies `2 * size` optical modes.
+        size: u32,
+        /// `photon q[N] pol;` — each spatial mode carries H and V, indexed
+        /// `(s, p) -> 2s + p` with `p = 0` meaning H.
+        ///
+        /// Kept as a flag on the declaration rather than a separate statement
+        /// kind so that the mode-doubling happens in exactly one place
+        /// (`lower_opticqasm_stmt`). That matters beyond tidiness: the resource
+        /// governor prices photonic jobs from `ir.num_qubits`, so as long as
+        /// lowering doubles, admission is automatically correct and no change
+        /// is needed in the governor. Doubling anywhere downstream of the IR
+        /// would under-price by a binomial factor — see FIXES_PLAN.md I1.
+        polarized: bool,
+    },
     GateApp(OpticGateApp),
 }
 

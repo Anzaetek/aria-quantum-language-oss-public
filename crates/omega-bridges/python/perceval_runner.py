@@ -24,6 +24,7 @@ subset omega-parser actually emits today (`ps`, `bs_rx`, `bs_ry`).
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 import traceback
@@ -194,12 +195,46 @@ class _OpticQasmParseError(Exception):
     pass
 
 
-_PHOTON_DECL = re.compile(r"^photon\s+\w+\s*\[\s*(\d+)\s*\]\s*;\s*$")
+_PHOTON_DECL = re.compile(r"^photon\s+\w+\s*\[\s*(\d+)\s*\]\s*(pol)?\s*;\s*$")
+# `pbs` takes no parameters, so the parameter list is optional — matching the
+# grammar in omega-parser/src/opticqasm.pest.
 _GATE_APP = re.compile(
-    r"^(?P<name>ps|bs_rx|bs_ry)\s*\((?P<params>[^)]*)\)\s*"
+    r"^(?P<name>ps|bs_rx|bs_ry|hwp|pbs)\s*(?:\((?P<params>[^)]*)\))?\s*"
     r"(?P<modes>(?:\w+\s*\[\s*\d+\s*\]\s*,?\s*)+);\s*$"
 )
 _MODE_REF = re.compile(r"\w+\s*\[\s*(\d+)\s*\]")
+
+
+def _add_two_mode(circuit, pcvl, comp, i, j):
+    """Add a 2-mode component across modes `i` and `j`, adjacent or not.
+
+    Perceval's `Circuit.add` asserts "Range must be a consecutive set of port
+    indexes", but polarization expansion produces non-adjacent pairs by
+    construction: a PBS acts on the H sub-modes `2a` and `2b`, which are two
+    apart. So the pair is brought together with a PERM, the component applied,
+    and the PERM undone.
+
+    Using PERM rather than pre-computing the full mode unitary in numpy is
+    deliberate. Handing Perceval a finished matrix would leave it doing only the
+    SLOS/permanent step, and the cross-check would no longer test our gate
+    conventions at all — it would test our matrix against our matrix. This way
+    Perceval still assembles the circuit from its OWN components, so a
+    convention error on our side still shows up as a disagreement.
+    """
+    if j < i:
+        i, j = j, i
+    if j == i + 1:
+        circuit.add((i, j), comp)
+        return
+
+    # Swap mode j down to i+1, act, swap back. The PERM spans [i+1 .. j].
+    span = j - i
+    perm = list(range(span))
+    perm[0], perm[span - 1] = perm[span - 1], perm[0]
+
+    circuit.add(i + 1, pcvl.components.PERM(perm))
+    circuit.add((i, i + 1), comp)
+    circuit.add(i + 1, pcvl.components.PERM(perm))
 
 
 def _build_opticqasm_circuit(source: str, pcvl, PS, BS):
@@ -222,7 +257,19 @@ def _build_opticqasm_circuit(source: str, pcvl, PS, BS):
 
         m = _PHOTON_DECL.match(line)
         if m:
-            num_modes = int(m.group(1))
+            declared = int(m.group(1))
+            # `photon q[N] pol;` -> N SPATIAL modes = 2N optical modes,
+            # interleaved (s, p) -> 2s + p with p=0 meaning H.
+            #
+            # We expand polarization into PLAIN optical modes here rather than
+            # building a polarized Perceval processor. That keeps the bridge
+            # protocol unchanged: `input_fock` stays a flat list of length
+            # num_modes and outputs stay flat integer tuples. A polarized
+            # processor would need a polarization-aware input encoding (Perceval
+            # writes |{P:H},0>), which the flat contract cannot express, and
+            # would break the output key loop below.
+            polarized = m.group(2) is not None
+            num_modes = declared * 2 if polarized else declared
             circuit = pcvl.Circuit(num_modes)
             continue
 
@@ -235,7 +282,8 @@ def _build_opticqasm_circuit(source: str, pcvl, PS, BS):
             )
 
         name = m.group("name")
-        param_strs = [p.strip() for p in m.group("params").split(",") if p.strip()]
+        raw_params = m.group("params") or ""
+        param_strs = [p.strip() for p in raw_params.split(",") if p.strip()]
         params = []
         for p in param_strs:
             if p.startswith("$"):
@@ -293,7 +341,7 @@ def _build_opticqasm_circuit(source: str, pcvl, PS, BS):
             theta, phi_tr = params[0], params[1]
             if phi_tr != 0.0:
                 circuit.add(modes[0], PS(phi=-phi_tr))
-            circuit.add((modes[0], modes[1]), BS.Ry(theta=2.0 * theta))
+            _add_two_mode(circuit, pcvl, BS.Ry(theta=2.0 * theta), modes[0], modes[1])
             if phi_tr != 0.0:
                 circuit.add(modes[0], PS(phi=phi_tr))
         elif name == "bs_ry":
@@ -306,6 +354,49 @@ def _build_opticqasm_circuit(source: str, pcvl, PS, BS):
                 (modes[0], modes[1]),
                 BS.Ry(theta=2.0 * params[0], phi_tr=params[1]),
             )
+        elif name == "hwp":
+            # Half-wave plate on ONE spatial mode's (H, V) pair.
+            #
+            #   HWP(θ) = i · BSrx(2θ, 0) · PS(π on V)
+            #
+            # The global `i` is applied as PS(π/2) on BOTH sub-modes. It is not
+            # droppable: the plate acts on a subset of the interferometer's
+            # modes, so a global factor on that 2×2 block is a RELATIVE phase
+            # between interfering paths. Aria adopts Perceval's convention
+            # verbatim (FIXES_PLAN.md I1b) so this comparison needs no fudge
+            # factor. Mirrors `lower_half_wave_plate` in omega-parser.
+            if len(params) != 1 or len(modes) != 1:
+                raise _OpticQasmParseError(
+                    f"hwp takes (theta) on 1 spatial mode; got {len(params)} "
+                    f"params, {len(modes)} modes"
+                )
+            h, v = 2 * modes[0], 2 * modes[0] + 1
+            if v >= num_modes:
+                raise _OpticQasmParseError(
+                    f"hwp on spatial mode {modes[0]} needs a `pol` declaration"
+                )
+            circuit.add(v, PS(phi=math.pi))
+            _add_two_mode(circuit, pcvl, BS.Ry(theta=2.0 * (2.0 * params[0])), h, v)
+            circuit.add(h, PS(phi=math.pi / 2))
+            circuit.add(v, PS(phi=math.pi / 2))
+        elif name == "pbs":
+            # Swaps H between the two spatial modes, transmits V — Perceval's
+            # convention, which is the OPPOSITE of the usual textbook phrasing.
+            # Swap = PS(π) · BSrx(π/2, π); the phase shifter supplies det = −1.
+            if params or len(modes) != 2:
+                raise _OpticQasmParseError(
+                    f"pbs takes no params on 2 spatial modes; got "
+                    f"{len(params)} params, {len(modes)} modes"
+                )
+            a_h, b_h = 2 * modes[0], 2 * modes[1]
+            if max(a_h, b_h) + 1 >= num_modes:
+                raise _OpticQasmParseError(
+                    "pbs needs a `pol` declaration covering both spatial modes"
+                )
+            circuit.add(a_h, PS(phi=-math.pi))
+            _add_two_mode(circuit, pcvl, BS.Ry(theta=2.0 * (math.pi / 2)), a_h, b_h)
+            circuit.add(a_h, PS(phi=math.pi))
+            circuit.add(b_h, PS(phi=math.pi))
         else:
             raise _OpticQasmParseError(f"unknown gate {name!r}")
 
