@@ -583,6 +583,28 @@ else
   skipped "QEC cross-check (MANDATORY) — set ARIA_QEC_XCHECK=1 with a qiskit venv"
 fi
 
+# Optional: CV backend vs piquasso, LIVE.
+#
+# The committed fixture (tools/cv_cross_check/piquasso_fixture.jsonl) is already
+# compared on every `cargo test -p omega-backend-cv`, with no Python needed.
+# This stage covers the one failure that check structurally cannot see: a
+# fixture regenerated to match a change in OUR conventions would still be green,
+# and the independence that justifies using piquasso at all would be gone.
+if [ "${ARIA_CV_XCHECK:-0}" = "1" ]; then
+  step "+   Optional: CV backend vs piquasso (fixture drift)"
+  CV_PY=""
+  for cand in ./.venv-piquasso/bin/python ./tools/cv_cross_check/.venv/bin/python; do
+    [ -x "$cand" ] && CV_PY="$cand" && break
+  done
+  if [ -n "$CV_PY" ]; then
+    "$CV_PY" tools/cv_cross_check/verify_fixture.py
+  else
+    echo "  SKIP: no piquasso venv (see PREREQUISITES.md)"
+  fi
+else
+  skipped "CV/piquasso drift check — set ARIA_CV_XCHECK=1 with the piquasso venv"
+fi
+
 if [ -n "${QISKIT_XCHECK_SKIPPED:-}" ]; then
     SKIPPED_STAGES+=("Qiskit cross-check (MANDATORY) — $QISKIT_XCHECK_SKIPPED")
 fi
