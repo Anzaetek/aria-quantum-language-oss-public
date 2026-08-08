@@ -1319,6 +1319,51 @@ defect happened:
 * **verified on the hardware it claims to support** — `f11a9f5` shipped 2/70
   failing Metal tests because the work was checked on a CUDA box.
 
+## Part H — QASM export drops `if(c==V)` (scoped, not yet fixed)
+
+**Third defect from the 2026-08-08 review cycle.** The other two are fixed
+(`11888a9` expectation refusal, `ae6da5c` per-shot sampling); this one is
+scoped but deliberately not started, because it needs a signature change and
+the scoping is what was missing.
+
+**The defect.** `to_qasm` emits a conditional gate **unconditionally** — the
+guard is dropped with no diagnostic. Measured: Qiskit running Aria's own export
+of `H q0; measure q0 -> c0; when c0 == 1 { X q1 }` returns
+`{'11': 2002, '10': 1998}` where the true distribution is
+`{'00': 1995, '11': 2005}`. The correlation is destroyed, and both the export
+and the re-import succeed.
+
+**Why it is not a one-line fix.** Aria's condition is a **single bit**
+(`Instruction.condition: Option<(Clbit, u64)>`), while QASM 2.0's `if` compares
+a **whole classical register**: `if (c == V) gate;`. So a condition on `c[i]` is
+exactly expressible only when that register has size 1. On a wider register,
+`if (c == 1)` means *the whole register equals 1*, which is a different
+predicate — emitting it would trade a silent drop for a silent **change of
+meaning**, which is worse.
+
+**Design.** Make export fallible and refuse what QASM 2.0 cannot say:
+
+* creg size 1 → emit `if (c == V) gate;`
+* otherwise → **error**, naming the register and bit, and pointing at QASM 3
+  (`to_qasm3`, whose `if (c[i] == V)` *can* address a single bit) or at
+  restructuring the circuit.
+
+Refusing matches every other decision in this repo — CV gates, unpriceable
+jobs, leaking Fock states, feedforward expectations. A lossy export is
+especially bad because it is *silent on both sides*: the file is valid QASM and
+the importer has no way to know a guard was lost.
+
+**Scope, measured rather than estimated:** `to_qasm` has **8 call sites, of
+which 1 is production** (`aria-cli/src/main.rs:760`); the rest are tests. So
+the signature change is small.
+
+**Acceptance:** the round-trip test that currently cannot exist — export a
+feedforward circuit, run the exported text through Qiskit, and require the
+distribution to match Aria's own execution. That is the corpus item flagged in
+`OPTIONAL_TESTS.md` as still missing, and it is the only check that would have
+caught this: comparing *both engines on the same exported text* agrees
+precisely because the export dropped the same thing on both sides.
+
 ## Part G — Embedding as a native library (`.dylib` / `.so` / `.dll`)
 
 **PLAN. Reframes two request documents** (`PLAN-PYTHON-LIBS`,
