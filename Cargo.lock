@@ -2451,6 +2451,7 @@ name = "omega-backend-cv"
 version = "0.1.0"
 dependencies = [
  "num-complex",
+ "serde_json",
 ]
 
 [[package]]

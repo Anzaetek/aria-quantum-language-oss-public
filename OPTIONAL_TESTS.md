@@ -27,6 +27,7 @@ details; this covers *what each stage buys you*.
 | **QEC cross-check — MANDATORY** | `ARIA_QEC_XCHECK=1` | same venv + `pymatching` | **INSTALLED** | **100.00% (20000/20000)** shot-for-shot logical-class agreement vs PyMatching 2.4.0 at d=3 and d=5; logical rates within 3σ (aria 0.0367 vs pymatching 0.0367) — measured 2026-08-06, `CI_EXIT=0` |
 | Lean 4 proof tree | `ARIA_LEAN=1` | `elan` + `lake`, warm mathlib cache | **READY** | 8281 jobs, exit 0 |
 | TLA+ models | `tools/tla/check.sh` | JDK + `tla2tools.jar` | **READY** | safety holds (26 states); liveness violated — starvation, *expected* |
+| CV ↔ piquasso fixture drift | `ARIA_CV_XCHECK=1` | `tools/cv_cross_check/.venv` with `piquasso` | **INSTALLED** (piquasso 8.0.1) | fixture matches live piquasso across 17 cases, worst 0.000e+00 — measured 2026-08-08 |
 | CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here** — see `CUDA_TODO.md` | untested on this box |
 | Deep harnesses | `ARIA_DEEP=1` | none (just slow) | available | `spectra_noise`, `spectra_scaling_noise` skipped in the default `all` |
 
@@ -101,6 +102,50 @@ quantum-linear-algebra theorems (via `#print axioms` greps for `sorryAx`).
 gate. Known-open: `Reset.lean` and `StabilizerExpectation.lean` carry 7 `sorry`
 targets — they need a real ordered field, which core Lean lacks. Those are
 recorded, not regressions.
+
+**CV ↔ piquasso** — the same independence argument as Qiskit, applied to
+continuous-variable simulation. Split deliberately in two halves that fail for
+different reasons:
+
+* `cargo test -p omega-backend-cv` compares against a **committed** fixture, so
+  it runs on every default CI with no Python. It catches regressions in our code.
+* `ARIA_CV_XCHECK=1` reruns piquasso live and checks the fixture has not
+  **drifted**. This is the half the Rust test structurally cannot do: if our
+  conventions changed and the fixture were regenerated to match, the committed
+  numbers would record our own opinion rather than an independent one, and the
+  test would stay green. Verified to fire on a 1e-9 nudge — well below the Rust
+  side's own tolerance, so the two halves genuinely overlap rather than duplicate.
+
+**Amplitudes are compared, not just probabilities**, and that is load-bearing.
+`kerr` and `phase_shift` are diagonal — `exp(i·χ·n²)` and `exp(i·φ·n)` — so they
+move phases and nothing else. Against a probability vector, a no-op
+implementation of either is *indistinguishable* from a correct one, and the
+squeezing sign convention is equally invisible. Both were confirmed by mutation:
+no-op'ing Kerr is caught at 4.9e-1 and flipping the squeezing sign at 1.4e-1,
+both by the amplitude assertion, and neither would have moved a single
+probability. Global phase is quotiented out against the largest-magnitude
+component, since it is unobservable and the two libraries have no reason to agree
+on it.
+
+**Two holes, recorded rather than papered over:**
+
+1. **Single mode only.** `FockState` is single-mode — there is no beamsplitter
+   and no multimode state — so mode mixing, which is exactly where independent CV
+   implementations diverge on convention, is untested because it is
+   *unimplemented*.
+2. **Preparations are constructors, not operators.** `squeezed_vacuum` and
+   `coherent` build a state from vacuum; there is no `displace(&mut self, ..)`.
+   So an ordinary circuit like *squeeze then displace* cannot be expressed, and
+   the corpus reports it as `NOT COMPARED` rather than dropping it. A second test
+   pins this set exactly, so when an operator form lands the test fails and says
+   to move the case into the compared corpus.
+
+Where the two disagree at all, the assertion is not "they agree" but the stronger
+claim that **the gap stays inside the truncation error this backend advertises**
+via `lost_norm`. At `r=0.8` that is 4.7e-5 against a 6.3e-5 budget. A leak metric
+that under-reports is worse than a numeric mismatch, because callers trust it to
+decide whether an answer is usable — so this turns an awkward convention gap into
+a live test of the metric itself.
 
 **TLA+** — properties that hold over *all* interleavings rather than one run.
 Already earned its keep: `Governor.tla` produced a concrete lasso proving a
