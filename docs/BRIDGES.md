@@ -14,8 +14,8 @@ green on a machine that has none of them.
 | Qiskit | `bridge-qiskit` | reference SDK | implemented |
 | Perceval | `bridge-perceval` | Quandela photonics | implemented |
 | Bloqade | `bridge-bloqade` | QuEra Aquila (gate mode; analog AHS returns `Unavailable`) | implemented |
-| **ppvm** | `bridge-ppvm` | QuEra Pauli-sum propagation | **scaffolded, no runner yet** |
-| **tsim** | `bridge-tsim` | QuEra ZX stabilizer-rank sampler | **scaffolded, no runner yet** |
+| ppvm | `bridge-ppvm` | QuEra Pauli-sum propagation | implemented (runner + QASM2→Stim lowering) |
+| tsim | `bridge-tsim` | QuEra ZX stabilizer-rank sampler | implemented (runner + QASM2→Stim lowering) |
 | Cirq / Qadence | `bridge-cirq`, `bridge-qadence` | — | placeholder |
 
 ## Discovery

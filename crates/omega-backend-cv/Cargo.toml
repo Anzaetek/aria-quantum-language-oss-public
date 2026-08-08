@@ -9,3 +9,9 @@ description = "Continuous-variable photonic simulation on a truncated Fock space
 
 [dependencies]
 num-complex = { workspace = true }
+
+# Test-only. The shipped library keeps its single runtime dependency — this
+# crate is meant to be embeddable (docs/LIBRARY.md), and a dev-dependency does
+# not travel with the cdylib.
+[dev-dependencies]
+serde_json = { workspace = true }

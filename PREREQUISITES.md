@@ -41,6 +41,7 @@ are installed here, **each in its own venv** — never system Python:
 |---|---|---|---|
 | `.venv-qiskit` | `ARIA_QISKIT_XCHECK=1` | qiskit 2.5.1, qiskit-aer 0.17.2, numpy 2.5.1, scipy 1.18.0 | 193 MB |
 | `tools/qec_cross_check/.venv` | `ARIA_QEC_XCHECK=1` | qiskit 2.5.1, PyMatching 2.4.0, stim 1.16.0 | 566 MB |
+| `tools/cv_cross_check/.venv` | `ARIA_CV_XCHECK=1` | piquasso 8.0.1, numpy 2.4.6 | 130 MB |
 
 Two separate environments is deliberate, not an accident: the QEC script
 **self-provisions** its own (`tools/qec_cross_check/run.sh` creates it and
@@ -57,8 +58,20 @@ $ ARIA_QISKIT_XCHECK=1 ./ci.sh        # QEC venv builds itself on first run
 $ ARIA_QEC_XCHECK=1 ./ci.sh
 ```
 
-No C++ toolchain is needed: `qiskit-aer`, `stim` and `PyMatching` all ship
-prebuilt wheels for Apple Silicon. Nothing compiles from source.
+No C++ toolchain is needed: `qiskit-aer`, `stim`, `PyMatching` and `piquasso`
+all ship prebuilt wheels for Apple Silicon. Nothing compiles from source.
+
+The CV venv is **not** needed to run the CV cross-check: its piquasso fixture is
+committed, so `cargo test -p omega-backend-cv` compares against it with no Python
+at all. The venv is only for `ARIA_CV_XCHECK=1`, which reruns piquasso live and
+checks the committed fixture has not drifted — the one failure the Rust test
+cannot see, since a fixture regenerated to match our own change would still be
+green. Create it with:
+
+```console
+$ python3 -m venv tools/cv_cross_check/.venv
+$ ./tools/cv_cross_check/.venv/bin/pip install piquasso numpy
+```
 
 Measured here 2026-08-06, both `CI_EXIT=0`:
 
