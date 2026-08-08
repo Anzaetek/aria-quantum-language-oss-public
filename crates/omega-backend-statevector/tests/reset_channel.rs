@@ -71,7 +71,10 @@ fn counts(c: &CircuitIR, seed: u64) -> HashMap<u64, u32> {
 
 /// Shots whose key has `bit` set.
 fn ones(m: &HashMap<u64, u32>, bit: u64) -> u32 {
-    m.iter().filter(|(k, _)| *k & bit != 0).map(|(_, v)| v).sum()
+    m.iter()
+        .filter(|(k, _)| *k & bit != 0)
+        .map(|(_, v)| v)
+        .sum()
 }
 
 fn bell_reset0(n: u32) -> CircuitIR {
@@ -189,5 +192,81 @@ fn analytic_expectation_allows_unentangled_superposition_reset() {
     let v = StatevectorBackend::new()
         .expectation(&c, &ParameterBinding::new(), &obs)
         .expect("unentangled reset is deterministic — must not refuse");
-    assert!((v - 1.0).abs() < 1e-12, "⟨Z⟩ after reset(|−⟩) = {v}, want +1");
+    assert!(
+        (v - 1.0).abs() < 1e-12,
+        "⟨Z⟩ after reset(|−⟩) = {v}, want +1"
+    );
+}
+
+/// Collapse-mode mid-circuit measurement must be sampled PER SHOT, like Reset.
+///
+/// Regression for a defect that made a superposition measure with certainty:
+/// the per-shot loop tested `circuit_has_reset` alone, so a circuit with a
+/// mid-circuit measurement but no Reset ran ONE trajectory and reported it for
+/// every shot.
+///
+/// ```text
+/// H q0 ; measure q0 -> c0 ; if c0 == 1 { X q1 } ; measure q1 -> c1
+/// ```
+///
+/// Ground truth from **Qiskit/Aer** (`qiskit 2.5.1 / aer 0.17.2`, 4000 shots,
+/// seed 7): `{'00': 1995, '11': 2005}` — q1 correlated with q0, ~50/50, and
+/// **never** `01` or `10`. Before the fix this returned `|00>` 4000/4000.
+#[test]
+fn collapse_measurement_is_sampled_per_shot_not_once_per_run() {
+    use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, Qubit};
+    use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode};
+    use omega_core::params::ParameterBinding;
+
+    let mut c = CircuitIR::new(2, CircuitType::GateBased);
+    c.num_classical_bits = 2;
+    let push = |c: &mut CircuitIR, gate, qs: &[u32], cb: Option<u32>, cond| {
+        c.add_op(GateOp {
+            gate,
+            qubits: qs.iter().map(|&q| Qubit(q)).collect(),
+            params: Default::default(),
+            classical_bit: cb,
+            condition: cond,
+        });
+    };
+    push(&mut c, GateKind::H, &[0], None, None);
+    push(&mut c, GateKind::Measure, &[0], Some(0), None);
+    push(&mut c, GateKind::X, &[1], None, Some((0, 1, 1)));
+    push(&mut c, GateKind::Measure, &[1], Some(1), None);
+
+    const SHOTS: u32 = 4000;
+    let cfg = ExecConfig {
+        shots: Some(SHOTS),
+        seed: Some(7),
+        mid_circuit_mode: MidCircuitMode::Collapse,
+    };
+    let res = omega_backend_statevector::StatevectorBackend::new()
+        .execute(&c, &ParameterBinding::new(), &cfg)
+        .expect("executes");
+    let counts = match res {
+        ExecResult::Counts(m) => m,
+        other => panic!("expected counts, got {other:?}"),
+    };
+
+    // The defect's signature: a single outcome taking every shot.
+    for (k, v) in &counts {
+        assert!(
+            *v < SHOTS,
+            "outcome {k:02b} took all {SHOTS} shots — one trajectory replayed, \
+             not sampled per shot"
+        );
+    }
+    // q1 must track q0: only 00 and 11 are reachable.
+    let c00 = *counts.get(&0b00).unwrap_or(&0);
+    let c11 = *counts.get(&0b11).unwrap_or(&0);
+    assert_eq!(
+        c00 + c11,
+        SHOTS,
+        "feedforward broken: got anti-correlated outcomes {counts:?}"
+    );
+    // ~50/50, generously banded (5 sigma on 4000 draws is ~158).
+    assert!(
+        c00.abs_diff(SHOTS / 2) < 300,
+        "expected ~50/50 like Qiskit's {{'00': 1995, '11': 2005}}, got {counts:?}"
+    );
 }
