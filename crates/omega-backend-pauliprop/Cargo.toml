@@ -17,3 +17,8 @@ num-complex = { workspace = true }
 [dev-dependencies]
 num-complex = { workspace = true }
 smallvec = { workspace = true }
+# The conditional-refusal test asserts the value pauliprop USED to return
+# silently is wrong, and gets "wrong" from the statevector backend running the
+# same circuit rather than from arithmetic in the test. A hand-computed
+# expected value is a second implementation with no reviewer.
+omega-backend-statevector = { path = "../omega-backend-statevector" }

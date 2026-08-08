@@ -2499,5 +2499,65 @@ when a listed one starts working, so the list cannot go stale.
 `PhaseGate` and `U1Gate` are bit-identical (max|Δ| = 0.0, measured), so the
 alias carries no caveat.
 
-Still open from K6: the expectation lane (step 4) and the `ARIA_NWAY=1` CI
-stage (step 5).
+Step 5 (the `ARIA_NWAY=1` CI stage) landed with step 3 — a test nobody invokes
+is not a gate, and the counts lane had no reason to wait for the expectation
+lane to be wired up.
+
+### K8. Step 4 — the expectation lane: K3's premise was wrong, in our favour
+
+K3 concluded the expectation lane "reduces to `pauliprop` vs `statevector` vs
+`mps`: **all in-tree**" and offered only two options — add an expectation mode
+to the Qiskit runner, or label the lane internal-consistency-only.
+
+**That was true of the bridge protocol, not of the tools already vendored
+here.** Measured 2026-08-09 with all venvs built:
+
+| in-tree engine | anchor | relationship |
+|---|---|---|
+| statevector / mps | Qiskit `Statevector.expectation_value` | exact ground truth, **different** algorithm |
+| `pauli` (stabilizer) | **Stim** `peek_observable_expectation` | same algorithm, independent implementation |
+| `pauliprop` (Heisenberg) | **ppvm** `PauliSum.overlap_with_zero` | same algorithm, independent implementation, **same truncation knobs** |
+
+Every engine gets a reference implementing the same idea — the strongest
+evidence form K3 itself argues for — so the "internal-consistency only" caveat
+does not need to be written. `docs/BRIDGES.md` already described ppvm as "an
+independent numeric reference that validates pauliprop"; nothing had used it
+that way, because the counts protocol could only reach ppvm's *other* engine.
+
+**Three traps in the references themselves**, each measured, each of which
+would have produced a confidently wrong anchor:
+
+1. **Stim's `state_vector()` is `complex64`.** `1/√2` returns as `0.70710677`,
+   error **1.21e-08**. An earlier draft of this plan claimed Stim gave "an exact
+   state vector" and proposed a 1e-15 gate — which would have failed every
+   Clifford fixture and invited a 1e-6 fudge factor covering a misunderstanding.
+   Use `peek_observable_expectation`, which returns exact integers.
+2. **Plain Stim silently mis-executes our tag dialect.** `S[T] 0` applies **S,
+   not T**; `I[R_Z(theta=0.25*pi)] 0` applies **identity, not a rotation**. Both
+   accepted without complaint. The Clifford restriction must be enforced by
+   asserting the emitted Stim text carries no `[` tag.
+3. **ppvm needs gates in REVERSE circuit order** (correct for Heisenberg
+   conjugation, but silent when wrong). On `h q0; rz(0.9) q0` with observable
+   `X`: reverse gives `+0.6216099683`, matching Qiskit; circuit order gives
+   `+1.0000000000`.
+
+> **The first version of trap 3's test could not have caught it.** It used
+> `rx(a); ry(b)` with `⟨Z⟩ = cos a·cos b` — symmetric in `a` and `b` — so both
+> orders agreed and it read as a pass. A non-commuting *circuit* is not enough;
+> the *observable* must separate the orderings too.
+>
+> That is the **third** instance in one session of the same shape: a fixture
+> invariant under the very transformation the test exists to detect (the others:
+> a palindromic `{00,11}` bit-order fixture, and an observable set giving
+> exactly `0.00e+00` for a `t`→`tdg` mutation). Before trusting a test, ask what
+> symmetry its fixture has.
+
+**Found while planning: `pauliprop` ignored classical conditions entirely.**
+Zero references to `condition` in the whole crate, against 3 call sites in
+statevector, 2 in MPS, 1 in Pauli. A guarded gate ran **unconditionally and
+silently**. Measured on `h q0; measure q0 -> c0; if (c==1) x q1`: it returned
+`⟨Z₁⟩ = −1` ("q1 definitely flipped") where the statevector backend gives `0`,
+a gap of 1.0 on an observable bounded in `[−1, +1]` — the largest error
+reachable when the truth is 0. Same failure mode as the `Reset` case the crate
+had already fixed and documented; conditionals were the missed half. Now a
+typed `Unsupported` refusal, so the N-way matrix files it as `cannot-express`.
