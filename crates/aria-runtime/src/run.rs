@@ -13,7 +13,7 @@ use num_complex::Complex64;
 use omega_backend_mps::{MpsBackend, MpsRunStats, NoisyMpsBackend};
 use omega_backend_pauliprop::PauliPropBackend;
 use omega_backend_statevector::{NoisyStatevectorBackend, StatevectorBackend};
-use omega_core::circuit::{GateKind as OGateKind, SymbolId};
+use omega_core::circuit::SymbolId;
 use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode, Observable};
 use omega_core::gradient::compute_gradient_for;
 use omega_core::noise::NoiseModel;
@@ -314,60 +314,18 @@ fn concrete_ir(circuit: &Circuit, bindings: &HashMap<String, f64>) -> Result<Low
 }
 
 /// `measure qubit -> clbit` pairs of a lowered circuit, in program order.
-/// Empty when the program declares no measure-to-creg mapping. The single
-/// source of the pair-extraction semantics — the remote path lowers the
-/// same bound circuit and calls this too.
+/// Empty when the program declares no measure-to-creg mapping.
+///
+/// Thin adapter over [`omega_core::executor::measure_pairs`], which is where
+/// the semantics live. It moved there when the N-way counts matrix
+/// (`crates/omega-cli/tests/nway_counts.rs`) needed the same projection for
+/// QASM2-sourced circuits: two copies of a counts-keying convention is how a
+/// matrix ends up validating a convention no shipped path uses.
 pub(crate) fn measure_pairs(low: &Lowered) -> Vec<(u32, u32)> {
-    low.ir
-        .ops
-        .iter()
-        .filter(|op| op.gate == OGateKind::Measure)
-        .filter_map(|op| {
-            let q = op.qubits.first()?.0;
-            op.classical_bit.map(|c| (q, c))
-        })
-        .collect()
+    omega_core::executor::measure_pairs(&low.ir)
 }
 
-/// Project full-register sampled counts onto the classical register via the
-/// program's `measure → creg` statements (OpenQASM semantics). Backends
-/// sample the full qubit register at the end of the circuit; when the
-/// program declares an explicit mapping, the reported counts must be keyed
-/// over creg bits, one bit per `measure`, in `c[j]` order. A later measure
-/// into the same classical bit overwrites the earlier one. Shared by the
-/// local and remote (omega-server) execution paths.
-///
-/// Counts keys are `u64`, so a measure targeting bit ≥ 64 of either register
-/// cannot be represented — that's a loud error, not a masked shift.
-pub(crate) fn project_counts_onto_creg(
-    res: ExecResult,
-    pairs: &[(u32, u32)],
-) -> Result<ExecResult, String> {
-    if pairs.is_empty() {
-        return Ok(res);
-    }
-    if let Some(&(q, c)) = pairs.iter().find(|&&(q, c)| q >= 64 || c >= 64) {
-        return Err(format!(
-            "measure q[{q}] -> c[{c}]: sampled-count keys are u64, so register \
-             indices ≥ 64 cannot be reported; reduce the register or drop --shots"
-        ));
-    }
-    match res {
-        ExecResult::Counts(counts) => {
-            let mut projected: HashMap<u64, u32> = HashMap::new();
-            for (outcome, n) in counts {
-                let mut key = 0u64;
-                for &(q, c) in pairs {
-                    let bit = (outcome >> q) & 1;
-                    key = (key & !(1u64 << c)) | (bit << c);
-                }
-                *projected.entry(key).or_insert(0) += n;
-            }
-            Ok(ExecResult::Counts(projected))
-        }
-        other => Ok(other),
-    }
-}
+pub(crate) use omega_core::executor::project_counts_onto_creg;
 
 /// Width in bits of the outcome keys produced by [`run_counts`] for the same
 /// `(circuit, bindings)`: the creg width when counts are projected onto the

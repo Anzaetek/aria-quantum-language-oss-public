@@ -880,43 +880,9 @@ fn main() {
     // double-count), the simulator must collapse. Pure end-of-circuit
     // sampling with a 1:1 qubit→cbit mapping stays in Skip mode (cheaper,
     // preserves the analytic statevector path).
-    let needs_collapse = {
-        let last_meas = circuit
-            .ops
-            .iter()
-            .rposition(|op| matches!(op.gate, omega_core::circuit::GateKind::Measure));
-        let has_cond = circuit.ops.iter().any(|op| op.condition.is_some());
-        let cbit_overwritten = {
-            let mut seen = std::collections::HashSet::new();
-            let mut dup = false;
-            for op in &circuit.ops {
-                if matches!(op.gate, omega_core::circuit::GateKind::Measure) {
-                    if let Some(c) = op.classical_bit {
-                        if !seen.insert(c) {
-                            dup = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            dup
-        };
-        has_cond
-            || cbit_overwritten
-            || last_meas
-                .map(|i| {
-                    circuit.ops[i + 1..]
-                        .iter()
-                        .any(|op| !matches!(op.gate, omega_core::circuit::GateKind::Measure))
-                })
-                .unwrap_or(false)
-            || circuit.ops.iter().enumerate().any(|(i, op)| {
-                matches!(op.gate, omega_core::circuit::GateKind::Measure)
-                    && circuit.ops[i + 1..]
-                        .iter()
-                        .any(|next| !matches!(next.gate, omega_core::circuit::GateKind::Measure))
-            })
-    };
+    // The predicate lives in `omega_core::executor` so the N-way counts
+    // matrix drives the same decision this path ships (see its docs).
+    let needs_collapse = omega_core::executor::needs_collapse(&circuit);
     let mid_circuit_mode = if needs_collapse {
         MidCircuitMode::Collapse
     } else {

@@ -421,18 +421,9 @@ fn stochastic_evolution(circuit: &CircuitIR, config: &ExecConfig) -> bool {
     collapses(circuit, config) || circuit_has_reset(circuit)
 }
 
-/// Pack the classical register (bit `i` = cbit `i`) into a `u64` counts key,
-/// identical to the noiseless backend's collapse-mode encoding.
-fn creg_to_u64(classical_bits: &[u8]) -> u64 {
-    let mut bits = 0u64;
-    for (i, b) in classical_bits.iter().enumerate() {
-        if i >= 64 {
-            break;
-        }
-        bits |= ((*b as u64) & 1) << i;
-    }
-    bits
-}
+/// Pack the classical register into a `u64` counts key. One definition for
+/// every backend — see [`omega_core::executor::creg_to_u64`].
+use omega_core::executor::creg_to_u64;
 
 /// Flip each qubit `q` of one measured outcome with its (bit-dependent,
 /// per-qubit) readout-error probability. `readout` may be asymmetric, so the

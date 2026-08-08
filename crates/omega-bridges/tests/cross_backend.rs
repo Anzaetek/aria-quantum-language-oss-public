@@ -31,6 +31,7 @@ use std::path::PathBuf;
 
 #[cfg(feature = "bridge-perceval")]
 use omega_bridges::run_opticqasm;
+use omega_bridges::corpus::{crosscheck_corpus, gates_used};
 use omega_bridges::{run_qasm2, Backend, BridgeError, Counts};
 
 /// Curated subset of the verify-qiskit corpus. Picked so the cross-
@@ -54,96 +55,6 @@ fn curated_fixtures() -> Vec<(&'static str, PathBuf)> {
         .map(|(cat, name)| (cat, root.join(cat).join(name)))
         .filter(|(_, path)| path.exists())
         .collect()
-}
-
-/// Every `*.qasm` under a directory tree, sorted for a stable report
-/// order. Used by the gate-set-filtered arms below.
-#[allow(dead_code)]
-fn walk_qasm(root: &std::path::Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "qasm") {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// The QASM2 corpus the gate-set-filtered arms scan.
-///
-/// Prefers the private `verify-qiskit/fixtures/` tree (369 files) when
-/// the operator has it checked out beside this repo; that is the
-/// corpus the crate docs and the Perceval/Bloqade thresholds refer to.
-/// It is **not vendored into this repository** (see
-/// `crates/omega-cli/tests/bridge_smoke.rs`, which hit the same wall),
-/// so the fallback is the self-contained corpus under
-/// `tests/fixtures/crosscheck/`. Returns `(label, path, source)`.
-#[allow(dead_code)]
-fn crosscheck_corpus() -> (&'static str, Vec<PathBuf>) {
-    let private = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("verify-qiskit")
-        .join("fixtures");
-    if private.is_dir() {
-        let files = walk_qasm(&private);
-        if !files.is_empty() {
-            return ("verify-qiskit/fixtures", files);
-        }
-    }
-    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("crosscheck");
-    ("tests/fixtures/crosscheck", walk_qasm(&vendored))
-}
-
-/// Gate names a QASM2 source applies, plus any construct the shared
-/// lowering refuses outright (`gate`, `opaque`, `if`) reported under
-/// its own keyword. Declarations, `barrier`, and `measure`/`reset`
-/// (which every backend handles structurally) are not gates and are
-/// skipped.
-///
-/// Deliberately the same shallow scan the Python converter does — it
-/// only has to be *conservative*: a name this misses that the
-/// converter then refuses simply shows up as a skipped fixture, never
-/// as a wrong number.
-#[allow(dead_code)]
-fn gates_used(qasm: &str) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
-    for raw_line in qasm.lines() {
-        let line = raw_line.split("//").next().unwrap_or("");
-        for stmt in line.split(';') {
-            let stmt = stmt.trim();
-            if stmt.is_empty() {
-                continue;
-            }
-            let head: String = stmt
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if head.is_empty() {
-                continue;
-            }
-            match head.as_str() {
-                "OPENQASM" | "include" | "qreg" | "creg" | "barrier" | "measure" | "reset" => {}
-                other => {
-                    out.insert(other.to_string());
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Ask a runner which QASM2 gate names it can lower (`{"mode":"gates"}`).
@@ -195,9 +106,11 @@ fn runner_gate_set(slug: &str) -> std::collections::BTreeSet<String> {
 fn fixtures_within_gate_set(
     gate_set: &std::collections::BTreeSet<String>,
 ) -> (&'static str, Vec<PathBuf>, usize) {
-    let (label, all) = crosscheck_corpus();
-    let total = all.len();
-    let selected = all
+    let corpus = crosscheck_corpus();
+    let label = corpus.label;
+    let total = corpus.files.len();
+    let selected = corpus
+        .files
         .into_iter()
         .filter(|path| {
             let Ok(qasm) = std::fs::read_to_string(path) else {
@@ -680,7 +593,8 @@ fn count_l2_matches_hand_computed_value() {
 /// A matrix built on that corpus would have been green by construction.
 #[test]
 fn corpus_identity_is_reported_and_covers_the_defect_classes() {
-    let (label, files) = crosscheck_corpus();
+    let corpus = crosscheck_corpus();
+    let (label, files) = (corpus.label, &corpus.files);
 
     let strip = |s: &str| -> String {
         s.lines()
@@ -692,7 +606,7 @@ fn corpus_identity_is_reported_and_covers_the_defect_classes() {
     let mut with_if = 0usize;
     let mut with_reset = 0usize;
     let mut with_measure = 0usize;
-    for path in &files {
+    for path in files {
         let Ok(raw) = std::fs::read_to_string(path) else {
             continue;
         };

@@ -2422,3 +2422,82 @@ summary line rather than passing silently.
    mode, per K3.
 4. GPU rows behind their existing platform flags.
 5. Only then wire the CI stage.
+
+### K7. Step 3 as built — what it found, and where the plan was wrong
+
+The counts lane landed as `crates/omega-cli/tests/nway_counts.rs`.
+
+**It found three live defects and one of its own.** That is the whole argument
+for the matrix, so the details matter more than the green tick.
+
+| # | where | defect | evidence |
+|---|---|---|---|
+| 1 | `MpsBackend::execute` | per-shot trajectory loop guarded on `circuit_has_reset` **alone**, so a collapse-mode measurement ran ONE trajectory and every shot re-sampled it | `12_feedforward_sometimes_false.qasm` returned `{0: 20000}` where Aer gives ~50/50. A fair coin reported as certainty |
+| 2 | `MpsBackend::execute` | never keyed by the creg in collapse mode | keys over the qubit register, not the 1-bit creg |
+| 3 | `PauliBackend::execute` | honoured the guard correctly, then **re-measured every qubit** and keyed by the full register | emitted key `3` for a 1-bit creg |
+| 4 | the harness itself | rendered keys MSB-first; the bridge wire format is **LSB-first** (`qiskit_runner.py:162`, `bits = flat[::-1]`) | all three dense engines at L2 = 0.24–0.59 vs Qiskit while agreeing perfectly with each other |
+
+Defect 1 is **the exact defect the statevector backend fixed in `11888a9`**, with
+the fix documented at length in its own source, and which `NoisyMpsBackend`
+already carried. It never propagated to the noiseless MPS backend, and nothing
+in the repository could have caught it: the two MPS backends were never compared
+on a conditional circuit, and the broken one agreed with itself every time. K3's
+claim that internal agreement is weak evidence is not a stylistic preference —
+this is the second time the same class of bug has hidden behind it.
+
+Defect 3 was nearly excused by defect 4's neighbour: the harness originally
+formatted keys to creg width, which **truncated** `3` to `"1"` — the right
+answer from a backend reading the wrong register — and scored `pauli` as fully
+in agreement on its first run. `to_str_counts` now refuses an over-wide key
+instead of truncating.
+
+Defect 4 is worth its own note because of *why* it survived local testing: it is
+correct on every palindromic outcome, and `{00, 11}` — Bell, GHZ, the
+partial-measure fixture — is palindromic. The first key-conversion test passed
+against a bug it was written to catch. Pinned now by
+`bit_order_is_lsb_first_on_an_asymmetric_outcome`, which uses `0b100`.
+
+**Two places the plan was wrong or incomplete:**
+
+* **K5 said to build on `cross_backend.rs`.** The bridge-to-bridge arms still
+  belong there, but the counts lane needs the in-tree engines, and
+  `omega-bridges` deliberately depends on `omega-core` alone. Adding
+  `omega-parser` + statevector + mps + pauli as dev-dependencies would invert
+  that layering for file placement. The lane lives in `omega-cli` (which
+  already depends on all of them *and* on `omega-bridges`); what the two lanes
+  now share is the thing that actually matters, `omega_bridges::corpus` — one
+  definition of *which* corpus ran.
+* **K5 called counts-key conversion "unstated work" — it was partly already
+  written.** `aria-runtime` had `project_counts_onto_creg` + `measure_pairs`
+  (`pub(crate)`, over the Aria AST), and `omega-cli` had the `needs_collapse`
+  predicate inline. Three backends each carried their own `creg_to_u64`. All
+  four now live in `omega_core::executor` with unit tests, so the matrix drives
+  **the shipped decision** rather than a convention invented for the test. A
+  matrix that picks its own conversion validates an execution path no user gets.
+
+**Thresholds are derived, not hardcoded** — `K·√(Σ p̂ₖ(1−p̂ₖ)(1/n_a + 1/n_b))`
+at `K = 6`, which is exactly 6σ in the narrowest (two-outcome) case and
+strictly more conservative as `d` grows. This is what K2's correction asked
+for, and it is what makes 20k shots enough: `cross_backend.rs` needs 4M shots
+to hold a hardcoded 0.0025, and an in-tree engine in `Collapse` mode runs one
+trajectory per shot.
+
+**Reported coverage, measured:** statevector / mps / noisy-mps(p=0) 13 of 14
+fixtures compared and agreeing; `pauli` 7 of 14, with 6 correct `cannot-express`
+refusals on non-Clifford circuits. One fixture (`03_sqrt_x.qasm`) reaches no
+in-tree engine at all.
+
+**One gap deliberately left open.** `sx` / `sxdg` have no `GateKind`. They are
+exactly `e^{±iπ/4}·u3(π/2, ∓π/2, ±π/2)` (verified against Qiskit), so lowering
+to `U3` is right for counts and wrong by a global phase for any statevector
+comparison. Aliasing versus a new `GateKind` threaded through six backends is a
+design decision, so it is planned rather than slipped in — tracked in
+`NOT_LOWERABLE`, which fails the test both when an unlisted gap appears **and**
+when a listed one starts working, so the list cannot go stale.
+
+`p(λ)` was the other half of that gap and *was* closed here: Qiskit's
+`PhaseGate` and `U1Gate` are bit-identical (max|Δ| = 0.0, measured), so the
+alias carries no caveat.
+
+Still open from K6: the expectation lane (step 4) and the `ARIA_NWAY=1` CI
+stage (step 5).

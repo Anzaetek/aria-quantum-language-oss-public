@@ -14,6 +14,8 @@ use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
 use omega_core::params::ParameterBinding;
 
+use omega_core::executor::creg_to_u64;
+
 use crate::stabilizer::pauli_mult_phase;
 use crate::stabilizer::{PauliRow, StabilizerTableau};
 
@@ -92,12 +94,31 @@ impl Backend for PauliBackend {
                         apply_circuit(&mut tab, circuit, params, &mut rng, false)?;
                     }
 
-                    let mut bitstring = 0u64;
-                    for q in 0..n {
-                        if tab.measure(q, &mut rng) {
-                            bitstring |= 1 << q;
+                    // In collapse mode the mid-circuit `measure` statements
+                    // already ran and recorded outcomes into `classical_bits`.
+                    // Key by the creg, matching the statevector and MPS
+                    // backends (and Qiskit, which reports over the creg).
+                    //
+                    // Re-measuring every qubit here instead — which is what
+                    // this did — keys by the FULL qubit register. On
+                    // `12_feedforward_sometimes_false.qasm` (2 qubits, a 1-bit
+                    // creg) it produced keys {0, 3} where the creg values are
+                    // {0, 1}: right physics, wrong register, and a key too
+                    // wide to be a creg value at all. Anything that then
+                    // truncated to creg width would have read as agreement.
+                    let bitstring = if config.mid_circuit_mode == MidCircuitMode::Collapse
+                        && circuit.num_classical_bits > 0
+                    {
+                        creg_to_u64(&classical_bits)
+                    } else {
+                        let mut bits = 0u64;
+                        for q in 0..n {
+                            if tab.measure(q, &mut rng) {
+                                bits |= 1 << q;
+                            }
                         }
-                    }
+                        bits
+                    };
                     *counts.entry(bitstring).or_insert(0) += 1;
                 }
 
@@ -1177,10 +1198,26 @@ mod tests {
 
     #[test]
     fn test_pauli_midcircuit_conditional() {
-        // H q0 → measure q0 → if(c0==1) X q1 → measure all
-        // Should get only |00⟩ or |11⟩ (never |01⟩ or |10⟩)
+        // `h q0; measure q0 -> c0; if (c==1) x q1; measure q1 -> c1`
+        //
+        // The feedforward correlates q1 with q0, so only |00⟩ and |11⟩ appear
+        // and never |01⟩ or |10⟩ — that is the physics under test, unchanged.
+        //
+        // What changed is HOW it is observed. This test used to declare a
+        // 1-bit creg, leave q1 unmeasured, and rely on the backend
+        // re-measuring every qubit at the end and keying counts over the full
+        // qubit register (giving 0 and 3). That keying was unique to this
+        // backend: on the identical circuit, statevector and MPS both key by
+        // the creg and return {0: 261, 1: 239} — as does Qiskit, which always
+        // reports over the classical register. So the old assertion pinned
+        // this backend's *divergence* from every other one.
+        //
+        // The fix is to record the correlation where the convention can carry
+        // it: a 2-bit creg with q1 measured into c1. Strictly stronger — the
+        // same property, checked through the shared counts convention rather
+        // than around it.
         let mut circuit = empty_circuit(2);
-        circuit.num_classical_bits = 1;
+        circuit.num_classical_bits = 2;
         circuit.ops.push(make_op(GateKind::H, &[0]));
         circuit.ops.push(GateOp {
             gate: GateKind::Measure,
@@ -1196,6 +1233,13 @@ mod tests {
             classical_bit: None,
             condition: Some((0, 1, 1)),
         });
+        circuit.ops.push(GateOp {
+            gate: GateKind::Measure,
+            qubits: smallvec![Qubit(1)],
+            params: smallvec![],
+            classical_bit: Some(1),
+            condition: None,
+        });
 
         let backend = PauliBackend::new();
         let config = ExecConfig {
@@ -1208,7 +1252,8 @@ mod tests {
             .unwrap();
         let counts = result.counts();
 
-        // Only |00⟩ (0) and |11⟩ (3) should appear
+        // creg values: c1c0 = 00 (0) and 11 (3). The anti-correlated 01 / 10
+        // must be absent.
         let c00 = counts.get(&0).copied().unwrap_or(0);
         let c11 = counts.get(&3).copied().unwrap_or(0);
         assert_eq!(
@@ -1216,6 +1261,15 @@ mod tests {
             500,
             "should only have |00⟩ and |11⟩, got {:?}",
             counts
+        );
+        // Both must actually occur — otherwise a backend that ignored the
+        // guard entirely (q1 always 0, so always 00) would pass the line
+        // above. 500 shots at p = 1/2: sd = 22 shots, so 150 is > 6 sigma
+        // from either degenerate outcome.
+        assert!(
+            c00 > 150 && c11 > 150,
+            "expected both outcomes near 250/250, got 00={c00} 11={c11} — a \
+             single outcome means the guard was not evaluated per shot"
         );
     }
 
