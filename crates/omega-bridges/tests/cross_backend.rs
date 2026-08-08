@@ -599,7 +599,7 @@ fn perceval_opticqasm_hom_bunching() {
     // 2-mode 50/50 BS with one photon in each mode. Indistinguishable
     // photons bunch — output distribution is |2,0⟩ + |0,2⟩, never
     // |1,1⟩. Same circuit omega's photonic backend exercises in
-    // `examples/circuits/hom_effect.opticqasm`.
+    // `examples/circuits/hom_dip.opticqasm`.
     let source = "OPTICQASM 1.0;\n\
                   photon q[2];\n\
                   bs_rx(0.7853981633974483, 0.0) q[0], q[1];";

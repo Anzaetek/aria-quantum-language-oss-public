@@ -33,7 +33,14 @@ pub fn build_unitary(num_modes: usize, ops: &[PhotonicOp]) -> Vec<Vec<Complex64>
 pub enum PhotonicOp {
     /// Phase shifter on a single mode: applies e^{i*phi} to mode k.
     PhaseShifter { mode: usize, phi: f64 },
-    /// Beam splitter (Rx convention) on two adjacent modes.
+    /// Beam splitter (Rx convention) on any two modes.
+    ///
+    /// NOT restricted to adjacent modes — this doc previously said "adjacent",
+    /// which is wrong and actively misleading: polarization lowering emits
+    /// beam splitters on non-adjacent pairs by construction (a PBS acts on the
+    /// H sub-modes `2a` and `2b`). `apply_beam_splitter_rx` operates on
+    /// arbitrary row pairs. Note Perceval's `Circuit.add` DOES require
+    /// consecutive ports, which is why its bridge routes with PERM.
     /// Matrix: [[cos(theta), -e^{i*phi}*sin(theta)],
     ///          [e^{-i*phi}*sin(theta), cos(theta)]]
     BeamSplitterRx {
