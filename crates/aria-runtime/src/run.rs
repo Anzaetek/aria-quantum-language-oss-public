@@ -551,6 +551,36 @@ pub fn statevector(
 
 /// Expectation value `⟨ψ|O|ψ⟩` of a Pauli observable string (e.g. `"Z0"`,
 /// `"1.0*Z0 Z1"`), parsed by `omega_core::executor::Observable::parse`.
+/// Refuse an expectation/gradient on a circuit whose classically-conditioned
+/// gates would be silently skipped.
+///
+/// `Backend::expectation` hardcodes `MidCircuitMode::Skip`
+/// (`omega-backend-statevector/src/sim.rs`), so a `when c == v { .. }` gate
+/// never fires on this path. The counts path handles feedforward correctly —
+/// only expectation and gradient do not — which makes the failure especially
+/// easy to miss: the same circuit gives right answers with `--shots` and wrong
+/// ones with `--expectation`.
+///
+/// Measured: `X q0; measure q0 -> c0; when c0 == 1 { X q1 }` returns
+/// `⟨Z1⟩ = +1.0` where the correct value is `−1.0`, because the conditional
+/// `X` is dropped. A plausible number, silently wrong, on the path QML uses.
+///
+/// So refuse. Returning a value here and documenting the caveat elsewhere is
+/// the same mistake as a governor advertising headroom it does not have: the
+/// number gets used, the caveat does not.
+fn reject_feedforward_on_analytic_path(low: &Lowered, what: &str) -> Result<(), String> {
+    if low.needs_collapse {
+        return Err(format!(
+            "{what} cannot be computed for a circuit with classically-conditioned gates: \
+             the analytic path evaluates without mid-circuit collapse, so every \
+             `when c == v` gate would be silently skipped and the result would be \
+             plausible but wrong. Use `--shots` (the sampled path executes feedforward \
+             correctly), or rewrite the feedforward as coherent control."
+        ));
+    }
+    Ok(())
+}
+
 pub fn expectation(
     circuit: &Circuit,
     observable: &str,
@@ -558,6 +588,7 @@ pub fn expectation(
     sel: BackendSel,
 ) -> Result<f64, String> {
     let low = concrete_ir(circuit, bindings)?;
+    reject_feedforward_on_analytic_path(&low, "expectation")?;
     let obs = Observable::parse(observable)?;
     with_backend_stats(sel, |b| {
         b.expectation(&low.ir, &ParameterBinding::new(), &obs)
