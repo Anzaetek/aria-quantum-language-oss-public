@@ -49,42 +49,64 @@ use omega_backend_cv::FockState;
 /// tolerance is meaningless — it would demand agreement on values that are
 /// pure floating-point noise in both implementations.
 ///
-/// The value is set from measurement, not taste. See `TRUNCATION_CASES`: the
-/// cases where the two disagree by more than this are exactly the ones where
-/// **the disagreement is real physics**, not numerics, and they are listed
-/// individually rather than absorbed by loosening this number.
-const PROB_TOL: f64 = 1e-9;
+/// Set from measurement, not taste: with both sides on the same normalisation
+/// convention the worst residual across the whole corpus is 1.1e-16, so 1e-14
+/// leaves ~2 orders of margin over float noise while still being 10^10 tighter
+/// than the leak-budget tolerance this replaced.
+///
+/// (An earlier revision of this doc pointed at a `TRUNCATION_CASES` constant.
+/// That constant was removed when the per-case budget replaced the exception
+/// list, and the reference was left dangling — it named nothing in the repo.)
+const PROB_TOL: f64 = 1e-14;
 
 /// Same reasoning, on amplitudes. Looser than `PROB_TOL` by roughly the square
 /// root, because an amplitude error of `e` shows up in a probability as `~2*e`
 /// near unit magnitude but as `e^2` where the amplitude itself is small.
-const AMP_TOL: f64 = 1e-8;
+const AMP_TOL: f64 = 1e-13;
 
-/// Where the two implementations genuinely differ, and the claim made about it.
+/// Same reasoning again for `<n>`. Both sides renormalise, so this is float
+/// noise; measured worst across the corpus is 2.2e-16.
+const MEAN_N_TOL: f64 = 1e-14;
+
+/// # A correction, kept visible because the wrong version shipped
 ///
-/// We evaluate the closed-form Fock amplitudes and then cut. piquasso applies a
-/// squeezing operator that is itself already truncated. **Those are not the same
-/// state**, and the gap grows with `r` as the cutoff bites — at `r=0.5` it is
-/// 3.4e-8, far above any floating-point noise floor. Neither side is "wrong";
-/// they are two defensible readings of "squeezed vacuum at cutoff 20".
+/// This file used to carry a `probability_budget()` helper and the claim that
+/// Aria and piquasso "genuinely differ" on squeezed vacuum because *we evaluate
+/// the closed-form Fock amplitudes and then cut, while piquasso applies a
+/// squeezing operator that is itself already truncated* — "two defensible
+/// readings of squeezed vacuum at cutoff 20". Disagreements were then held to
+/// the backend's own `lost_norm` budget rather than to a numeric tolerance.
 ///
-/// So the assertion is not "these agree to 1e-9". It is the stronger and more
-/// useful claim:
+/// **Both halves of that explanation were wrong.**
 ///
-/// > wherever we disagree with piquasso, the disagreement is bounded by the
-/// > truncation error **this backend itself advertises** via `lost_norm`.
+/// * The underlying amplitudes agree to **1e-16**. There was never a difference
+///   of state to defend.
+/// * piquasso does not exponentiate a truncated generator (that disagrees by
+///   1.8e-2 at r=1.0). It applies the truncation of the **exact** operator, via
+///   the Miatto–Quesada recurrence in `piquasso/_math/gate_matrices.py`.
 ///
-/// That turns an awkward mismatch into a live test of the leak metric. If the
-/// gap ever exceeds the budget, the metric is understating the error — and a
-/// leak metric that under-reports is worse than none, because callers trust it
-/// to decide whether an answer is usable. Bounding it per-case also means no
-/// hand-maintained exception list to go stale.
+/// The entire gap was a **normalisation convention**: piquasso returns raw
+/// truncated probabilities (`sum = 0.999936664825` at r=0.8) while Aria
+/// renormalises by the represented mass. Renormalising piquasso's own vector
+/// and re-diffing reproduces **3.434e-08** (r=0.5) and **4.736e-05** (r=0.8) —
+/// *exactly* the two numbers this test used to report as "reconciled by the
+/// truncation budget".
 ///
-/// `lost_norm` is the right unit here: these are probabilities. `lost_n_weight`
-/// is photon-weighted and bounds `<n>`, which is checked separately below.
-fn probability_budget(state: &FockState) -> f64 {
-    state.lost_norm().max(PROB_TOL)
-}
+/// So the check passed, and its bound was even valid — `p/(1−ε) − p ≈ pε` is
+/// maximal at the dominant `p`, which is why the gap tracked the lost mass. It
+/// passed **for a reason other than the one documented**, with a tolerance
+/// roughly 10¹⁰ looser than necessary: a leak-budget-sized tolerance standing
+/// in for a floating-point-sized one.
+///
+/// `piquasso_ref.py` now normalises both sides once, at the source, so the
+/// comparison is a plain numeric one at `PROB_TOL`.
+///
+/// **`lost_norm` / `lost_n_weight` still matter — but not here.** They bound the
+/// distance to *truth* (`sinh²r`), not the distance to piquasso, which is float
+/// noise once the conventions match. Their proper home is
+/// `matches_piquasso_and_predicts_where_piquasso_goes_wrong` in `lib.rs`, where
+/// the reference is analytic.
+const _: () = ();
 
 #[derive(Debug)]
 struct Case {
@@ -332,48 +354,47 @@ fn cv_backend_agrees_with_piquasso_on_equivalent_circuits() {
             .collect();
         let amp_diff = max_diff_up_to_global_phase(&ours_amps, &case.amps);
 
-        let budget = probability_budget(&state);
         assert!(
-            amp_diff <= budget.max(AMP_TOL),
+            amp_diff <= AMP_TOL,
             "{}: Fock AMPLITUDES disagree with piquasso {version} by \
-             {amp_diff:.3e} (budget {budget:.3e}) after removing global phase. \
+             {amp_diff:.3e} (tolerance {AMP_TOL:.1e}) after removing global phase. \
              A probability-only comparison would have missed this — which is \
              exactly why amplitudes are compared.",
             case.name
         );
 
         assert!(
-            max_diff <= budget,
+            max_diff <= PROB_TOL,
             "{}: Fock probabilities disagree with piquasso {version} by \
-             {max_diff:.3e}, EXCEEDING the {budget:.3e} truncation error this \
-             backend advertises via lost_norm. Either the numerics are wrong or \
-             the leak metric is understating — and an understating leak metric \
-             is the worse of the two, because callers trust it to decide whether \
-             an answer is usable.\n  ours: {:?}\n  piq:  {:?}",
+             {max_diff:.3e} (tolerance {PROB_TOL:.1e}). Both sides are on the \
+             SAME normalisation convention now, so this is a real numeric \
+             disagreement, not a convention artefact.\n  ours: {:?}\n  piq:  {:?}",
             case.name,
             &ours[..ours.len().min(6)],
             &case.probs[..case.probs.len().min(6)]
         );
 
-        // Record cases that needed more than the noise floor, so the report
-        // shows WHERE truncation is doing the reconciling rather than leaving
-        // "all green" to imply exact agreement everywhere.
-        if max_diff > PROB_TOL {
-            truncation_seen.push(format!(
-                "{} (diff {max_diff:.3e} <= budget {budget:.3e})",
-                case.name
-            ));
+        // Record any case that clears the pure-noise floor, so the report shows
+        // where the residual actually sits rather than letting "all green"
+        // imply exact agreement everywhere.
+        if max_diff > 1e-15 {
+            truncation_seen.push(format!("{} (diff {max_diff:.3e})", case.name));
         }
 
-        // <n> as a secondary check — a scalar, and scalars collide, so the
-        // vector above is what actually discriminates. Bounded by the
-        // PHOTON-WEIGHTED leak, which is the quantity that governs <n>.
+        // <n> is compared at the SAME tolerance as everything else.
+        //
+        // It used to be budgeted at `lost_n_weight().max(1e-9)` — about 1.4e-3
+        // at r=0.8, some 10^12 looser than needed. That was the same mistake as
+        // the probability lane, and it survived the first correction of that
+        // mistake: the fixture's `mean_n` is computed from ALREADY-renormalised
+        // probabilities and `expect_n` divides by `norm_sqr()`, so both sides
+        // share a convention and the difference is float noise (measured 2.2e-16
+        // worst across the corpus). `lost_n_weight` bounds |<n> - sinh^2 r|,
+        // the distance to TRUTH — it is not a bound on the distance to piquasso.
         if let Ok(n) = state.expect_n(1.0) {
-            let n_budget = state.lost_n_weight().max(1e-9);
             assert!(
-                (n - case.mean_n).abs() <= n_budget,
-                "{}: <n> {n} vs piquasso {} differs by {:.3e}, exceeding the \
-                 photon-weighted leak budget {n_budget:.3e}",
+                (n - case.mean_n).abs() <= MEAN_N_TOL,
+                "{}: <n> {n} vs piquasso {} differs by {:.3e}, tolerance {MEAN_N_TOL:.1e}",
                 case.name,
                 case.mean_n,
                 (n - case.mean_n).abs()
@@ -391,7 +412,7 @@ fn cv_backend_agrees_with_piquasso_on_equivalent_circuits() {
     eprintln!("piquasso {version}: compared {compared}/{} cases", cases.len());
     eprintln!("  worst agreeing diff: {} at {:.3e}", worst.0, worst.1);
     for t in &truncation_seen {
-        eprintln!("  reconciled by truncation budget — {t}");
+        eprintln!("  residual above the noise floor — {t}");
     }
     for (name, why) in &skipped {
         eprintln!("  NOT COMPARED — {name}: {why:?}");
