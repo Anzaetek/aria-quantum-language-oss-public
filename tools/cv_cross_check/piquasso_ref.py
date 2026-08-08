@@ -110,9 +110,31 @@ def case(name, ops, out, cutoff=CUTOFF):
         amps = np.concatenate([amps, np.zeros(cutoff - len(amps), dtype=complex)])
     amps = amps[:cutoff]
 
+    # NORMALISATION — the single most important line in this file.
+    #
+    # piquasso returns RAW truncated probabilities: at r=0.8, cutoff 20,
+    # `sum(probs)` is 0.999936664825, not 1. Aria renormalises by the represented
+    # mass. Comparing the two conventions directly produces a spurious
+    # disagreement of exactly (1 - sum) * p_max — 4.736e-05 at r=0.8, 3.434e-08
+    # at r=0.5.
+    #
+    # Those two numbers were previously reported by the cross-check as
+    # "reconciled by the truncation budget" and explained as a genuine physical
+    # difference ("we take closed-form amplitudes and cut, piquasso applies an
+    # already-truncated operator"). That explanation was WRONG. The underlying
+    # amplitudes agree to 1e-16; the entire gap was this normalisation.
+    #
+    # So both sides are put on Aria's convention HERE, once, and the comparison
+    # tightens from a leak-budget-sized tolerance (~1e-4) to a
+    # floating-point-sized one (~1e-14) — about ten orders of magnitude more
+    # discriminating.
     total = probs.sum()
+    if total > 0:
+        probs = probs / total
+        amps = amps / np.sqrt(total)
+
     ks = np.arange(len(probs))
-    mean_n = float((ks * probs).sum() / total) if total > 0 else 0.0
+    mean_n = float((ks * probs).sum()) if total > 0 else 0.0
 
     out.append({
         "case": name,

@@ -140,12 +140,33 @@ on it.
    pins this set exactly, so when an operator form lands the test fails and says
    to move the case into the compared corpus.
 
-Where the two disagree at all, the assertion is not "they agree" but the stronger
-claim that **the gap stays inside the truncation error this backend advertises**
-via `lost_norm`. At `r=0.8` that is 4.7e-5 against a 6.3e-5 budget. A leak metric
-that under-reports is worse than a numeric mismatch, because callers trust it to
-decide whether an answer is usable — so this turns an awkward convention gap into
-a live test of the metric itself.
+**A correction, recorded because the wrong version shipped.** This section used
+to say the two implementations "genuinely differ" on squeezed vacuum — that Aria
+takes closed-form amplitudes and cuts while piquasso applies an already-truncated
+operator, "two defensible readings" — and that disagreements were held to the
+backend's own `lost_norm` budget (4.7e-5 against a 6.3e-5 budget at `r=0.8`).
+
+**That explanation was wrong in both halves.** The underlying amplitudes agree to
+**1e-16**, so there was no difference of state; and piquasso does *not*
+exponentiate a truncated generator (that disagrees by 1.8e-2 at `r=1.0`) — it
+applies the truncation of the **exact** operator, via the Miatto–Quesada
+recurrence.
+
+The whole gap was a **normalisation convention**: piquasso returns raw truncated
+probabilities (`sum = 0.999936664825` at `r=0.8`), Aria renormalises by the
+represented mass. Renormalising piquasso's own vector reproduces **3.434e-08**
+and **4.736e-05** — exactly the numbers the check reported as "reconciled by the
+truncation budget". It passed, and its bound was even valid, but **for a
+different reason than documented**, at a tolerance ~10¹⁰ too loose.
+
+Both sides are now normalised once in `piquasso_ref.py`, and the tolerance is a
+plain 1e-14. Measured worst residual across the corpus: **2.220e-16**. The
+tightening is not cosmetic — it now catches a **1e-11 relative error in the Kerr
+phase**, which the old budget-sized tolerance passed without complaint.
+
+`lost_norm` and `lost_n_weight` still matter, but they bound the distance to
+**truth** (`sinh²r`), not to piquasso. Their proper home is the analytic test in
+`lib.rs`, not the differential one.
 
 **TLA+** — properties that hold over *all* interleavings rather than one run.
 Already earned its keep: `Governor.tla` produced a concrete lasso proving a
