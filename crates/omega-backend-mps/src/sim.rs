@@ -188,18 +188,49 @@ impl Backend for MpsBackend {
             None => rand::make_rng::<StdRng>(),
         };
 
-        // `Reset` is a stochastic CHANNEL, not a gate (see `apply_reset_mps`):
-        // one chain carries one trajectory, so correct shot statistics require
-        // independent evolutions. Sampling every shot from a single post-reset
-        // chain would replay one draw of the reset outcome as certainty.
-        // Mirrors the CPU statevector backend.
-        if let (true, Some(shots)) = (circuit_has_reset(circuit), config.shots) {
+        // Any STOCHASTIC evolution needs one independent trajectory per shot,
+        // not one trajectory replayed `shots` times.
+        //
+        // `Reset` is a stochastic CHANNEL, not a gate (see `apply_reset_mps`),
+        // and a `Collapse`-mode mid-circuit measurement is stochastic too.
+        // This predicate tested `circuit_has_reset` ALONE, which is the exact
+        // defect the CPU statevector backend fixed in `11888a9` and documents
+        // at `omega-backend-statevector/src/sim.rs`, and which
+        // `NoisyMpsBackend` already guards with `mps_collapses`. It never
+        // propagated here.
+        //
+        // Consequence, measured on
+        // `omega-bridges/tests/fixtures/crosscheck/12_feedforward_sometimes_false.qasm`
+        // (`h q0; measure q0 -> c0; if (c==1) x q1; measure q1 -> c0`) at
+        // 20000 shots, seed 7:
+        //
+        //   MpsBackend before: {0: 20000}          — certainty
+        //   Qiskit Aer:        {0: ~9900, 1: ~10100} — a fair coin
+        //
+        // One trajectory drew c0 = 0, the guarded X never fired, and every
+        // one of the 20000 shots then sampled that same collapsed chain. A
+        // superposition reported as deterministic, silently. Found by the
+        // N-way counts matrix (`omega-cli/tests/nway_counts.rs`) — no
+        // in-tree-only comparison could have caught it, because the *noisy*
+        // MPS backend was right and this one was wrong in a way that still
+        // agreed with itself.
+        let by_creg = mps_collapses(circuit, config);
+        if let (true, Some(shots)) = (by_creg || circuit_has_reset(circuit), config.shots) {
             let mut counts = HashMap::new();
             for _ in 0..shots {
-                let (mps, _cbits) = self.evolve_once(circuit, params, config, &mut rng)?;
+                let (mps, cbits) = self.evolve_once(circuit, params, config, &mut rng)?;
                 self.record_stats(&mps);
-                let envs = mps.right_environments();
-                let outcome = mps.sample_with_envs(&envs, &mut rng);
+                // In collapse mode the creg IS the outcome: the measures
+                // already happened during evolution, and re-sampling the
+                // final chain would report the post-collapse qubit state
+                // rather than what was recorded. Matches the statevector and
+                // noisy-MPS backends.
+                let outcome = if by_creg {
+                    mps_creg_to_u64(&cbits)
+                } else {
+                    let envs = mps.right_environments();
+                    mps.sample_with_envs(&envs, &mut rng)
+                };
                 *counts.entry(outcome).or_insert(0) += 1;
             }
             return Ok(ExecResult::Counts(counts));
@@ -607,18 +638,9 @@ fn mps_collapses(circuit: &CircuitIR, config: &ExecConfig) -> bool {
     config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0
 }
 
-/// Pack the classical register (bit `i` = cbit `i`) into a `u64` counts key,
-/// matching the statevector backend's collapse-mode encoding.
-fn mps_creg_to_u64(classical_bits: &[u8]) -> u64 {
-    let mut bits = 0u64;
-    for (i, b) in classical_bits.iter().enumerate() {
-        if i >= 64 {
-            break;
-        }
-        bits |= ((*b as u64) & 1) << i;
-    }
-    bits
-}
+/// Pack the classical register into a `u64` counts key. One definition for
+/// every backend — see [`omega_core::executor::creg_to_u64`].
+use omega_core::executor::creg_to_u64 as mps_creg_to_u64;
 
 /// Flip each qubit of a sampled outcome with its per-qubit (possibly
 /// asymmetric) readout-error probability.

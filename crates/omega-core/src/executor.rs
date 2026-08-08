@@ -117,6 +117,136 @@ impl ExecResult {
     }
 }
 
+/// Whether a circuit must be simulated with [`MidCircuitMode::Collapse`]
+/// rather than the cheaper end-of-circuit sampling path.
+///
+/// True when the circuit has any classically conditioned gate, any classical
+/// bit written by more than one `measure` (Qiskit is last-write-wins on the
+/// creg; basis-state sampling would double-count), or any operation after a
+/// `measure`. Otherwise the measurements are terminal, the qubit→cbit mapping
+/// is a pure relabelling, and `Skip` mode plus
+/// [`project_counts_onto_creg`] gives the same distribution more cheaply and
+/// without per-shot trajectories.
+///
+/// Extracted from `omega-cli`'s execute path so the N-way counts matrix
+/// (`crates/omega-cli/tests/nway_counts.rs`) drives the **same** decision the
+/// CLI ships. A matrix that picked its own mode would be validating an
+/// execution path no user gets — and `Skip` vs `Collapse` is exactly where the
+/// counts-keying convention changes, so the difference is not academic.
+pub fn needs_collapse(circuit: &CircuitIR) -> bool {
+    use crate::circuit::GateKind;
+    if circuit.ops.iter().any(|op| op.condition.is_some()) {
+        return true;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for op in &circuit.ops {
+        if matches!(op.gate, GateKind::Measure) {
+            if let Some(c) = op.classical_bit {
+                if !seen.insert(c) {
+                    return true; // cbit written twice
+                }
+            }
+        }
+    }
+    // Any non-measure operation after any measure. (The CLI additionally
+    // tested "ops after the LAST measure", which this subsumes; the two were
+    // kept as separate disjuncts there and are merged here without changing
+    // the predicate's value on any input.)
+    circuit.ops.iter().enumerate().any(|(i, op)| {
+        matches!(op.gate, GateKind::Measure)
+            && circuit.ops[i + 1..]
+                .iter()
+                .any(|next| !matches!(next.gate, GateKind::Measure))
+    })
+}
+
+/// Pack a classical register (bit `i` = cbit `i`, LSB-first) into a `u64`
+/// counts key.
+///
+/// This is the encoding every `Collapse`-mode backend must use: the mid-circuit
+/// `measure` statements already ran and recorded their outcomes, so the creg —
+/// not a fresh sample of the qubit register — is the shot's result. Qiskit
+/// reports over the creg too, which is what makes the two comparable.
+///
+/// Lives here because it had been copy-pasted into three backends, and a
+/// fourth copy is a fourth chance to key counts differently from the rest.
+pub fn creg_to_u64(classical_bits: &[u8]) -> u64 {
+    let mut bits = 0u64;
+    for (i, b) in classical_bits.iter().enumerate() {
+        if i >= 64 {
+            break;
+        }
+        bits |= ((*b as u64) & 1) << i;
+    }
+    bits
+}
+
+/// The `(qubit, classical_bit)` pairs a circuit's `measure` statements
+/// declare, in program order.
+///
+/// Lives here rather than in a front end because **every** consumer of
+/// [`ExecResult::Counts`] needs it to interpret the keys, and a second copy is
+/// a second convention. See [`project_counts_onto_creg`].
+pub fn measure_pairs(circuit: &CircuitIR) -> Vec<(u32, u32)> {
+    circuit
+        .ops
+        .iter()
+        .filter(|op| op.gate == crate::circuit::GateKind::Measure)
+        .filter_map(|op| {
+            let q = op.qubits.first()?.0;
+            op.classical_bit.map(|c| (q, c))
+        })
+        .collect()
+}
+
+/// Project full-register sampled counts onto the classical register via the
+/// program's `measure → creg` statements (OpenQASM semantics).
+///
+/// Backends sample the **full qubit register** at the end of the circuit, so a
+/// raw counts key is a basis index with bit `q` = qubit `q`. When the program
+/// declares an explicit mapping, the reported counts must instead be keyed
+/// over creg bits, one bit per `measure`, in `c[j]` order. A later measure
+/// into the same classical bit overwrites the earlier one.
+///
+/// **This is not cosmetic.** A qubit that is never measured must not appear in
+/// the key at all. On `08_partial_measure.qasm` — 3 qubits, a 2-bit creg, and
+/// an unmeasured `h q[2]` — skipping the projection turns Qiskit's two
+/// outcomes `{00, 11}` into four, because the unmeasured qubit's coin flip
+/// leaks into the key. A differential test comparing raw keys against a bridge
+/// would report an L2 near 1.0 and blame the backend.
+///
+/// Counts keys are `u64`, so a measure targeting bit ≥ 64 of either register
+/// cannot be represented — that's a loud error, not a masked shift.
+pub fn project_counts_onto_creg(
+    res: ExecResult,
+    pairs: &[(u32, u32)],
+) -> std::result::Result<ExecResult, String> {
+    if pairs.is_empty() {
+        return Ok(res);
+    }
+    if let Some(&(q, c)) = pairs.iter().find(|&&(q, c)| q >= 64 || c >= 64) {
+        return Err(format!(
+            "measure q[{q}] -> c[{c}]: sampled-count keys are u64, so register \
+             indices ≥ 64 cannot be reported; reduce the register or drop --shots"
+        ));
+    }
+    match res {
+        ExecResult::Counts(counts) => {
+            let mut projected: HashMap<u64, u32> = HashMap::new();
+            for (outcome, n) in counts {
+                let mut key = 0u64;
+                for &(q, c) in pairs {
+                    let bit = (outcome >> q) & 1;
+                    key = (key & !(1u64 << c)) | (bit << c);
+                }
+                *projected.entry(key).or_insert(0) += n;
+            }
+            Ok(ExecResult::Counts(projected))
+        }
+        other => Ok(other),
+    }
+}
+
 /// A Pauli operator for defining observables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PauliOp {
@@ -591,5 +721,195 @@ mod tests {
     #[test]
     fn parse_observable_rejects_empty() {
         assert!(Observable::parse("").is_err());
+    }
+
+    // --- counts-keying convention -------------------------------------
+    //
+    // These pin the two functions that decide what a `Counts` key MEANS.
+    // Both were extracted from front ends so the N-way matrix could reuse
+    // them; the tests below are what makes the extraction safe to trust.
+
+    use crate::circuit::{CircuitIR, CircuitType, GateKind, GateOp, Qubit};
+
+    fn op(gate: GateKind, qubits: &[u32], cbit: Option<u32>) -> GateOp {
+        GateOp {
+            gate,
+            qubits: qubits.iter().map(|q| Qubit(*q)).collect(),
+            params: smallvec::smallvec![],
+            classical_bit: cbit,
+            condition: None,
+        }
+    }
+
+    fn circuit(n: u32, ncl: u32, ops: Vec<GateOp>) -> CircuitIR {
+        let mut ir = CircuitIR::new(n, CircuitType::GateBased);
+        ir.num_classical_bits = ncl;
+        ir.ops = ops;
+        ir
+    }
+
+    /// `h q0; cx q0,q1; h q2; measure q0->c0; measure q1->c1` — the shape of
+    /// `08_partial_measure.qasm`. Terminal measures, no conditionals, no
+    /// overwrite, so `Skip` + projection is the correct (and cheaper) route.
+    #[test]
+    fn terminal_measures_do_not_need_collapse() {
+        let c = circuit(
+            3,
+            2,
+            vec![
+                op(GateKind::H, &[0], None),
+                op(GateKind::CX, &[0, 1], None),
+                op(GateKind::H, &[2], None),
+                op(GateKind::Measure, &[0], Some(0)),
+                op(GateKind::Measure, &[1], Some(1)),
+            ],
+        );
+        assert!(!needs_collapse(&c));
+    }
+
+    #[test]
+    fn a_gate_after_a_measure_needs_collapse() {
+        let c = circuit(
+            2,
+            2,
+            vec![
+                op(GateKind::Measure, &[0], Some(0)),
+                op(GateKind::X, &[1], None),
+                op(GateKind::Measure, &[1], Some(1)),
+            ],
+        );
+        assert!(
+            needs_collapse(&c),
+            "a gate between two measures must force collapse — this is the case \
+             where the CLI's now-merged 'ops after the LAST measure' disjunct \
+             was false and only the 'ops after ANY measure' one fired"
+        );
+    }
+
+    #[test]
+    fn a_conditioned_gate_needs_collapse_even_with_terminal_measures() {
+        let mut conditioned = op(GateKind::X, &[1], None);
+        conditioned.condition = Some((0, 1, 1));
+        let c = circuit(
+            2,
+            2,
+            vec![
+                op(GateKind::Measure, &[0], Some(0)),
+                conditioned,
+                op(GateKind::Measure, &[1], Some(1)),
+            ],
+        );
+        assert!(needs_collapse(&c));
+    }
+
+    #[test]
+    fn a_twice_written_cbit_needs_collapse() {
+        // Both measures are terminal, so the "op after a measure" disjunct is
+        // false. Only the overwrite check catches this. Without it, Skip-mode
+        // projection would apply last-write-wins to a SINGLE sample of both
+        // qubits, which is not the same distribution as Qiskit's.
+        let c = circuit(
+            2,
+            1,
+            vec![
+                op(GateKind::H, &[0], None),
+                op(GateKind::H, &[1], None),
+                op(GateKind::Measure, &[0], Some(0)),
+                op(GateKind::Measure, &[1], Some(0)),
+            ],
+        );
+        assert!(needs_collapse(&c));
+    }
+
+    #[test]
+    fn no_measures_at_all_does_not_need_collapse() {
+        let c = circuit(2, 0, vec![op(GateKind::H, &[0], None)]);
+        assert!(!needs_collapse(&c));
+    }
+
+    /// The projection must DROP unmeasured qubits, not merely reorder bits.
+    /// This is the failure that would otherwise be blamed on a backend.
+    #[test]
+    fn projection_drops_the_unmeasured_qubit() {
+        let c = circuit(
+            3,
+            2,
+            vec![
+                op(GateKind::Measure, &[0], Some(0)),
+                op(GateKind::Measure, &[1], Some(1)),
+            ],
+        );
+        let pairs = measure_pairs(&c);
+        assert_eq!(pairs, vec![(0, 0), (1, 1)]);
+
+        // Full-register keys: bit2 = q2 (unmeasured, a coin flip), bits 1..0
+        // = the correlated Bell pair. Four raw keys must collapse to two.
+        let mut raw: HashMap<u64, u32> = HashMap::new();
+        raw.insert(0b000, 25); // q2=0, q1q0=00
+        raw.insert(0b100, 25); // q2=1, q1q0=00
+        raw.insert(0b011, 25); // q2=0, q1q0=11
+        raw.insert(0b111, 25); // q2=1, q1q0=11
+        let out = project_counts_onto_creg(ExecResult::Counts(raw), &pairs).unwrap();
+        let got = out.counts();
+        assert_eq!(got.len(), 2, "expected 2 creg outcomes, got {got:?}");
+        assert_eq!(got.get(&0b00), Some(&50));
+        assert_eq!(got.get(&0b11), Some(&50));
+    }
+
+    /// A permuted qubit→cbit map must actually permute. The vendored corpus
+    /// is all-identity, so nothing there can distinguish a correct projection
+    /// from one that ignores `classical_bit` and uses the qubit index.
+    #[test]
+    fn projection_honours_a_permuted_qubit_to_cbit_map() {
+        let c = circuit(
+            2,
+            2,
+            vec![
+                op(GateKind::Measure, &[0], Some(1)),
+                op(GateKind::Measure, &[1], Some(0)),
+            ],
+        );
+        assert_eq!(measure_pairs(&c), vec![(0, 1), (1, 0)]);
+        let mut raw: HashMap<u64, u32> = HashMap::new();
+        raw.insert(0b01, 7); // q0=1, q1=0
+        let out = project_counts_onto_creg(ExecResult::Counts(raw), &measure_pairs(&c)).unwrap();
+        // q0=1 lands in c1, q1=0 in c0 → creg value 0b10.
+        assert_eq!(out.counts().get(&0b10), Some(&7));
+        assert_eq!(out.counts().get(&0b01), None);
+    }
+
+    /// Last-write-wins on an overwritten cbit, matching Qiskit.
+    #[test]
+    fn projection_is_last_write_wins_on_a_reused_cbit() {
+        let c = circuit(
+            2,
+            1,
+            vec![
+                op(GateKind::Measure, &[0], Some(0)),
+                op(GateKind::Measure, &[1], Some(0)),
+            ],
+        );
+        let mut raw: HashMap<u64, u32> = HashMap::new();
+        raw.insert(0b01, 3); // q0=1, q1=0 → c0 written 1 then 0
+        let out = project_counts_onto_creg(ExecResult::Counts(raw), &measure_pairs(&c)).unwrap();
+        assert_eq!(out.counts().get(&0), Some(&3), "q1's later write must win");
+    }
+
+    /// No pairs → pass through untouched. A no-measure circuit's counts are
+    /// already keyed over the full register, which is what the Qiskit
+    /// runner's synthesised `measure_all()` produces.
+    #[test]
+    fn projection_without_measures_is_identity() {
+        let mut raw: HashMap<u64, u32> = HashMap::new();
+        raw.insert(0b101, 9);
+        let out = project_counts_onto_creg(ExecResult::Counts(raw), &[]).unwrap();
+        assert_eq!(out.counts().get(&0b101), Some(&9));
+    }
+
+    #[test]
+    fn projection_refuses_registers_beyond_u64() {
+        let err = project_counts_onto_creg(ExecResult::Counts(HashMap::new()), &[(0, 64)])
+            .expect_err("cbit 64 does not fit a u64 key");
+        assert!(err.contains("u64"), "unhelpful message: {err}");
     }
 }

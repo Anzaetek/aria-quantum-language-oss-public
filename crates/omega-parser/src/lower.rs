@@ -759,7 +759,14 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         "rz" => Ok(GateKind::Rz),
         "u3" | "U" => Ok(GateKind::U3),
         "u2" => Ok(GateKind::U2),
-        "u1" => Ok(GateKind::U1),
+        // `p(λ)` is qelib1's phase gate. Qiskit's `PhaseGate(λ)` and
+        // `U1Gate(λ)` are **bit-identical** — `diag(1, e^{iλ})`, verified at
+        // max|Δ| = 0.0 — so this is a pure alias with no global-phase caveat,
+        // unlike `sx` (see `NOT_LOWERABLE` in
+        // `crates/omega-cli/tests/nway_counts.rs`). Missing until the N-way
+        // matrix ran `02_single_qubit_rotations.qasm` through every in-tree
+        // engine and all four refused it identically.
+        "u1" | "p" => Ok(GateKind::U1),
         "cx" | "CX" | "cnot" => Ok(GateKind::CX),
         "cy" => Ok(GateKind::CY),
         "cz" => Ok(GateKind::CZ),

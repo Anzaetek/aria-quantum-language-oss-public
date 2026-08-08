@@ -268,6 +268,10 @@ pub fn run_opticqasm(
 
 mod bloqade;
 mod cirq;
+// The shared cross-check corpus locator. Public and in the library (not in a
+// test file) because two harnesses in two different crates must agree on
+// *which* corpus ran — see the module docs.
+pub mod corpus;
 mod perceval;
 mod ppvm;
 mod qadence;

@@ -330,6 +330,34 @@ else
   skipped "bridge cross-checks — set ARIA_BRIDGE_XCHECK=1 with the backend venvs"
 fi
 
+# N-way counts matrix (FIXES_PLAN.md Part K step 3). One QASM2 corpus through
+# every in-tree engine that can sample it, anchored on Qiskit.
+#
+# Distinct from the stage above: that one compares BRIDGE to bridge, this one
+# compares OUR ENGINES to an independent implementation. The distinction is the
+# whole point — the first defect this matrix found (MpsBackend replaying one
+# trajectory for every shot, reporting a fair coin as certainty) was invisible
+# to every internal comparison, because the broken backend agreed with itself
+# perfectly and the correct MPS backend was never put beside it on a
+# conditional circuit.
+#
+# The test auto-skips out loud when the Qiskit venv is absent — the anchor is
+# not optional, and a lane without it degrades to our engines agreeing with
+# each other. It also carries a vacuous-pass guard: zero cells compared is a
+# failure, not a green.
+#
+# NOTE the harness-only tests in the same file (bit order, gate scaling, key
+# width) need no venv and no feature, so they already run under the plain
+# `cargo test --workspace` stage above. This stage adds the matrix itself.
+if [ "${ARIA_NWAY:-0}" = "1" ]; then
+  step "+   N-way counts matrix (statevector / mps / noisy-mps / pauli vs Qiskit)"
+  cargo test -p omega-cli --features bridge-qiskit \
+    --test nway_counts -- --nocapture
+  echo "  OK: in-tree engines agree with Qiskit at the derived per-circuit gate"
+else
+  skipped "N-way counts matrix — set ARIA_NWAY=1 with the qiskit venv"
+fi
+
 # Qiskit differential cross-check. MANDATORY in intent: it is the only
 # INDEPENDENT implementation available, and this project has already shipped a
 # defect that every internal cross-backend agreement gate missed (each pair of

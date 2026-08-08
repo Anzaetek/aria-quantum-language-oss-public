@@ -28,6 +28,7 @@ details; this covers *what each stage buys you*.
 | Lean 4 proof tree | `ARIA_LEAN=1` | `elan` + `lake`, warm mathlib cache | **READY** | 8281 jobs, exit 0 |
 | TLA+ models | `tools/tla/check.sh` | JDK + `tla2tools.jar` | **READY** | safety holds (26 states); liveness violated — starvation, *expected* |
 | CV ↔ piquasso fixture drift | `ARIA_CV_XCHECK=1` | `tools/cv_cross_check/.venv` with `piquasso` | **INSTALLED** (piquasso 8.0.1) | fixture matches live piquasso across 17 cases, worst 0.000e+00 — measured 2026-08-08 |
+| N-way counts matrix | `ARIA_NWAY=1` | `.venv-qiskit` | **INSTALLED** | statevector / mps / noisy-mps(p=0) **13 of 14 fixtures compared, 0 disagree**; `pauli` 7 of 14 with 6 correct `cannot-express` refusals — measured 2026-08-09. Found 3 live defects on its first run (see below) |
 | CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here** — see `CUDA_TODO.md` | untested on this box |
 | Deep harnesses | `ARIA_DEEP=1` | none (just slow) | available | `spectra_noise`, `spectra_scaling_noise` skipped in the default `all` |
 
@@ -181,6 +182,35 @@ hardware; so far they have only met the OpenCL path.
 
 **Deep harnesses** — `ARIA_DEEP=1` adds the two spectra-noise apps the default
 `all` skips for runtime. Worth running before a release.
+
+## What `ARIA_NWAY=1` found on its first run
+
+**Recorded 2026-08-09.** Three live defects, all invisible to every check that
+existed before it. The details are in `FIXES_PLAN.md` K7; the point for this
+document is *why* they were invisible.
+
+1. **`MpsBackend` replayed one trajectory for every shot.** Its per-shot loop
+   was guarded on `circuit_has_reset` alone, so a collapse-mode measurement took
+   the single-evolution path. On `12_feedforward_sometimes_false.qasm` it
+   returned `{0: 20000}` — certainty — where Aer gives ~50/50. This is the exact
+   defect the statevector backend fixed in `11888a9`, which `NoisyMpsBackend`
+   already carried and which never propagated here.
+2. **`MpsBackend` never keyed by the creg** in collapse mode.
+3. **`PauliBackend` evaluated the guard correctly, then re-measured every
+   qubit** and keyed over the full register — key `3` for a 1-bit creg.
+
+None of the three could be caught by an internal comparison. The broken MPS
+backend agreed with itself perfectly on every rerun, and the *correct* MPS
+backend was never placed beside it on a conditional circuit. That is the
+concrete version of this file's standing caveat: agreement between our own
+engines is weak evidence, and it stays weak no matter how many of them agree.
+
+The matrix also caught one defect in **itself** — it rendered counts keys
+MSB-first where the bridge wire format is LSB-first — and that one is worth
+noting because of how it survived: the wrong order is *correct on every
+palindromic outcome*, and `{00, 11}` (Bell, GHZ, partial-measure) is
+palindromic. The first key-conversion test passed against the bug it was
+written to catch. Anything asserting a bit order needs an asymmetric fixture.
 
 ## Standing caveat
 
