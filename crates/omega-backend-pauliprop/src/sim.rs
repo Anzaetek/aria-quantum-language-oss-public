@@ -182,6 +182,37 @@ impl PauliPropBackend {
             self.apply_readout_adjoint(model, n, &mut sum)?;
         }
         for op in circuit.ops.iter().rev() {
+            // A classically-conditioned gate is NOT a plain gate. Its action
+            // depends on a measurement outcome, so the circuit is a classical
+            // mixture over branches — not one unitary — and observable
+            // conjugation cannot express it.
+            //
+            // This backend used to ignore `op.condition` entirely (zero
+            // references to it in the whole crate), which meant a guarded gate
+            // was applied **unconditionally and silently** — answering a
+            // different circuit, exactly as skipping `Reset` did before the
+            // refusal below was added.
+            //
+            // Measured on `h q0; measure q0 -> c0; if (c==1) x q1` (the shape
+            // of `12_feedforward_sometimes_false.qasm`): ignoring the guard
+            // gives ⟨Z₁⟩ = −1, "q1 definitely flipped", where the statevector
+            // backend in collapse mode gives 0 because the X fires on about
+            // half the shots. A gap of 1.0 on an observable bounded in
+            // [−1, +1] — the largest error reachable when the truth is 0.
+            // Pinned in `tests/conditional_refusal.rs`.
+            //
+            // Refuse, so the caller falls back to a backend that models it.
+            // Found by the N-way matrix work (`FIXES_PLAN.md` K7): statevector,
+            // MPS and Pauli all call `condition_satisfied`; this backend was
+            // the only one that did not.
+            if op.condition.is_some() {
+                return Err(OmegaError::Unsupported(
+                    "pauliprop: a classically-conditioned gate makes the circuit a mixture \
+                     over measurement outcomes, which cannot be represented by observable \
+                     conjugation; use the statevector or MPS backend"
+                        .into(),
+                ));
+            }
             // The per-gate channel follows its gate in forward time, so its
             // adjoint precedes the gate's adjoint here.
             if let Some(model) = &self.noise {
