@@ -239,13 +239,7 @@ pub(crate) fn invoke_runner(
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("(no error message)");
-        if kind.ends_with("-not-installed") {
-            return Err(BridgeError::Unavailable(spec.backend, msg.to_string()));
-        }
-        return Err(BridgeError::Backend(
-            spec.backend,
-            format!("{}: {}", kind, msg),
-        ));
+        return Err(classify_failure(spec.backend, kind, msg));
     }
 
     match parse_as {
@@ -519,5 +513,133 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+}
+
+
+/// Map a runner's `kind` string onto a typed [`BridgeError`].
+///
+/// A cross-backend matrix has to tell three things apart that all look like
+/// "no result", and collapsing them is how a matrix reports coverage it does
+/// not have:
+///
+/// 1. **cannot express** — the backend understood the request and CORRECTLY
+///    refused (unsupported gate, unsupported noise, a circuit shape it cannot
+///    represent). The cell is legitimately empty.
+/// 2. **not installed** — environmental; says nothing about the backend.
+/// 3. **error** — a real defect.
+///
+/// Before this existed, only `*-not-installed` was typed; every structured
+/// refusal, including `tsim-unsupported-gate` and `ppvm-unsupported-gate`,
+/// landed in [`BridgeError::Backend`] with the kind glued into the message, so
+/// telling (1) from (3) meant sniffing text.
+///
+/// Suffix matching rather than an exhaustive list, so a new runner that follows
+/// the naming convention is classified correctly without editing this function.
+/// The cost is that a badly-named kind is misclassified — hence the convention
+/// is documented in `docs/BRIDGES.md` rather than left implicit.
+pub(crate) fn classify_failure(backend: Backend, kind: &str, msg: &str) -> BridgeError {
+    // Checked FIRST: `-not-installed` is environmental and must not be read as
+    // a refusal.
+    if kind.ends_with("-not-installed") {
+        return BridgeError::Unavailable(backend, msg.to_string());
+    }
+    if kind.ends_with("-unsupported-gate")
+        || kind.ends_with("-not-supported")
+        || kind.ends_with("-not-implemented")
+    {
+        return BridgeError::CannotExpress(backend, format!("{kind}: {msg}"));
+    }
+    BridgeError::Backend(backend, format!("{kind}: {msg}"))
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    /// Every `kind` the Python runners actually emit, classified.
+    ///
+    /// The list is taken from a grep of `crates/omega-bridges/python/*.py`, not
+    /// invented — a classifier tested only against kinds someone imagined is
+    /// exactly the kind of check this repository keeps finding to be hollow.
+    #[test]
+    fn every_real_runner_kind_lands_in_the_right_bucket() {
+        let cannot_express = [
+            "tsim-unsupported-gate",
+            "ppvm-unsupported-gate",
+            "tsim-noise-not-supported",
+            "ppvm-noise-not-supported",
+            "bloqade-multi-creg-not-supported",
+            "bloqade-ahs-not-implemented",
+        ];
+        let unavailable = [
+            "qiskit-not-installed",
+            "perceval-not-installed",
+            "perceval-converter-not-installed",
+            "bloqade-not-installed",
+            "tsim-not-installed",
+            "ppvm-not-installed",
+        ];
+        let real_errors = [
+            "bad-request",
+            "execute",
+            "tsim-execute",
+            "ppvm-execute",
+            "tsim-lower",
+            "ppvm-lower",
+            "bloqade-lower",
+            "bloqade-execute",
+            "tsim-internal",
+            "ppvm-internal",
+            "qasm-parse",
+            "qasm-emit",
+            "qpy-parse",
+            "qpy-emit",
+            "qpy-multi-circuit",
+            "opticqasm-parse",
+            "opticqasm-build",
+            "noise-model",
+        ];
+
+        for k in cannot_express {
+            assert!(
+                matches!(
+                    classify_failure(Backend::Tsim, k, "x"),
+                    BridgeError::CannotExpress(..)
+                ),
+                "{k} must classify as CannotExpress — a correct refusal is not a defect"
+            );
+        }
+        for k in unavailable {
+            assert!(
+                matches!(
+                    classify_failure(Backend::Tsim, k, "x"),
+                    BridgeError::Unavailable(..)
+                ),
+                "{k} must classify as Unavailable — environmental, not a refusal"
+            );
+        }
+        for k in real_errors {
+            assert!(
+                matches!(
+                    classify_failure(Backend::Tsim, k, "x"),
+                    BridgeError::Backend(..)
+                ),
+                "{k} must classify as Backend — a real failure must not be excused \
+                 as 'cannot express', which would hide a defect as coverage"
+            );
+        }
+    }
+
+    /// `-not-installed` must win over the refusal suffixes.
+    ///
+    /// Not currently reachable (no kind ends with both), but the ordering is
+    /// load-bearing and a future kind could collide.
+    #[test]
+    fn not_installed_is_checked_before_the_refusal_suffixes() {
+        assert!(matches!(
+            classify_failure(Backend::Tsim, "weird-not-supported-not-installed", "x"),
+            BridgeError::Unavailable(..)
+        ));
     }
 }

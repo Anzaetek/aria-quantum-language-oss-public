@@ -143,6 +143,24 @@ pub enum BridgeError {
     NotCompiled(Backend, &'static str),
     #[error("backend `{0:?}` is feature-compiled but unavailable at runtime: {1}")]
     Unavailable(Backend, String),
+    /// The backend ran, understood the request, and **correctly refused** it —
+    /// an unsupported gate, an unsupported noise model, a circuit shape it
+    /// cannot represent.
+    ///
+    /// Distinct from [`BridgeError::Backend`] on purpose. A cross-backend
+    /// matrix has to tell three things apart that all look like "no result":
+    ///
+    /// 1. **cannot express** — a correct refusal. The cell is legitimately empty.
+    /// 2. **not installed** ([`BridgeError::Unavailable`]) — environmental.
+    /// 3. **error** ([`BridgeError::Backend`]) — a real defect.
+    ///
+    /// Collapsing these is how a matrix reports coverage it does not have.
+    /// Before this variant existed, every structured refusal — including
+    /// `tsim-unsupported-gate` and `ppvm-unsupported-gate` — landed in
+    /// `Backend(..)` with the kind glued into the message string, so telling
+    /// (1) from (3) meant sniffing text.
+    #[error("backend `{0:?}` cannot express this circuit: {1}")]
+    CannotExpress(Backend, String),
     #[error("backend `{0:?}` returned an error: {1}")]
     Backend(Backend, String),
     #[error("invalid input: {0}")]

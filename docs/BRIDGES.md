@@ -95,6 +95,32 @@ backends happened to coincide in the basis being checked. Two implementations of
 the same idea, written by different people, agreeing is evidence. One
 implementation agreeing with itself is not.
 
+## Error `kind` naming — it is a contract, not a label
+
+A runner reports failure as `{"ok": false, "kind": "...", "error": "..."}`, and
+`classify_failure` (`src/runner.rs`) maps the **suffix** onto a typed
+`BridgeError`. Three outcomes look identical from outside — "no result" — and a
+cross-backend matrix that collapses them reports coverage it does not have:
+
+| suffix | maps to | meaning |
+|---|---|---|
+| `*-not-installed` | `Unavailable` | environmental; says nothing about the backend |
+| `*-unsupported-gate`, `*-not-supported`, `*-not-implemented` | `CannotExpress` | the backend understood and **correctly refused**; the cell is legitimately empty |
+| anything else | `Backend` | a real defect |
+
+`-not-installed` is checked first. Suffix matching is deliberate, so a new
+runner following the convention classifies correctly with no change to
+`runner.rs` — the cost being that a **badly-named kind is misclassified**, which
+is why the convention is written down here.
+
+Getting this wrong in the safe direction is loud (a refusal reported as a
+defect). Getting it wrong the other way is silent: a genuine failure excused as
+"cannot express" disappears from the matrix as a legitimately empty cell. Name
+accordingly.
+
+`classify_failure` is unit-tested against **every kind the runners actually
+emit**, harvested by grepping `python/*.py` rather than imagined.
+
 ## Adding a bridge
 
 Mirror `crates/omega-bridges/src/bloqade.rs` (34 lines) plus
