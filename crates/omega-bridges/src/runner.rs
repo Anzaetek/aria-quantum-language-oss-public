@@ -148,6 +148,11 @@ pub(crate) enum ParseAs {
     Counts,
     Qasm2String,
     QpyBytes,
+    /// A list of real numbers, for the `expectation` mode. Distinct from
+    /// `Counts` because an expectation value is not a frequency: it is signed,
+    /// unnormalised, and carries no shot count, so nothing in the counts path
+    /// applies to it.
+    Values,
 }
 
 #[allow(dead_code)]
@@ -156,6 +161,7 @@ pub(crate) enum ParsedResponse {
     Counts(Counts),
     Qasm2(String),
     Qpy(Vec<u8>),
+    Values(Vec<f64>),
 }
 
 #[allow(dead_code)]
@@ -267,6 +273,32 @@ pub(crate) fn invoke_runner(
                 BridgeError::Backend(spec.backend, "runner response missing `qasm2`".into())
             })?;
             Ok(ParsedResponse::Qasm2(qasm2.to_string()))
+        }
+        ParseAs::Values => {
+            let arr = resp.get("values").and_then(|v| v.as_array()).ok_or_else(|| {
+                BridgeError::Backend(spec.backend, "runner response missing `values`".into())
+            })?;
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, v) in arr.iter().enumerate() {
+                // Reject non-finite values rather than propagating them. A NaN
+                // that reaches a comparison makes every `<= tolerance` test
+                // FALSE, so a defect would surface as an unexplained
+                // disagreement; and a NaN reaching a `>= ` test would pass.
+                let x = v.as_f64().ok_or_else(|| {
+                    BridgeError::Backend(
+                        spec.backend,
+                        format!("values[{i}] is not a number: {v}"),
+                    )
+                })?;
+                if !x.is_finite() {
+                    return Err(BridgeError::Backend(
+                        spec.backend,
+                        format!("values[{i}] is not finite: {x}"),
+                    ));
+                }
+                out.push(x);
+            }
+            Ok(ParsedResponse::Values(out))
         }
         ParseAs::QpyBytes => {
             use base64::Engine;

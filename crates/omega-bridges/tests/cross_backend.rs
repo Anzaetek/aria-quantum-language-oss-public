@@ -34,26 +34,36 @@ use omega_bridges::run_opticqasm;
 use omega_bridges::corpus::{crosscheck_corpus, gates_used};
 use omega_bridges::{run_qasm2, Backend, BridgeError, Counts};
 
-/// Curated subset of the verify-qiskit corpus. Picked so the cross-
-/// backend harness runs in seconds rather than minutes — a few simple
-/// circuits per category, enough to exercise the wire format.
+/// Small subset of the cross-check corpus, so the Perceval and Bloqade arms
+/// run in seconds rather than minutes.
+///
+/// **This was hard-wired to the private `verify-qiskit/` tree and hard-failed
+/// without it.** `curated_fixtures()` filtered its five picks by
+/// `path.exists()`, so on any checkout lacking that tree it returned an empty
+/// vector and the arms tripped `assert!(!fixtures.is_empty(), "repo broken?")`.
+/// The repo was not broken; the corpus simply was not there.
+///
+/// It survived because `ci.sh`'s bridge stage compiles
+/// `bridge-qiskit,bridge-tsim,bridge-ppvm` — **not** `bridge-perceval` — so
+/// the two arms that call this are `#[cfg]`'d out of every CI run. A test that
+/// CI cannot compile is not a gate, which is the same lesson as `FIXES_PLAN.md`
+/// K9 one layer down.
+///
+/// Now it takes the first `n` entries of whichever corpus
+/// [`crosscheck_corpus`] resolves — the vendored one when the private tree is
+/// absent — so the arms exercise real fixtures everywhere. Deliberately NOT
+/// filtered by gate set: Perceval and Bloqade have no `{"mode":"gates"}`
+/// introspection, so an out-of-subset fixture comes back `Unavailable` and is
+/// skipped with a reason by `run_or_skip`, which is the existing behaviour.
 #[allow(dead_code)]
 fn curated_fixtures() -> Vec<(&'static str, PathBuf)> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("verify-qiskit")
-        .join("fixtures");
-    let pick: Vec<(&'static str, &'static str)> = vec![
-        ("01_single_qubit_basic", "sq_000.qasm"),
-        ("02_single_qubit_rotations", "sqr_000.qasm"),
-        ("06_bell_ghz_w", "bell_phi_plus.qasm"),
-        ("06_bell_ghz_w", "ghz_3.qasm"),
-        ("07_qft_like", "qft_3.qasm"),
-    ];
-    pick.into_iter()
-        .map(|(cat, name)| (cat, root.join(cat).join(name)))
-        .filter(|(_, path)| path.exists())
+    const MAX: usize = 5;
+    let corpus = crosscheck_corpus();
+    corpus
+        .files
+        .into_iter()
+        .take(MAX)
+        .map(|p| (corpus.label, p))
         .collect()
 }
 
@@ -164,6 +174,43 @@ fn count_l2(a: &Counts, b: &Counts, total_a: u32, total_b: u32) -> f64 {
     sum_sq.sqrt()
 }
 
+/// The L2 gate for this circuit: `K` × the RMS L2 expected when both sides
+/// sample the same distribution, floored at a few shots' worth of granularity.
+///
+/// **This replaced a hardcoded `0.0025` that was wrong by 7.6x on the very
+/// first fixture it was ever applied to.** That constant came from the
+/// reference Python harness and implicitly assumed a shot count and an outcome
+/// count; it is roughly 4σ at the tsim/ppvm arms' 4M shots and **7.6× TIGHTER
+/// THAN THE NOISE FLOOR** at the Perceval arm's 4096. Measured on
+/// `01_single_qubit_basic.qasm` (4 outcomes, 4096 shots): null scale
+/// 1.9133e-2, observed L2 2.1382e-2 — 1.1σ, i.e. two correct samplers — and
+/// the constant called it a failure.
+///
+/// For two independent samplers of the same `p`,
+/// `E[L2²] = Σₖ pₖ(1−pₖ)·(1/n_a + 1/n_b)`, and the gate is `K` times that RMS.
+/// `K = 6` is exactly 6σ in the narrowest two-outcome case and strictly more
+/// conservative as the outcome count grows. Same derivation as
+/// `omega-cli/tests/nway_counts.rs`; see `FIXES_PLAN.md` K2.
+///
+/// When one side returns EXACT probabilities rather than samples (Bloqade
+/// multiplies probability by shots), its variance term is really zero, so the
+/// gate is conservative by up to √2. Erring loose there is the right direction:
+/// it cannot manufacture a failure.
+#[allow(dead_code)]
+fn l2_gate(anchor: &Counts, n_a: u32, n_b: u32) -> f64 {
+    let inv = 1.0 / n_a as f64 + 1.0 / n_b as f64;
+    let var: f64 = anchor
+        .values()
+        .map(|&c| {
+            let p = c as f64 / n_a as f64;
+            p * (1.0 - p)
+        })
+        .sum();
+    let rms = (var * inv).sqrt();
+    let floor = 8.0 / n_a.min(n_b) as f64;
+    (6.0 * rms).max(floor)
+}
+
 #[allow(dead_code)]
 fn run_or_skip(
     backend: Backend,
@@ -188,6 +235,16 @@ fn run_or_skip(
             eprintln!("{seed_label}: backend {b:?} unavailable ({msg}); skipping");
             None
         }
+        // A typed refusal is a CORRECT answer: the backend understood the
+        // circuit and cannot express it. Skipping with a reason is right;
+        // panicking would count an honest refusal as a defect and redden the
+        // arm. `run_or_skip` predated `BridgeError::CannotExpress` (added in
+        // the step-2 taxonomy work) and fell through to the panic arm — so
+        // the first refusal this harness ever received crashed it.
+        Err(BridgeError::CannotExpress(b, msg)) => {
+            eprintln!("{seed_label}: backend {b:?} cannot express this circuit ({msg}); skipping");
+            None
+        }
         Err(e) => panic!("{seed_label}: backend {backend:?} failed: {e}"),
     }
 }
@@ -195,10 +252,9 @@ fn run_or_skip(
 #[cfg(all(feature = "bridge-qiskit", feature = "bridge-perceval"))]
 #[test]
 fn perceval_matches_qiskit_within_threshold() {
-    // Threshold from backend.py:147 — perceval gets the tightest of
-    // the four (0.0025) because dual-rail postselection should land
-    // very close to the Qiskit reference for the gate set we test.
-    const PERCEVAL_THRESHOLD: f64 = 0.0025;
+    // Gate derived per circuit — see `l2_gate`. The former hardcoded 0.0025
+    // was 7.6x tighter than this arm's own noise floor and failed a correct
+    // backend on the first fixture.
     const SHOTS: u32 = 4096;
 
     if !venv_python("qiskit").exists() {
@@ -245,10 +301,11 @@ fn perceval_matches_qiskit_within_threshold() {
         };
 
         let l2 = count_l2(&qk_counts, &pe_counts, qk_total, pe_total);
+        let gate = l2_gate(&qk_counts, qk_total, pe_total);
         report.push((label.clone(), l2));
         assert!(
-            l2 <= PERCEVAL_THRESHOLD,
-            "{label}: L2 = {l2:.5e} exceeds Perceval threshold {PERCEVAL_THRESHOLD}"
+            l2 <= gate,
+            "{label}: L2 = {l2:.5e} exceeds derived gate {gate:.5e}"
         );
     }
     eprintln!("\nperceval_matches_qiskit_within_threshold:");
@@ -289,7 +346,6 @@ fn perceval_matches_qiskit_within_threshold() {
 #[cfg(all(feature = "bridge-qiskit", feature = "bridge-bloqade"))]
 #[test]
 fn bloqade_matches_qiskit_within_threshold() {
-    const BLOQADE_THRESHOLD: f64 = 0.0025;
     // 1_000_000 shots: Bloqade's side is exact (probability * shots,
     // rounded), so the L2 mismatch with Qiskit is dominated by
     // Qiskit's binomial sampling noise. Expected
@@ -341,10 +397,11 @@ fn bloqade_matches_qiskit_within_threshold() {
             };
 
         let l2 = count_l2(&qk_counts, &bl_counts, qk_total, bl_total);
+        let gate = l2_gate(&qk_counts, qk_total, bl_total);
         report.push((label.clone(), l2));
         assert!(
-            l2 <= BLOQADE_THRESHOLD,
-            "{label}: L2 = {l2:.5e} exceeds Bloqade threshold {BLOQADE_THRESHOLD}"
+            l2 <= gate,
+            "{label}: L2 = {l2:.5e} exceeds derived gate {gate:.5e}"
         );
     }
     eprintln!("\nbloqade_matches_qiskit_within_threshold:");
@@ -396,7 +453,6 @@ fn bloqade_matches_qiskit_within_threshold() {
 #[cfg(feature = "bridge-qiskit")]
 #[allow(dead_code)]
 fn quera_stim_bridge_matches_qiskit(backend: Backend, slug: &str) {
-    const THRESHOLD: f64 = 0.0025;
     const SHOTS: u32 = 4_000_000;
 
     if !venv_python("qiskit").exists() {
@@ -447,10 +503,11 @@ fn quera_stim_bridge_matches_qiskit(backend: Backend, slug: &str) {
             };
 
         let l2 = count_l2(&qk_counts, &other_counts, qk_total, other_total);
+        let gate = l2_gate(&qk_counts, qk_total, other_total);
         report.push((label.clone(), l2));
         assert!(
-            l2 <= THRESHOLD,
-            "{label}: L2 = {l2:.5e} exceeds {slug} threshold {THRESHOLD}"
+            l2 <= gate,
+            "{label}: L2 = {l2:.5e} exceeds derived gate {gate:.5e}"
         );
     }
     for (label, l2) in &report {

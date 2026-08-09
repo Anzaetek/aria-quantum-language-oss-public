@@ -74,6 +74,8 @@ def main() -> int:
         return _qpy_to_qasm2(req)
     if mode == "qasm2_to_qpy":
         return _qasm2_to_qpy(req)
+    if mode == "expectation":
+        return _expectation(req)
     if mode != "execute":
         _err(f"unknown mode {mode!r}", kind="bad-request")
         return 0
@@ -163,6 +165,140 @@ def main() -> int:
         counts[bits] = counts.get(bits, 0) + int(val)
 
     _emit({"ok": True, "counts": counts})
+    return 0
+
+
+def _expectation(req: dict) -> int:
+    """`{"mode":"expectation","qasm":...,"observables":[[["ZI",0.5],...],...]}`
+    -> `{"ok":true,"values":[...]}`.
+
+    EXACT: `Statevector.from_instruction` with no shots, so the value carries
+    no sampling error and the in-tree comparison is analytic (see K2 —
+    "analytic vs stochastic must not share a tolerance").
+
+    ## The observable wire format, and the trap in it
+
+    Each observable is a list of `[pauli_string, coefficient]` terms. The
+    string is **DENSE and LSB-FIRST**: `len == num_qubits`, and the LEFTMOST
+    character is qubit 0.
+
+    That is deliberately NOT Qiskit's own convention. `SparsePauliOp` is
+    MSB-first — measured on `x q[0]`, `SparsePauliOp("IZ")` gives -1 and
+    `("ZI")` gives +1 — so this function REVERSES every string before handing
+    it to Qiskit. LSB-first was chosen because it matches the two other
+    references in this comparison (Stim's `PauliString` and ppvm's
+    `PauliSum` are both LSB-first, both verified on the same asymmetric
+    fixture) and because `omega_bridges::Counts` is already documented
+    LSB-first, so one rule covers the whole wire.
+
+    Get this backwards and the error is silent on any palindromic observable
+    — `ZZ`, `XX`, `II` — which is most of the obvious test cases. The pin is
+    an asymmetric one-qubit term.
+
+    ## Measurements
+
+    Terminal measurements are stripped (`remove_final_measurements`);
+    expectation is a property of the unitary evolution. Verified equal to a
+    textual strip of the `measure`/`creg` lines across all 11 applicable
+    fixtures, worst |delta| 3.253e-19.
+
+    A circuit with a *mid-circuit* measurement, a `reset`, or a classical
+    condition is REFUSED rather than answered. Qiskit's own behaviour here is
+    not safe to rely on: `from_instruction` raises on a leftover measure, but
+    on an entangled `reset` it silently returns ONE stochastic trajectory —
+    a different answer per invocation. Refusing keeps a nondeterministic
+    anchor out of the matrix.
+    """
+    qasm = req.get("qasm")
+    obs_in = req.get("observables")
+    if not isinstance(qasm, str) or not qasm.strip():
+        _err("`qasm` must be a non-empty string", kind="bad-request")
+        return 0
+    if not isinstance(obs_in, list) or not obs_in:
+        _err("`observables` must be a non-empty list", kind="bad-request")
+        return 0
+
+    try:
+        from qiskit import qasm2
+        from qiskit.quantum_info import SparsePauliOp, Statevector
+    except ImportError as e:
+        _err(f"qiskit import failed: {e}", kind="qiskit-not-installed")
+        return 0
+
+    try:
+        circuit = qasm2.loads(
+            qasm,
+            include_path=qasm2.LEGACY_INCLUDE_PATH,
+            custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS,
+            custom_classical=qasm2.LEGACY_CUSTOM_CLASSICAL,
+            strict=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        _err(f"qasm2.loads: {e}", kind="qasm-parse")
+        return 0
+
+    # Refuse constructs that make "the expectation of this circuit"
+    # ill-defined, BEFORE stripping anything.
+    for instr in circuit.data:
+        name = instr.operation.name
+        if name == "reset":
+            _err(
+                "expectation is undefined for a circuit containing `reset`: it is a "
+                "non-unitary channel, and Statevector.from_instruction silently returns "
+                "one stochastic trajectory rather than refusing",
+                kind="qiskit-not-supported",
+            )
+            return 0
+        if getattr(instr.operation, "condition", None) is not None:
+            _err(
+                "expectation is undefined for a classically-conditioned gate: the "
+                "circuit is a mixture over measurement outcomes, not one unitary",
+                kind="qiskit-not-supported",
+            )
+            return 0
+
+    circuit.remove_final_measurements(inplace=True)
+    for instr in circuit.data:
+        if instr.operation.name == "measure":
+            _err(
+                "mid-circuit measurement remains after removing terminal measurements; "
+                "expectation is not defined for this circuit",
+                kind="qiskit-not-supported",
+            )
+            return 0
+
+    n = circuit.num_qubits
+    try:
+        state = Statevector.from_instruction(circuit)
+    except Exception as e:  # noqa: BLE001
+        _err(f"Statevector.from_instruction: {e}", kind="execute")
+        return 0
+
+    values = []
+    for obs in obs_in:
+        terms = []
+        for term in obs:
+            try:
+                pauli, coeff = term[0], float(term[1])
+            except Exception:  # noqa: BLE001
+                _err(f"malformed observable term {term!r}", kind="bad-request")
+                return 0
+            if not isinstance(pauli, str) or len(pauli) != n or set(pauli) - set("IXYZ"):
+                _err(
+                    f"pauli {pauli!r} must be {n} chars over IXYZ (dense, LSB-first)",
+                    kind="bad-request",
+                )
+                return 0
+            # LSB-first on the wire -> MSB-first for Qiskit.
+            terms.append((pauli[::-1], coeff))
+        try:
+            op = SparsePauliOp.from_list(terms)
+            values.append(float(state.expectation_value(op).real))
+        except Exception as e:  # noqa: BLE001
+            _err(f"expectation_value: {e}", kind="execute")
+            return 0
+
+    _emit({"ok": True, "values": values})
     return 0
 
 

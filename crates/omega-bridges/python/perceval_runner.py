@@ -25,15 +25,40 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sys
 import traceback
 
 
+# STDOUT IS THE PROTOCOL. Only `_emit` may write to it.
+#
+# Perceval logs a DeprecationWarning when the converter builds a Processor
+# ("Getting Processor from perceval.components is deprecated"). It landed in
+# front of the JSON and the Rust side failed with `invalid JSON from runner:
+# expected value at line 1 column 2`. The bridge looked broken; it was being
+# talked over.
+#
+# Reassigning `sys.stdout` is NOT enough — measured: the warning still appeared.
+# Perceval's logger writes to FILE DESCRIPTOR 1, which a Python-level rebind
+# cannot intercept. So duplicate fd 1 to a private fd, point fd 1 at stderr,
+# and hand the private one to `_emit`. Anything any library prints — Python or
+# native — becomes operator-visible diagnostics on stderr instead of protocol
+# corruption.
+#
+# This is a general robustness fix, not a Perceval one: every bridge shares
+# this wire, and any dependency that printed would have broken any of them the
+# same way. `qiskit_runner.py` has simply been lucky.
+_PROTOCOL_FD = os.dup(1)
+os.dup2(2, 1)
+_PROTOCOL_STDOUT = os.fdopen(_PROTOCOL_FD, "w")
+sys.stdout = sys.stderr
+
+
 def _emit(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload))
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    _PROTOCOL_STDOUT.write(json.dumps(payload))
+    _PROTOCOL_STDOUT.write("\n")
+    _PROTOCOL_STDOUT.flush()
 
 
 def _err(msg: str, kind: str = "execute") -> None:
@@ -87,30 +112,115 @@ def _run_qasm2(qasm: str, shots: int) -> int:
         )
         return 0
 
-    try:
-        from perceval.converters import QiskitConverter
-    except ImportError as e:
+    # Perceval MOVED the converters out of the core package at 1.0: what was
+    # `perceval.converters` is now the separate `perceval-interop`
+    # distribution, importable as `perceval_interop`. Measured on
+    # perceval-quandela 1.2.4 — `perceval.converters` raises ModuleNotFoundError
+    # and the shipped submodules are algorithm/backends/components/
+    # error_mitigation/providers/rendering/runtime/serialization/simulators/utils.
+    #
+    # Try both, new location first. Pinning to only the old path made the whole
+    # Perceval arm report `Unavailable` on any current install, which the
+    # cross-backend test then honestly reported as "compared nothing" — green,
+    # and validating exactly zero circuits.
+    QiskitConverter = None
+    import_errors = []
+    for module_name in ("perceval_interop", "perceval.converters"):
+        try:
+            QiskitConverter = __import__(
+                module_name, fromlist=["QiskitConverter"]
+            ).QiskitConverter
+            break
+        except (ImportError, AttributeError) as e:  # noqa: PERF203
+            import_errors.append(f"{module_name}: {e}")
+    if QiskitConverter is None:
         _err(
-            f"QiskitConverter not importable from perceval.converters: {e}. "
-            "Install the matching converter add-on package; see "
-            "crates/omega-bridges/python/requirements-perceval.txt.",
+            "QiskitConverter not importable ("
+            + "; ".join(import_errors)
+            + "). Perceval >= 1.0 ships it in the separate `perceval-interop` "
+            "package; see crates/omega-bridges/python/requirements-perceval.txt.",
             kind="perceval-converter-not-installed",
         )
         return 0
 
     try:
-        qiskit_circuit = qasm2.loads(qasm)
+        # Qiskit 2.x's loader does not auto-expose the qelib1.inc gate set:
+        # bare `qasm2.loads` rejects `p`, `swap`, `crz`, `sx`, ... with
+        # "'p' is not defined in this scope". `qiskit_runner.py` already
+        # passes the LEGACY_* hooks for exactly this reason; this runner did
+        # not, so every fixture beyond the basic Clifford surface came back
+        # as `qasm-parse` and never reached Perceval at all.
+        qiskit_circuit = qasm2.loads(
+            qasm,
+            include_path=qasm2.LEGACY_INCLUDE_PATH,
+            custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS,
+            custom_classical=qasm2.LEGACY_CUSTOM_CLASSICAL,
+            strict=False,
+        )
     except Exception as e:  # noqa: BLE001
         _err(f"qasm2.loads: {e}", kind="qasm-parse")
         return 0
 
+    # Perceval's converter accepts GATES ONLY — it asserts every instruction is
+    # a `qiskit.circuit.gate.Gate` and dies with "Cannot convert instruction(s):
+    # <class '_SingletonMeasure'>" otherwise. That is correct for its model: the
+    # dual-rail encoding measures photons at the output, so a QASM `measure` is
+    # implicit rather than an operation to translate.
+    #
+    # Terminal measurements are therefore removed. A MID-CIRCUIT measurement is
+    # a different thing entirely — it collapses the state and cannot be pushed
+    # to the end — so it is refused rather than silently dropped, which would
+    # answer a different circuit.
+    n_before = len(qiskit_circuit.data)
+    qiskit_circuit.remove_final_measurements(inplace=True)
+    leftover = [
+        i.operation.name
+        for i in qiskit_circuit.data
+        if i.operation.name in ("measure", "reset")
+        or getattr(i.operation, "condition", None) is not None
+    ]
+    if leftover:
+        _err(
+            f"circuit has mid-circuit {sorted(set(leftover))} after removing terminal "
+            "measurements; Perceval's dual-rail conversion measures only at the output "
+            "and cannot express it",
+            kind="perceval-not-supported",
+        )
+        return 0
+    _ = n_before
+
     try:
-        processor = QiskitConverter(pcvl.catalog).convert(
+        # Perceval 1.x: `QiskitConverter(backend_name: str = "SLOS",
+        # noise_model=None)`. Passing `pcvl.catalog` (the 0.x form) reaches
+        # `Processor.__init__`, which asserts `isinstance(backend, ABackend)`
+        # and dies with "'backend' must be an ABackend (got ...Catalog)".
+        # SLOS is Perceval's default strong-simulation backend.
+        processor = QiskitConverter().convert(
             qiskit_circuit, use_postselection=True
         )
         sampler = pcvl.algorithm.Sampler(processor)
         sample_result = sampler.samples(shots)
     except Exception as e:  # noqa: BLE001
+        # UPSTREAM LIMITATION, not a defect on either side: perceval-interop
+        # 1.2.4 collides on internal parameter names when a circuit contains
+        # several parameterised gates, raising "The experiment already owns a
+        # parameter named theta". Bisected on
+        # `02_single_qubit_rotations.qasm`: ry, rz, rx, u2, u1, h convert
+        # fine; adding the 7th op (u3) trips it.
+        #
+        # Report it as a REFUSAL so the cross-backend arm records
+        # `cannot-express` and skips the fixture with a reason, rather than
+        # counting a Perceval bug as a disagreement between our engines.
+        # Matched on the exact message — a blanket "execute errors are
+        # refusals" rule is the silent direction docs/BRIDGES.md warns about.
+        if "already owns a parameter named" in str(e):
+            _err(
+                f"perceval-interop cannot convert this circuit: {e}. Upstream "
+                "parameter-name collision across multiple parameterised gates "
+                "(reproduced on perceval-quandela 1.2.4 / perceval-interop 1.1).",
+                kind="perceval-not-supported",
+            )
+            return 0
         _err(
             f"Perceval execute: {e}\n{traceback.format_exc()}",
             kind="execute",
