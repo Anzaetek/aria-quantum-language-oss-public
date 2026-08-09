@@ -30,6 +30,60 @@ pub fn run(qasm: &str, shots: u32, noise: Option<&NoiseConfig>) -> Result<Counts
 }
 
 #[cfg(not(feature = "bridge-qiskit"))]
+pub fn expectation(
+    _qasm: &str,
+    _observables: &[crate::WireObservable],
+) -> Result<Vec<f64>, BridgeError> {
+    Err(BridgeError::NotCompiled(Backend::Qiskit, "qiskit"))
+}
+
+/// Exact expectation values of `observables` on the state `qasm` prepares.
+///
+/// Uses `Statevector.from_instruction` — no shots, so the result carries no
+/// sampling error and the comparison against an in-tree engine is analytic.
+///
+/// Observables are dense **LSB-first** Pauli strings (leftmost char = qubit 0),
+/// matching `Counts` and the Stim / ppvm references. Qiskit's own
+/// `SparsePauliOp` is MSB-first; the runner reverses. See its docstring.
+#[cfg(feature = "bridge-qiskit")]
+pub fn expectation(
+    qasm: &str,
+    observables: &[crate::WireObservable],
+) -> Result<Vec<f64>, BridgeError> {
+    if observables.is_empty() {
+        return Err(BridgeError::InvalidInput(
+            "observables must not be empty".into(),
+        ));
+    }
+    let payload = serde_json::json!({
+        "mode": "expectation",
+        "qasm": qasm,
+        "observables": observables,
+    })
+    .to_string();
+    let spec = RunnerSpec::new(Backend::Qiskit, "qiskit");
+    match invoke_runner(&spec, &payload, ParseAs::Values)? {
+        ParsedResponse::Values(v) => {
+            if v.len() != observables.len() {
+                return Err(BridgeError::Backend(
+                    Backend::Qiskit,
+                    format!(
+                        "runner returned {} values for {} observables",
+                        v.len(),
+                        observables.len()
+                    ),
+                ));
+            }
+            Ok(v)
+        }
+        other => Err(BridgeError::Backend(
+            Backend::Qiskit,
+            format!("unexpected response shape: {other:?}"),
+        )),
+    }
+}
+
+#[cfg(not(feature = "bridge-qiskit"))]
 pub fn qpy_to_qasm2(_qpy_bytes: &[u8]) -> Result<String, BridgeError> {
     Err(BridgeError::NotCompiled(Backend::Qiskit, "qiskit"))
 }

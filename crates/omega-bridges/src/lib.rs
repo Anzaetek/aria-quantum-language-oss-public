@@ -51,6 +51,25 @@ use thiserror::Error;
 /// Counts dictionary: outcome bit-string (LSB-first) → frequency.
 pub type Counts = HashMap<String, u32>;
 
+/// One term of an observable: a dense Pauli string and a real coefficient.
+///
+/// The string is **LSB-first** — leftmost character is qubit 0 — and its
+/// length must equal the circuit's qubit count. `I` pads unused qubits.
+///
+/// This is the same direction as [`Counts`], and the same direction as Stim's
+/// `PauliString` and ppvm's `PauliSum`. It is the OPPOSITE of Qiskit's
+/// `SparsePauliOp`, which is MSB-first; the Qiskit runner reverses on the way
+/// in. Measured on `x q[0]`: `SparsePauliOp("IZ")` = −1 while our `"ZI"` = −1,
+/// both naming qubit 0.
+///
+/// Choosing one direction for the whole wire means a reader never has to ask
+/// which surface they are looking at. The cost is one reversal, in one place,
+/// with a test that pins it on an asymmetric term.
+pub type PauliTerm = (String, f64);
+
+/// A weighted sum of Pauli strings: `Σ coeff · pauli`.
+pub type WireObservable = Vec<PauliTerm>;
+
 /// Backend identifier. Stable strings so the same name routes through
 /// the CLI, REST API, and library entry points without translation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -196,6 +215,35 @@ pub fn run_qasm2(
         Backend::Tsim => tsim::run(qasm, shots, noise),
         Backend::Cirq => cirq::run(qasm, shots, noise),
         Backend::Qadence => qadence::run(qasm, shots, noise),
+    }
+}
+
+/// Exact expectation values of `observables` on the state `qasm` prepares.
+///
+/// Distinct from [`run_qasm2`] in kind, not just in return type: this is an
+/// **analytic** query with no shots, so results are compared at ~1e-12 rather
+/// than at a sampling tolerance (Part K2: "analytic vs stochastic must not
+/// share a tolerance").
+///
+/// Only Qiskit implements it today. Every other backend returns
+/// `CannotExpress` rather than `NotCompiled`, because the distinction matters:
+/// the feature is compiled, the backend simply has no expectation path through
+/// this protocol, and a matrix that reported that as "not installed" would be
+/// claiming an environmental excuse for a capability gap.
+pub fn expectation_qasm2(
+    backend: Backend,
+    qasm: &str,
+    observables: &[WireObservable],
+) -> Result<Vec<f64>, BridgeError> {
+    match backend {
+        Backend::Qiskit => qiskit::expectation(qasm, observables),
+        other => Err(BridgeError::CannotExpress(
+            other,
+            format!(
+                "{other:?} has no expectation mode: the bridge protocol carries \
+                 QASM2-in / counts-out for every backend but Qiskit"
+            ),
+        )),
     }
 }
 

@@ -12,3 +12,11 @@
 perceval-quandela>=0.10
 qiskit>=1.3,<3
 numpy>=1.26
+# Perceval MOVED its circuit converters out of the core package at 1.0.
+# `perceval.converters.QiskitConverter` is now `perceval_interop
+# .QiskitConverter`, shipped by this separate distribution. Without it the
+# whole gate-based Perceval arm reports `perceval-converter-not-installed`
+# and the cross-backend test compares nothing (honestly, but usefully: zero).
+# The runner tries `perceval_interop` first and falls back to the old path,
+# so both old and new installs work.
+perceval-interop>=1.1
