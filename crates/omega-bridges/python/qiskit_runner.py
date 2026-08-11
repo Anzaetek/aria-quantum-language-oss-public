@@ -38,18 +38,15 @@ output may be incomplete.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 
 
-def _emit(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload))
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-
-
-def _err(msg: str, kind: str = "execute") -> None:
-    _emit({"ok": False, "error": msg, "kind": kind})
+# STDOUT IS THE WIRE — see runner_io. Imported FIRST, before any heavy
+# third-party import, so nothing can print to the real stdout before the swap.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from runner_io import emit as _emit, err as _err  # noqa: E402
 
 
 def main() -> int:

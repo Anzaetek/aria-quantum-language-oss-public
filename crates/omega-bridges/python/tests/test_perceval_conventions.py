@@ -33,8 +33,23 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import perceval as pcvl
-from perceval.components import BS, PS, HWP, PBS
+import pytest
+
+# K13: an external tool that is not installed must SKIP CLEANLY, never error.
+# A bare `import perceval` made pytest fail at COLLECTION time, which takes the
+# whole test session down — including tests that need no Perceval at all. That
+# turned "Perceval is not installed here" into "the python test stage is red",
+# which is the opposite of the clean-skip contract.
+pcvl = pytest.importorskip("perceval", reason="perceval-quandela not installed")
+_components = pytest.importorskip(
+    "perceval.components", reason="perceval-quandela not installed"
+)
+BS, PS, HWP, PBS = (
+    _components.BS,
+    _components.PS,
+    _components.HWP,
+    _components.PBS,
+)
 
 TOL = 1e-14
 

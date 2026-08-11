@@ -336,6 +336,27 @@ fi
 # Each arm auto-skips when its venv is absent and carries a vacuous-pass guard
 # (every case Unavailable => fail, not pass), so enabling this cannot turn a
 # missing toolchain into a false green.
+# Python-side unit tests for the runners. These need no simulator install
+# beyond a venv with pytest, and they gate two things nothing else does: the
+# stdout-protocol guard (`runner_io`) and the Perceval convention pins.
+#
+# ci.sh ran NO python tests at all until this stage existed, so
+# `tests/test_perceval_conventions.py` — written to pin the hwp/pbs/bs_rx
+# conventions — had never executed in CI either. Same hand-maintained-gate
+# hole as FIXES_PLAN.md K9.
+PYTEST_PY=""
+for cand in crates/omega-bridges/python/.venv-qiskit/bin/python \
+            crates/omega-bridges/python/.venv-perceval/bin/python; do
+  [ -x "$cand" ] && "$cand" -c "import pytest" 2>/dev/null && PYTEST_PY="$cand" && break
+done
+if [ -n "$PYTEST_PY" ]; then
+  step "+   Bridge runner python tests (protocol guard + conventions)"
+  "$PYTEST_PY" -m pytest crates/omega-bridges/python/tests -q
+  echo "  OK: stdout protocol guard holds and Perceval conventions are pinned"
+else
+  skipped "bridge runner python tests — no venv with pytest installed"
+fi
+
 if [ "${ARIA_BRIDGE_XCHECK:-0}" = "1" ]; then
   step "+   Bridge cross-checks (perceval / bloqade / tsim / ppvm)"
   # bridge-perceval was MISSING from this list, so both arms that call
