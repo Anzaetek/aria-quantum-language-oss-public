@@ -31,38 +31,10 @@ import sys
 import traceback
 
 
-# STDOUT IS THE PROTOCOL. Only `_emit` may write to it.
-#
-# Perceval logs a DeprecationWarning when the converter builds a Processor
-# ("Getting Processor from perceval.components is deprecated"). It landed in
-# front of the JSON and the Rust side failed with `invalid JSON from runner:
-# expected value at line 1 column 2`. The bridge looked broken; it was being
-# talked over.
-#
-# Reassigning `sys.stdout` is NOT enough — measured: the warning still appeared.
-# Perceval's logger writes to FILE DESCRIPTOR 1, which a Python-level rebind
-# cannot intercept. So duplicate fd 1 to a private fd, point fd 1 at stderr,
-# and hand the private one to `_emit`. Anything any library prints — Python or
-# native — becomes operator-visible diagnostics on stderr instead of protocol
-# corruption.
-#
-# This is a general robustness fix, not a Perceval one: every bridge shares
-# this wire, and any dependency that printed would have broken any of them the
-# same way. `qiskit_runner.py` has simply been lucky.
-_PROTOCOL_FD = os.dup(1)
-os.dup2(2, 1)
-_PROTOCOL_STDOUT = os.fdopen(_PROTOCOL_FD, "w")
-sys.stdout = sys.stderr
-
-
-def _emit(payload: dict) -> None:
-    _PROTOCOL_STDOUT.write(json.dumps(payload))
-    _PROTOCOL_STDOUT.write("\n")
-    _PROTOCOL_STDOUT.flush()
-
-
-def _err(msg: str, kind: str = "execute") -> None:
-    _emit({"ok": False, "error": msg, "kind": kind})
+# STDOUT IS THE WIRE — see runner_io. Imported FIRST, before any heavy
+# third-party import, so nothing can print to the real stdout before the swap.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from runner_io import emit as _emit, err as _err  # noqa: E402
 
 
 def main() -> int:

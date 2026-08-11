@@ -71,14 +71,10 @@ from qasm2_stim import (  # noqa: E402
 )
 
 
-def _emit(payload: dict) -> None:
-    sys.stdout.write(json.dumps(payload))
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+# STDOUT IS THE WIRE — see runner_io. Imported FIRST, before any heavy
+# third-party import, so nothing can print to the real stdout before the swap.
 
-
-def _err(msg: str, kind: str = "execute") -> None:
-    _emit({"ok": False, "error": msg, "kind": kind})
+from runner_io import emit as _emit, err as _err  # noqa: E402
 
 
 def main() -> int:
