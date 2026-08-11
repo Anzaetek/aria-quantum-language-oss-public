@@ -42,6 +42,15 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("spawn omega-run")
 }
 
+/// Only meaningful when the feature is ABSENT — the whole point is what
+/// happens without it. Compiled in, `--bridge qiskit` succeeds and the
+/// assertion `expected failure, got success` fires.
+///
+/// It was ungated, so `cargo test -p omega-cli --features bridge-qiskit` had
+/// always failed here. Nothing noticed because ci.sh never tested omega-cli
+/// with bridge features until the N-way matrix stage arrived — the same
+/// hand-maintained-crate-list hole as FIXES_PLAN.md K9, one layer down.
+#[cfg(not(feature = "bridge-qiskit"))]
 #[test]
 fn bridge_default_features_reports_not_compiled() {
     // Without `bridge-qiskit`/`bridge-perceval` compiled in, every

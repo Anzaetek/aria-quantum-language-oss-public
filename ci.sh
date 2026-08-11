@@ -338,7 +338,11 @@ fi
 # missing toolchain into a false green.
 if [ "${ARIA_BRIDGE_XCHECK:-0}" = "1" ]; then
   step "+   Bridge cross-checks (perceval / bloqade / tsim / ppvm)"
-  cargo test -p omega-bridges --features bridge-qiskit,bridge-tsim,bridge-ppvm \
+  # bridge-perceval was MISSING from this list, so both arms that call
+  # `curated_fixtures()` were cfg'd out of every CI run — which is how that
+  # helper kept a hard-wired path to a private corpus and a dead
+  # `perceval.converters` import. A test CI cannot compile is not a gate.
+  cargo test -p omega-bridges --features bridge-qiskit,bridge-tsim,bridge-ppvm,bridge-perceval \
     --test cross_backend -- --nocapture
   echo "  OK: bridge arms agree with Qiskit within L2 0.0025 (or skipped with a reason)"
 else
@@ -368,7 +372,14 @@ if [ "${ARIA_NWAY:-0}" = "1" ]; then
   step "+   N-way counts matrix (statevector / mps / noisy-mps / pauli vs Qiskit)"
   cargo test -p omega-cli --features bridge-qiskit \
     --test nway_counts -- --nocapture
-  echo "  OK: in-tree engines agree with Qiskit at the derived per-circuit gate"
+  # Expectation lane (Part K step 4). Separate target, separate quantity: this
+  # one is ANALYTIC (no shots), so it gates at 1e-12 rather than a derived
+  # sigma. K3 said this lane could not have an independent anchor without new
+  # protocol work; the protocol work is the `expectation` mode in
+  # qiskit_runner.py, so it does.
+  cargo test -p omega-cli --features bridge-qiskit \
+    --test nway_expectation -- --nocapture
+  echo "  OK: in-tree engines agree with Qiskit on counts (derived gate) and expectations (1e-12)"
 else
   skipped "N-way counts matrix — set ARIA_NWAY=1 with the qiskit venv"
 fi
