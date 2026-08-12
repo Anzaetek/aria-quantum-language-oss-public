@@ -276,9 +276,19 @@ if [ "${ARIA_TCH:-1}" = "1" ]; then
     export CXXFLAGS="${CXXFLAGS:--std=gnu++17 -Wno-invalid-specialization -Wno-error=invalid-specialization}"
     # Any value of LIBTORCH_USE_PYTORCH makes torch-sys hunt for a pip torch.
     unset LIBTORCH_USE_PYTORCH || true
+    # macOS SIP strips DYLD_* when exec'ing a protected binary, and this script
+    # runs under /bin/bash — so an EXPORTED DYLD_LIBRARY_PATH is gone before
+    # cargo ever starts, and the test binary aborts with
+    #   dyld: Library not loaded: @rpath/libtorch_cpu.dylib
+    # Setting it INLINE on the cargo invocation hands it straight to cargo's env
+    # (cargo is not a protected binary), which is the only form that survives.
+    # LD_LIBRARY_PATH is the Linux equivalent and is harmless on macOS.
+    #
     # tch uses a process-global RNG, so the backend tests run single-threaded.
-    cargo test -p aria-runtime --features tch --test run_examples tch_backend \
-      -- --test-threads=1
+    DYLD_LIBRARY_PATH="$LIBTORCH/lib:${DYLD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="$LIBTORCH/lib:${LD_LIBRARY_PATH:-}" \
+      cargo test -p aria-runtime --features tch --test run_examples tch_backend \
+        -- --test-threads=1
     echo "  OK: tch statevector matches CPU (libtorch $(cat "$LIBTORCH/build-version"))"
   fi
 else
@@ -349,6 +359,21 @@ fi
 # Each arm auto-skips when its venv is absent and carries a vacuous-pass guard
 # (every case Unavailable => fail, not pass), so enabling this cannot turn a
 # missing toolchain into a false green.
+# aria-py bindings. A SEPARATE cargo project (own Cargo.lock), so
+# `cargo test --workspace` does not reach it -- the same coverage hole as the
+# typed crate list, one directory over. Builds always; the python tests need a
+# venv with the extension built, so they skip cleanly when it is absent.
+step "+   aria-py bindings"
+( cd bindings/aria-py && cargo build )
+ARIA_PY_VENV="bindings/aria-py/.venv/bin/python"
+if [ -x "$ARIA_PY_VENV" ] && "$ARIA_PY_VENV" -c "import aria_py, pytest" 2>/dev/null; then
+  "$ARIA_PY_VENV" -m pytest bindings/aria-py/tests -q
+  echo "  OK: aria-py builds and its python tests pass"
+else
+  echo "  OK: aria-py builds (python tests skipped — no venv with aria_py + pytest)"
+  skipped "aria-py python tests — build bindings/aria-py/.venv and \`maturin develop\`"
+fi
+
 # Python-side unit tests for the runners. These need no simulator install
 # beyond a venv with pytest, and they gate two things nothing else does: the
 # stdout-protocol guard (`runner_io`) and the Perceval convention pins.

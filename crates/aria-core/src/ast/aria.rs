@@ -38,9 +38,12 @@
 //!
 //! # Limitations
 //!
-//! - Conditional gates (`when m[0] == 1 { … }`) are emitted as
-//!   unconditional gates plus an annotation describing the condition,
-//!   matching what the Rust imperative counterparts currently do.
+//! - Conditional gates (`when m[0] == 1 { … }`) attach a per-instruction
+//!   classical condition (`Instruction::condition`). Only the single-bit
+//!   form `reg[i] == literal` is representable; any other runtime guard,
+//!   and any nesting of runtime `when`, is a lowering error — the circuit
+//!   model holds one condition per instruction, and executing a body whose
+//!   guard was dropped would be silently wrong.
 //! - `observable` blocks are parsed to a template but not lowered —
 //!   observables live in `backends::omega::OmegaObservable`, which
 //!   is a cross-boundary concern left to the caller.
@@ -1640,15 +1643,12 @@ fn gate_from_name(name: &str, params: Vec<ParamExpr>) -> Result<GateDef, String>
     Ok(GateDef::with_exprs(kind, params))
 }
 
-/// Is the body unconditionally safe to emit — i.e., the `when` condition
-/// references only classical measurement outcomes that won't be known at
-/// parse time? We emit the gates regardless (matching the imperative Rust
-/// counterparts) and record the condition as a `Comment` annotation.
-/// If `e` is a simple `reg[idx_lit] == int_lit` (or the symmetric form,
-/// or `==` against a `true`/`false`/`IntLit(0|1)`), return the
-/// `(Clbit, expected)` pair. Anything more complex returns `None`; the
-/// caller falls back to executing the body unconditionally and recording
-/// the condition as a `Comment` annotation.
+/// If `e` is a simple `reg[idx_lit] == int_lit` (or the symmetric form),
+/// return the `(Clbit, expected)` pair to attach as a per-instruction
+/// classical condition. Anything more complex returns `None`, which the
+/// caller MUST turn into a lowering error: there is no way to attach such
+/// a guard to the circuit model, and executing the body unconditionally
+/// (the old fallback) produced a silently wrong circuit.
 fn extract_simple_clbit_cond(e: &Expr, scope: &Scope) -> Option<(Clbit, u64)> {
     let (lhs, rhs) = match e {
         Expr::CmpEq(a, b) => (a.as_ref(), b.as_ref()),
@@ -1828,19 +1828,45 @@ fn lower_stmt(
         Stmt::When { cond, body } => {
             let runtime = is_runtime_cond(cond);
             if runtime {
+                // A runtime guard must become a per-instruction classical
+                // condition. If it cannot, refuse: lowering the body
+                // unconditionally (the old behaviour, with the guard demoted
+                // to a comment annotation nothing reads) executes it on
+                // every shot — a silently wrong circuit.
+                let Some((cl, v)) = extract_simple_clbit_cond(cond, scope) else {
+                    return Err(format!(
+                        "cannot lower `when {}`: a runtime `when` guard must have \
+                         the form `reg[i] == literal` (or its mirror) to become a \
+                         classically-controlled instruction; rewrite the guard or \
+                         split it into supported single-bit comparisons",
+                        describe_expr(cond)
+                    ));
+                };
                 circ.annotate(Annotation::Comment(format!(
                     "conditional execution: when {}",
                     describe_expr(cond)
                 )));
-                let cond_clbit = extract_simple_clbit_cond(cond, scope);
                 let start = circ.instructions.len();
                 lower_stmts(body, circ, scope, prog)?;
-                if let Some((cl, v)) = cond_clbit {
-                    for inst in &mut circ.instructions[start..] {
-                        if inst.condition.is_none() {
-                            inst.condition = Some((cl.clone(), v));
-                        }
+                for inst in &mut circ.instructions[start..] {
+                    // The circuit model holds ONE classical condition per
+                    // instruction. An instruction that already carries one
+                    // came from a nested runtime `when`; stamping around it
+                    // (the old behaviour) silently dropped THIS outer guard.
+                    if let Some((prev_cl, prev_v)) = &inst.condition {
+                        return Err(format!(
+                            "nested runtime `when` is not supported: an instruction \
+                             under `when {}` already carries the condition \
+                             `{}[{}] == {}`, and the circuit model cannot represent \
+                             the conjunction of both guards; flatten the guards into \
+                             a single `reg[i] == literal` condition",
+                            describe_expr(cond),
+                            prev_cl.register,
+                            prev_cl.index,
+                            prev_v
+                        ));
                     }
+                    inst.condition = Some((cl.clone(), v));
                 }
             } else {
                 let v = eval_expr(cond, scope)?;
@@ -2212,7 +2238,7 @@ circuit C {
     }
 
     #[test]
-    fn parse_when_runtime_cond_emits_unconditional_with_comment() {
+    fn parse_when_runtime_cond_sets_instruction_condition() {
         const SRC: &str = r#"
 circuit C {
     qreg q[1]
@@ -2243,6 +2269,81 @@ circuit C {
             .annotations
             .iter()
             .any(|a| matches!(a, Annotation::Comment(s) if s.contains("when"))));
+    }
+
+    #[test]
+    fn when_runtime_cond_that_cannot_lower_is_an_error() {
+        // None of these guards has a `reg[i] == literal` form, so none can
+        // be attached to an instruction as a classical condition. They used
+        // to lower the body UNCONDITIONALLY with the guard demoted to a
+        // comment annotation — a silently wrong circuit. They must error.
+        for (guard, frag) in [
+            ("m[0] == m[1]", "m[0] == m[1]"),
+            ("m[0] + m[1] == 2", "(m[0] + m[1]) == 2"),
+            ("m[0] != 1", "m[0] != 1"),
+            ("m[0] >= 1", "m[0] >= 1"),
+        ] {
+            let src = format!(
+                r#"
+circuit C {{
+    qreg q[2]
+    creg m[2]
+    measure q[0] -> m[0]
+    measure q[1] -> m[1]
+    when {guard} {{ apply X on q[0] }}
+}}
+"#
+            );
+            let err = parse_aria_circuit(&src, "C")
+                .expect_err("unrepresentable runtime `when` guard must not lower");
+            assert!(err.contains("when"), "error must name the construct: {err}");
+            assert!(
+                err.contains(frag),
+                "error must echo the guard `{frag}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_runtime_when_is_an_error() {
+        // The circuit model holds a single classical condition per
+        // instruction. Nesting used to let the INNER guard claim the slot
+        // and the outer guard was silently dropped: X fired whenever
+        // m[1] == 1 regardless of m[0]. It must be rejected instead.
+        const SRC: &str = r#"
+circuit C {
+    qreg q[3]
+    creg m[2]
+    measure q[0] -> m[0]
+    measure q[1] -> m[1]
+    when m[0] == 1 { when m[1] == 1 { apply X on q[2] } }
+}
+"#;
+        let err = parse_aria_circuit(SRC, "C")
+            .expect_err("nested runtime `when` must not lower");
+        assert!(err.contains("nested"), "{err}");
+        assert!(err.contains("m[0] == 1"), "{err}");
+    }
+
+    #[test]
+    fn compile_time_when_inside_runtime_when_still_lowers() {
+        // A compile-time inner guard leaves no per-instruction condition,
+        // so the outer runtime guard stamps the body as usual.
+        const SRC: &str = r#"
+circuit C {
+    qreg q[2]
+    creg m[1]
+    measure q[0] -> m[0]
+    when m[0] == 1 { when 1 == 1 { apply X on q[1] } }
+}
+"#;
+        let c = parse_aria_circuit(SRC, "C").unwrap();
+        let x = c
+            .instructions
+            .iter()
+            .find(|i| i.gate.kind == GateKind::X)
+            .expect("X lowered");
+        assert_eq!(x.condition.as_ref(), Some(&(Clbit::new("m", 0), 1)));
     }
 
     #[test]
