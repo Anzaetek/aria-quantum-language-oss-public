@@ -62,12 +62,25 @@ cargo build "${OMEGA_CORE[@]}"
 step "4/9  Build Aria crates"
 cargo build "${ARIA_CRATES[@]}"
 
-step "5/9  Test Aria crates (numeric gates)"
-cargo test "${ARIA_CRATES[@]}"
-# The pure-Rust omega backends carry their own numeric gates (e.g. the MPS
-# SVD-unitarity + deep-circuit norm/truncation regressions). Step 3 only builds
-# them, so run their tests here or those gates never execute in CI.
-cargo test "${OMEGA_CORE[@]}"
+step "5/9  Test the WHOLE WORKSPACE (numeric gates)"
+# `--workspace`, NOT a typed crate list.
+#
+# This used to be `cargo test "${ARIA_CRATES[@]}"` + `cargo test
+# "${OMEGA_CORE[@]}"`, and the list had holes that hid real work: the
+# creg-keying regression in omega-backend-pauli was inert because only that
+# crate's `reset_channel` target was named, and omega-backend-photonics /
+# omega-backend-cv / omega-tensor had full suites that never ran. A crate was
+# covered only if someone remembered to type it.
+#
+# `--workspace` has no holes by construction. It was RED until 2026-08-12 --
+# omega-wasm-cli reads four fixtures under examples/circuits/ that had never
+# been tracked in git, so 8 tests failed on every clean checkout (FIXES_PLAN.md
+# K9) -- which is why the typed list survived as long as it did. With those
+# fixtures restored the workspace is green: 227 targets, 0 failed.
+#
+# The crate arrays above are still used for `cargo build`, fmt and clippy,
+# where a curated set is the point rather than a gap.
+cargo test --workspace
 
 # --- Reset-channel regression gates (every CPU backend) ---------------------
 # `reset q` is the non-unitary CHANNEL rho -> |0><0|_q (x) Tr_q(rho): the qubit
