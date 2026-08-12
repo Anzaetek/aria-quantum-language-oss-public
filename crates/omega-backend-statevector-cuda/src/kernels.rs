@@ -413,6 +413,27 @@ pub fn all_kernel_sources() -> Vec<(&'static str, &'static str)> {
         ("apply_2q_pooled_dual", KERNEL_APPLY_2Q_POOLED_DUAL),
         ("apply_1q_pooled_dual", KERNEL_APPLY_1Q_POOLED_DUAL),
         ("pauli_z_chain_accumulate", KERNEL_PAULI_Z_CHAIN_ACCUMULATE),
+        // The graph-path kernels that mix `real2` state math with `double`
+        // gradient accumulators / atomicAdd(double*) — the highest-risk shapes
+        // under -DOMEGA_REAL=double, so they must be in the dual-precision gate.
+        (
+            "inner_product_accumulate_pooled",
+            KERNEL_INNER_PRODUCT_ACCUMULATE_POOLED,
+        ),
+        ("pauli_z_expectation_to_slot", KERNEL_PAULI_Z_EXPECTATION_TO_SLOT),
+        (
+            "apply_1q_inner_product_accumulate_pooled",
+            KERNEL_APPLY_1Q_INNER_PRODUCT_ACCUMULATE_POOLED,
+        ),
+        ("apply_diagonal_chain_pooled", KERNEL_APPLY_DIAGONAL_CHAIN_POOLED),
+        (
+            "apply_diagonal_chain_dual_pooled",
+            KERNEL_APPLY_DIAGONAL_CHAIN_DUAL_POOLED,
+        ),
+        (
+            "pauli_y_accumulate_then_dagger_both_pooled",
+            KERNEL_PAULI_Y_ACCUMULATE_THEN_DAGGER_BOTH_POOLED,
+        ),
     ]
 }
 

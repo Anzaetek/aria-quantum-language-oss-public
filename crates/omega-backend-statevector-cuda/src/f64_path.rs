@@ -222,6 +222,15 @@ impl StateF64 {
     /// here keeps the f64 surface to the two gate kernels. The point of this
     /// module is precision, not a second full backend.
     pub fn expectation_z(&self, qubit: u32) -> Result<f64, CudaError> {
+        if qubit >= self.num_qubits {
+            // Without this, an out-of-range mask exceeds `dim`, every `i & mask`
+            // is 0, and the sum returns ~+1.0 — a plausible-looking value in
+            // place of an error. Match apply_1q/apply_2q's bounds check.
+            return Err(CudaError::Driver(format!(
+                "qubit {qubit} out of range for {} wires",
+                self.num_qubits
+            )));
+        }
         let host = self.to_host()?;
         let dim = 1usize << self.num_qubits;
         let mask = 1usize << qubit;
