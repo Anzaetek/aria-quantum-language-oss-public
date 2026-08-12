@@ -413,6 +413,7 @@ dependencies = [
 name = "aria-core"
 version = "0.1.0"
 dependencies = [
+ "omega-parser",
  "regex",
  "serde",
  "serde_json",

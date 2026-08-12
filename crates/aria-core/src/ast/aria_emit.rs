@@ -62,6 +62,16 @@ pub fn to_aria_source(circuit: &Circuit, name: &str) -> String {
     }
 
     for inst in &circuit.instructions {
+        // Where this instruction's output starts, so a classical guard can be
+        // wrapped around everything it emitted.
+        //
+        // The Aria emitter had the SAME defect as `to_qasm` did: zero
+        // references to `condition`, so `when m[0] == 1 { apply X on q[0] }`
+        // round-tripped as a bare `apply X on q[0]` and the guard vanished.
+        // Aria -> Aria is the one export where a reader is most likely to
+        // assume fidelity, which makes the silence worse rather than better.
+        let emitted_from = lines.len();
+
         match inst.gate.kind {
             GateKind::Measure => {
                 lines.push(format!(
@@ -97,6 +107,25 @@ pub fn to_aria_source(circuit: &Circuit, name: &str) -> String {
                     "    apply {gate_name}{params} on {}",
                     targets.join(", ")
                 ));
+            }
+        }
+
+        // Wrap whatever this instruction produced in the `when reg[i] == v { … }`
+        // form the parser lowers back to the same per-instruction condition.
+        //
+        // Unlike the QASM 2.0 path there is nothing to refuse: Aria's guard
+        // addresses a single classical bit directly, which is exactly what the
+        // condition holds. Lines already emitted as `--` comments (barrier,
+        // reset, unsupported) are wrapped too — the comment is what round-trips,
+        // and dropping the guard from it would lose information the reader can
+        // see is there.
+        if let Some((clbit, value)) = &inst.condition {
+            for line in lines.iter_mut().skip(emitted_from) {
+                let body = line.trim_start();
+                *line = format!(
+                    "    when {}[{}] == {} {{ {} }}",
+                    clbit.register, clbit.index, value, body
+                );
             }
         }
     }

@@ -138,3 +138,92 @@ fn to_qasm3_accepts_what_qasm2_refuses() {
          and this test, which deliberately records its ABSENCE"
     );
 }
+
+/// **Round-trip through the real parser**, not just a substring check.
+///
+/// Asserting that the emitted text *contains* `if (c == 1) x q[1];` only proves
+/// we wrote what we meant to write. Re-parsing proves a consumer can read it
+/// back and recovers the guard — which is the property the export exists for,
+/// and the one the original defect broke while leaving the file perfectly
+/// well-formed.
+#[test]
+fn an_exported_guard_survives_reparsing() {
+    let qasm = to_qasm(&feedforward("c", 1)).expect("size-1 creg is expressible");
+    let ir = omega_parser::lower_to_ir(&qasm).expect("our own export must re-parse");
+
+    let guarded: Vec<_> = ir
+        .ops
+        .iter()
+        .filter(|op| op.condition.is_some())
+        .collect();
+    assert_eq!(
+        guarded.len(),
+        1,
+        "exactly one op should come back conditioned; got {} in:\n{qasm}",
+        guarded.len()
+    );
+    // (start_bit, num_bits, expected) — a size-1 creg at bit 0, expecting 1.
+    assert_eq!(guarded[0].condition, Some((0, 1, 1)));
+    assert_eq!(
+        format!("{:?}", guarded[0].gate),
+        "X",
+        "the X is the guarded op"
+    );
+}
+
+/// A conditioned `barrier` is refused, because QASM 2.0's `if` takes a gate
+/// application, measurement or reset — and a barrier is none of those.
+///
+/// **Measured against Qiskit 2.5.1**, not assumed: `if (c==1) barrier q;` is
+/// rejected with "needed a gate application, measurement or reset", while
+/// guarded gate / reset / measure are all accepted.
+///
+/// Our own pest grammar happens to ADMIT it (`barrier q` parses as a gate
+/// application), so a round-trip through `omega-parser` alone would not have
+/// caught this. The export exists for interchange, so the consumer that
+/// matters is the other toolchain.
+#[test]
+fn a_conditioned_barrier_is_refused() {
+    let mut c = feedforward("c", 1);
+    c.instructions.push(Instruction {
+        gate: GateDef::new(GateKind::Barrier),
+        qubits: vec![Qubit::new("q", 0), Qubit::new("q", 1)],
+        clbits: vec![],
+        condition: Some((Clbit::new("c", 0), 1)),
+    });
+    let err = to_qasm(&c).expect_err("a guarded barrier is not valid QASM 2.0");
+    assert!(
+        err.contains("barrier") && err.contains("gate application"),
+        "the refusal must say why a barrier cannot be guarded; got:\n{err}"
+    );
+}
+
+/// **The Aria emitter had the same defect**, and it was missed entirely by the
+/// QASM work above.
+///
+/// `aria_emit.rs` had ZERO references to `condition`, so
+/// `when m[0] == 1 { apply X on q[0] }` round-tripped as a bare
+/// `apply X on q[0]` — the guard silently gone. Aria → Aria is the export a
+/// reader is *most* likely to assume is faithful, which makes the silence
+/// worse rather than better.
+///
+/// Found by cross-checking an external patch series against the in-tree
+/// implementation: the QASM fix and this one are the same bug in two emitters,
+/// and fixing one drew no attention to the other.
+#[test]
+fn the_aria_emitter_carries_the_guard_too() {
+    use aria_core::ast::to_aria_source;
+    let src = to_aria_source(&feedforward("c", 1), "Feedforward");
+    assert!(
+        src.contains("when c[0] == 1"),
+        "the Aria emitter must wrap the guarded gate in `when`; got:\n{src}"
+    );
+    // And the guarded gate must not ALSO appear bare.
+    let bare = src
+        .lines()
+        .any(|l| l.trim() == "apply X on q[1]");
+    assert!(
+        !bare,
+        "found a BARE `apply X on q[1]` — the guard was dropped. Full output:\n{src}"
+    );
+}
