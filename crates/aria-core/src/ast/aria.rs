@@ -1622,6 +1622,13 @@ fn gate_from_name(name: &str, params: Vec<ParamExpr>) -> Result<GateDef, String>
         "CZ" => GateKind::CZ,
         "SWAP" => GateKind::SWAP,
         "CP" => GateKind::CP,
+        "CRZ" => GateKind::CRz,
+        // Reset is a CHANNEL, not a unitary, but it lives in GateKind, has a
+        // builder (`Circuit::reset_qubit`), a QASM spelling in both
+        // directions, and an audited implementation in every backend — it
+        // simply had no Aria-language spelling. `apply RESET on q[i]` lowers
+        // to exactly the instruction `reset_qubit` produces.
+        "RESET" => GateKind::Reset,
         "CCX" | "TOFFOLI" => GateKind::CCX,
         "CSWAP" | "FREDKIN" => GateKind::CSWAP,
         "RXX" => GateKind::RXX,

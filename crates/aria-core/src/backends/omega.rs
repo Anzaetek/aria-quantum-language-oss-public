@@ -212,6 +212,11 @@ fn map_gate_kind(kind: GateKind) -> Option<OmegaGateKind> {
         GateKind::SWAP => Some(OmegaGateKind::Swap),
         // CP(λ) == controlled-U1(λ) == CU3(0, 0, λ); params synthesized below.
         GateKind::CP => Some(OmegaGateKind::CU3),
+        // CRz has a NATIVE omega variant, so it maps directly rather than
+        // through CU3. Routing it via CP/CU3 would be wrong: CP(λ) is
+        // diag(1,1,1,e^{iλ}) while CRz(λ) is diag(1,1,e^{-iλ/2},e^{iλ/2}) —
+        // a relative phase on the controlled block, not a global one.
+        GateKind::CRz => Some(OmegaGateKind::CRz),
         GateKind::CCX => Some(OmegaGateKind::CCX),
         GateKind::CSWAP => Some(OmegaGateKind::CSwap),
         GateKind::Measure => Some(OmegaGateKind::Measure),

@@ -31,6 +31,7 @@ fn gate_to_aria(kind: GateKind) -> Option<&'static str> {
         GateKind::CZ => "CZ",
         GateKind::SWAP => "SWAP",
         GateKind::CP => "CP",
+        GateKind::CRz => "CRZ",
         GateKind::CCX => "CCX",
         GateKind::CSWAP => "CSWAP",
         GateKind::RXX => "RXX",

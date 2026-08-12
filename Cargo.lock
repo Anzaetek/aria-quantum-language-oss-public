@@ -413,6 +413,9 @@ dependencies = [
 name = "aria-core"
 version = "0.1.0"
 dependencies = [
+ "num-complex",
+ "omega-backend-statevector",
+ "omega-core",
  "omega-parser",
  "regex",
  "serde",
