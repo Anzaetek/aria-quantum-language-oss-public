@@ -169,12 +169,13 @@ dispatch (`apply_op`, `src/lib.rs`) and the adjoint (`apply_op_dagger`,
 `adjoint_cuda_matches_cpu_12q_hea` exercising the dagger arms). `--features cuda`
 compiles; 27/27 lib + integration green; clippy clean both feature states.
 
-**Still open (graph-capture path):** `forward_graph.rs` / `backward_graph.rs` do
-NOT list `Sx`/`Sxdg`, so a circuit with `√X` in the CUDA-graph *training* path
-returns `Unsupported` and falls back to the fused `apply_ops`/adjoint (correct
-result, no graph fast-path). Wire `Sx`/`Sxdg` into `classify_op_kernel`
-(`backward_graph.rs`) + the forward-graph gate list to close it. Not a
-correctness gap — a performance one — so it was not bundled into the build fix.
+**Graph-capture path — DONE (`3f43d06`).** `forward_graph.rs` and
+`backward_graph.rs` now list `Sx`/`Sxdg` (generic-1q plan +
+`classify_op_kernel`/`forward_1q_matrix`, exact matrices; the dagger is derived
+by conj-transpose, and non-parametric gates skip the derivative path).
+`train_step_graph_matches_naive_backward` carries a √X/√X† layer, so the
+graph-captured gradients are pinned against the naive adjoint. `√X` in a CUDA
+*training* circuit now uses the graph fast-path instead of falling back.
 
 Sites the compiler will point at:
 
