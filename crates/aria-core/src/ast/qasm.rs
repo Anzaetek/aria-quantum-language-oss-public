@@ -61,8 +61,34 @@ fn format_param(p: f64) -> String {
     format!("{p:.10}")
 }
 
-/// Convert a Circuit AST to an OpenQASM 2.0 string.
-pub fn to_qasm(circuit: &Circuit) -> String {
+/// Convert a Circuit AST to an OpenQASM 2.0 string, or refuse if QASM 2.0
+/// cannot express the circuit.
+///
+/// # Why this is fallible (FIXES_PLAN.md Part H)
+///
+/// It used to return `String` and emit a classically-conditioned gate
+/// **unconditionally** — the guard vanished with no diagnostic on either side.
+/// Measured on `H q0; measure q0 -> c0; when c0 == 1 { X q1 }`: Qiskit running
+/// Aria's own export returned `{"11": 2002, "10": 1998}` where the true
+/// distribution is `{"00": 1995, "11": 2005}`. The correlation is destroyed,
+/// the file is valid QASM, and the importer has no way to know a guard was
+/// lost. A lossy export is the worst case for silence, because both ends look
+/// healthy.
+///
+/// # Why it cannot simply emit `if`
+///
+/// Aria's condition is a **single classical bit** (`Option<(Clbit, u64)>`).
+/// QASM 2.0's `if` compares a **whole classical register**: `if (c == V)`. On
+/// a register of size 1 the two coincide. On a wider one they do not —
+/// `if (c == 1)` asserts the *entire register* equals 1, a different
+/// predicate. Emitting it anyway would trade a silent drop for a silent
+/// **change of meaning**, which is worse: the output would look right and be
+/// wrong.
+///
+/// So a size-1 register gets the `if`; anything wider is refused, naming the
+/// register and bit and pointing at [`to_qasm3`], whose `if (c[i] == V)` can
+/// address a single bit.
+pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
     let mut lines = vec![
         "OPENQASM 2.0;".to_string(),
         "include \"qelib1.inc\";".to_string(),
@@ -79,6 +105,16 @@ pub fn to_qasm(circuit: &Circuit) -> String {
     lines.push(String::new());
 
     for inst in &circuit.instructions {
+        // Remember where this instruction's output starts. Some kinds expand
+        // to SEVERAL statements (RBS becomes ~7), and QASM 2.0's `if` guards
+        // exactly one statement — so a conditioned multi-line gate needs the
+        // guard on every line it produced, not just the first. Prefixing by
+        // line range handles single- and multi-line expansions identically;
+        // special-casing the single-line arm would leave a conditioned RBS
+        // emitting six unguarded statements and one guarded one — a NEW silent
+        // defect of exactly the kind this change removes.
+        let emitted_from = lines.len();
+
         match inst.gate.kind {
             GateKind::Barrier => {
                 let qrefs: Vec<String> = inst.qubits.iter().map(|q| q.to_string()).collect();
@@ -132,9 +168,47 @@ pub fn to_qasm(circuit: &Circuit) -> String {
                 }
             }
         }
+
+        if let Some((clbit, value)) = &inst.condition {
+            let reg = circuit
+                .registers
+                .iter()
+                .find(|r| r.name == clbit.register && r.kind == RegisterKind::Classical)
+                .ok_or_else(|| {
+                    format!(
+                        "conditioned gate {:?} references classical register `{}`, \
+                         which the circuit does not declare",
+                        inst.gate.kind, clbit.register
+                    )
+                })?;
+
+            if reg.size != 1 {
+                return Err(format!(
+                    "cannot export `when {}[{}] == {}` to OpenQASM 2.0: Aria conditions \
+                     on a SINGLE classical bit, but QASM 2.0's `if` compares the WHOLE \
+                     register, and `{}` has size {}. Emitting `if ({} == {})` would \
+                     assert that the entire register equals {}, a different predicate — \
+                     a silent change of meaning. Use `to_qasm3` (OpenQASM 3's \
+                     `if ({}[{}] == {})` addresses a single bit), or restructure the \
+                     circuit so the guard reads a size-1 register.",
+                    clbit.register, clbit.index, value,
+                    clbit.register, reg.size,
+                    clbit.register, value, value,
+                    clbit.register, clbit.index, value,
+                ));
+            }
+
+            // Size 1: `c[0] == V` and `c == V` are the same predicate.
+            for line in lines.iter_mut().skip(emitted_from) {
+                if line.starts_with("//") || line.is_empty() {
+                    continue;
+                }
+                *line = format!("if ({} == {}) {}", clbit.register, value, line);
+            }
+        }
     }
 
-    lines.join("\n") + "\n"
+    Ok(lines.join("\n") + "\n")
 }
 
 /// QASM 3 gate name for a kind. Identical to the 2.0 table except `U` is the
@@ -555,7 +629,7 @@ mod tests {
             .measure_all()
             .build();
 
-        let qasm_str = to_qasm(&original);
+        let qasm_str = to_qasm(&original).expect("unconditioned circuit exports");
         assert!(qasm_str.contains("OPENQASM 2.0;"));
         assert!(qasm_str.contains("qreg q[2];"));
         assert!(qasm_str.contains("h q[0];"));
@@ -603,7 +677,7 @@ mod tests {
                 .ry(1, theta)
                 .rz(0, theta)
                 .build();
-            let back = from_qasm(&to_qasm(&circ)).unwrap();
+            let back = from_qasm(&to_qasm(&circ).expect("unconditioned circuit exports")).unwrap();
             for (orig, imported) in circ.instructions.iter().zip(back.instructions.iter()) {
                 let vo = orig.gate.params[0].try_as_f64().unwrap();
                 let vb = imported.gate.params[0].try_as_f64().unwrap();
@@ -751,7 +825,7 @@ mod tests {
             .ry(0, PI / 2.0)
             .rz(0, PI / 4.0)
             .build();
-        let qasm_str = to_qasm(&circ);
+        let qasm_str = to_qasm(&circ).expect("unconditioned circuit exports");
         assert!(qasm_str.contains("rx(pi)"));
         assert!(qasm_str.contains("ry(1*pi/2)"));
         assert!(qasm_str.contains("rz(1*pi/4)"));

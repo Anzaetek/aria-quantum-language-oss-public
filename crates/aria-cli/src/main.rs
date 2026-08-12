@@ -757,7 +757,7 @@ fn cmd_export(raw: &[String]) -> Result<(), String> {
         );
     }
     let out = if a.has("qasm") {
-        aria_core::ast::to_qasm(&circuit)
+        aria_core::ast::to_qasm(&circuit)?
     } else if a.has("qasm3") {
         aria_core::ast::to_qasm3(&circuit)
     } else if a.has("json") {
