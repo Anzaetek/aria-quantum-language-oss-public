@@ -62,6 +62,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import qasm2_stim  # noqa: E402
 from qasm2_stim import (  # noqa: E402
     GATE_SETS,
     ConversionError,
@@ -89,6 +90,8 @@ def main() -> int:
         return 0
 
     mode = req.get("mode") or "execute"
+    if mode == "expectation":
+        return _expectation(req)
     if mode == "gates":
         # Introspection mode: report the QASM2 gate names this bridge
         # can lower. `tests/cross_backend.rs` asks the runner for this
@@ -187,6 +190,121 @@ def main() -> int:
         return 0
 
     _emit({"ok": True, "counts": counts})
+    return 0
+
+
+def _expectation(req: dict) -> int:
+    """Exact Clifford expectation values via **plain Stim's tableau**.
+
+    Request:  {"mode":"expectation","qasm":...,"observables":[[[pauli,coeff],...],...]}
+    Response: {"ok":true,"values":[...]}
+
+    This is the same-algorithm anchor for the in-tree `omega-backend-pauli`
+    stabilizer backend: Stim is *the* reference stabilizer simulator, so a
+    disagreement is a defect by construction rather than a modelling choice.
+
+    ## It uses Stim, NOT tsim
+
+    tsim's ZX stabilizer-rank engine handles non-Clifford circuits; that is its
+    whole point, and it is irrelevant here. What this mode wants is an EXACT
+    Clifford reference, and `TableauSimulator.peek_observable_expectation`
+    returns exact integers (+1 / -1 / 0) with no float error at all. It lives
+    in this runner only because `bloqade-tsim` already pulls Stim into the
+    venv.
+
+    ## Two traps, both measured, both of which would give a WRONG anchor
+
+    1. **`TableauSimulator.state_vector()` is `complex64`.** `1/sqrt(2)` comes
+       back as 0.70710677, error 1.21e-08. An earlier plan proposed comparing
+       state vectors at 1e-15, which would have failed every Clifford fixture
+       and invited a 1e-6 fudge factor covering a misunderstanding. Expectation
+       values avoid it entirely -- they are integers.
+
+    2. **Plain Stim SILENTLY MIS-EXECUTES our tag dialect.** `qasm2_stim`
+       emits `S[T] 0` and `I[R_Z(theta=0.25*pi)] 0` for non-Clifford gates.
+       Stim parses the bracket as an annotation on the base gate and accepts
+       both without complaint -- applying **S instead of T**, and **identity
+       instead of a rotation**. It does not refuse; it returns a confident
+       wrong answer.
+
+       So this mode REFUSES any lowering that emits a `[` tag, rather than
+       trusting the upstream gate-set filter. Anchoring a non-Clifford circuit
+       on plain Stim would manufacture a disagreement and blame our backend.
+
+    ## Conventions
+
+    Pauli strings are dense and **LSB-first** (leftmost char = qubit 0),
+    matching `stim.PauliString`, ppvm and our wire format -- and OPPOSITE to
+    Qiskit's `SparsePauliOp`, whose runner reverses on its own side. Verified
+    on `x q[0]`: stim `"ZI"` = -1, qiskit `"IZ"` = -1, both naming qubit 0.
+    """
+    qasm = req.get("qasm")
+    obs_in = req.get("observables")
+    if not isinstance(qasm, str) or not qasm.strip():
+        _err("`qasm` must be a non-empty string", kind="bad-request")
+        return 0
+    if not isinstance(obs_in, list) or not obs_in:
+        _err("`observables` must be a non-empty list", kind="bad-request")
+        return 0
+    try:
+        import stim
+    except ImportError as e:
+        _err(f"stim import failed: {e}", kind="tsim-not-installed")
+        return 0
+
+    try:
+        text, n_qubits, _, _ = qasm2_stim.convert(qasm, GATE_SETS["tsim"])
+    except qasm2_stim.UnsupportedGate as e:
+        _err(f"qasm2 -> stim: {e}", kind="tsim-unsupported-gate")
+        return 0
+    except Exception as e:  # noqa: BLE001
+        _err(f"qasm2 -> stim: {e}", kind="qasm-parse")
+        return 0
+
+    # THE CLIFFORD GUARD. A `[` in the emitted text means a tag, which means a
+    # non-Clifford gate that Stim would silently mis-execute. Checked on the
+    # TEXT, not on the input gate list, because the text is what Stim consumes.
+    tagged = [ln for ln in text.splitlines() if "[" in ln]
+    if tagged:
+        _err(
+            "circuit is not Clifford: the Stim lowering emitted tagged "
+            f"instruction(s) {tagged[:3]}, which plain Stim parses as "
+            "annotations and executes as the BASE gate (S[T] applies S, not T). "
+            "Refusing rather than returning a confidently wrong reference.",
+            kind="tsim-not-supported",
+        )
+        return 0
+
+    body = "\n".join(
+        ln for ln in text.splitlines()
+        if not ln.strip().startswith(("M ", "MZ ", "MX ", "MY ", "R ", "RZ ", "TICK", "DETECTOR"))
+    )
+    try:
+        sim = stim.TableauSimulator()
+        sim.do(stim.Circuit(body))
+    except Exception as e:  # noqa: BLE001
+        _err(f"stim tableau: {e}", kind="execute")
+        return 0
+
+    values = []
+    for obs in obs_in:
+        total = 0.0
+        for term in obs:
+            pauli, coeff = term[0], float(term[1])
+            if (not isinstance(pauli, str) or len(pauli) != n_qubits
+                    or set(pauli) - set("IXYZ")):
+                _err(f"pauli {pauli!r} must be {n_qubits} chars over IXYZ "
+                     "(dense, LSB-first)", kind="bad-request")
+                return 0
+            try:
+                v = sim.peek_observable_expectation(stim.PauliString(pauli))
+            except Exception as e:  # noqa: BLE001
+                _err(f"peek_observable_expectation({pauli}): {e}", kind="execute")
+                return 0
+            total += coeff * float(v)
+        values.append(total)
+
+    _emit({"ok": True, "values": values})
     return 0
 
 
