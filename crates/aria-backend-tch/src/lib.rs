@@ -54,6 +54,22 @@ impl TchBackend {
             Self::cpu()
         }
     }
+
+    /// NVIDIA CUDA backend if a CUDA-enabled libtorch and a device are present,
+    /// else CPU. Unlike MPS, CUDA supports float64, so it stays complex128
+    /// (≤1e-15) — identical numerics to the CPU path, on the GPU. Requires a
+    /// libtorch built with CUDA (see `ARIA_TCH_CUDA=1` in tools/setup-libtorch.sh);
+    /// with a CPU-only libtorch `is_available()` is false and this is just `cpu()`.
+    pub fn cuda_or_cpu() -> Self {
+        if tch::Cuda::is_available() {
+            Self {
+                device: Device::Cuda(0),
+                rkind: Kind::Double,
+            }
+        } else {
+            Self::cpu()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

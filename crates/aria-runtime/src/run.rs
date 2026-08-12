@@ -225,7 +225,14 @@ pub(crate) fn make_pauliprop(
 fn make_tch() -> Result<Box<dyn Backend>, String> {
     #[cfg(feature = "tch")]
     {
-        return Ok(Box::new(aria_backend_tch::TchBackend::cpu()));
+        // Auto-select the GPU when the linked libtorch was built with CUDA and a
+        // device is present; otherwise this is exactly `cpu()`. CUDA keeps
+        // complex128, so the numerics match the CPU path (unlike the MPS arm).
+        // Set ARIA_TCH_CPU=1 to force CPU even on a CUDA libtorch (debugging).
+        if std::env::var("ARIA_TCH_CPU").is_ok_and(|v| v == "1") {
+            return Ok(Box::new(aria_backend_tch::TchBackend::cpu()));
+        }
+        return Ok(Box::new(aria_backend_tch::TchBackend::cuda_or_cpu()));
     }
     Err(
         "aria was built without the libtorch backend; rebuild with `--features tch` \
