@@ -234,12 +234,19 @@ impl StateF64 {
         let host = self.to_host()?;
         let dim = 1usize << self.num_qubits;
         let mask = 1usize << qubit;
+        // Kahan-compensated sum: a naive sequential sum drifts ~dim·ε, which
+        // exceeds the 1e-13 bar this path is validated against once n is large.
         let mut acc = 0.0f64;
+        let mut comp = 0.0f64;
         for i in 0..dim {
             let re = host[2 * i];
             let im = host[2 * i + 1];
             let p = re * re + im * im;
-            acc += if i & mask == 0 { p } else { -p };
+            let term = if i & mask == 0 { p } else { -p };
+            let y = term - comp;
+            let t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
         }
         Ok(acc)
     }
