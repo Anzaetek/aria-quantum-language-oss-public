@@ -2200,6 +2200,105 @@ dangling.
 Correct the prose in both files rather than deleting it — the wrong explanation
 should stay visible next to the measurement that overturned it.
 
+## Part L — Remoting resilience (task #7): what is real, what is a stub
+
+**Surveyed 2026-08-12, read-only. Not started — this is the scoping that was
+missing.** The task line reads "A10 → A9 → A6/A8/A8b — formal models, then
+durable batches, then async + resilience", which says the ORDER but not the
+starting position.
+
+### What is already real
+
+* **The PQC handshake** — `ws/handshake.rs`, 585 lines. Key exchange, session
+  establishment, optional client-certificate validation with a policy, and a
+  validated `client_subject` on the outcome.
+* **Session encryption** — `session.encrypt` / `.decrypt` on every frame.
+* **The resource governor** — `worker.rs`, including `JobShape` with the
+  distinctions that took real work to get right (`densifies` vs
+  `returns_statevector`, per-pool debiting, f32 vs f64 amplitude width).
+* **Admission control**, and *deliberately* non-queueing: "a caller that queues
+  instead of failing turns an admission problem into an unbounded-queue
+  problem."
+
+### What is a stub
+
+**`ws/handler.rs:98` — the message loop is an echo.**
+
+```rust
+// Echo back encrypted (placeholder — real handler would dispatch to circuit execution)
+let response = match session.encrypt(&plaintext) { ... };
+```
+
+So the transport is production-grade and carries nothing. `client_subject` is
+decoded and then dropped into `let _client_subject`, with a comment promising
+"the request-dispatch layer (next commit)" that has not landed.
+
+There is **no job lifecycle at all**: no job id, no status enum, no submit /
+poll / cancel, no durable record. Every REST route is synchronous
+request-response.
+
+### The trap this arrangement sets
+
+A working handshake plus an echo loop is a **worse** state than an unimplemented
+endpoint, for the same reason a lossy export is worse than a missing one: it
+answers. A client can connect, authenticate, send a circuit, and receive a
+well-formed encrypted frame back — and that frame is its own request. Nothing
+in the protocol distinguishes "executed and returned" from "echoed".
+
+Any integration test written against `/v1/ws` today would pass by construction.
+That is this repository's signature defect wearing a network interface, and it
+is the first thing the dispatch work must remove: **before adding a dispatch
+path, add a test that FAILS against the echo** — otherwise there is no evidence
+the dispatch is what produced the answer.
+
+### Order, and why
+
+1. **A discriminating test first.** Send a circuit whose correct response
+   differs from its request (any execution result does). Confirm it fails
+   against `HEAD`. Only then build.
+2. **Share the execution path with REST**, do not reimplement it. Two code
+   paths that both "run a circuit" is how the counts-keying divergence in
+   Part K happened — the same question answered twice, differently.
+3. **Job lifecycle** (submit → id → poll → result / cancel) is what durable
+   batches and async need underneath, so it precedes both.
+4. **Then** durable batches (A9) and resilience (A6/A8/A8b).
+
+### Open question, not a decision to make silently
+
+Admission currently REFUSES rather than queues, on purpose. An async job API
+implies a queue. Those are in tension, and resolving it by quietly adding a
+queue would discard a deliberate design choice. The queue must be **bounded**
+and its refusal must stay as loud as today's — or the async API must expose
+admission failure as a first-class terminal state rather than a retry loop.
+
+## Part H — RESOLVED 2026-08-12
+
+`to_qasm` now returns `Result<String, String>`: it emits `if (c == V)` when the
+classical register has size 1, and **refuses** otherwise, naming the register
+and bit and pointing at `to_qasm3`.
+
+**One thing this document's scoping got wrong.** It described the change as an
+edit to the gate-emitting arm, on the basis that `to_qasm` has 8 call sites of
+which 1 is production. The call-site count was right; the edit was not. The
+emitter pushes **multiple lines** for some kinds — RBS expands to about seven —
+and QASM 2.0's `if` guards exactly one statement. Patching the single-line arm
+would have left a conditioned RBS emitting six unguarded statements and one
+guarded one: a **new silent defect of exactly the class Part H exists to
+remove**. The guard is therefore applied by line range (`lines.len()` before,
+prefix everything the instruction produced), which handles single- and
+multi-line expansions identically by construction.
+
+Mutation-verified in `crates/aria-core/tests/qasm_conditional_export.rs`:
+restoring the original defect (ignoring `condition`) fails two tests; emitting
+the `if` on a wide register anyway fails one.
+
+**A gap the fix exposes.** The refusal points at `to_qasm3` because OpenQASM 3's
+`if (c[i] == V)` *can* address a single bit — but `to_qasm3` does not emit
+classical control flow either; its own doc comment says so. The escape hatch is
+signposted and not yet built. `to_qasm3_accepts_what_qasm2_refuses` deliberately
+asserts the **absence** of `if` so this stays visible and the test does not
+claim a capability that does not exist; it will fail loudly when the gap closes.
+
 ## Part K — N-way correctness matrix (task #16), new 2026-08-08
 
 > "a few correctness tests with ppvm / tsim / mps / pauli-prop / qiskit /
