@@ -326,6 +326,8 @@ fn build_plan(circuit: &CircuitIR) -> OmegaResult<Vec<PlanEntry>> {
             GateKind::H
             | GateKind::X
             | GateKind::Y
+            | GateKind::Sx
+            | GateKind::Sxdg
             | GateKind::Rx
             | GateKind::Ry
             | GateKind::U2
@@ -428,6 +430,19 @@ fn resolve_apply_1q_params(op: &GateOp, params: &ParameterBinding) -> OmegaResul
             Complex64::new(0.0, -1.0),
             Complex64::new(0.0, 1.0),
             Complex64::new(0.0, 0.0),
+        ],
+        // √X / √X† — exact Qiskit matrices, NOT the U3 alias (differs by e^{iπ/4}).
+        GateKind::Sx => [
+            Complex64::new(0.5, 0.5),
+            Complex64::new(0.5, -0.5),
+            Complex64::new(0.5, -0.5),
+            Complex64::new(0.5, 0.5),
+        ],
+        GateKind::Sxdg => [
+            Complex64::new(0.5, -0.5),
+            Complex64::new(0.5, 0.5),
+            Complex64::new(0.5, 0.5),
+            Complex64::new(0.5, -0.5),
         ],
         GateKind::Rx => {
             let c = (resolved[0] / 2.0).cos();
