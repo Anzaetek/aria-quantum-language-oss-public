@@ -33,14 +33,20 @@ fn every_kernel_compiles_in_f32_and_f64() {
         compiled + failures.len(),
         failures.join("\n  ")
     );
-    // Both precisions, every source: a bare count guards against the list
-    // silently emptying.
     // Two precisions per source; the count guards against the list silently
-    // emptying, which would turn this test into a vacuous pass.
+    // shrinking, which would turn this test into a vacuous pass. Pinned to the
+    // full kernel population (every .cu under src/kernels/), so dropping OR
+    // failing to add a kernel trips this.
+    let on_disk = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernels"))
+        .expect("read kernels dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "cu"))
+        .count();
     let sources = all_kernel_sources().len();
-    assert!(
-        sources >= 18,
-        "only {sources} kernel sources listed — list shrank?"
+    assert_eq!(
+        sources, on_disk,
+        "{sources} kernels listed in all_kernel_sources() but {on_disk} .cu files on disk \
+         — every kernel must be in the dual-precision compile gate"
     );
     assert_eq!(
         compiled,

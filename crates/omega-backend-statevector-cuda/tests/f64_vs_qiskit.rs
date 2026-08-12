@@ -80,6 +80,16 @@ fn circuit(n: u32) -> Vec<G> {
     ops
 }
 
+/// The Qiskit venv interpreter, if it has been provisioned. An ABSENT venv is a
+/// skipped prerequisite (loud skip); a PRESENT venv that then fails to run or
+/// disagrees is a hard failure. The two must not be conflated — otherwise this
+/// panics on every CUDA box (incl. the DGX Spark) that has not built the venv,
+/// reddening the whole `ARIA_CUDA=1` stage over a missing optional dep.
+fn qiskit_python() -> Option<std::path::PathBuf> {
+    let py = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.venv-qiskit/bin/python");
+    py.exists().then_some(py)
+}
+
 fn qiskit_reference(n: u32, ops: &[G]) -> Option<Vec<(f64, f64)>> {
     let mut py_ops = String::new();
     for op in ops {
@@ -99,10 +109,10 @@ fn qiskit_reference(n: u32, ops: &[G]) -> Option<Vec<(f64, f64)>> {
          print(json.dumps([[float(z.real), float(z.imag)] for z in sv]))\n"
     );
     // The interpreter lives at the REPO root, but cargo runs a test with its
-    // CWD set to the PACKAGE root, so a relative path silently fails to resolve
-    // and the reference "does not run" — which this test treats as a failure,
-    // correctly, but for the wrong reason. Derive it from the manifest dir.
-    let py = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.venv-qiskit/bin/python");
+    // CWD set to the PACKAGE root, so a relative path silently fails to resolve.
+    // Callers guard on qiskit_python() first, so a None here means the venv
+    // vanished between the guard and now — treat as "did not run".
+    let py = qiskit_python()?;
     let out = std::process::Command::new(&py)
         .arg("-c")
         .arg(&script)
@@ -129,6 +139,14 @@ fn f64_statevector_matches_qiskit_amplitude_by_amplitude() {
         eprintln!("no CUDA device — skipping (device test)");
         return;
     };
+    if qiskit_python().is_none() {
+        eprintln!(
+            "SKIP: ./.venv-qiskit not built — the Qiskit f64 gate needs it \
+             (build per PREREQUISITES.md). This is the independent reference; \
+             it is skipped, not passed."
+        );
+        return;
+    }
     let Some(reference) = qiskit_reference(n, &ops) else {
         // A missing reference must not read as a pass: this is the only
         // independent check, so say it did not run.
@@ -184,6 +202,10 @@ fn f64_expectation_matches_qiskit() {
     let Ok(ctx) = CudaContext::new(0) else {
         return;
     };
+    if qiskit_python().is_none() {
+        eprintln!("SKIP: ./.venv-qiskit not built — see the other test");
+        return;
+    }
     let Some(reference) = qiskit_reference(n, &ops) else {
         panic!("the Qiskit reference did not run — see the other test");
     };
