@@ -155,18 +155,26 @@ rationale if a decision looks wrong on real hardware.
   budgets against the container limit and not host RAM. That path exists but has
   only been exercised by unit tests with injected probe values.
 
-## `GateKind::Sx` / `Sxdg` — CUDA is NOT updated (2026-08-11)
+## `GateKind::Sx` / `Sxdg` — forward + adjoint DONE on CUDA (2026-08-13)
 
 `√X` and `√X†` landed as first-class `GateKind` variants (see the doc comment on
 `GateKind::Sx` for why they are not aliased to `U3`). CPU statevector, MPS,
-Pauli, **Metal** and **OpenCL** are done and verified against Qiskit. **CUDA is
-deliberately untouched**, because nothing here can compile or run it.
+Pauli, **Metal** and **OpenCL** were already done.
 
-**Expect `cargo build -p omega-backend-statevector-cuda --features cuda` to FAIL
-with `non-exhaustive patterns: &GateKind::Sx and &GateKind::Sxdg not covered`.**
-That is the intended state: a compile error on the box that can test it beats an
-implementation written blind and never executed. Do not "fix" it by adding a
-catch-all arm.
+**RESOLVED on a Linux + NVIDIA box (RTX PRO 6000, nvcc 12.9):** the forward
+dispatch (`apply_op`, `src/lib.rs`) and the adjoint (`apply_op_dagger`,
+`src/adjoint.rs`) now apply the exact `gates::sx`/`sxdg` matrices via the generic
+`apply_1q` — NOT `U3`. `diagonal_factor` correctly leaves them out. Commits
+`e47fd15` (fix) + `9c8c01c` (tests: on-device forward phase-pin +
+`adjoint_cuda_matches_cpu_12q_hea` exercising the dagger arms). `--features cuda`
+compiles; 27/27 lib + integration green; clippy clean both feature states.
+
+**Still open (graph-capture path):** `forward_graph.rs` / `backward_graph.rs` do
+NOT list `Sx`/`Sxdg`, so a circuit with `√X` in the CUDA-graph *training* path
+returns `Unsupported` and falls back to the fused `apply_ops`/adjoint (correct
+result, no graph fast-path). Wire `Sx`/`Sxdg` into `classify_op_kernel`
+(`backward_graph.rs`) + the forward-graph gate list to close it. Not a
+correctness gap — a performance one — so it was not bundled into the build fix.
 
 Sites the compiler will point at:
 
@@ -195,3 +203,43 @@ with the exact matrix for this reason.
 Verification once implemented: `03_sqrt_x.qasm` in the N-way counts matrix
 (`ARIA_NWAY=1`) exercises `sx`+`sxdg`, and `tests/sqrt_x_conventions.rs` pins
 the matrices, the `sx·sx = X` identity and the Clifford tableau action.
+
+## R8 — f64 CUDA statevector: landed, with follow-ups (2026-08-13)
+
+The double-precision forward path landed (commits `9a04d9c` + `4aa11a2`):
+precision-parametric kernels (all 24 `.cu` compile f32 **and** f64 — 48/48 on
+sm_120 / nvcc 12.9), `src/f64_path.rs` (`StateF64`), validated amplitude-by-
+amplitude vs Qiskit 2.5.1 at ≤1e-13. f32 stays the default and bit-identical.
+Open, all low priority:
+
+- **Adjoint / training / sampling / multi-observable stay f32.** By design (the
+  f64 argument is forward *agreement*); revisit only when an f64 *training* loop
+  is wanted. The kernels already compile in f64, so it is host buffers + graph
+  capture that need the work.
+- `Precision::bytes_per_amplitude` is unused pub API; the memory governor still
+  prices device work at f32 (8 B/amp) — wire it in before f64 is bench-priced.
+- A few `.cu` comments still say "f32" after the `real`/`real2` rewrite; and
+  `StateF64::expectation_z` is a naive O(dim) sum (fine at tested n≈6, drifts
+  past the 1e-13 bar near n≈20 — use pairwise/Kahan before claiming large n).
+
+## libtorch / `tch` GPU backend on Linux (2026-08-13)
+
+`--backend tch` now runs on the GPU (`TchBackend::cuda_or_cpu`, commits
+`84bd5ba` + `012a8d0`); `ARIA_TCH_CUDA=1 tools/setup-libtorch.sh` fetches a CUDA
+libtorch and the script force-retains `libtorch_cuda` in the link
+(`--no-as-needed -ltorch_cuda -lc10_cuda`, else the linker drops it and
+`is_available()` is false). Proven on RTX PRO 6000 Blackwell + in ubuntu 22/24/26
+containers (see `INSTALL_LIBTORCH.md` §4). Open:
+
+- **Dist-swap idempotency**: the download-path check compares only the version
+  *base* (`${have_ver%%+*}`), so toggling `ARIA_TCH_CUDA=1` on a box that already
+  has the `2.7.0+cpu` dist SKIPS the re-download and silently stays CPU. Key the
+  idempotency on the full local tag (`+cpu` vs `+cuXXX`) so a CPU↔CUDA switch
+  re-provisions.
+- A user-exported `LIBTORCH` bypasses `tch-env.sh`, losing the CUDA/`torch.libs`
+  `RUSTFLAGS`; and a stale wrong-version aarch64 `$LIBTORCH` lands on the
+  "download from pytorch.org" branch that has no aarch64 C++ dist.
+- **DGX Spark (aarch64)**: the `cuXXX` wheel index and the `torch.libs`/`nvidia/*`
+  runtime-lib layout are unverified on a real GB10 — confirm there.
+- **E6**: `tools/qec_cross_check/run.sh` bootstraps with plain `pip`, which cannot
+  build `pymatching` on **aarch64** — needs the wheel index / build deps.
