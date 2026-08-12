@@ -17,3 +17,10 @@
 # the numbers honest.
 ppvm @ git+https://github.com/QuEraComputing/ppvm.git#subdirectory=ppvm-python
 numpy>=1.26
+# Used ONLY to parse QASM2 into a gate list for the `expectation` mode — never
+# to compute. ppvm's value here is that it implements the SAME ALGORITHM as
+# omega-backend-pauliprop independently; sharing the parser with the Qiskit
+# anchor removes "the two sides read the circuit differently" as an
+# explanation for any disagreement, which sharpens the comparison rather than
+# weakening it.
+qiskit>=1.3,<3

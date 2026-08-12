@@ -119,15 +119,23 @@ fn a_conditioned_gate_is_refused() {
     }
 }
 
-/// Every non-Qiskit backend reports `CannotExpress`, not `NotCompiled`.
+/// A backend with no expectation path reports `CannotExpress`, not
+/// `NotCompiled`.
 ///
 /// The distinction is the whole point of the step-2 taxonomy: the feature IS
 /// compiled, the protocol simply carries no expectation path for those
 /// backends. Reporting it as "not installed" would claim an environmental
 /// excuse for a capability gap.
+///
+/// **`Ppvm` was in this list and is deliberately no longer.** It gained an
+/// expectation path (its `PauliSum` engine, the same-algorithm anchor for
+/// pauliprop), so asserting it "cannot express" became false — and the test
+/// failed, which is the correct outcome. A list of capability gaps must fail
+/// when a gap closes, or it silently keeps asserting a limitation that no
+/// longer exists.
 #[test]
-fn other_backends_report_cannot_express_not_not_installed() {
-    for b in [Backend::Perceval, Backend::Bloqade, Backend::Tsim, Backend::Ppvm] {
+fn backends_without_an_expectation_path_report_cannot_express() {
+    for b in [Backend::Perceval, Backend::Bloqade, Backend::Tsim] {
         let qasm = format!("{HDR}qreg q[1];\nh q[0];");
         match expectation_qasm2(b, &qasm, &[obs("Z")]) {
             Err(BridgeError::CannotExpress(got, _)) => assert_eq!(got, b),
