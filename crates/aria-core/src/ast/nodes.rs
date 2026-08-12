@@ -32,6 +32,19 @@ pub enum GateKind {
     RYY,
     RZZ,
     CP,
+    /// Controlled-RZ: `CRz(λ) = diag(1, 1, e^{−iλ/2}, e^{+iλ/2})`, control
+    /// first and target second — qelib1's `crz`.
+    ///
+    /// Distinct from [`GateKind::CP`], which is `diag(1, 1, 1, e^{iλ})`. They
+    /// differ by a relative phase `e^{-iλ/2}` on the controlled block, so
+    /// substituting one for the other is NOT a global phase and is visible in
+    /// any interference. `CRz(λ) = CP(λ)` preceded by `P(−λ/2)` on the
+    /// control, exactly.
+    ///
+    /// The omega IR and the QASM lane both had this gate; the Aria language
+    /// simply could not spell it, so a circuit its own backends execute was
+    /// inexpressible in its own source form.
+    CRz,
     /// Reconfigurable Beam Splitter / Givens rotation:
     /// `RBS(θ) = exp(−i·θ/2·(Y⊗X − X⊗Y))`. Hamming-weight preserving;
     /// the primitive of butterfly / unary QML circuits

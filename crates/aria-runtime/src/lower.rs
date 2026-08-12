@@ -167,6 +167,10 @@ pub fn lower(circuit: &Circuit) -> Result<Lowered, String> {
                     vec![OExpr::Concrete(0.0), OExpr::Concrete(0.0), lam],
                 )
             }
+            // Native, NOT synthesised through CU3 — see the note in
+            // aria-core/src/backends/omega.rs. CRz(λ) and CP(λ) differ by a
+            // relative phase on the controlled block.
+            AKind::CRz => (OKind::CRz, conv_all(p, &mut syms)?),
             AKind::RBS => (OKind::Rbs, conv_all(p, &mut syms)?),
             AKind::CCX => (OKind::CCX, vec![]),
             AKind::CSWAP => (OKind::CSwap, vec![]),
