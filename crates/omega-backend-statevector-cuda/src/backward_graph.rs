@@ -1746,6 +1746,8 @@ fn classify_op_kernel(op: &GateOp) -> OmegaResult<KernelKind> {
         GateKind::H
         | GateKind::X
         | GateKind::Y
+        | GateKind::Sx
+        | GateKind::Sxdg
         | GateKind::Rx
         | GateKind::Ry
         | GateKind::U2
@@ -1859,6 +1861,20 @@ fn forward_1q_matrix(op: &GateOp, params: &ParameterBinding) -> OmegaResult<[Com
             Complex64::new(0.0, -1.0),
             Complex64::new(0.0, 1.0),
             Complex64::new(0.0, 0.0),
+        ],
+        // √X / √X† — exact Qiskit matrices (½[[1±i,1∓i],[1∓i,1±i]]), the dagger
+        // is derived generically by conj-transpose downstream.
+        GateKind::Sx => [
+            Complex64::new(0.5, 0.5),
+            Complex64::new(0.5, -0.5),
+            Complex64::new(0.5, -0.5),
+            Complex64::new(0.5, 0.5),
+        ],
+        GateKind::Sxdg => [
+            Complex64::new(0.5, -0.5),
+            Complex64::new(0.5, 0.5),
+            Complex64::new(0.5, 0.5),
+            Complex64::new(0.5, -0.5),
         ],
         GateKind::Rx => {
             let c = (resolved[0] / 2.0).cos();

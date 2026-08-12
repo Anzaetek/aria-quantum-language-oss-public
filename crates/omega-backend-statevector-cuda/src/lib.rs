@@ -2611,6 +2611,18 @@ mod tests {
                 condition: None,
             });
         }
+        // Non-parametric √X / √X† in the graph-capture path: exercises the
+        // Sx/Sxdg arms of classify_op_kernel + forward_1q_matrix against the
+        // naive adjoint (dagger derived by conj-transpose).
+        for (q, gate) in [(0u32, GateKind::Sx), (2u32, GateKind::Sxdg)] {
+            circuit.ops.push(GateOp {
+                gate,
+                qubits: smallvec::smallvec![Qubit(q)],
+                params: smallvec::smallvec![],
+                classical_bit: None,
+                condition: None,
+            });
+        }
         // CX ladder.
         for q in 0..n - 1 {
             circuit.ops.push(GateOp {
