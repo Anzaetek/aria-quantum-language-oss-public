@@ -1,8 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # PLAN — OPTICQASM export/import integrity
 
-**Status: PLAN. Nothing here is implemented yet.** Written after the
-measurements below, before any code. Companion to `PLAN-EXPORT-INTEGRITY.md`,
+**Status: O1, O2, O3 and O5 are IMPLEMENTED (2026-08-13). O4 and O6 remain
+open.** Written as a plan first, after the measurements below and before any
+code; this header is the only part edited after the fact, so the reasoning
+below is what was decided *before* the work, not a retrospective. Companion to `PLAN-EXPORT-INTEGRITY.md`,
 which covers the same defect class on the qubit (QASM2/QASM3/Aria) side; this
 document is P7 of that plan, expanded once it turned out to be seven defects
 rather than two.
@@ -155,6 +157,60 @@ pattern its sibling already established.
 ---
 
 ## 4. Fix plan
+
+**Landed so far:**
+
+| step | state | evidence |
+|---|---|---|
+| O1 emitter refuses instead of corrupting | **done** | `opticqasm.rs` returns `Result`; D4/D5 tests, both mutation-verified |
+| O2 reader refuses instead of skipping | **done, after a false start** | statement-based, not line-based — see below; `opticqasm_reader_agreement.rs` |
+| O3 CV gates **import** | **done** | `omega_parser::lower_opticqasm_cv`; 8 unit tests + 5 cross-crate, 6 mutations verified |
+| O4 emit `hwp`/`pbs` + `pol` | **open** | needs new `GateKind`s in `aria-core` — see below |
+| O5 cross-backend agreement | **done (CV)** | **17/17 piquasso fixture cases agree**, amps 1e-13, probs 1e-14, **0 skipped**; DV/Perceval arm still open |
+| O6 exhaustive-`match` guard | **open** | |
+
+### What the adversarial review caught, after these were called done
+
+Both are recorded because the plan's §5 predicted this class and the work fell
+into it anyway.
+
+**O2's first attempt re-committed the defect one level down.** It iterated over
+`src.lines()`. The grammar's `WHITESPACE` includes `\n`, so a statement may
+share a line with any other, and:
+
+* `OPTICQASM 1.0; photon q[2]; ps(0.5) q[0];` on one line → **`Ok`, 0 registers,
+  0 operations** — D7 verbatim, in the function whose doc comment claimed to
+  have killed it, because `line.starts_with("OPTICQASM")` skipped the whole line
+  rather than the header token;
+* `ps(0.5) q[0]; ps(0.7) q[1];` on one line → **`Ok`, ONE gate**, parameter
+  `0.5`, on modes `[0, 1]` — the two were *merged*, which is worse than a drop.
+
+The reader now splits on `;` after stripping comments, which is what the grammar
+does, and validates registers, mode ranges and both arities. Five inputs where
+the two readers disagreed — always with `aria-core` silent — are pinned by
+`opticqasm_reader_agreement.rs`.
+
+**O5's acceptance test could not fail for the operation it most needed to
+check.** It asserted `compared >= 10`. The fixture has 17 cases, 7 of which use
+`squeeze`, and an executor error became a *skip* rather than a failure — so the
+floor was set to exactly the number that survives when squeezing is entirely
+broken. Measured: swapping `r` and `phi` in the CV import left the test **green**
+at "10 cases agree, 7 skipped". It now asserts the skip list is empty and the
+compared count equals the case count, and that same mutation fails it.
+
+**One instruction in this plan was wrong.** §O3 said `bs_ry` "comes out of the
+grammar". Removing it makes the diagnostic *worse*: `gate_name` is an ordered
+choice over an atomic rule, so the earlier `"bs"` alternative then matches the
+prefix and leaves `_ry` dangling — measured, a clear `unknown photonic gate:
+bs_ry` degrades to pest's `--> 3:3`. The spelling stays tokenizable and the
+lowering now says what is true: named by the grammar, implemented nowhere.
+
+O4 turned out larger than this plan assumed: `aria-core`'s `GateKind` has **no
+polarization variants at all** (no `HalfWavePlate`, no `PolarizingBeamSplitter`),
+so emitting `hwp`/`pbs` means adding them to the AST first, plus the register
+flag D3 needs. `from_opticqasm` therefore refuses both by name for now, saying
+which crate does implement them, rather than reporting "unknown gate".
+
 
 Ordered so that each step is verifiable on its own and none depends on a later
 decision.

@@ -652,9 +652,74 @@ impl LowerCtx {
 
                 let gate = match app.name.as_str() {
                     "ps" => GateKind::PhaseShifter,
-                    "bs_rx" => GateKind::BeamSplitterRx,
+                    // `bs` is an accepted alias in `aria-core::from_opticqasm`
+                    // and is named by the grammar's `gate_name` rule, so it
+                    // parsed here and then died at lowering — a spelling two of
+                    // the three tables knew.
+                    "bs_rx" | "bs" => GateKind::BeamSplitterRx,
+                    // The continuous-variable profile. Saying "unknown" here was
+                    // FALSE and it is what made `aria-core`'s own OPTICQASM
+                    // export unreadable: piquasso implements all three, and so
+                    // does this workspace's `omega-backend-cv`. What is true is
+                    // that the discrete-variable IR cannot express a Fock-space
+                    // operator. Wording deliberately parallels
+                    // `aria-core/src/backends/omega.rs`, which refuses the same
+                    // three on the execution path.
+                    cv @ ("squeeze" | "displace" | "kerr") => {
+                        return Err(format!(
+                            "`{cv}` is a continuous-variable gate; the discrete-variable \
+                             omega IR cannot express it. Import the CV profile with \
+                             `omega_parser::lower_opticqasm_cv` and run it on \
+                             `omega-backend-cv` (piquasso reads the same operations)."
+                        ))
+                    }
+                    // Named by the grammar's `gate_name` rule but implemented
+                    // nowhere. It cannot simply be deleted from the grammar:
+                    // `gate_name` is an ordered choice over an atomic rule, so
+                    // with `bs_ry` gone the earlier `"bs"` alternative matches
+                    // its prefix and leaves `_ry` dangling — measured, the clear
+                    // message below degrades into `--> 3:3` from pest. So the
+                    // spelling stays tokenizable and the refusal says what is
+                    // actually true.
+                    "bs_ry" => {
+                        return Err(
+                            "`bs_ry` (Ry-convention beam splitter) is named by the OPTICQASM \
+                             grammar but has no implementation: the IR carries only \
+                             `BeamSplitterRx`. Use `bs_rx`, which Perceval's `BS` and \
+                             piquasso's `Beamsplitter` both match."
+                                .to_string(),
+                        )
+                    }
                     other => return Err(format!("unknown photonic gate: {}", other)),
                 };
+
+                // Arity, on BOTH parameters and modes.
+                //
+                // Neither was checked. Measured before this: `bs_rx(1.2) q[0], q[1];`,
+                // `ps(0.5, 0.7) q[0];` and `ps(0.5) q[0], q[1];` all lowered to
+                // `Ok(1 op)` here while the CV profile refused all three — two
+                // readers of one dialect disagreeing about what is valid, with
+                // this one silent. A one-mode beam splitter then reaches a
+                // backend that indexes `qubits[1]`.
+                let (want_params, want_modes) = match gate {
+                    GateKind::PhaseShifter => (1usize, 1usize),
+                    GateKind::BeamSplitterRx => (2, 2),
+                    _ => unreachable!("gate table above yields only these two"),
+                };
+                if app.params.len() != want_params {
+                    return Err(format!(
+                        "`{}` takes {want_params} parameter(s), got {}",
+                        app.name,
+                        app.params.len()
+                    ));
+                }
+                if app.modes.len() != want_modes {
+                    return Err(format!(
+                        "`{}` acts on {want_modes} mode(s), got {}",
+                        app.name,
+                        app.modes.len()
+                    ));
+                }
 
                 let mut params = smallvec::SmallVec::new();
                 for p in &app.params {
