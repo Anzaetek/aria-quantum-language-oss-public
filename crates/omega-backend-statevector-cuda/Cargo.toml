@@ -38,6 +38,8 @@ thiserror = { workspace = true }
 cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "curand", "std", "fallback-dynamic-loading", "cuda-version-from-build-system"], optional = true }
 
 [dev-dependencies]
+# Test-only: parses the Qiskit reference statevector in tests/f64_vs_qiskit.rs.
+serde_json = "1"
 criterion = { workspace = true }
 
 [[bench]]

@@ -30,25 +30,25 @@
 
 extern "C" {
 
-__device__ inline float2 cmul_conj_local(float2 a, float2 b) {
-    return make_float2(a.x * b.x + a.y * b.y, a.x * b.y - a.y * b.x);
+__device__ inline real2 cmul_conj_local(real2 a, real2 b) {
+    return make_real2(a.x * b.x + a.y * b.y, a.x * b.y - a.y * b.x);
 }
 
 __global__ void inner_product_accumulate_pooled(
-    const float2* nu,
-    const float2* temp,
+    const real2* nu,
+    const real2* temp,
     double* grad_dev,
     const double* chain_pool,
     const unsigned int* sym_idx_pool,
     unsigned int slot,
     unsigned long long dim
 ) {
-    extern __shared__ float2 sdata_acc[];
+    extern __shared__ real2 sdata_acc[];
     unsigned int tid = threadIdx.x;
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + tid;
 
-    float2 v = (gid < dim) ? cmul_conj_local(nu[gid], temp[gid])
-                           : make_float2(0.0f, 0.0f);
+    real2 v = (gid < dim) ? cmul_conj_local(nu[gid], temp[gid])
+                           : make_real2(0.0, 0.0);
     sdata_acc[tid] = v;
     __syncthreads();
     for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {

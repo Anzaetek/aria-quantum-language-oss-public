@@ -21,20 +21,20 @@
 extern "C" {
 
 __global__ void pauli_z_expectation_to_slot(
-    const float2* psi,
+    const real2* psi,
     double* predictions,
     unsigned int sign_mask,
     unsigned int slot,
     unsigned long long dim
 ) {
-    extern __shared__ float sdata_pz[];
+    extern __shared__ real sdata_pz[];
     unsigned int tid = threadIdx.x;
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + tid;
 
-    float v = 0.0f;
+    real v = 0.0;
     if (gid < dim) {
-        float2 amp = psi[gid];
-        float prob = amp.x * amp.x + amp.y * amp.y;
+        real2 amp = psi[gid];
+        real prob = amp.x * amp.x + amp.y * amp.y;
         unsigned int parity = __popc((unsigned int)(gid & 0xFFFFFFFFULL) & sign_mask) & 1u;
         v = (parity == 0u) ? prob : -prob;
     }

@@ -19,27 +19,27 @@
 
 extern "C" {
 
-__device__ inline float2 cmul_conj(float2 a, float2 b) {
-    return make_float2(a.x * b.x + a.y * b.y, a.x * b.y - a.y * b.x);
+__device__ inline real2 cmul_conj(real2 a, real2 b) {
+    return make_real2(a.x * b.x + a.y * b.y, a.x * b.y - a.y * b.x);
 }
 
-__device__ inline float2 cmul(float2 a, float2 b) {
-    return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+__device__ inline real2 cmul(real2 a, real2 b) {
+    return make_real2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
 __global__ void pauli_expectation(
-    const float2* psi,
-    float2* partials,
+    const real2* psi,
+    real2* partials,
     unsigned int x_mask,
     unsigned int sign_mask,
-    float2 y_factor,
+    real2 y_factor,
     unsigned long long dim
 ) {
-    extern __shared__ float2 sdata[];
+    extern __shared__ real2 sdata[];
     unsigned int tid = threadIdx.x;
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + tid;
 
-    float2 contrib = make_float2(0.0f, 0.0f);
+    real2 contrib = make_real2(0.0, 0.0);
     if (gid < dim) {
         unsigned int i = (unsigned int)(gid & 0xFFFFFFFFULL);
         unsigned int j = i ^ x_mask;

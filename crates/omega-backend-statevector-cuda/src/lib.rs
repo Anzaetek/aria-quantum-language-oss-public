@@ -54,9 +54,13 @@ mod forward_graph;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 mod backward_graph;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
-mod imp;
+pub mod f64_path;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
-mod kernels;
+mod imp;
+// `pub` so the dual-precision compile test can reach `Precision` and the
+// source list; still gated, because the module uses cudarc.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+pub mod kernels;
 
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 use num_complex::Complex64;
@@ -1944,7 +1948,10 @@ mod tests {
             f
         };
         let a = freq(cpu.execute(&circuit, &params, &shot_cfg(7)).expect("cpu"));
-        let b = freq(cuda.execute(&circuit, &params, &shot_cfg(11)).expect("cuda"));
+        let b = freq(
+            cuda.execute(&circuit, &params, &shot_cfg(11))
+                .expect("cuda"),
+        );
         // 5 sigma on 8000 draws at p<=0.5 is ~0.028; 0.04 keeps the gate sharp
         // (the old fold misses whole outcomes) without being seed-fragile.
         for i in 0..4 {

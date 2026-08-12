@@ -17,20 +17,20 @@ struct DiagonalProductParams {
 };
 
 __global__ void apply_diagonal_product(
-    float2* state,
+    real2* state,
     DiagonalProductParams p,
     const unsigned int* qubits,
-    const float2* d0_factors,
-    const float2* d1_factors,
+    const real2* d0_factors,
+    const real2* d1_factors,
     unsigned long long dim
 ) {
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (gid >= dim) { return; }
-    float2 amp = state[gid];
+    real2 amp = state[gid];
     for (unsigned int k = 0u; k < p.num_factors; ++k) {
         unsigned int bit = (unsigned int)((gid >> qubits[k]) & 1ULL);
-        float2 d = (bit == 0u) ? d0_factors[k] : d1_factors[k];
-        amp = make_float2(amp.x * d.x - amp.y * d.y,
+        real2 d = (bit == 0u) ? d0_factors[k] : d1_factors[k];
+        amp = make_real2(amp.x * d.x - amp.y * d.y,
                           amp.x * d.y + amp.y * d.x);
     }
     state[gid] = amp;

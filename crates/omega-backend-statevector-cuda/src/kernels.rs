@@ -16,6 +16,58 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
 use crate::CudaError;
 
+/// Precision prelude, prepended to every kernel source. The kernels are written
+/// once in terms of `real`/`real2` and compiled per [`Precision`]; see
+/// `kernels/prelude.cuh` for why that is sound (no precision-specific
+/// intrinsics anywhere in the kernel math).
+const PRELUDE: &str = include_str!("kernels/prelude.cuh");
+
+/// Which floating-point precision a kernel module is compiled for.
+///
+/// f32 is the default and remains so: it is measurably sufficient for a forward
+/// expectation and roughly 64x faster than f64 on consumer-class Blackwell
+/// (GB10, compute 12.1), where f64 runs at 1/64 rate. f64 exists because f32
+/// caps agreement with the f64 CPU statevector at ~5e-7, six orders looser than
+/// the 1e-9 this project gates cross-checks at — so an f32-only GPU cannot enter
+/// its own verification gates. On an H100 (compute 9.0, f64 at ~1/2 rate) the
+/// cost of choosing f64 is small.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Precision {
+    #[default]
+    F32,
+    F64,
+}
+
+impl Precision {
+    /// NVRTC defines that select the scalar types in `prelude.cuh`.
+    fn defines(self) -> &'static [&'static str] {
+        match self {
+            // The prelude's own defaults are f32, so nothing to override.
+            Precision::F32 => &[],
+            Precision::F64 => &[
+                "-DOMEGA_REAL=double",
+                "-DOMEGA_REAL2=double2",
+                "-DOMEGA_MAKE_REAL2=make_double2",
+            ],
+        }
+    }
+
+    pub fn bytes_per_amplitude(self) -> usize {
+        match self {
+            // Interleaved (re, im).
+            Precision::F32 => 8,
+            Precision::F64 => 16,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Precision::F32 => "f32",
+            Precision::F64 => "f64",
+        }
+    }
+}
+
 /// CUDA C source for the kernels we ship. Embedded at compile time;
 /// no runtime filesystem access required.
 const KERNEL_APPLY_DIAGONAL: &str = include_str!("kernels/apply_diagonal.cu");
@@ -338,14 +390,105 @@ impl KernelLibrary {
     }
 }
 
+/// Every embedded kernel source with its label, for the dual-precision compile
+/// test. Kept next to the constants so a new kernel that is not listed here is
+/// visible in review.
+pub fn all_kernel_sources() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("apply_diagonal", KERNEL_APPLY_DIAGONAL),
+        ("apply_diagonal_pauli_sum", KERNEL_APPLY_DIAGONAL_PAULI_SUM),
+        ("apply_diagonal_product", KERNEL_APPLY_DIAGONAL_PRODUCT),
+        ("apply_1q", KERNEL_APPLY_1Q),
+        ("apply_2q", KERNEL_APPLY_2Q),
+        ("inner_product", KERNEL_INNER_PRODUCT),
+        ("pauli_expectation", KERNEL_PAULI_EXPECTATION),
+        ("apply_diagonal_pooled", KERNEL_APPLY_DIAGONAL_POOLED),
+        ("apply_1q_pooled", KERNEL_APPLY_1Q_POOLED),
+        ("apply_2q_pooled", KERNEL_APPLY_2Q_POOLED),
+        ("compute_probabilities", KERNEL_COMPUTE_PROBABILITIES),
+        ("cdf_scan", KERNEL_CDF_SCAN),
+        ("sample_from_cdf", KERNEL_SAMPLE_FROM_CDF),
+        ("compute_residual_coeffs", KERNEL_COMPUTE_RESIDUAL_COEFFS),
+        ("apply_1q_from_to_pooled", KERNEL_APPLY_1Q_FROM_TO_POOLED),
+        ("apply_2q_pooled_dual", KERNEL_APPLY_2Q_POOLED_DUAL),
+        ("apply_1q_pooled_dual", KERNEL_APPLY_1Q_POOLED_DUAL),
+        ("pauli_z_chain_accumulate", KERNEL_PAULI_Z_CHAIN_ACCUMULATE),
+    ]
+}
+
+/// Open a context on device 0, or `None` when there is no usable device — lets
+/// a device test skip out loud instead of failing on a CPU-only box.
+pub fn compile_probe() -> Option<Arc<CudaContext>> {
+    CudaContext::new(0).ok()
+}
+
+/// The two kernel sources the f64 forward path needs.
+pub fn source_apply_1q() -> &'static str {
+    KERNEL_APPLY_1Q
+}
+pub fn source_apply_2q() -> &'static str {
+    KERNEL_APPLY_2Q
+}
+
+/// Compile one source at one precision and hand back the module plus the named
+/// function. The module must be kept alive by the caller.
+pub fn try_compile_module(
+    ctx: &Arc<CudaContext>,
+    source: &str,
+    function_name: &'static str,
+    prec: Precision,
+) -> Result<(Arc<CudaModule>, CudaFunction), CudaError> {
+    load_kernel_prec(ctx, source, function_name, prec)
+}
+
+/// Compile one source at one precision, discarding the module. Used by the
+/// dual-precision test.
+pub fn try_compile(
+    ctx: &Arc<CudaContext>,
+    source: &str,
+    label: &'static str,
+    prec: Precision,
+) -> Result<(), CudaError> {
+    let source = prefix_prelude(source);
+    let opts = CompileOptions {
+        arch: Some(nvrtc_arch(ctx)?),
+        name: Some(label.to_string()),
+        options: prec.defines().iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    compile_ptx_with_opts(&source, opts)
+        .map(|_| ())
+        .map_err(|e| CudaError::KernelCompile {
+            kernel: label,
+            reason: format!("nvrtc ({}): {e:?}", prec.as_str()),
+        })
+}
+
+/// Prepend the precision prelude. Done by concatenation rather than `#include`
+/// because NVRTC has no filesystem to include from.
+fn prefix_prelude(source: &str) -> String {
+    format!("{PRELUDE}\n{source}")
+}
+
 fn load_kernel(
     ctx: &Arc<CudaContext>,
     source: &str,
     function_name: &'static str,
 ) -> Result<(Arc<CudaModule>, CudaFunction), CudaError> {
+    load_kernel_prec(ctx, source, function_name, Precision::default())
+}
+
+fn load_kernel_prec(
+    ctx: &Arc<CudaContext>,
+    source: &str,
+    function_name: &'static str,
+    prec: Precision,
+) -> Result<(Arc<CudaModule>, CudaFunction), CudaError> {
+    let source = &prefix_prelude(source);
     let opts = CompileOptions {
         arch: Some(nvrtc_arch(ctx)?),
         name: Some(function_name.to_string()),
+        options: prec.defines().iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
     let ptx = compile_ptx_with_opts(source, opts).map_err(|e| CudaError::KernelCompile {
@@ -375,9 +518,21 @@ fn load_kernel_multi(
     label: &'static str,
     function_names: &[&'static str],
 ) -> Result<(Arc<CudaModule>, Vec<CudaFunction>), CudaError> {
+    load_kernel_multi_prec(ctx, source, label, function_names, Precision::default())
+}
+
+fn load_kernel_multi_prec(
+    ctx: &Arc<CudaContext>,
+    source: &str,
+    label: &'static str,
+    function_names: &[&'static str],
+    prec: Precision,
+) -> Result<(Arc<CudaModule>, Vec<CudaFunction>), CudaError> {
+    let source = &prefix_prelude(source);
     let opts = CompileOptions {
         arch: Some(nvrtc_arch(ctx)?),
         name: Some(label.to_string()),
+        options: prec.defines().iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
     let ptx = compile_ptx_with_opts(source, opts).map_err(|e| CudaError::KernelCompile {

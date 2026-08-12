@@ -1,6 +1,6 @@
 // Per-amplitude probability kernel.
 //
-// Reads the interleaved float2 statevector and writes the
+// Reads the interleaved real2 statevector and writes the
 // per-amplitude squared magnitude to a parallel f32 array. Used by
 // the shot-sampling path so the host pulls 1×dim f32s instead of
 // 2×dim f32s (the full statevector). At n=20 that's 4 MB vs 8 MB
@@ -24,13 +24,13 @@
 extern "C" {
 
 __global__ void compute_probabilities(
-    const float2* state,
-    float* probs,
+    const real2* state,
+    real* probs,
     unsigned long long dim
 ) {
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (gid >= dim) { return; }
-    float2 amp = state[gid];
+    real2 amp = state[gid];
     probs[gid] = amp.x * amp.x + amp.y * amp.y;
 }
 

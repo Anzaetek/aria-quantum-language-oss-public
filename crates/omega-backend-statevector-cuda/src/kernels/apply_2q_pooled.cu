@@ -9,24 +9,24 @@ extern "C" {
 struct Apply2qParams {
     unsigned int qa;
     unsigned int qb;
-    float u[32];
+    real u[32];
 };
 
-__device__ inline float2 cmul(float2 a, float2 b) {
-    return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+__device__ inline real2 cmul(real2 a, real2 b) {
+    return make_real2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-__device__ inline float2 cadd(float2 a, float2 b) {
-    return make_float2(a.x + b.x, a.y + b.y);
+__device__ inline real2 cadd(real2 a, real2 b) {
+    return make_real2(a.x + b.x, a.y + b.y);
 }
 
-__device__ inline float2 ucell_pooled(const Apply2qParams& p, unsigned int r, unsigned int c) {
+__device__ inline real2 ucell_pooled(const Apply2qParams& p, unsigned int r, unsigned int c) {
     unsigned int k = r * 4u + c;
-    return make_float2(p.u[2u * k], p.u[2u * k + 1u]);
+    return make_real2(p.u[2u * k], p.u[2u * k + 1u]);
 }
 
 __global__ void apply_2q_pooled(
-    float2* state,
+    real2* state,
     const Apply2qParams* pool,
     unsigned int slot,
     unsigned long long quads
@@ -55,15 +55,15 @@ __global__ void apply_2q_pooled(
     unsigned long long i10 = i00 | mask_b;
     unsigned long long i11 = i00 | mask_a | mask_b;
 
-    float2 v[4];
+    real2 v[4];
     v[0] = state[i00];
     v[1] = state[i01];
     v[2] = state[i10];
     v[3] = state[i11];
 
-    float2 o[4];
+    real2 o[4];
     for (unsigned int r = 0u; r < 4u; r++) {
-        float2 acc = make_float2(0.0f, 0.0f);
+        real2 acc = make_real2(0.0, 0.0);
         for (unsigned int c = 0u; c < 4u; c++) {
             acc = cadd(acc, cmul(ucell_pooled(params, r, c), v[c]));
         }
