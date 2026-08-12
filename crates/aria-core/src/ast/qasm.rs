@@ -170,6 +170,27 @@ pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
         }
 
         if let Some((clbit, value)) = &inst.condition {
+            // QASM 2.0: `if (creg == N) qop;` where a *qop* is a gate
+            // application, a measurement, or a reset. `barrier` is NOT one.
+            //
+            // Measured against Qiskit 2.5.1: `if (c==1) barrier q;` is
+            // REJECTED with "needed a gate application, measurement or reset",
+            // while guarded gate / reset / measure are all accepted. Our own
+            // pest grammar happens to admit it — `barrier q` parses as a gate
+            // application — so a round-trip through omega-parser alone would
+            // NOT have caught this. The export exists for interchange, so the
+            // consumer that matters is the other toolchain.
+            if inst.gate.kind == GateKind::Barrier {
+                return Err(format!(
+                    "cannot export a conditioned `barrier` to OpenQASM 2.0: `if` \
+                     takes a gate application, measurement or reset, and a barrier \
+                     is none of those (Qiskit rejects `if ({} == {}) barrier ...;`). \
+                     A barrier is a scheduling hint with no classical semantics — \
+                     drop the guard, or express the intent with a guarded gate.",
+                    clbit.register, value
+                ));
+            }
+
             let reg = circuit
                 .registers
                 .iter()
