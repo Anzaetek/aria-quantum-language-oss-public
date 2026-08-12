@@ -272,8 +272,12 @@ if [ "${ARIA_TCH:-1}" = "1" ]; then
   fi
   if [ -n "${LIBTORCH:-}" ] && [ -f "${LIBTORCH}/build-version" ]; then
     # Apple clang >= 21 rejects libtorch 2.7's std::is_arithmetic specialization
-    # (c10/util/strong_type.h); demote it or torch-sys will not compile.
-    export CXXFLAGS="${CXXFLAGS:--std=gnu++17 -Wno-invalid-specialization -Wno-error=invalid-specialization}"
+    # (c10/util/strong_type.h); demote it or torch-sys will not compile. macOS
+    # ONLY: GCC has no `-Winvalid-specialization` and hard-errors on the
+    # `-Wno-error=` form, so applying it everywhere breaks every GCC host.
+    if [ "$(uname -s)" = "Darwin" ]; then
+      export CXXFLAGS="${CXXFLAGS:--std=gnu++17 -Wno-invalid-specialization -Wno-error=invalid-specialization}"
+    fi
     # Any value of LIBTORCH_USE_PYTORCH makes torch-sys hunt for a pip torch.
     unset LIBTORCH_USE_PYTORCH || true
     # macOS SIP strips DYLD_* when exec'ing a protected binary, and this script
@@ -290,6 +294,12 @@ if [ "${ARIA_TCH:-1}" = "1" ]; then
       cargo test -p aria-runtime --features tch --test run_examples tch_backend \
         -- --test-threads=1
     echo "  OK: tch statevector matches CPU (libtorch $(cat "$LIBTORCH/build-version"))"
+  else
+    # Register the skip. Every other optional stage reports itself in the final
+    # summary; this one used to print SKIP inline and then vanish from it, so a
+    # run with no libtorch ended "All CI stages that ran passed" listing only
+    # Metal/OpenCL/Lean — the exact erosion the summary exists to prevent.
+    skipped "tch backend — no usable libtorch (see INSTALL_LIBTORCH.md)"
   fi
 else
   echo

@@ -40,6 +40,50 @@ case "$uname_s/$uname_m" in
     ;;
 esac
 
+# ---- 0b. Linux/aarch64: take libtorch from the pip wheel ----
+#
+# pytorch.org publishes no prebuilt C++ dist for Linux/aarch64, but the pip
+# `torch` wheel for this arch SHIPS the same libtorch — `lib/` and `include/`
+# in the package directory — at the same version. So an ARM Linux box (Grace,
+# GB10, Jetson, Ampere) does not need to build libtorch from source: install
+# the pinned wheel into a throwaway venv and point LIBTORCH at it.
+#
+# Two wrinkles the plain layout does not have, both handled here:
+#   * the wheel has no `build-version`; we write one, so the idempotency check
+#     above and ci.sh's `[ -f "$LIBTORCH/build-version" ]` both work,
+#   * the bundled OpenBLAS lives in a SIBLING `torch.libs/` and needs its
+#     `libgfortran` from there, which the linker will not find on its own —
+#     hence the extra -L and -rpath in the env file below. Without them the
+#     link fails with `undefined reference to _gfortran_concat_string`.
+LIBTORCH_PIP_SITE=""
+if [ -z "$LIBTORCH_URL" ] && [ "$uname_s/$uname_m" = "Linux/aarch64" ] && \
+   [ ! -f "$LIBTORCH_DIR/build-version" ]; then
+  TORCH_VENV="${ARIA_TORCH_VENV:-$REPO_DIR/.venv-libtorch}"
+  echo "==> Linux/aarch64: no C++ dist upstream; using the pip torch wheel"
+  if [ ! -x "$TORCH_VENV/bin/python" ]; then
+    # uv resolves aarch64 wheels directly; plain pip may try source builds.
+    if command -v uv >/dev/null 2>&1; then
+      uv venv "$TORCH_VENV"
+      uv pip install --python "$TORCH_VENV/bin/python" "torch==$LIBTORCH_VERSION"
+    else
+      python3 -m venv "$TORCH_VENV"
+      "$TORCH_VENV/bin/pip" install -q --upgrade pip
+      "$TORCH_VENV/bin/pip" install -q "torch==$LIBTORCH_VERSION"
+    fi
+  fi
+  pip_torch="$("$TORCH_VENV/bin/python" -c \
+    'import torch,os;print(os.path.dirname(torch.__file__))' 2>/dev/null || true)"
+  if [ -z "$pip_torch" ] || [ ! -d "$pip_torch/lib" ] || [ ! -d "$pip_torch/include" ]; then
+    echo "ERROR: pip torch==$LIBTORCH_VERSION did not yield a usable libtorch." >&2
+    echo "  looked in: $TORCH_VENV" >&2
+    exit 1
+  fi
+  LIBTORCH_DIR="$pip_torch"
+  LIBTORCH_PIP_SITE="$(dirname "$pip_torch")"
+  printf '%s' "$LIBTORCH_VERSION" > "$LIBTORCH_DIR/build-version"
+  echo "==> libtorch $LIBTORCH_VERSION from the wheel at $LIBTORCH_DIR"
+fi
+
 echo "==> libtorch dir : $LIBTORCH_DIR"
 echo "==> repo         : $REPO_DIR"
 
@@ -65,15 +109,36 @@ else
   exit 1
 fi
 
+# Apple clang >= 21 forbids libtorch 2.7's std::is_arithmetic specialization
+# (c10/util/strong_type.h), so that diagnostic has to be demoted — but ONLY on
+# macOS. GCC has no `-Winvalid-specialization`, and it does not ignore the
+# unknown flag: `cc1plus: error: '-Wno-error=invalid-specialization': no option
+# '-Winvalid-specialization'` is a hard error, so exporting these
+# unconditionally makes torch-sys fail to build on every GCC host.
+# Kept non-empty on Linux so ci.sh's `${CXXFLAGS:-<apple flags>}` fallback does
+# not reintroduce them.
+case "$uname_s" in
+  Darwin) TCH_CXXFLAGS="-std=gnu++17 -Wno-invalid-specialization -Wno-error=invalid-specialization" ;;
+  *)      TCH_CXXFLAGS="-std=gnu++17" ;;
+esac
+
+# The wheel route needs the sibling `torch.libs/` on both the link path and the
+# rpath (see 0b). Empty for a normal C++ dist, so the env file is unchanged there.
+PIP_LINK_FLAGS=""
+if [ -n "$LIBTORCH_PIP_SITE" ]; then
+  PIP_LINK_FLAGS="-L native=$LIBTORCH_PIP_SITE/torch.libs \
+-C link-arg=-Wl,-rpath,$LIBTORCH_DIR/lib \
+-C link-arg=-Wl,-rpath,$LIBTORCH_PIP_SITE/torch.libs"
+fi
+
 # ---- 2. write the env file to source later ----
 cat > "$ENV_FILE" <<EOF
 # Source before building the Aria tch backend:  source ./tch-env.sh
 export LIBTORCH="$LIBTORCH_DIR"
 export DYLD_LIBRARY_PATH="\$LIBTORCH/lib:\${DYLD_LIBRARY_PATH:-}"  # macOS
-export LD_LIBRARY_PATH="\$LIBTORCH/lib:\${LD_LIBRARY_PATH:-}"      # Linux
-# Apple clang >=21 forbids libtorch 2.7's std::is_arithmetic specialization;
-# demote that diagnostic so torch-sys compiles (see INSTALL_LIBTORCH.md).
-export CXXFLAGS="-std=gnu++17 -Wno-invalid-specialization -Wno-error=invalid-specialization"
+export LD_LIBRARY_PATH="\$LIBTORCH/lib:${LIBTORCH_PIP_SITE:+$LIBTORCH_PIP_SITE/torch.libs:}\${LD_LIBRARY_PATH:-}"      # Linux
+${PIP_LINK_FLAGS:+export RUSTFLAGS=\"$PIP_LINK_FLAGS \${RUSTFLAGS:-}\"}
+export CXXFLAGS="$TCH_CXXFLAGS"
 unset LIBTORCH_USE_PYTORCH   # any value makes torch-sys hunt for a pip torch
 EOF
 echo "==> wrote env file: $ENV_FILE  (source it in future shells)"
@@ -81,8 +146,9 @@ echo "==> wrote env file: $ENV_FILE  (source it in future shells)"
 # ---- 3. set the env for this script's own builds ----
 export LIBTORCH="$LIBTORCH_DIR"
 export DYLD_LIBRARY_PATH="$LIBTORCH/lib:${DYLD_LIBRARY_PATH:-}"
-export LD_LIBRARY_PATH="$LIBTORCH/lib:${LD_LIBRARY_PATH:-}"
-export CXXFLAGS="-std=gnu++17 -Wno-invalid-specialization -Wno-error=invalid-specialization"
+export LD_LIBRARY_PATH="$LIBTORCH/lib:${LIBTORCH_PIP_SITE:+$LIBTORCH_PIP_SITE/torch.libs:}${LD_LIBRARY_PATH:-}"
+[ -n "$PIP_LINK_FLAGS" ] && export RUSTFLAGS="$PIP_LINK_FLAGS ${RUSTFLAGS:-}"
+export CXXFLAGS="$TCH_CXXFLAGS"
 unset LIBTORCH_USE_PYTORCH || true
 
 # ---- 4. build ----
