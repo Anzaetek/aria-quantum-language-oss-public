@@ -107,3 +107,57 @@ steps rather than failing the run). So none of the above is a prerequisite for
 `./ci.sh` — it is the manual path. `ARIA_TCH=0 ./ci.sh` skips the stage.
 
 See `TESTING.md` §11 for the same steps in the manual testing manual.
+
+## 4. GPU (CUDA) — run `--backend tch` on an NVIDIA device
+
+CPU is the default. To run tch on the GPU, install a **CUDA** libtorch and let
+the runtime pick the device:
+
+```console
+$ ARIA_TCH_CUDA=1 ARIA_TCH_CUDA_VER=cu128 tools/setup-libtorch.sh
+```
+
+- `ARIA_TCH_CUDA_VER` selects the CUDA build pytorch publishes for the pin
+  (`cu118` / `cu126` / `cu128`); it must match your driver. **Blackwell (sm_120,
+  e.g. RTX PRO 6000) and Hopper (H100) → `cu128`.** x86_64 downloads the
+  `+cuXXX -with-deps` dist (bundles the CUDA runtime); aarch64 (Grace/GB10) pulls
+  the CUDA `torch` wheel from `download.pytorch.org/whl/cuXXX`.
+- `crates/aria-runtime/src/run.rs` `make_tch()` calls `TchBackend::cuda_or_cpu()`
+  — GPU if `tch::Cuda::is_available()`, else CPU (so a CPU-only libtorch is
+  unchanged). CUDA keeps `Kind::Double`, so numerics match the CPU path.
+  `ARIA_TCH_CPU=1` forces CPU on a CUDA libtorch.
+
+### Gotcha: the linker drops `libtorch_cuda` (the reason "CUDA present but unused")
+
+`torch-sys` emits `-ltorch_cuda`, but the linker's default `--as-needed` **drops
+it** because no Rust symbol references it directly — so `libtorch_cuda.so` never
+lands in the binary's `DT_NEEDED`, the CUDA backend never registers, and
+`tch::Cuda::is_available()` is **false even with a CUDA dist and a working
+driver**. `tools/setup-libtorch.sh` fixes this automatically (when it sees
+`libtorch_cuda.so` in the dist) by adding to `RUSTFLAGS`:
+
+```
+-C link-arg=-Wl,--no-as-needed -C link-arg=-L$LIBTORCH/lib \
+-C link-arg=-ltorch_cuda -C link-arg=-lc10_cuda
+```
+
+appended **after** the flag so link order retains both libs. The recipe's CUDA
+verify gate runs `crates/aria-backend-tch/tests/gpu_probe.rs` with
+`ARIA_EXPECT_CUDA=1`, so a dropped `libtorch_cuda` is a hard failure, not a
+silent CPU fallback.
+
+### Tested matrix (build + `libtorch_cuda` retained in `NEEDED`; ✱ = real GPU op)
+
+| Environment | GCC | Result |
+|---|---|---|
+| Host: Ubuntu 24.04, RTX PRO 6000 Blackwell, `cu128`, driver 580 | 13.3 | GPU gate + VQE ✱ |
+| `ubuntu:22.04` container | 11 | build + link ✓ |
+| `ubuntu:24.04` container, GPU device-bind | 13 | `is_available`=true, GPU op ✱ |
+| `ubuntu:26.04` container | 15.2 | build + link ✓ |
+
+GPU-in-container passthrough on this host uses **device-bind, not CDI** (no
+`/etc/cdi` here): `--device /dev/nvidia0 --device /dev/nvidiactl --device
+/dev/nvidia-uvm --device /dev/nvidia-uvm-tools --security-opt=label=disable`,
+plus bind-mounting the host driver libs (`libcuda.so.<drv>`,
+`libnvidia-ptxjitcompiler.so.<drv>`) and recreating their `.so.1` symlinks. The
+CUDA *runtime* (cudart/cuDNN/cuBLAS) rides along inside the libtorch dist.
