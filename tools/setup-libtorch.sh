@@ -48,9 +48,16 @@ esac
 # libtorch makes `--backend tch` run on the GPU via TchBackend::cuda_or_cpu().
 # NOTE: the correct cuXXX for a given box (esp. the DGX Spark / GB10) is not
 # verified here — set ARIA_TCH_CUDA_VER to match the target's driver.
+# WANT_LOCAL is the build-version local tag an already-present install MUST have
+# for the idempotency shortcut to reuse it. Empty (default/CPU) accepts any
+# matching-base dist; `cuXXX` (ARIA_TCH_CUDA=1) forces a re-provision when the
+# box currently holds a `+cpu` dist — otherwise a CPU->CUDA switch silently keeps
+# CPU, since the base version (2.7.0) matches either way.
 TORCH_PIP_INDEX=""
+WANT_LOCAL=""
 if [ "${ARIA_TCH_CUDA:-0}" = "1" ]; then
   CUDA_VER="${ARIA_TCH_CUDA_VER:-cu128}"
+  WANT_LOCAL="$CUDA_VER"
   case "$uname_s/$uname_m" in
     Linux/x86_64)
       LIBTORCH_URL="https://download.pytorch.org/libtorch/${CUDA_VER}/libtorch-cxx11-abi-shared-with-deps-${LIBTORCH_VERSION}%2B${CUDA_VER}.zip"
@@ -90,13 +97,17 @@ if [ -z "$LIBTORCH_URL" ] && [ "$uname_s/$uname_m" = "Linux/aarch64" ] && \
   echo "==> Linux/aarch64: no C++ dist upstream; using the pip torch wheel"
   if [ ! -x "$TORCH_VENV/bin/python" ]; then
     # uv resolves aarch64 wheels directly; plain pip may try source builds.
+    # $TORCH_PIP_INDEX (unquoted, may be empty) points at the CUDA sbsa index
+    # under ARIA_TCH_CUDA=1; empty → the default PyPI (CPU) wheel.
     if command -v uv >/dev/null 2>&1; then
       uv venv "$TORCH_VENV"
-      uv pip install --python "$TORCH_VENV/bin/python" "torch==$LIBTORCH_VERSION"
+      # shellcheck disable=SC2086
+      uv pip install --python "$TORCH_VENV/bin/python" $TORCH_PIP_INDEX "torch==$LIBTORCH_VERSION"
     else
       python3 -m venv "$TORCH_VENV"
       "$TORCH_VENV/bin/pip" install -q --upgrade pip
-      "$TORCH_VENV/bin/pip" install -q "torch==$LIBTORCH_VERSION"
+      # shellcheck disable=SC2086
+      "$TORCH_VENV/bin/pip" install -q $TORCH_PIP_INDEX "torch==$LIBTORCH_VERSION"
     fi
   fi
   # Probe the wheel's dir AND real version in one call. Capture stderr: a failed
@@ -125,6 +136,17 @@ if [ -z "$LIBTORCH_URL" ] && [ "$uname_s/$uname_m" = "Linux/aarch64" ] && \
     echo "  remove the venv and retry:  rm -rf \"$TORCH_VENV\"" >&2
     exit 1
   fi
+  # Variant guard (CPU<->CUDA switch on aarch64): the venv-exists gate above
+  # skips reinstall, so an existing CPU venv would be trusted under
+  # ARIA_TCH_CUDA=1. Fail loudly rather than silently keep CPU; removing the venv
+  # forces a reinstall from the requested cuXXX index. Not auto-removed — the
+  # venv may be a user-supplied ARIA_TORCH_VENV.
+  pip_local="${pip_ver#*+}"; [ "$pip_local" = "$pip_ver" ] && pip_local=""
+  if [ -n "$WANT_LOCAL" ] && [ "$pip_local" != "$WANT_LOCAL" ]; then
+    echo "ERROR: $TORCH_VENV has torch '$pip_ver' but ARIA_TCH_CUDA wants '$WANT_LOCAL'." >&2
+    echo "  remove the venv and retry:  rm -rf \"$TORCH_VENV\"" >&2
+    exit 1
+  fi
   LIBTORCH_DIR="$pip_torch"
   LIBTORCH_PIP_SITE="$(dirname "$pip_torch")"
   printf '%s' "$pip_ver" > "$LIBTORCH_DIR/build-version"
@@ -144,9 +166,19 @@ echo "==> repo         : $REPO_DIR"
 # compare only the part before `+` — otherwise the exact-match check re-downloads
 # forever and the post-download gate below hard-exits on a correct install.
 have_ver="$(cat "$LIBTORCH_DIR/build-version" 2>/dev/null || echo '')"
+# The local-version tag of the present install ("" if none, else cpu / cuXXX).
+have_local="${have_ver#*+}"; [ "$have_local" = "$have_ver" ] && have_local=""
+# Reuse only when the base matches AND (no specific variant wanted, OR the
+# present variant is the wanted one). WANT_LOCAL=cuXXX therefore does NOT reuse a
+# `+cpu` install, so control falls to the download branch (which rm's and
+# re-fetches the CUDA dist) — the CPU->CUDA switch that used to silently no-op.
+if [ -n "$WANT_LOCAL" ] && [ -n "$have_ver" ] && [ "$have_local" != "$WANT_LOCAL" ]; then
+  echo "==> present libtorch is '$have_ver' but '$WANT_LOCAL' requested — re-provisioning"
+fi
 if [ -f "$LIBTORCH_DIR/build-version" ] && \
-   [ "${have_ver%%+*}" = "$LIBTORCH_VERSION" ]; then
-  echo "==> libtorch $LIBTORCH_VERSION already present — skipping download"
+   [ "${have_ver%%+*}" = "$LIBTORCH_VERSION" ] && \
+   { [ -z "$WANT_LOCAL" ] || [ "$have_local" = "$WANT_LOCAL" ]; }; then
+  echo "==> libtorch $have_ver already present — skipping download"
 elif [ -n "$LIBTORCH_URL" ]; then
   echo "==> downloading libtorch $LIBTORCH_VERSION (~67 MB)..."
   tmp="$(mktemp -d)"
