@@ -250,6 +250,9 @@ fn apply_op_dagger(
 
         GateKind::S => state.apply_sdg(q0),
         GateKind::Sdg => state.apply_s(q0),
+        // (√X)† = √X† and vice versa.
+        GateKind::Sx => state.apply_1q(q0, &gates::sxdg()),
+        GateKind::Sxdg => state.apply_1q(q0, &gates::sx()),
         GateKind::T => state.apply_tdg(q0),
         GateKind::Tdg => state.apply_t(q0),
 

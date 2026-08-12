@@ -1245,6 +1245,11 @@ pub(crate) fn apply_op(
         GateKind::Z => state.apply_z(q0()),
         GateKind::S => state.apply_s(q0()),
         GateKind::Sdg => state.apply_sdg(q0()),
+        // √X / √X† are non-diagonal Cliffords; apply the exact Qiskit matrix
+        // (the CPU sim uses the same `gates::sx`/`sxdg`), not the U3 alias that
+        // differs by a global e^{iπ/4}.
+        GateKind::Sx => state.apply_1q(q0(), &omega_backend_statevector::gates::sx()),
+        GateKind::Sxdg => state.apply_1q(q0(), &omega_backend_statevector::gates::sxdg()),
         GateKind::T => state.apply_t(q0()),
         GateKind::Tdg => state.apply_tdg(q0()),
 
@@ -1939,7 +1944,7 @@ mod tests {
     #[test]
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     fn reset_channel_matches_aer_ground_truth() {
-        use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
+        use omega_core::circuit::{CircuitType, GateOp, Qubit};
         const SHOTS: u32 = 4000;
         const BAND: u32 = 250;
 
