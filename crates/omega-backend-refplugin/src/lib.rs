@@ -345,7 +345,7 @@ mod tests {
         let ffi = run(&circuit, &config).unwrap();
         assert_eq!(ffi.result_type, FfiResultType::Counts);
         let entries = ffi.num_entries as usize;
-        assert!(entries >= 1 && entries <= 2);
+        assert!((1..=2).contains(&entries));
         let bitstrings = unsafe { std::slice::from_raw_parts(ffi.bitstrings, entries) };
         for &bs in bitstrings {
             assert!(bs == 0b00 || bs == 0b11, "unexpected basis state {bs:#b}");

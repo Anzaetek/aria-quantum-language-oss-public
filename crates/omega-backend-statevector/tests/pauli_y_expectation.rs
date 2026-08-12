@@ -12,7 +12,6 @@ use omega_backend_statevector::StatevectorBackend;
 use omega_core::circuit::*;
 use omega_core::executor::*;
 use omega_core::params::ParameterBinding;
-use smallvec::smallvec;
 
 fn gate(kind: GateKind, qubits: &[u32], params: &[ParamExpr]) -> GateOp {
     GateOp {

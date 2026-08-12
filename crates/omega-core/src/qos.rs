@@ -370,7 +370,7 @@ mod tests {
         // Property over random data vectors and random φ: the fitted convergence
         // exponent stays ≈ −2 (infidelity ~ 1/N²) — not just the 3 fixed kinds.
         let mut s = 0xF00D_2024u64;
-        let mut lcg = |st: &mut u64| {
+        let lcg = |st: &mut u64| {
             *st = st
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
@@ -426,8 +426,8 @@ mod tests {
         for r in 0..n2 {
             for c in 0..n2 {
                 let mut acc = Complex64::new(0.0, 0.0);
-                for k in 0..n2 {
-                    acc += u[r][k] * u[c][k].conj();
+                for (urk, uck) in u[r].iter().zip(u[c].iter()) {
+                    acc += urk * uck.conj();
                 }
                 let expect = if r == c { 1.0 } else { 0.0 };
                 worst = worst.max((acc - Complex64::new(expect, 0.0)).norm());

@@ -80,8 +80,8 @@ fn gram_schmidt_unitary(m: usize, seed: u64) -> Vec<Vec<Complex64>> {
         for j in 0..i {
             // proj = <col_j, col_i>
             let mut dot = c(0.0, 0.0);
-            for k in 0..m {
-                dot += cols[j][k].conj() * cols[i][k];
+            for (cj, ci) in cols[j].iter().zip(cols[i].iter()) {
+                dot += cj.conj() * ci;
             }
             let sub: Vec<Complex64> = (0..m).map(|k| dot * cols[j][k]).collect();
             for k in 0..m {
@@ -90,8 +90,8 @@ fn gram_schmidt_unitary(m: usize, seed: u64) -> Vec<Vec<Complex64>> {
         }
         let n: f64 = cols[i].iter().map(|v| v.norm_sqr()).sum::<f64>().sqrt();
         assert!(n > 1e-9, "degenerate random column; change the seed");
-        for k in 0..m {
-            cols[i][k] /= n;
+        for v in cols[i].iter_mut() {
+            *v /= n;
         }
     }
 
@@ -113,8 +113,8 @@ fn assert_unitary(u: &[Vec<Complex64>], what: &str) {
     for i in 0..m {
         for j in 0..m {
             let mut dot = c(0.0, 0.0);
-            for k in 0..m {
-                dot += u[k][i].conj() * u[k][j];
+            for row in u.iter().take(m) {
+                dot += row[i].conj() * row[j];
             }
             let want = if i == j { 1.0 } else { 0.0 };
             assert!(

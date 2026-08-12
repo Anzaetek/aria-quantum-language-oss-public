@@ -8,8 +8,11 @@
 
 use aria_core::ast::parse_aria;
 
-/// (file, circuit name, instantiation params). Keep alphabetical.
-const EXAMPLES: &[(&str, &str, &[(&str, i64)])] = &[
+/// (file, circuit name, instantiation params).
+type Example<'a> = (&'a str, &'a str, &'a [(&'a str, i64)]);
+
+/// Keep alphabetical.
+const EXAMPLES: &[Example<'static>] = &[
     ("bell.aria", "Bell", &[]),
     ("butterfly_qnn.aria", "ButterflyQNN", &[]),
     ("ghz.aria", "GHZ", &[]),

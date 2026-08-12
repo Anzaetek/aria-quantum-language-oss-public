@@ -102,9 +102,9 @@ fn the_same_circuit_without_the_guard_is_accepted() {
 /// A gap of **1.0 on an observable bounded in [−1, +1]**. Note that is the
 /// largest error attainable *given the correct answer is 0*: the old value sat
 /// at one endpoint of the range while the truth sat at its centre. (An earlier
-/// draft of this test called it "wrong by a full sign" and asserted a gap
-/// > 1.5, which is impossible here and simply failed — the phrase described a
-/// +1 → −1 swing that does not occur on this circuit.)
+/// draft of this test called it "wrong by a full sign" and asserted a
+/// gap > 1.5, which is impossible here and simply failed — the phrase
+/// described a +1 → −1 swing that does not occur on this circuit.)
 ///
 /// The "correct" value comes from `StatevectorBackend`, not from arithmetic in
 /// this file: a hand-computed expected value is a second implementation with no
