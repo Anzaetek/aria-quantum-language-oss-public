@@ -187,6 +187,30 @@ if [ -n "$LIBTORCH_PIP_SITE" ]; then
 -C link-arg=-Wl,-rpath,$LIBTORCH_PIP_SITE/torch.libs"
 fi
 
+# ---- CUDA link retention ----
+# torch-sys emits `-ltorch_cuda` but the linker's default --as-needed DROPS it,
+# because no Rust symbol references it directly — so libtorch_cuda.so never lands
+# in the binary's DT_NEEDED and tch::Cuda::is_available() is false even with a
+# CUDA dist and a working driver. Force-retain it: --no-as-needed followed (in
+# link order) by an explicit re-link of torch_cuda + c10_cuda. Keyed on the .so
+# actually being present, so this covers the x86_64 dist AND the aarch64 wheel
+# (same lib names) AND a user-supplied CUDA LIBTORCH — not just ARIA_TCH_CUDA.
+CUDA_LINK_FLAGS=""
+if [ -f "$LIBTORCH_DIR/lib/libtorch_cuda.so" ]; then
+  CUDA_LINK_FLAGS="-C link-arg=-Wl,--no-as-needed -C link-arg=-L$LIBTORCH_DIR/lib \
+-C link-arg=-ltorch_cuda -C link-arg=-lc10_cuda"
+  echo "==> CUDA libtorch detected — forcing torch_cuda into the link (--no-as-needed)"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "    driver: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1)"
+  else
+    echo "    WARN: no nvidia-smi/driver found — the build links CUDA but is_available() will be false at runtime" >&2
+  fi
+  command -v nvcc >/dev/null 2>&1 && echo "    nvcc:   $(nvcc --version | tail -1)"
+fi
+
+# Everything that belongs in RUSTFLAGS, in one place.
+LINK_FLAGS="$(printf '%s %s' "$PIP_LINK_FLAGS" "$CUDA_LINK_FLAGS" | sed -e 's/^ *//' -e 's/ *$//')"
+
 # ---- 2. write the env file to source later ----
 cat > "$ENV_FILE" <<EOF
 # Source before building the Aria tch backend:  source ./tch-env.sh
@@ -197,11 +221,11 @@ export CXXFLAGS="$TCH_CXXFLAGS"
 unset LIBTORCH_USE_PYTORCH   # any value makes torch-sys hunt for a pip torch
 EOF
 # The RUSTFLAGS line is appended OUTSIDE the heredoc: writing shell via
-# `${PIP_LINK_FLAGS:+export RUSTFLAGS=...${RUSTFLAGS:-}}` inside a heredoc
-# mis-nests the braces and emits an unbalanced quote, which aborts every
-# shell that sources the file. Only the pip-wheel (aarch64) route needs it.
-if [ -n "$PIP_LINK_FLAGS" ]; then
-  printf 'export RUSTFLAGS="%s ${RUSTFLAGS:-}"\n' "$PIP_LINK_FLAGS" >> "$ENV_FILE"
+# `${LINK_FLAGS:+export RUSTFLAGS=...${RUSTFLAGS:-}}` inside a heredoc mis-nests
+# the braces and emits an unbalanced quote, which aborts every shell that
+# sources the file. Non-empty for the aarch64 wheel and/or a CUDA dist.
+if [ -n "$LINK_FLAGS" ]; then
+  printf 'export RUSTFLAGS="%s ${RUSTFLAGS:-}"\n' "$LINK_FLAGS" >> "$ENV_FILE"
 fi
 echo "==> wrote env file: $ENV_FILE  (source it in future shells)"
 
@@ -209,7 +233,7 @@ echo "==> wrote env file: $ENV_FILE  (source it in future shells)"
 export LIBTORCH="$LIBTORCH_DIR"
 export DYLD_LIBRARY_PATH="$LIBTORCH/lib:${DYLD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="$LIBTORCH/lib:${LIBTORCH_PIP_SITE:+$LIBTORCH_PIP_SITE/torch.libs:}${LD_LIBRARY_PATH:-}"
-[ -n "$PIP_LINK_FLAGS" ] && export RUSTFLAGS="$PIP_LINK_FLAGS ${RUSTFLAGS:-}"
+[ -n "$LINK_FLAGS" ] && export RUSTFLAGS="$LINK_FLAGS ${RUSTFLAGS:-}"
 export CXXFLAGS="$TCH_CXXFLAGS"
 unset LIBTORCH_USE_PYTORCH || true
 
@@ -220,6 +244,15 @@ cargo build -p aria-runtime --features tch
 
 # ---- 5. verify ----
 if [ "$DO_VERIFY" = 1 ]; then
+  # With a CUDA dist, prove the GPU is actually reached — the numeric gate below
+  # agrees with CPU whether it ran on GPU or silently fell back, so it cannot
+  # catch a dropped libtorch_cuda. gpu_probe asserts is_available() + a real GPU
+  # op. (Excluded crate → its own target dir, so this rebuilds torch-sys once.)
+  if [ -n "$CUDA_LINK_FLAGS" ]; then
+    echo "==> GPU gate: tch::Cuda::is_available() + a device op ..."
+    ARIA_EXPECT_CUDA=1 cargo test --manifest-path crates/aria-backend-tch/Cargo.toml \
+      --test gpu_probe -- --nocapture --test-threads=1
+  fi
   echo "==> numeric gate: tch backend == CPU statevector ..."
   cargo test -p aria-runtime --features tch --test run_examples tch_backend -- --test-threads=1
   echo "==> end-to-end: VQE train on tch (expect final <O> ~ -1.851199) ..."
