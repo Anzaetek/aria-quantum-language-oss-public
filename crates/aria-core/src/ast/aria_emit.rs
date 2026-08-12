@@ -85,7 +85,14 @@ pub fn to_aria_source(circuit: &Circuit, name: &str) -> String {
                 lines.push(format!("    -- barrier {}", qrefs.join(", ")));
             }
             GateKind::Reset => {
-                lines.push(format!("    -- reset {}", inst.qubits[0]));
+                // `apply RESET on q[i]` is SPELLABLE as of the commit that
+                // added it to the gate table — so emitting a `--` comment here
+                // deleted a channel that changes measurement statistics, with
+                // no diagnostic, in the same change that made it writable.
+                //
+                // Aria -> Aria is the export a reader is most likely to assume
+                // is faithful, which makes the silence worse rather than better.
+                lines.push(format!("    apply RESET on {}", inst.qubits[0]));
             }
             kind => {
                 let Some(gate_name) = gate_to_aria(kind) else {
@@ -123,10 +130,28 @@ pub fn to_aria_source(circuit: &Circuit, name: &str) -> String {
         if let Some((clbit, value)) = &inst.condition {
             for line in lines.iter_mut().skip(emitted_from) {
                 let body = line.trim_start();
-                *line = format!(
-                    "    when {}[{}] == {} {{ {} }}",
-                    clbit.register, clbit.index, value, body
-                );
+                // A `--` comment runs to END OF LINE, so wrapping one in
+                // `when … { … }` comments out the closing brace and the file
+                // no longer parses. The previous version did exactly that and
+                // claimed in a code comment that "the comment is what
+                // round-trips" — reasoning, not measurement, and false.
+                //
+                // Fold the guard INTO the comment instead: it stays readable
+                // and the brace structure is untouched.
+                if body.starts_with("--") {
+                    *line = format!(
+                        "    -- when {}[{}] == {}: {}",
+                        clbit.register,
+                        clbit.index,
+                        value,
+                        body.trim_start_matches("--").trim_start()
+                    );
+                } else {
+                    *line = format!(
+                        "    when {}[{}] == {} {{ {} }}",
+                        clbit.register, clbit.index, value, body
+                    );
+                }
             }
         }
     }
