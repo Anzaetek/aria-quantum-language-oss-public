@@ -400,7 +400,17 @@ if [ "${ARIA_NWAY:-0}" = "1" ]; then
   # qiskit_runner.py, so it does.
   cargo test -p omega-cli --features bridge-qiskit \
     --test nway_expectation -- --nocapture
-  echo "  OK: in-tree engines agree with Qiskit on counts (derived gate) and expectations (1e-12)"
+  # `dropped_mass` as a BOUND, not a printed number: |E_trunc - E_exact| must
+  # be <= the reported budget, swept across coeff_min. Needs the Qiskit anchor
+  # for E_exact, and needs a TRUNCATED backend — PauliPropBackend::new() has
+  # truncation off, so the assertions would otherwise hold vacuously.
+  cargo test -p omega-cli --features bridge-qiskit \
+    --test pauliprop_truncation_bound -- --nocapture
+  # ppvm's PauliSum as the SAME-ALGORITHM anchor for pauliprop. Qiskit catches
+  # arithmetic errors; ppvm catches a shared misunderstanding of the method.
+  cargo test -p omega-bridges --features bridge-qiskit,bridge-ppvm \
+    --test ppvm_expectation -- --nocapture
+  echo "  OK: counts (derived gate), expectations (1e-12), truncation bound, ppvm same-algorithm anchor"
 else
   skipped "N-way counts matrix — set ARIA_NWAY=1 with the qiskit venv"
 fi

@@ -237,6 +237,11 @@ pub fn expectation_qasm2(
 ) -> Result<Vec<f64>, BridgeError> {
     match backend {
         Backend::Qiskit => qiskit::expectation(qasm, observables),
+        // ppvm takes no truncation here; `expectation_qasm2_truncated` is the
+        // entry point for that. Keeping the common call simple means a caller
+        // cannot silently get a truncated answer when they asked for an exact
+        // one.
+        Backend::Ppvm => ppvm::expectation(qasm, observables, None),
         other => Err(BridgeError::CannotExpress(
             other,
             format!(

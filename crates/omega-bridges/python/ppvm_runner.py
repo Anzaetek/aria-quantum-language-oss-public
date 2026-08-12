@@ -106,6 +106,8 @@ def main() -> int:
         # can never drift from the converter.
         _emit({"ok": True, "gates": sorted(GATE_SETS["ppvm"])})
         return 0
+    if mode == "expectation":
+        return _expectation(req)
     if mode != "execute":
         _err(f"unknown mode {mode!r}", kind="bad-request")
         return 0
@@ -198,6 +200,154 @@ def main() -> int:
         return 0
 
     _emit({"ok": True, "counts": counts})
+    return 0
+
+
+# ppvm PauliSum method per QASM2 gate name; angle passed as `theta=`.
+#
+# `t` / `tdg` map to `rz(+-pi/4)`: PauliSum has no T, and T differs from
+# RZ(pi/4) only by a global phase, which an expectation value cannot see. That
+# substitution would be WRONG for a statevector and is exactly right here.
+#
+# ppvm has NATIVE `sqrt_x` / `sqrt_x_dag` — independent confirmation that
+# treating sx/sxdg as first-class Clifford gates, rather than U3 aliases, is
+# the right shape.
+_PS_GATES = {
+    "h": ("h", 0), "x": ("x", 0), "y": ("y", 0), "z": ("z", 0),
+    "s": ("s", 0), "sdg": ("s_dag", 0),
+    "sx": ("sqrt_x", 0), "sxdg": ("sqrt_x_dag", 0),
+    "t": ("rz", "+pi4"), "tdg": ("rz", "-pi4"),
+    "rx": ("rx", 1), "ry": ("ry", 1), "rz": ("rz", 1),
+    "p": ("rz", 1), "u1": ("rz", 1),
+    "cx": ("cx", 0), "cz": ("cz", 0), "cy": ("cy", 0),
+    "id": (None, 0), "barrier": (None, 0),
+}
+
+
+def _expectation(req: dict) -> int:
+    """Exact/truncated expectation values via ppvm's `PauliSum`.
+
+    Request:  {"mode":"expectation","qasm":...,"observables":[[[pauli,coeff],...],...],
+               "min_abs_coeff":float?, "max_pauli_weight":int?}
+    Response: {"ok":true,"values":[...]}
+
+    ppvm's `PauliSum` is Heisenberg propagation with truncation — **the same
+    algorithm family as the in-tree `omega-backend-pauliprop`**, independently
+    implemented. That is the stated reason ppvm is vendored at all
+    (`docs/BRIDGES.md`), and nothing could use it that way until this mode
+    existed, because the counts protocol only reaches ppvm's *other* engine.
+
+    Two conventions that fail SILENTLY if reversed:
+
+    1. **Gates apply in REVERSE circuit order** — correct for Heisenberg
+       conjugation, and wrong with no error if forwards. Measured on
+       `h q0; rz(0.9) q0` with observable X: reverse gives +0.6216099683,
+       matching Qiskit exactly; forward gives +1.0000000000.
+    2. **Pauli strings are LSB-first** (leftmost char = qubit 0), matching
+       `PauliSum.new`, Stim and our wire format — the OPPOSITE of Qiskit's
+       `SparsePauliOp`. The Qiskit runner reverses on its side; this one must
+       not. Verified on `x q[0]`: ppvm `"ZI"` = -1, Qiskit `"IZ"` = -1.
+
+    `min_abs_coeff` / `max_pauli_weight` mirror
+    `PauliPropBackend::with_truncation`, so the truncation behaviour is
+    comparable and not merely the exact result.
+
+    Qiskit is used ONLY to parse QASM2, never to compute. Sharing the parser
+    with the anchor removes "the two sides read the circuit differently" as an
+    explanation for a disagreement.
+    """
+    import math
+
+    qasm = req.get("qasm")
+    obs_in = req.get("observables")
+    if not isinstance(qasm, str) or not qasm.strip():
+        _err("`qasm` must be a non-empty string", kind="bad-request")
+        return 0
+    if not isinstance(obs_in, list) or not obs_in:
+        _err("`observables` must be a non-empty list", kind="bad-request")
+        return 0
+    try:
+        from ppvm import PauliSum
+    except ImportError as e:
+        _err(f"ppvm import failed: {e}", kind="ppvm-not-installed")
+        return 0
+    try:
+        from qiskit import qasm2 as qk
+    except ImportError as e:
+        _err(f"qiskit needed to parse QASM2 for this mode: {e}",
+             kind="ppvm-not-installed")
+        return 0
+    try:
+        circ = qk.loads(qasm, include_path=qk.LEGACY_INCLUDE_PATH,
+                        custom_instructions=qk.LEGACY_CUSTOM_INSTRUCTIONS,
+                        custom_classical=qk.LEGACY_CUSTOM_CLASSICAL, strict=False)
+    except Exception as e:  # noqa: BLE001
+        _err(f"qasm2.loads: {e}", kind="qasm-parse")
+        return 0
+
+    circ.remove_final_measurements(inplace=True)
+    n = circ.num_qubits
+    ops = []
+    for instr in circ.data:
+        name = instr.operation.name
+        if getattr(instr.operation, "condition", None) is not None:
+            _err("expectation is undefined for a classically-conditioned gate: "
+                 "the circuit is a mixture over outcomes, not one unitary",
+                 kind="ppvm-not-supported")
+            return 0
+        if name in ("measure", "reset"):
+            _err(f"mid-circuit `{name}` cannot be represented by conjugation",
+                 kind="ppvm-not-supported")
+            return 0
+        if name not in _PS_GATES:
+            _err(f"ppvm PauliSum has no mapping for gate `{name}`",
+                 kind="ppvm-unsupported-gate")
+            return 0
+        method, arity = _PS_GATES[name]
+        if method is None:
+            continue
+        qubits = [circ.find_bit(q).index for q in instr.qubits]
+        if arity == 1:
+            theta = float(instr.operation.params[0])
+        elif arity == "+pi4":
+            theta = math.pi / 4
+        elif arity == "-pi4":
+            theta = -math.pi / 4
+        else:
+            theta = None
+        ops.append((method, qubits, theta))
+
+    min_abs = req.get("min_abs_coeff")
+    max_w = req.get("max_pauli_weight")
+    values = []
+    for obs in obs_in:
+        try:
+            total = 0.0
+            for term in obs:
+                pauli, coeff = term[0], float(term[1])
+                if (not isinstance(pauli, str) or len(pauli) != n
+                        or set(pauli) - set("IXYZ")):
+                    _err(f"pauli {pauli!r} must be {n} chars over IXYZ "
+                         "(dense, LSB-first)", kind="bad-request")
+                    return 0
+                ps = PauliSum.new(n, [pauli])
+                if min_abs is not None:
+                    ps.min_abs_coeff = float(min_abs)
+                if max_w is not None:
+                    ps.max_pauli_weight = int(max_w)
+                for method, qubits, theta in reversed(ops):   # REVERSED
+                    f = getattr(ps, method)
+                    if theta is None:
+                        f(*qubits)
+                    else:
+                        f(*qubits, theta=theta)
+                total += coeff * float(ps.overlap_with_zero())
+            values.append(total)
+        except Exception as e:  # noqa: BLE001
+            _err(f"ppvm PauliSum: {e}", kind="execute")
+            return 0
+
+    _emit({"ok": True, "values": values})
     return 0
 
 
