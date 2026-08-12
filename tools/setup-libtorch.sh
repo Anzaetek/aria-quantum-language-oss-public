@@ -40,6 +40,34 @@ case "$uname_s/$uname_m" in
     ;;
 esac
 
+# CUDA-enabled libtorch is opt-in: `ARIA_TCH_CUDA=1` (default is CPU, unchanged).
+# The CUDA minor must be one pytorch actually publishes for 2.7.0 — cu118 /
+# cu126 / cu128 — via `ARIA_TCH_CUDA_VER` (default cu128). torch-sys auto-detects
+# CUDA from the dist contents (no TORCH_CUDA_VERSION needed), and the `+cuXXX`
+# local tag is stripped by the build-version check exactly like `+cpu`. A CUDA
+# libtorch makes `--backend tch` run on the GPU via TchBackend::cuda_or_cpu().
+# NOTE: the correct cuXXX for a given box (esp. the DGX Spark / GB10) is not
+# verified here — set ARIA_TCH_CUDA_VER to match the target's driver.
+TORCH_PIP_INDEX=""
+if [ "${ARIA_TCH_CUDA:-0}" = "1" ]; then
+  CUDA_VER="${ARIA_TCH_CUDA_VER:-cu128}"
+  case "$uname_s/$uname_m" in
+    Linux/x86_64)
+      LIBTORCH_URL="https://download.pytorch.org/libtorch/${CUDA_VER}/libtorch-cxx11-abi-shared-with-deps-${LIBTORCH_VERSION}%2B${CUDA_VER}.zip"
+      echo "==> ARIA_TCH_CUDA=1: fetching CUDA libtorch ($CUDA_VER, -with-deps bundles the CUDA runtime)"
+      ;;
+    Linux/aarch64)
+      # The default PyPI aarch64 torch wheel is CPU-only; the CUDA sbsa wheel
+      # lives on the pytorch cuXXX index.
+      TORCH_PIP_INDEX="--index-url https://download.pytorch.org/whl/${CUDA_VER}"
+      echo "==> ARIA_TCH_CUDA=1: aarch64 CUDA wheel from the $CUDA_VER index"
+      ;;
+    *)
+      echo "WARN: ARIA_TCH_CUDA=1 ignored on $uname_s/$uname_m (no CUDA libtorch there)" >&2
+      ;;
+  esac
+fi
+
 # ---- 0b. Linux/aarch64: take libtorch from the pip wheel ----
 #
 # pytorch.org publishes no prebuilt C++ dist for Linux/aarch64, but the pip
