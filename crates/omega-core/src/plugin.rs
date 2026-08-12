@@ -350,6 +350,43 @@ fn flatten_circuit(circuit: &CircuitIR, params: &ParameterBinding) -> Result<Vec
     Ok(ffi_ops)
 }
 
+/// Convert FFI result back to ExecResult.
+fn unflatten_result(ffi: &FfiExecResult) -> Result<ExecResult> {
+    match ffi.result_type {
+        FfiResultType::Counts => {
+            let mut counts = HashMap::new();
+            unsafe {
+                for i in 0..ffi.num_entries as usize {
+                    let bs = *ffi.bitstrings.add(i);
+                    let ct = *ffi.counts.add(i);
+                    counts.insert(bs, ct);
+                }
+            }
+            Ok(ExecResult::Counts(counts))
+        }
+        FfiResultType::Statevector => {
+            let mut sv = Vec::with_capacity(ffi.num_amplitudes as usize);
+            unsafe {
+                for i in 0..ffi.num_amplitudes as usize {
+                    let re = *ffi.amplitudes.add(i * 2);
+                    let im = *ffi.amplitudes.add(i * 2 + 1);
+                    sv.push(num_complex::Complex64::new(re, im));
+                }
+            }
+            Ok(ExecResult::Statevector(sv))
+        }
+        FfiResultType::Probabilities => {
+            let mut probs = Vec::with_capacity(ffi.num_probs as usize);
+            unsafe {
+                for i in 0..ffi.num_probs as usize {
+                    probs.push(*ffi.probs.add(i));
+                }
+            }
+            Ok(ExecResult::Probabilities(probs))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,42 +443,5 @@ mod tests {
             std::mem::size_of::<BackendVTable>(),
             12 * std::mem::size_of::<usize>()
         );
-    }
-}
-
-/// Convert FFI result back to ExecResult.
-fn unflatten_result(ffi: &FfiExecResult) -> Result<ExecResult> {
-    match ffi.result_type {
-        FfiResultType::Counts => {
-            let mut counts = HashMap::new();
-            unsafe {
-                for i in 0..ffi.num_entries as usize {
-                    let bs = *ffi.bitstrings.add(i);
-                    let ct = *ffi.counts.add(i);
-                    counts.insert(bs, ct);
-                }
-            }
-            Ok(ExecResult::Counts(counts))
-        }
-        FfiResultType::Statevector => {
-            let mut sv = Vec::with_capacity(ffi.num_amplitudes as usize);
-            unsafe {
-                for i in 0..ffi.num_amplitudes as usize {
-                    let re = *ffi.amplitudes.add(i * 2);
-                    let im = *ffi.amplitudes.add(i * 2 + 1);
-                    sv.push(num_complex::Complex64::new(re, im));
-                }
-            }
-            Ok(ExecResult::Statevector(sv))
-        }
-        FfiResultType::Probabilities => {
-            let mut probs = Vec::with_capacity(ffi.num_probs as usize);
-            unsafe {
-                for i in 0..ffi.num_probs as usize {
-                    probs.push(*ffi.probs.add(i));
-                }
-            }
-            Ok(ExecResult::Probabilities(probs))
-        }
     }
 }

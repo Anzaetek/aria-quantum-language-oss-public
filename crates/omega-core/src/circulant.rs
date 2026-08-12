@@ -375,9 +375,9 @@ mod tests {
             let inv_eig: Vec<Complex64> = eig.iter().map(|z| z.inv()).collect();
             // (a) circulant_solve_operator: S = Fᴴ·diag(1/eig)·F = C⁻¹, so S·C = I.
             let s = op(&inv_eig);
-            for a in 0..n {
-                for b in 0..n {
-                    let sc: Complex64 = (0..n).map(|k| s[a][k] * c[k][b]).sum();
+            for (a, s_row) in s.iter().enumerate() {
+                for (b, _) in c.iter().enumerate() {
+                    let sc: Complex64 = (0..n).map(|k| s_row[k] * c[k][b]).sum();
                     let exp = if a == b {
                         Complex64::new(1.0, 0.0)
                     } else {
@@ -528,7 +528,7 @@ mod tests {
         // solve == independent Gaussian solve, and the analytic eigenvalues ==
         // DFT-of-assembled-column. Dominant diagonal keeps most draws solvable.
         let mut st = 0xBEEF_0077u64;
-        let mut lcg = |s: &mut u64| {
+        let lcg = |s: &mut u64| {
             *s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);

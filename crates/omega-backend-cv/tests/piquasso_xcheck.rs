@@ -224,6 +224,7 @@ fn load() -> (String, Vec<Case>) {
 /// Why a case could not be compared. Carried as a value, not a `continue`, so
 /// the reason reaches the report.
 #[derive(Debug)]
+#[allow(dead_code)]
 enum Skip {
     /// The backend has no operator form of this preparation.
     PrepNotFirst(String),

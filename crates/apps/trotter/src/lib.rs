@@ -169,10 +169,10 @@ mod tests {
     #[test]
     fn mat_exp_of_zero_is_identity() {
         let e = mat_exp(&zero());
-        for i in 0..4 {
-            for j in 0..4 {
+        for (i, row) in e.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
                 let want = if i == j { 1.0 } else { 0.0 };
-                assert!((e[i][j].re - want).abs() < 1e-12 && e[i][j].im.abs() < 1e-12);
+                assert!((v.re - want).abs() < 1e-12 && v.im.abs() < 1e-12);
             }
         }
     }

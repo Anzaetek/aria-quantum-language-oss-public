@@ -838,6 +838,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn from_qasm_accepts_qasm2_builtin_U_and_CX() {
         let circ = from_qasm("qreg q[2];\nU(pi/2, 0, pi) q[0];\nCX q[0], q[1];\n").unwrap();
         assert_eq!(circ.gate_count(), 2);

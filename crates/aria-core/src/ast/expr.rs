@@ -201,9 +201,9 @@ mod tests {
 
     #[test]
     fn test_concrete() {
-        let e = ParamExpr::from(3.14);
+        let e = ParamExpr::from(2.5);
         assert!(e.is_concrete());
-        assert_eq!(e.try_as_f64(), Some(3.14));
+        assert_eq!(e.try_as_f64(), Some(2.5));
         assert!(e.free_symbols().is_empty());
     }
 

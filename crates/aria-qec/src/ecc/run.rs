@@ -603,7 +603,7 @@ mod differential_fuzz {
             for op in [PauliOp::Z, PauliOp::X] {
                 out.push(
                     backend
-                        .expectation(ir, &params, &pauli_obs(q, op.clone()))
+                        .expectation(ir, &params, &pauli_obs(q, op))
                         .expect("expectation"),
                 );
             }

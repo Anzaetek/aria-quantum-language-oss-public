@@ -37,6 +37,7 @@ fn main() {
     };
 
     let mut seed = 0x5150u64;
+    #[cfg_attr(not(all(target_os = "macos", feature = "metal")), allow(unused_mut))]
     let mut worst_metal = 0.0f64;
     let mut worst_stab = 0.0f64;
     let mut unnorm = 0usize;

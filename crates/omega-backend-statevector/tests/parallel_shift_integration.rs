@@ -9,7 +9,6 @@ use omega_core::executor::*;
 use omega_core::gradient::{compute_gradient, GradMethod};
 use omega_core::parallel_shift::parallel_parameter_shift_gradient;
 use omega_core::params::ParameterBinding;
-use smallvec::smallvec;
 
 fn gate(kind: GateKind, qubits: &[u32], params: &[ParamExpr]) -> GateOp {
     GateOp {
