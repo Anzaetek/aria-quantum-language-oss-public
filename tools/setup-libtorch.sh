@@ -71,17 +71,41 @@ if [ -z "$LIBTORCH_URL" ] && [ "$uname_s/$uname_m" = "Linux/aarch64" ] && \
       "$TORCH_VENV/bin/pip" install -q "torch==$LIBTORCH_VERSION"
     fi
   fi
-  pip_torch="$("$TORCH_VENV/bin/python" -c \
-    'import torch,os;print(os.path.dirname(torch.__file__))' 2>/dev/null || true)"
+  # Probe the wheel's dir AND real version in one call. Capture stderr: a failed
+  # `import torch` (missing deps, glibc too old) must be shown, not swallowed —
+  # otherwise a half-provisioned venv loops forever with a generic message.
+  probe_err="$(mktemp)"
+  pip_info="$("$TORCH_VENV/bin/python" -c \
+    'import torch,os;print(os.path.dirname(torch.__file__));print(torch.__version__)' \
+    2>"$probe_err" || true)"
+  pip_torch="$(printf '%s\n' "$pip_info" | sed -n 1p)"
+  pip_ver="$(printf '%s\n' "$pip_info" | sed -n 2p)"
   if [ -z "$pip_torch" ] || [ ! -d "$pip_torch/lib" ] || [ ! -d "$pip_torch/include" ]; then
     echo "ERROR: pip torch==$LIBTORCH_VERSION did not yield a usable libtorch." >&2
     echo "  looked in: $TORCH_VENV" >&2
+    [ -s "$probe_err" ] && { echo "  import torch said:" >&2; sed 's/^/    /' "$probe_err" >&2; }
+    echo "  then remove the venv and retry:  rm -rf \"$TORCH_VENV\"" >&2
+    rm -f "$probe_err"; exit 1
+  fi
+  rm -f "$probe_err"
+  # A leftover or user-supplied venv can carry a different torch; the `[ ! -x
+  # bin/python ]` gate above would skip the pinned install and we'd trust it
+  # blindly. Verify the REAL version against the pin, and stamp what is actually
+  # installed (e.g. 2.7.0+cpu / +cuXXX) rather than the pin string.
+  if [ "${pip_ver%%+*}" != "$LIBTORCH_VERSION" ]; then
+    echo "ERROR: $TORCH_VENV has torch $pip_ver, need $LIBTORCH_VERSION." >&2
+    echo "  remove the venv and retry:  rm -rf \"$TORCH_VENV\"" >&2
     exit 1
   fi
   LIBTORCH_DIR="$pip_torch"
   LIBTORCH_PIP_SITE="$(dirname "$pip_torch")"
-  printf '%s' "$LIBTORCH_VERSION" > "$LIBTORCH_DIR/build-version"
-  echo "==> libtorch $LIBTORCH_VERSION from the wheel at $LIBTORCH_DIR"
+  printf '%s' "$pip_ver" > "$LIBTORCH_DIR/build-version"
+  # The OpenBLAS/libgfortran the link needs live in a sibling torch.libs/ (the
+  # auditwheel layout). Warn if it is absent — a CUDA sbsa wheel may stage those
+  # under nvidia/*/lib instead, and the link would then fail on gfortran.
+  [ -d "$LIBTORCH_PIP_SITE/torch.libs" ] || \
+    echo "WARN: $LIBTORCH_PIP_SITE/torch.libs not found — link may fail on _gfortran_concat_string" >&2
+  echo "==> libtorch $pip_ver from the wheel at $LIBTORCH_DIR"
 fi
 
 echo "==> libtorch dir : $LIBTORCH_DIR"
@@ -141,10 +165,16 @@ cat > "$ENV_FILE" <<EOF
 export LIBTORCH="$LIBTORCH_DIR"
 export DYLD_LIBRARY_PATH="\$LIBTORCH/lib:\${DYLD_LIBRARY_PATH:-}"  # macOS
 export LD_LIBRARY_PATH="\$LIBTORCH/lib:${LIBTORCH_PIP_SITE:+$LIBTORCH_PIP_SITE/torch.libs:}\${LD_LIBRARY_PATH:-}"      # Linux
-${PIP_LINK_FLAGS:+export RUSTFLAGS=\"$PIP_LINK_FLAGS \${RUSTFLAGS:-}\"}
 export CXXFLAGS="$TCH_CXXFLAGS"
 unset LIBTORCH_USE_PYTORCH   # any value makes torch-sys hunt for a pip torch
 EOF
+# The RUSTFLAGS line is appended OUTSIDE the heredoc: writing shell via
+# `${PIP_LINK_FLAGS:+export RUSTFLAGS=...${RUSTFLAGS:-}}` inside a heredoc
+# mis-nests the braces and emits an unbalanced quote, which aborts every
+# shell that sources the file. Only the pip-wheel (aarch64) route needs it.
+if [ -n "$PIP_LINK_FLAGS" ]; then
+  printf 'export RUSTFLAGS="%s ${RUSTFLAGS:-}"\n' "$PIP_LINK_FLAGS" >> "$ENV_FILE"
+fi
 echo "==> wrote env file: $ENV_FILE  (source it in future shells)"
 
 # ---- 3. set the env for this script's own builds ----
