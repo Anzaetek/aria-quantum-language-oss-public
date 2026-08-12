@@ -357,7 +357,7 @@ impl LowerCtx {
             }
         }
         // Lower parameter expressions
-        let mut params = smallvec::SmallVec::new();
+        let mut params: smallvec::SmallVec<[ParamExpr; 3]> = smallvec::SmallVec::new();
         for p in &app.params {
             params.push(self.lower_expr(p, local_params, param_values)?);
         }
@@ -432,6 +432,38 @@ impl LowerCtx {
 
         // Standard gate
         let gate = name_to_gate(&app.name)?;
+
+        // `cp(λ)` / `cu1(λ)` are qelib1's controlled-phase gate, and omega has
+        // no CP variant — but `CU3(0, 0, λ)` IS it, exactly: `U3(0, 0, λ) =
+        // diag(1, e^{iλ}) = U1(λ) = P(λ)`, with no phase slack. So the name
+        // resolves to CU3 and the single angle is widened to three here.
+        //
+        // Without this, `aria-core` exported `cp` (its own emitter's spelling
+        // for `GateKind::CP`) and this parser rejected it with "unknown gate:
+        // cp" — a circuit whose QASM is valid qelib1, which Qiskit accepts,
+        // and which this repository could not read back. The round trip was
+        // broken while both ends looked healthy.
+        //
+        // Synthesised BEFORE the `inv @` handling below so the inverse path
+        // sees an ordinary CU3: `U3(θ,φ,λ)† = U3(−θ,−λ,−φ)`, which at
+        // `(0,0,λ)` gives `U3(0,−λ,0) = diag(1, e^{−iλ})` — correct.
+        let params = if matches!(app.name.as_str(), "cp" | "cu1") {
+            if params.len() != 1 {
+                return Err(format!(
+                    "{} expects 1 parameter, got {}",
+                    app.name,
+                    params.len()
+                ));
+            }
+            let mut widened: smallvec::SmallVec<[ParamExpr; 3]> =
+                smallvec::SmallVec::with_capacity(3);
+            widened.push(ParamExpr::Concrete(0.0));
+            widened.push(ParamExpr::Concrete(0.0));
+            widened.push(params[0].clone());
+            widened
+        } else {
+            params
+        };
 
         // Resolve qubits
         let mut qubits = smallvec::SmallVec::new();
@@ -780,7 +812,9 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         "cz" => Ok(GateKind::CZ),
         "swap" => Ok(GateKind::Swap),
         "crz" => Ok(GateKind::CRz),
-        "cu3" => Ok(GateKind::CU3),
+        // qelib1's controlled-phase. CP(λ) == CU3(0, 0, λ) exactly; the
+        // 1 -> 3 parameter widening happens in `lower_gate_app`.
+        "cu3" | "cp" | "cu1" => Ok(GateKind::CU3),
         "ccx" | "toffoli" => Ok(GateKind::CCX),
         "cswap" | "fredkin" => Ok(GateKind::CSwap),
         "measure" => Ok(GateKind::Measure),

@@ -23,3 +23,28 @@ aria-runtime = { path = "../../crates/aria-runtime" }
 omega-core = { path = "../../crates/omega-core" }
 omega-backend-statevector = { path = "../../crates/omega-backend-statevector" }
 omega-backend-mps = { path = "../../crates/omega-backend-mps" }
+omega-backend-pauliprop = { path = "../../crates/omega-backend-pauliprop" }
+# GPU arms, opt-in: `maturin build --features cuda`. Off by default so the
+# pure-Rust wheel keeps building on machines with no CUDA toolkit.
+omega-backend-statevector-cuda = { path = "../../crates/omega-backend-statevector-cuda", optional = true }
+omega-backend-mps-cuda = { path = "../../crates/omega-backend-mps-cuda", optional = true }
+omega-backend-pauliprop-cuda = { path = "../../crates/omega-backend-pauliprop-cuda", optional = true }
+# Apple arm. Same capability, different vendor — the Python spec strings do not
+# change between them (`gpu` resolves by cfg, exactly as aria_runtime does).
+omega-backend-statevector-metal = { path = "../../crates/omega-backend-statevector-metal", optional = true }
+omega-backend-mps-metal = { path = "../../crates/omega-backend-mps-metal", optional = true }
+omega-backend-pauliprop-metal = { path = "../../crates/omega-backend-pauliprop-metal", optional = true }
+omega-backend-statevector-opencl = { path = "../../crates/omega-backend-statevector-opencl", optional = true }
+
+[features]
+default = []
+cuda = ["dep:omega-backend-statevector-cuda", "dep:omega-backend-mps-cuda",
+        "dep:omega-backend-pauliprop-cuda",
+        "omega-backend-statevector-cuda/cuda", "omega-backend-mps-cuda/cuda",
+        "omega-backend-pauliprop-cuda/cuda"]
+metal = ["dep:omega-backend-statevector-metal", "dep:omega-backend-mps-metal",
+         "dep:omega-backend-pauliprop-metal",
+         "omega-backend-statevector-metal/metal", "omega-backend-mps-metal/metal",
+         "omega-backend-pauliprop-metal/metal"]
+opencl = ["dep:omega-backend-statevector-opencl",
+          "omega-backend-statevector-opencl/opencl"]

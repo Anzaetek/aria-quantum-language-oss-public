@@ -2200,6 +2200,21 @@ dangling.
 Correct the prose in both files rather than deleting it — the wrong explanation
 should stay visible next to the measurement that overturned it.
 
+## Platform split (2026-08-12)
+
+Two agents, two machines. **`PLATFORM-OWNERSHIP.md` is the authority**; this is
+the pointer.
+
+macOS holds everything in Parts H, K, L and the language/bridge work, and
+verifies Metal + OpenCL + Lean every run. Linux holds CUDA (`fixes/0011`-`0013`,
+the f64 kernel work in `REQUEST-R8-cuda-f64.md`) and tch-on-Linux
+(`fixes/0003-tch-on-Linux-...`).
+
+The rule: **if you cannot RUN it, do not land it.** `--features cuda` currently
+fails to compile on purpose — `GateKind::Sx`/`Sxdg` were added to every backend
+except CUDA, so the box that can test it gets a compile error rather than an
+implementation written blind.
+
 ## Part L — Remoting resilience (task #7): what is real, what is a stub
 
 **Surveyed 2026-08-12, read-only. Not started — this is the scoping that was

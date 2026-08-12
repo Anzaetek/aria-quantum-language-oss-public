@@ -31,7 +31,8 @@ details; this covers *what each stage buys you*.
 | N-way counts matrix | `ARIA_NWAY=1` | `.venv-qiskit` | **INSTALLED** | statevector / mps / noisy-mps(p=0) **14 of 14 fixtures compared, 0 disagree**; `pauli` 8 of 14 with 6 correct `cannot-express` refusals — re-measured 2026-08-11 after `sx`/`sxdg` landed natively. Found 3 live defects on its first run (see below) |
 | N-way expectation matrix | `ARIA_NWAY=1` | `.venv-qiskit` | **INSTALLED** | statevector / mps **11 of 11 admitted, 0 disagree** at an analytic 1e-12 vs Qiskit `Statevector`; `pauliprop` 7 of 11, `pauli` 5 of 11, rest correct refusals. 3 fixtures not admitted (genuinely mid-circuit) — measured 2026-08-11 |
 | Bridge runner python tests | *(always, if a venv has pytest)* | any bridge venv + `pytest` | **INSTALLED** | 6 passed / 1 skipped from `.venv-qiskit`; 12 passed from `.venv-perceval`. Gates the stdout-protocol guard and the Perceval convention pins — neither had ever run in CI before 2026-08-11 |
-| CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here** — see `CUDA_TODO.md` | untested on this box |
+| CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here — OWNED BY THE LINUX AGENT**, see `PLATFORM-OWNERSHIP.md` | untested on this box; `--features cuda` currently FAILS to compile by design (`GateKind::Sx`/`Sxdg` deliberately not added — see `CUDA_TODO.md`) |
+| aria-py bindings | *(always; python tests need the venv)* | `bindings/aria-py/.venv` + `maturin develop` | **INSTALLED** | cargo build clean; 8 python tests pass — 2026-08-12. A separate cargo project, so `cargo test --workspace` does NOT reach it |
 | Deep harnesses | `ARIA_DEEP=1` | none (just slow) | available | `spectra_noise`, `spectra_scaling_noise` skipped in the default `all` |
 
 ## The Qiskit corpus has a hole — and it is the shape of the bugs

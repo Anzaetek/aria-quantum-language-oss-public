@@ -247,3 +247,111 @@ circuit C {
         "RESET must lower to the channel, not to a Barrier or a no-op"
     );
 }
+
+/// **The CP round trip closes** — `to_qasm` output is readable by our own
+/// parser.
+///
+/// `aria-core` emits `cp` for `GateKind::CP`, and `omega-parser` had no `cp`
+/// entry, so exporting a CP circuit produced a file this repository could not
+/// read back ("unknown gate: cp"). The QASM was valid qelib1 and Qiskit
+/// accepted it — only the round trip was broken, with both ends looking
+/// healthy.
+///
+/// `CP(λ) == CU3(0, 0, λ)` exactly (`U3(0,0,λ) = diag(1, e^{iλ}) = P(λ)`), so
+/// the parser resolves `cp` to CU3 and widens the single angle to three.
+#[test]
+fn cp_round_trips_through_our_own_parser() {
+    const SRC: &str = r#"
+circuit C {
+    qreg q[2]
+    apply CP(0.7) on q[0], q[1]
+}
+"#;
+    let c = parse_aria_circuit(SRC, "C").unwrap();
+    let qasm = to_qasm(&c).expect("CP is expressible in QASM 2.0");
+    assert!(qasm.contains("cp"), "expected `cp` in:\n{qasm}");
+
+    let ir = omega_parser::lower_to_ir(&qasm)
+        .expect("our own export must re-parse — this is what #23 fixed");
+    assert_eq!(ir.ops.len(), 1);
+    assert_eq!(format!("{:?}", ir.ops[0].gate), "CU3");
+    assert_eq!(
+        ir.ops[0].params.len(),
+        3,
+        "the single cp angle must be widened to CU3's three"
+    );
+}
+
+/// The widened `cp` must be NUMERICALLY the controlled-phase gate, not merely
+/// parse to something with three parameters.
+///
+/// Compares against `cu3(0,0,0.7)` written directly: identical states. And
+/// against `crz(0.7)`: different, which is the same distinction
+/// [`crz_is_not_cp`] makes from the other side.
+#[test]
+fn the_widened_cp_is_the_controlled_phase_gate() {
+    use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode};
+    use omega_core::params::ParameterBinding;
+
+    let sv = |qasm: &str| -> Vec<num_complex::Complex64> {
+        let ir = omega_parser::lower_to_ir(qasm).unwrap();
+        let cfg = ExecConfig {
+            shots: None,
+            seed: None,
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        match omega_backend_statevector::StatevectorBackend::new()
+            .execute(&ir, &ParameterBinding::new(), &cfg)
+            .unwrap()
+        {
+            ExecResult::Statevector(v) => v,
+            other => panic!("expected a statevector, got {other:?}"),
+        }
+    };
+    let head = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\nh q[0];\nh q[1];\n";
+    let via_cp = sv(&format!("{head}cp(0.7) q[0],q[1];\n"));
+    let via_cu3 = sv(&format!("{head}cu3(0,0,0.7) q[0],q[1];\n"));
+    let via_crz = sv(&format!("{head}crz(0.7) q[0],q[1];\n"));
+
+    let d_same = via_cp
+        .iter()
+        .zip(&via_cu3)
+        .map(|(a, b)| (a - b).norm())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        d_same < 1e-15,
+        "cp(λ) must equal cu3(0,0,λ) exactly; worst |Δ| = {d_same:.3e}"
+    );
+
+    let d_diff = via_cp
+        .iter()
+        .zip(&via_crz)
+        .map(|(a, b)| (a - b).norm())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        d_diff > 1e-3,
+        "cp and crz must DIFFER (relative phase on the controlled block); \
+         worst |Δ| = {d_diff:.3e}"
+    );
+}
+
+/// `cu1` is qelib1's other spelling of the same gate.
+#[test]
+fn cu1_is_accepted_as_the_same_gate() {
+    let ir = omega_parser::lower_to_ir(
+        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\ncu1(0.7) q[0],q[1];\n",
+    )
+    .expect("cu1 must parse");
+    assert_eq!(format!("{:?}", ir.ops[0].gate), "CU3");
+    assert_eq!(ir.ops[0].params.len(), 3);
+}
+
+/// A wrong arity is refused rather than silently widened to garbage.
+#[test]
+fn cp_with_the_wrong_arity_is_refused() {
+    let err = omega_parser::lower_to_ir(
+        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\ncp(0.1,0.2) q[0],q[1];\n",
+    )
+    .expect_err("cp takes exactly one angle");
+    assert!(err.contains("1 parameter"), "unhelpful message: {err}");
+}
