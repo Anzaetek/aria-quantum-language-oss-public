@@ -28,7 +28,9 @@ details; this covers *what each stage buys you*.
 | Lean 4 proof tree | `ARIA_LEAN=1` | `elan` + `lake`, warm mathlib cache | **READY** | 8281 jobs, exit 0 |
 | TLA+ models | `tools/tla/check.sh` | JDK + `tla2tools.jar` | **READY** | safety holds (26 states); liveness violated — starvation, *expected* |
 | CV ↔ piquasso fixture drift | `ARIA_CV_XCHECK=1` | `tools/cv_cross_check/.venv` with `piquasso` | **INSTALLED** (piquasso 8.0.1) | fixture matches live piquasso across 17 cases, worst 0.000e+00 — measured 2026-08-08 |
-| N-way counts matrix | `ARIA_NWAY=1` | `.venv-qiskit` | **INSTALLED** | statevector / mps / noisy-mps(p=0) **13 of 14 fixtures compared, 0 disagree**; `pauli` 7 of 14 with 6 correct `cannot-express` refusals — measured 2026-08-09. Found 3 live defects on its first run (see below) |
+| N-way counts matrix | `ARIA_NWAY=1` | `.venv-qiskit` | **INSTALLED** | statevector / mps / noisy-mps(p=0) **14 of 14 fixtures compared, 0 disagree**; `pauli` 8 of 14 with 6 correct `cannot-express` refusals — re-measured 2026-08-11 after `sx`/`sxdg` landed natively. Found 3 live defects on its first run (see below) |
+| N-way expectation matrix | `ARIA_NWAY=1` | `.venv-qiskit` | **INSTALLED** | statevector / mps **11 of 11 admitted, 0 disagree** at an analytic 1e-12 vs Qiskit `Statevector`; `pauliprop` 7 of 11, `pauli` 5 of 11, rest correct refusals. 3 fixtures not admitted (genuinely mid-circuit) — measured 2026-08-11 |
+| Bridge runner python tests | *(always, if a venv has pytest)* | any bridge venv + `pytest` | **INSTALLED** | 6 passed / 1 skipped from `.venv-qiskit`; 12 passed from `.venv-perceval`. Gates the stdout-protocol guard and the Perceval convention pins — neither had ever run in CI before 2026-08-11 |
 | CUDA GPU backends | `ARIA_CUDA=1` | NVIDIA hardware | **N/A here** — see `CUDA_TODO.md` | untested on this box |
 | Deep harnesses | `ARIA_DEEP=1` | none (just slow) | available | `spectra_noise`, `spectra_scaling_noise` skipped in the default `all` |
 

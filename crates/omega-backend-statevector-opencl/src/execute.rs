@@ -133,6 +133,11 @@ fn apply_op(state: &mut StateBuffer, op: &GateOp, params: &ParameterBinding) -> 
         GateKind::Sdg => state
             .apply_diagonal(q0(), Complex64::new(1.0, 0.0), Complex64::new(0.0, -1.0))
             .map_err(OmegaError::from),
+        // NOT diagonal, so these cannot use the apply_diagonal fast path that
+        // S/Sdg/T/Tdg take — they need the general 1q kernel with the exact
+        // matrix (routing via u3 would add the e^{iπ/4} global phase).
+        GateKind::Sx => apply_1q_from_matrix(state, q0(), &gates::sx()),
+        GateKind::Sxdg => apply_1q_from_matrix(state, q0(), &gates::sxdg()),
         GateKind::T => state
             .apply_diagonal(
                 q0(),

@@ -131,6 +131,33 @@ impl StabilizerTableau {
         }
     }
 
+    /// Apply `√X` (Stim's `SQRT_X`) on qubit q.
+    /// `X → +X`, `Y → +Z`, `Z → −Y`.
+    ///
+    /// Closed form `x' = x XOR z, z' = z, sign ^= z AND NOT x`, derived from
+    /// that action and checked against ALL FOUR Pauli inputs (I/X/Y/Z), not
+    /// by analogy with `s()`. Stim's `Tableau::from_named_gate("SQRT_X")`
+    /// gives the same `X → +X, Z → −Y`.
+    pub fn sx(&mut self, q: usize) {
+        for row in &mut self.rows {
+            row.sign ^= row.z[q] && !row.x[q];
+            row.x[q] ^= row.z[q];
+        }
+    }
+
+    /// Apply `√X†` (Stim's `SQRT_X_DAG`) on qubit q.
+    /// `X → +X`, `Y → −Z`, `Z → +Y`.
+    ///
+    /// Same closed form with the sign condition on `z AND x` instead — note
+    /// this is NOT the `sx` rule with a blanket sign flip, which is why it is
+    /// derived rather than copied.
+    pub fn sxdg(&mut self, q: usize) {
+        for row in &mut self.rows {
+            row.sign ^= row.z[q] && row.x[q];
+            row.x[q] ^= row.z[q];
+        }
+    }
+
     /// Apply CNOT gate (control a, target b).
     pub fn cx(&mut self, ctrl: usize, tgt: usize) {
         for row in &mut self.rows {

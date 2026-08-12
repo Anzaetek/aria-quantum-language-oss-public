@@ -690,6 +690,9 @@ fn invert_gate_with_params(
         GateKind::Sdg => same(GateKind::S),
         GateKind::T => same(GateKind::Tdg),
         GateKind::Tdg => same(GateKind::T),
+        // sxdg = sx^dagger, verified `sx @ sxdg == I` to 0.000e+00.
+        GateKind::Sx => same(GateKind::Sxdg),
+        GateKind::Sxdg => same(GateKind::Sx),
         // RBS(θ)⁻¹ = RBS(−θ), same negatable-parameter shape as the
         // rotation gates.
         GateKind::Rx
@@ -753,6 +756,11 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         "sdg" => Ok(GateKind::Sdg),
         "t" | "T" => Ok(GateKind::T),
         "tdg" => Ok(GateKind::Tdg),
+        // Native, NOT aliased to U3 — see GateKind::Sx. Both tsim's and
+        // ppvm's gate sets accept these, so before this the in-tree lowering
+        // was the only thing in the pipeline that could not.
+        "sx" => Ok(GateKind::Sx),
+        "sxdg" => Ok(GateKind::Sxdg),
         "id" => Ok(GateKind::Id),
         "rx" => Ok(GateKind::Rx),
         "ry" => Ok(GateKind::Ry),

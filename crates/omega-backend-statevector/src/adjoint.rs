@@ -198,6 +198,8 @@ fn apply_gate_forward(
         GateKind::Z => apply_1q(state, n, q0, &gates::z()),
         GateKind::S => apply_1q(state, n, q0, &gates::s()),
         GateKind::Sdg => apply_1q(state, n, q0, &gates::sdg()),
+        GateKind::Sx => apply_1q(state, n, q0, &gates::sx()),
+        GateKind::Sxdg => apply_1q(state, n, q0, &gates::sxdg()),
         GateKind::T => apply_1q(state, n, q0, &gates::t()),
         GateKind::Tdg => apply_1q(state, n, q0, &gates::tdg()),
         GateKind::Id => {}
@@ -386,6 +388,9 @@ fn apply_adjoint_gate(
         GateKind::Z => apply_1q(state, n, q0, &gates::z()), // Z† = Z
         GateKind::S => apply_1q(state, n, q0, &gates::sdg()), // S† = Sdg
         GateKind::Sdg => apply_1q(state, n, q0, &gates::s()), // Sdg† = S
+        // sx† = sxdg, verified `sx @ sxdg == I` to 0.000e+00.
+        GateKind::Sx => apply_1q(state, n, q0, &gates::sxdg()),
+        GateKind::Sxdg => apply_1q(state, n, q0, &gates::sx()),
         GateKind::T => apply_1q(state, n, q0, &gates::tdg()), // T† = Tdg
         GateKind::Tdg => apply_1q(state, n, q0, &gates::t()), // Tdg† = T
         GateKind::Id => {}

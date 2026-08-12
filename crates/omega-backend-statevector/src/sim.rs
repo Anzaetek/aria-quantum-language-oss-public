@@ -598,6 +598,8 @@ fn apply_gate(
         GateKind::Z => apply_1q(state, n, op.qubits[0].0 as usize, &gates::z()),
         GateKind::S => apply_1q(state, n, op.qubits[0].0 as usize, &gates::s()),
         GateKind::Sdg => apply_1q(state, n, op.qubits[0].0 as usize, &gates::sdg()),
+        GateKind::Sx => apply_1q(state, n, op.qubits[0].0 as usize, &gates::sx()),
+        GateKind::Sxdg => apply_1q(state, n, op.qubits[0].0 as usize, &gates::sxdg()),
         GateKind::T => apply_1q(state, n, op.qubits[0].0 as usize, &gates::t()),
         GateKind::Tdg => apply_1q(state, n, op.qubits[0].0 as usize, &gates::tdg()),
         GateKind::Id => {} // no-op

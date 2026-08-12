@@ -236,6 +236,8 @@ fn apply_gate(
         GateKind::Z => tab.z(q(0)),
         GateKind::S => tab.s(q(0)),
         GateKind::Sdg => tab.sdg(q(0)),
+        GateKind::Sx => tab.sx(q(0)),
+        GateKind::Sxdg => tab.sxdg(q(0)),
         GateKind::Id | GateKind::Barrier => {}
 
         // CX is natively supported

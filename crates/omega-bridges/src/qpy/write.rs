@@ -109,6 +109,8 @@ pub fn gate_kind_to_qiskit_name(gate: &GateKind) -> Option<&'static str> {
         GateKind::Sdg => "SdgGate",
         GateKind::T => "TGate",
         GateKind::Tdg => "TdgGate",
+        GateKind::Sx => "SXGate",
+        GateKind::Sxdg => "SXdgGate",
         GateKind::Id => "IGate",
         GateKind::Rx => "RXGate",
         GateKind::Ry => "RYGate",

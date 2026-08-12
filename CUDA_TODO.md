@@ -154,3 +154,44 @@ rationale if a decision looks wrong on real hardware.
 - **cgroups**: if the box runs the server in a container, confirm the governor
   budgets against the container limit and not host RAM. That path exists but has
   only been exercised by unit tests with injected probe values.
+
+## `GateKind::Sx` / `Sxdg` — CUDA is NOT updated (2026-08-11)
+
+`√X` and `√X†` landed as first-class `GateKind` variants (see the doc comment on
+`GateKind::Sx` for why they are not aliased to `U3`). CPU statevector, MPS,
+Pauli, **Metal** and **OpenCL** are done and verified against Qiskit. **CUDA is
+deliberately untouched**, because nothing here can compile or run it.
+
+**Expect `cargo build -p omega-backend-statevector-cuda --features cuda` to FAIL
+with `non-exhaustive patterns: &GateKind::Sx and &GateKind::Sxdg not covered`.**
+That is the intended state: a compile error on the box that can test it beats an
+implementation written blind and never executed. Do not "fix" it by adding a
+catch-all arm.
+
+Sites the compiler will point at:
+
+| file | what it is | what to add |
+|---|---|---|
+| `src/lib.rs:~1247` | forward dispatch | `Sx`/`Sxdg` via the **generic 1q** path, exact matrices below |
+| `src/lib.rs:~1301` | `diagonal_factor` classifier | **leave them out** — `sx` is NOT diagonal, so it must not be classified as a fusion factor |
+| `src/adjoint.rs:~252` | adjoint (inverse) pass | `Sx → sxdg`, `Sxdg → sx` (`sx·sxdg = I`, verified 0.000e+00) |
+| `src/forward_graph.rs:~313,~379` | graph-capture gate list + diagonal factors | add to the gate list; **not** to the diagonal factors |
+| `src/backward_graph.rs:~1741,~1798` | same, backward | same, with the inverse mapping |
+
+Exact matrices (identical to `omega_backend_statevector::gates::{sx,sxdg}`):
+
+```
+sx   = ½·[[1+i, 1−i], [1−i, 1+i]]
+sxdg = ½·[[1−i, 1+i], [1+i, 1−i]]
+```
+
+**Do NOT route these through `apply_u3`.** `sx = e^{iπ/4}·U3(π/2, −π/2, π/2)`;
+the global phase makes `|sx − U3| = 0.541` and `det(sx) = i` vs `det(U3) = 1`.
+It is invisible in counts and expectations but wrong in any statevector
+comparison — and a GPU statevector backend is exactly where `gpu_parity.rs`
+would compare amplitudes. Metal and OpenCL both use their generic `apply_1q`
+with the exact matrix for this reason.
+
+Verification once implemented: `03_sqrt_x.qasm` in the N-way counts matrix
+(`ARIA_NWAY=1`) exercises `sx`+`sxdg`, and `tests/sqrt_x_conventions.rs` pins
+the matrices, the `sx·sx = X` identity and the Clifford tableau action.
