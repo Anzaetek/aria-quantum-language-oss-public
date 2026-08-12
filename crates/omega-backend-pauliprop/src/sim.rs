@@ -340,6 +340,13 @@ impl PauliPropBackend {
             GateKind::Z => self.map_single(sum, q(0), CLIFF_Z),
             GateKind::S => self.map_single(sum, q(0), CLIFF_S),
             GateKind::Sdg => self.map_single(sum, q(0), CLIFF_SDG),
+            // sx / sxdg ARE Clifford (sx*sx = X), so they conjugate a single
+            // Pauli to a single Pauli exactly like S/Sdg. They used to fall
+            // into the generic "not yet supported" arm below — honest, but a
+            // missed capability on a backend whose whole domain is Clifford
+            // conjugation.
+            GateKind::Sx => self.map_single(sum, q(0), CLIFF_SX),
+            GateKind::Sxdg => self.map_single(sum, q(0), CLIFF_SXDG),
 
             // ----- two-qubit Cliffords -----
             GateKind::CX => self.map_two(sum, q(0), q(1), CX_IMG),
@@ -583,6 +590,39 @@ const CLIFF_SDG: SingleImg = SingleImg {
     bx: false,
     bz: true,
     fz: ONE,
+};
+
+// √X and √X†.
+//
+// NOTE THE DIRECTION. This table stores `G† P G`, which is the OPPOSITE of the
+// `G P G†` form proved in `proofs/lean4/QuantumProofs/SqrtX.lean` — an easy
+// place to install a sign error that no self-consistent check would see. The
+// entries below are the theorems `sqrtX_conj_X` / `sqrtXdg_conj_Z` read in the
+// right direction, and were re-derived numerically before being written:
+//
+//   sx† X sx  = +1 · raw(1,0)        (X is the fixed axis)
+//   sx† Z sx  = +i · raw(1,1) = +Y
+//   sxdg† X sxdg = +1 · raw(1,0)
+//   sxdg† Z sxdg = −i · raw(1,1) = −Y
+//
+// The two differ ONLY in the sign of `fz`, which is exactly the bit that
+// distinguishes the gate from its inverse — so copying one to the other is
+// both the easiest mistake and an invisible one.
+const CLIFF_SX: SingleImg = SingleImg {
+    ax: true,
+    az: false,
+    fx: ONE,
+    bx: true,
+    bz: true,
+    fz: Complex64::new(0.0, 1.0),
+};
+const CLIFF_SXDG: SingleImg = SingleImg {
+    ax: true,
+    az: false,
+    fx: ONE,
+    bx: true,
+    bz: true,
+    fz: Complex64::new(0.0, -1.0),
 };
 
 // --------------------------------------------------------------------------

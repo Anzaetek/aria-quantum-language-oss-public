@@ -22,3 +22,8 @@ smallvec = { workspace = true }
 # same circuit rather than from arithmetic in the test. A hand-computed
 # expected value is a second implementation with no reviewer.
 omega-backend-statevector = { path = "../omega-backend-statevector" }
+# The sqrt-X conjugation test cross-checks against the stabilizer backend,
+# which encodes the same Clifford rule in a genuinely different form (bit-level
+# tableau vs Pauli-image table). Weak evidence on its own — see K3 — but it
+# would take a shared misreading to survive both representations.
+omega-backend-pauli = { path = "../omega-backend-pauli" }
