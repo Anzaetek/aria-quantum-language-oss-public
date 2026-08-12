@@ -114,7 +114,7 @@
 >    out of scope for the fix that landed; recorded here so it is not lost.
 
 > Active dev repo: **`aria-quantum-language-oss-public`** (per the README banner,
-> all future dev lands here). Rules from `CLAUDE.md` apply: local CI is the
+> all future dev lands here). The repository's contribution rules apply: local CI is the
 > single source of truth (`./ci.sh`), **commit often, never push**, every
 > acceptance is **numeric** against a golden ± tolerance.
 >
@@ -239,7 +239,7 @@ in sync; omega-functions is canonical).
 3. **omega-functions**: document the features the integration copies pull in
    (pauliprop engine, any shared kernels); reference `../omega-functions` where
    the in-tree copy is thin.
-4. Brutal subagent review of the entire diff (correctness, determinism, fallback
+4. Independent adversarial review of the entire diff (correctness, determinism, fallback
    safety, numeric gates); fix findings.
 - **Acceptance:** CI green (incl. opt-in CUDA stage on this box); review clean.
 
@@ -320,5 +320,5 @@ because it is correct — only the `execute` wiring delegates. See
   <team@anzaetek.com>**, **never push**.
 - Every GPU feature is **optional** and **falls back** — default `./ci.sh` must
   stay green with no GPU.
-- Run a **brutal review subagent** after each major phase.
+- Run an **independent adversarial review** after each major phase.
 - Keep `-public` and `../omega-functions` pauliprop sources in sync.

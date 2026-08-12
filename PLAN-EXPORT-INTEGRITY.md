@@ -171,7 +171,7 @@ Aria's `--` comment runs to end-of-line, so the `}` is commented out and the
 brace structure breaks. The code comment claiming *"the comment is what
 round-trips"* is **false** — it does not parse at all.
 
-I wrote that comment. It was reasoning, not measurement.
+That comment was reasoning, not measurement.
 
 **Fix:** never wrap a comment line in a guard. Either emit the guard as part of
 the comment (`-- when m[0] == 1: reset q[0]`) or refuse.
