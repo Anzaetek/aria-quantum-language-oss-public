@@ -15,3 +15,9 @@ num-complex = { workspace = true }
 # not travel with the cdylib.
 [dev-dependencies]
 serde_json = { workspace = true }
+# Test-only, and it must stay test-only: this crate ships with a single runtime
+# dependency so it remains embeddable (see the crate docs), which is also why
+# `CvProgram` lives in the parser rather than here. `opticqasm_cv_xcheck.rs`
+# drives OPTICQASM text through the CV import and compares against the piquasso
+# fixture — a dev-dependency does not travel with the cdylib.
+omega-parser = { path = "../omega-parser" }

@@ -32,6 +32,7 @@ start on these; they will arrive on `main` and are likely to conflict.
 | **Part L** — remoting resilience / WS dispatch | **scoped, in progress** |
 | **#22** — `to_qasm3` classical control flow | **claimed** |
 | **#7** — job lifecycle, durable batches, async | **claimed** |
+| OPTICQASM export/import integrity (`PLAN-OPTICQASM-INTEGRITY.md`) | **O1–O3, O5 done**; O4, O6 open |
 
 Verified here every run: Qiskit + QEC cross-checks, bridge arms
 (perceval/tsim/ppvm), CV↔piquasso, N-way matrices, **Metal**, **OpenCL**,
@@ -45,26 +46,31 @@ Each of these is blocked on hardware or an OS this Mac does not have. They are
 deliberately **not** applied here, because applying a patch you cannot execute
 is how an untested change acquires the appearance of review.
 
-### 1. CUDA — `fixes/0011`, `0012`, `0013`
+### 1. CUDA — **DONE 2026-08-13**, no longer owned here
 
-`GateKind::Sx` / `Sxdg` landed on every backend **except CUDA**, on purpose.
-`cargo build -p omega-backend-statevector-cuda --features cuda` will **fail**
-with `non-exhaustive patterns: &GateKind::Sx and &GateKind::Sxdg not covered`.
-That is the intended state — a compile error on the box that can test it beats
-an implementation written blind.
+`GateKind::Sx` / `Sxdg` landed on CUDA across the forward, adjoint and
+graph-capture paths, on a Linux + NVIDIA box (RTX PRO 6000, nvcc 12.9). The
+deliberate compile error this section used to describe is gone.
 
-`CUDA_TODO.md` names all six sites, the exact matrices, the inverse mapping,
-and one trap: **`sx` is NOT diagonal**, so it must not join the
-`diagonal_factor` fusion classifier alongside S/T.
+Reviewed from the macOS side without hardware, which is all that is possible
+here and is stated as such: the matrices in `forward_graph.rs` and
+`backward_graph.rs` are `½[[1±i, 1∓i],[1∓i, 1±i]]`, so `sx·sx` has diagonal
+`[(1+i)²+(1−i)²]/4 = 0` and off-diagonal `2(1−i²)/4 = 1` — exactly `X`. The
+documented trap was avoided: `diagonal_factor` classifies only Z/S/Sdg/T and
+does **not** include Sx, which is correct because `sx` is not diagonal.
 
-The three queued patches are the f64 precision-parametric kernel work
-(`REQUEST-R8-cuda-f64.md`). They have never been compiled here.
+**This is a code read, not a run.** `ARIA_CUDA=1` has still never executed on
+this machine, and the Linux agent's verification is the one that counts.
 
-### 2. tch on Linux — `fixes/0003-tch-on-Linux-...`
+Remaining CUDA items are tracked in `CUDA_TODO.md` §"Still open" and stay
+Linux-owned: the unused `Precision::bytes_per_amplitude` in the memory governor,
+a DGX Spark (aarch64+CUDA) hardware pass, and E6 aarch64 `pymatching`.
 
-Takes libtorch from the pip wheel and sets `LD_LIBRARY_PATH`. The macOS half of
-this problem is fixed here (SIP strips exported `DYLD_*`, so it is passed
-inline on the cargo invocation); the Linux half is untested on this machine.
+### 2. tch on Linux — **DONE 2026-08-13**, no longer owned here
+
+GPU-enabled `tch` and the aarch64/GCC libtorch provisioning both landed and were
+verified on Linux. The macOS half (SIP strips exported `DYLD_*`, so it is passed
+inline on the cargo invocation) remains fixed here.
 
 ### 3. Anything else needing an NVIDIA GPU or a Linux-only toolchain
 
@@ -83,8 +89,9 @@ That line is the handoff.
 
 ## Coordination
 
-* **Do not** apply the `fixes/0011`–`0013` CUDA patches on macOS, and do not
-  apply the Mac-side work on Linux — both would be unverifiable where they land.
+* **Do not** apply Mac-side work on Linux or Linux-side work on macOS — both
+  would be unverifiable where they land. (The `fixes/0011`–`0013` CUDA patches
+  this bullet used to name are landed and gone.)
 * `fixes/` is gitignored, so both agents see the same patch series but neither
   can commit it. Record what was applied in the commit message, as the commits
   referencing 0001/0002/0004/0005/0006/0007/0008/0010 do.

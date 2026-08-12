@@ -126,31 +126,72 @@ pub fn to_opticqasm(circuit: &Circuit) -> Result<String, String> {
 
 /// Parse an OPTICQASM 1.0 string into a Circuit.
 ///
-/// Every non-empty line must be understood. A line that matches nothing is an
-/// error, never a skip — see the module header for what skipping produced.
+/// # The unit is a STATEMENT, not a line
+///
+/// The first version of this function iterated over `src.lines()`. That is the
+/// wrong unit and it re-committed the defect the module header describes, one
+/// level down. The grammar's `WHITESPACE` rule includes `\n`, so a newline is
+/// no more significant than a space and a statement may share a line with any
+/// other:
+///
+/// | input | old result |
+/// |---|---|
+/// | `OPTICQASM 1.0; photon q[2]; ps(0.5) q[0];` (one line) | **`Ok`, 0 registers, 0 operations** |
+/// | `ps(0.5) q[0]; ps(0.7) q[1];` (one line) | **`Ok`, ONE gate, param 0.5, on modes [0, 1]** |
+///
+/// The first is `Ok(0, 0)` again — a whole circuit parsed into nothing, because
+/// `line.starts_with("OPTICQASM")` skipped the entire line rather than the
+/// header token. The second is worse than a drop: the two gates were *merged*
+/// into one with a different parameter and different modes, because the
+/// gate regex was anchored to the line and greedily swallowed the tail.
+///
+/// So this splits on `;` after stripping comments, which is what the grammar
+/// does. Every statement must be understood; none may be skipped.
+///
+/// # Validation matches `omega-parser`
+///
+/// Undefined registers, out-of-range mode indices, and wrong parameter or mode
+/// counts are refused here exactly as they are in
+/// `omega_parser::lower::lower_opticqasm`. Two readers of the same dialect
+/// disagreeing about what is valid is the same class of defect as one of them
+/// being unable to read the other's output — and this side was the silent one:
+/// `ps(0.5) zz[7];` with no `zz` register declared used to return `Ok`.
+///
+/// `opticqasm_reader_agreement.rs` pins the two against each other so they
+/// cannot drift apart again.
 pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
     let mut circuit = Circuit::new("photonic");
-    let mode_re = Regex::new(r"(\w+)\[(\d+)\]").unwrap();
-    // The parameter list is OPTIONAL: the grammar allows `pbs q[0], q[1];`
-    // with no parentheses, and requiring them meant every parameter-less gate
-    // fell through to the silent skip below.
-    let gate_re = Regex::new(r"^(\w+)\s*(?:\(([^)]*)\))?\s+(.+);$").unwrap();
+    let mode_re = Regex::new(r"^(\w+)\[(\d+)\]$").unwrap();
+    let gate_re = Regex::new(r"^(\w+)\s*(?:\(([^)]*)\))?\s+(.+)$").unwrap();
     // `pol` marks a polarization register: N SPATIAL modes each carrying H and
-    // V, so 2N optical modes. Requiring `];` immediately meant `photon q[2] pol;`
-    // was not recognised as a declaration at all.
-    let photon_re = Regex::new(r"^photon\s+(\w+)\[(\d+)\]\s*(pol)?\s*;$").unwrap();
+    // V, so 2N optical modes.
+    let photon_re = Regex::new(r"^photon\s+(\w+)\[(\d+)\]\s*(pol)?$").unwrap();
 
-    for (lineno, raw) in src.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with("OPTICQASM") {
+    // Declared registers, so mode references can be validated instead of
+    // invented.
+    let mut regs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seen_header = false;
+
+    for (stmt, line) in statements(src) {
+        if !seen_header {
+            let version = stmt
+                .strip_prefix("OPTICQASM")
+                .map(str::trim)
+                .ok_or_else(|| {
+                    format!("line {line}: expected an `OPTICQASM <version>;` header, got `{stmt}`")
+                })?;
+            if version.is_empty() {
+                return Err(format!("line {line}: the OPTICQASM header names no version"));
+            }
+            seen_header = true;
             continue;
         }
 
-        if let Some(caps) = photon_re.captures(line) {
-            let name = &caps[1];
+        if let Some(caps) = photon_re.captures(stmt) {
+            let name = caps[1].to_string();
             let size: usize = caps[2]
                 .parse()
-                .map_err(|e| format!("line {}: bad register size: {e}", lineno + 1))?;
+                .map_err(|e| format!("line {line}: bad register size: {e}"))?;
             if caps.get(3).is_some() {
                 // Representing polarization in the aria-core AST needs register
                 // metadata the AST does not carry yet (PLAN-OPTICQASM-INTEGRITY
@@ -158,30 +199,30 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
                 // reinterpret every mode index, since `pol` means 2N optical
                 // modes and a plain declaration means N.
                 return Err(format!(
-                    "line {}: `photon {name}[{size}] pol;` — polarization registers are \
-                     read by `omega-parser` but the aria-core AST cannot yet carry the \
-                     H/V mode mapping, and accepting this would silently reinterpret \
-                     every mode index (pol means {} optical modes, not {size}).",
-                    lineno + 1,
+                    "line {line}: `photon {name}[{size}] pol;` — polarization registers are \
+                     read by `omega-parser` but the aria-core AST cannot yet carry the H/V \
+                     mode mapping, and accepting this would silently reinterpret every mode \
+                     index (pol means {} optical modes, not {size}).",
                     2 * size
                 ));
             }
-            circuit.qreg(name, size);
+            if regs.insert(name.clone(), size).is_some() {
+                return Err(format!("line {line}: register `{name}` declared twice"));
+            }
+            circuit.qreg(&name, size);
             continue;
         }
 
-        let caps = gate_re.captures(line).ok_or_else(|| {
+        let caps = gate_re.captures(stmt).ok_or_else(|| {
             format!(
-                "line {}: cannot parse `{line}` as an OPTICQASM declaration or gate \
-                 application. Unrecognised lines used to be skipped, which parsed \
-                 whole circuits into empty ones.",
-                lineno + 1
+                "line {line}: cannot parse `{stmt}` as an OPTICQASM declaration or gate \
+                 application. Unrecognised statements used to be skipped, which parsed \
+                 whole circuits into empty ones."
             )
         })?;
-
-        let gate_name = &caps[1];
+        let gate_name = caps[1].to_string();
         let params_str = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-        let modes_str = &caps[3];
+        let modes_str = caps[3].to_string();
 
         let params: Vec<f64> = if params_str.trim().is_empty() {
             Vec::new()
@@ -190,65 +231,89 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
                 .split(',')
                 .map(|s| {
                     let s = s.trim();
-                    s.parse::<f64>().map_err(|_| {
-                        format!(
-                            "line {}: `{s}` is not a number. OPTICQASM 1.0 has no \
-                             symbolic parameters; bind it before importing.",
-                            lineno + 1
-                        )
-                    })
+                    // `f64::from_str` accepts `1e-5`, `+0.5`, `inf` and `NaN`,
+                    // none of which the grammar's `number` rule admits. Accepting
+                    // them here would produce a Circuit that re-exports to a file
+                    // `omega-parser` cannot read — the round-trip gap again.
+                    if !NUMBER_RE.is_match(s) {
+                        return Err(format!(
+                            "line {line}: `{s}` is not an OPTICQASM number. The grammar \
+                             admits an optional sign, digits, and an optional fractional \
+                             part — no exponent, no `inf`, no `NaN`, and no symbolic \
+                             parameters."
+                        ));
+                    }
+                    s.parse::<f64>()
+                        .map_err(|e| format!("line {line}: `{s}`: {e}"))
                 })
                 .collect::<Result<_, _>>()?
         };
 
-        let qubits: Vec<Qubit> = mode_re
-            .captures_iter(modes_str)
-            .map(|c| {
-                c[2].parse()
-                    .map(|i| Qubit::new(&c[1], i))
-                    .map_err(|e| format!("line {}: bad mode index: {e}", lineno + 1))
-            })
-            .collect::<Result<_, _>>()?;
+        // Each mode reference is matched WHOLE. The previous version scanned the
+        // tail for anything shaped `name[index]`, so `kerr(0.1) garbage q[0];`
+        // parsed happily by ignoring the garbage.
+        let mut qubits: Vec<Qubit> = Vec::new();
+        for raw in modes_str.split(',') {
+            let raw = raw.trim();
+            let m = mode_re.captures(raw).ok_or_else(|| {
+                format!("line {line}: `{raw}` is not a mode reference (expected `name[index]`)")
+            })?;
+            let reg = &m[1];
+            let index: usize = m[2]
+                .parse()
+                .map_err(|e| format!("line {line}: bad mode index: {e}"))?;
+            let size = regs.get(reg).ok_or_else(|| {
+                format!("line {line}: undefined photon register `{reg}`")
+            })?;
+            if index >= *size {
+                return Err(format!(
+                    "line {line}: mode index {index} out of range for `{reg}[{size}]`"
+                ));
+            }
+            qubits.push(Qubit::new(reg, index));
+        }
         if qubits.is_empty() {
-            return Err(format!(
-                "line {}: `{gate_name}` names no modes",
-                lineno + 1
-            ));
+            return Err(format!("line {line}: `{gate_name}` names no modes"));
         }
 
-        // Arity is checked here, not left to the backend: `ps(0.5, 0.2)` is a
-        // typo, and accepting it drops the second parameter silently.
-        let need = |n: usize| -> Result<(), String> {
-            if params.len() == n {
-                Ok(())
-            } else {
-                Err(format!(
-                    "line {}: `{gate_name}` takes {n} parameter(s), got {}",
-                    lineno + 1,
+        // Arity is checked on BOTH parameters and modes. Checking only
+        // parameters is what let `bs_rx(1.2, 0.3) q[0];` through as a
+        // one-mode beam splitter.
+        let check = |np: usize, nm: usize| -> Result<(), String> {
+            if params.len() != np {
+                return Err(format!(
+                    "line {line}: `{gate_name}` takes {np} parameter(s), got {}",
                     params.len()
-                ))
+                ));
             }
+            if qubits.len() != nm {
+                return Err(format!(
+                    "line {line}: `{gate_name}` acts on {nm} mode(s), got {}",
+                    qubits.len()
+                ));
+            }
+            Ok(())
         };
 
-        let gate = match gate_name {
+        let gate = match gate_name.as_str() {
             "ps" => {
-                need(1)?;
+                check(1, 1)?;
                 GateDef::with_params(GateKind::PhaseShifter, params)
             }
             "bs_rx" | "bs" => {
-                need(2)?;
+                check(2, 2)?;
                 GateDef::with_params(GateKind::BeamSplitter, params)
             }
             "squeeze" => {
-                need(2)?;
+                check(2, 1)?;
                 GateDef::with_params(GateKind::Squeezing, params)
             }
             "displace" => {
-                need(2)?;
+                check(2, 1)?;
                 GateDef::with_params(GateKind::Displacement, params)
             }
             "kerr" => {
-                need(1)?;
+                check(1, 1)?;
                 GateDef::with_params(GateKind::Kerr, params)
             }
             // `hwp` / `pbs` are read by `omega-parser` and executed by the
@@ -257,20 +322,18 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
             // suggest the operation does not exist.
             "hwp" | "pbs" => {
                 return Err(format!(
-                    "line {}: `{gate_name}` is a polarization element that `omega-parser` \
+                    "line {line}: `{gate_name}` is a polarization element that `omega-parser` \
                      reads and the perceval bridge executes, but the aria-core AST has no \
-                     GateKind for it yet (PLAN-OPTICQASM-INTEGRITY O4).",
-                    lineno + 1
+                     GateKind for it yet (PLAN-OPTICQASM-INTEGRITY O4)."
                 ))
             }
-            // Never `continue`: skipping an unknown gate parses the file
+            // Never skip: skipping an unknown gate parses the file
             // "successfully" into a circuit missing an operation, which then
             // executes and returns confident wrong numbers.
             other => {
                 return Err(format!(
-                    "line {}: unknown photonic gate `{other}` \
-                     (supported: ps, bs_rx/bs, squeeze, displace, kerr)",
-                    lineno + 1
+                    "line {line}: unknown photonic gate `{other}` \
+                     (supported: ps, bs_rx/bs, squeeze, displace, kerr)"
                 ))
             }
         };
@@ -278,8 +341,71 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
         circuit.apply(gate, qubits);
     }
 
+    if !seen_header {
+        return Err("empty input: an OPTICQASM file must open with `OPTICQASM <version>;`".into());
+    }
     Ok(circuit)
 }
+
+/// The grammar's `number` rule: `"-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)?`.
+static NUMBER_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"^-?\d+(\.\d+)?$").unwrap());
+
+/// Split into `;`-terminated statements, stripping comments, and pair each with
+/// the line it started on so diagnostics stay locatable.
+///
+/// A trailing fragment with no `;` is yielded as a statement so it is reported
+/// as unparseable rather than dropped — an unterminated statement is a
+/// truncated file, which is precisely when silence is most costly.
+fn statements(src: &str) -> Vec<(&str, usize)> {
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut start = 0usize;
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut stmt_line = 1usize;
+    let mut pending = false;
+
+    while i < bytes.len() {
+        // `//` to end of line, exactly as the grammar's COMMENT rule.
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            let nl = src[i..].find('\n').map(|k| i + k).unwrap_or(bytes.len());
+            if pending {
+                // Keep the text before the comment; the comment itself is not
+                // part of the statement.
+                out.push((src[start..i].trim(), stmt_line));
+                pending = false;
+            }
+            i = nl;
+            start = i;
+            continue;
+        }
+        if bytes[i] == b';' {
+            let text = src[start..i].trim();
+            if !text.is_empty() {
+                out.push((text, stmt_line));
+            }
+            pending = false;
+            i += 1;
+            start = i;
+            continue;
+        }
+        if bytes[i] == b'\n' {
+            line += 1;
+        }
+        if !pending && !bytes[i].is_ascii_whitespace() {
+            pending = true;
+            stmt_line = line;
+        }
+        i += 1;
+    }
+    let tail = src[start..].trim();
+    if !tail.is_empty() {
+        out.push((tail, stmt_line));
+    }
+    out
+}
+
 
 #[cfg(test)]
 mod tests {
