@@ -230,17 +230,34 @@ Open, all low priority:
 libtorch and the script force-retains `libtorch_cuda` in the link
 (`--no-as-needed -ltorch_cuda -lc10_cuda`, else the linker drops it and
 `is_available()` is false). Proven on RTX PRO 6000 Blackwell + in ubuntu 22/24/26
-containers (see `INSTALL_LIBTORCH.md` §4). Open:
+containers (see `INSTALL_LIBTORCH.md` §4).
 
-- **Dist-swap idempotency**: the download-path check compares only the version
-  *base* (`${have_ver%%+*}`), so toggling `ARIA_TCH_CUDA=1` on a box that already
-  has the `2.7.0+cpu` dist SKIPS the re-download and silently stays CPU. Key the
-  idempotency on the full local tag (`+cpu` vs `+cuXXX`) so a CPU↔CUDA switch
-  re-provisions.
-- A user-exported `LIBTORCH` bypasses `tch-env.sh`, losing the CUDA/`torch.libs`
-  `RUSTFLAGS`; and a stale wrong-version aarch64 `$LIBTORCH` lands on the
-  "download from pytorch.org" branch that has no aarch64 C++ dist.
+Fixed this session: dist-swap re-provision on a CPU↔CUDA toggle + the aarch64
+CUDA pip index (`457e1ab`); preset-`LIBTORCH` RUSTFLAGS retention + aarch64-aware
+stale-dist advice (`93c8ad6`).
+
+Open:
+
 - **DGX Spark (aarch64)**: the `cuXXX` wheel index and the `torch.libs`/`nvidia/*`
   runtime-lib layout are unverified on a real GB10 — confirm there.
 - **E6**: `tools/qec_cross_check/run.sh` bootstraps with plain `pip`, which cannot
   build `pymatching` on **aarch64** — needs the wheel index / build deps.
+
+## Still open after the 2026-08-13 CUDA + Linux session
+
+Everything the session set out to do (Sx/Sxdg on CUDA incl. graph paths, R8 f64
+mode, GPU-enabled `tch`, the aarch64/GCC libtorch dance, `--all-targets` clippy)
+is landed and verified. What remains, all lower priority:
+
+1. **`Precision::bytes_per_amplitude` is unused** — the memory governor still
+   prices device work at f32 (8 B/amp). Wire it in as part of §2 before f64 is
+   bench-priced.
+2. **DGX Spark (aarch64+CUDA) hardware pass** — the f64 path, `--backend gpu`,
+   and GPU `tch` are proven on x86_64 Blackwell + in containers, but not on a
+   real GB10. Also confirm §2/§3 topology classification there.
+3. **E6** — aarch64 `pymatching` bootstrap in the QEC cross-check.
+
+Out of scope for that session (not CUDA/Linux, tracked in the handoff, not here):
+aria-py CI stage (E1), missing wasm example circuits (E3), bloqade/perceval
+Python (E5), aria-py resource bounding (R2b), the pest-grammar residual for
+conditioned measure/reset.
