@@ -88,8 +88,12 @@ echo "==> libtorch dir : $LIBTORCH_DIR"
 echo "==> repo         : $REPO_DIR"
 
 # ---- 1. install libtorch (idempotent) ----
+# The CPU dist stamps build-version with a local-version tag (`2.7.0+cpu`), so
+# compare only the part before `+` — otherwise the exact-match check re-downloads
+# forever and the post-download gate below hard-exits on a correct install.
+have_ver="$(cat "$LIBTORCH_DIR/build-version" 2>/dev/null || echo '')"
 if [ -f "$LIBTORCH_DIR/build-version" ] && \
-   [ "$(cat "$LIBTORCH_DIR/build-version")" = "$LIBTORCH_VERSION" ]; then
+   [ "${have_ver%%+*}" = "$LIBTORCH_VERSION" ]; then
   echo "==> libtorch $LIBTORCH_VERSION already present — skipping download"
 elif [ -n "$LIBTORCH_URL" ]; then
   echo "==> downloading libtorch $LIBTORCH_VERSION (~67 MB)..."
@@ -100,7 +104,7 @@ elif [ -n "$LIBTORCH_URL" ]; then
   unzip -q "$tmp/libtorch.zip" -d "$(dirname "$LIBTORCH_DIR")"
   rm -rf "$tmp"
   got="$(cat "$LIBTORCH_DIR/build-version" 2>/dev/null || echo '?')"
-  [ "$got" = "$LIBTORCH_VERSION" ] || { echo "ERROR: got '$got', want $LIBTORCH_VERSION" >&2; exit 1; }
+  [ "${got%%+*}" = "$LIBTORCH_VERSION" ] || { echo "ERROR: got '$got', want $LIBTORCH_VERSION" >&2; exit 1; }
   echo "==> installed libtorch $got at $LIBTORCH_DIR"
 else
   echo "ERROR: no auto-download URL for $uname_s/$uname_m." >&2
