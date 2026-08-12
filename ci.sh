@@ -255,9 +255,17 @@ fi
 # `ARIA_TCH=0 ./ci.sh` skips the stage.
 if [ "${ARIA_TCH:-1}" = "1" ]; then
   step "+   libtorch (tch) backend"
-  if [ -z "${LIBTORCH:-}" ] && [ -f ./tch-env.sh ]; then
-    # shellcheck disable=SC1091
-    . ./tch-env.sh
+  # Source tch-env.sh when LIBTORCH is unset OR already points at the same dir it
+  # configured — otherwise a user who exports LIBTORCH loses the RUSTFLAGS it
+  # carries (the --no-as-needed/torch_cuda retention and the aarch64 torch.libs
+  # rpath), and the CUDA link silently drops libtorch_cuda. A LIBTORCH pointing
+  # somewhere else is left untouched.
+  if [ -f ./tch-env.sh ]; then
+    env_libtorch="$(sed -n 's/^export LIBTORCH="\(.*\)"$/\1/p' ./tch-env.sh)"
+    if [ -z "${LIBTORCH:-}" ] || [ "${LIBTORCH:-}" = "$env_libtorch" ]; then
+      # shellcheck disable=SC1091
+      . ./tch-env.sh
+    fi
   fi
   if [ -z "${LIBTORCH:-}" ] || [ ! -f "${LIBTORCH}/build-version" ]; then
     echo "  libtorch not configured — fetching the pinned CPU dist..."
