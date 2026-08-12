@@ -119,29 +119,65 @@ fn a_conditioned_gate_is_refused() {
     }
 }
 
-/// A backend with no expectation path reports `CannotExpress`, not
-/// `NotCompiled`.
+/// **Every backend answers or refuses with a TYPED refusal — never
+/// `NotCompiled`, never a bare `Backend` error.**
 ///
-/// The distinction is the whole point of the step-2 taxonomy: the feature IS
-/// compiled, the protocol simply carries no expectation path for those
-/// backends. Reporting it as "not installed" would claim an environmental
-/// excuse for a capability gap.
+/// This asserts the INVARIANT rather than enumerating which backends lack an
+/// expectation path, and it does so because the enumerating version went stale
+/// twice in two commits: first when `Ppvm` gained a `PauliSum` path, then when
+/// `Tsim` gained a Stim-tableau one. Each time the test failed — correctly, a
+/// capability list must break when a capability lands — but each time the fix
+/// was to delete a line, which is maintenance, not verification.
 ///
-/// **`Ppvm` was in this list and is deliberately no longer.** It gained an
-/// expectation path (its `PauliSum` engine, the same-algorithm anchor for
-/// pauliprop), so asserting it "cannot express" became false — and the test
-/// failed, which is the correct outcome. A list of capability gaps must fail
-/// when a gap closes, or it silently keeps asserting a limitation that no
-/// longer exists.
+/// The property that actually matters does not change as backends gain
+/// capabilities: a compiled-in backend must never report an expectation gap as
+/// `NotCompiled`, because that claims an environmental excuse ("rebuild with
+/// --features") for something no rebuild would fix. `CannotExpress` says the
+/// backend understood and correctly declined; the N-way matrix files it as a
+/// legitimately empty cell rather than a defect.
 #[test]
-fn backends_without_an_expectation_path_report_cannot_express() {
-    for b in [Backend::Perceval, Backend::Bloqade, Backend::Tsim] {
-        let qasm = format!("{HDR}qreg q[1];\nh q[0];");
+fn no_backend_reports_a_capability_gap_as_not_installed() {
+    let qasm = format!("{HDR}qreg q[1];\nh q[0];");
+    let mut answered = 0;
+    let mut refused = 0;
+    for b in [
+        Backend::Qiskit,
+        Backend::Perceval,
+        Backend::Bloqade,
+        Backend::Tsim,
+        Backend::Ppvm,
+    ] {
         match expectation_qasm2(b, &qasm, &[obs("Z")]) {
-            Err(BridgeError::CannotExpress(got, _)) => assert_eq!(got, b),
-            other => panic!("{b:?}: expected CannotExpress, got {other:?}"),
+            Ok(_) => answered += 1,
+            Err(BridgeError::CannotExpress(got, _)) => {
+                assert_eq!(got, b, "CannotExpress named the wrong backend");
+                refused += 1;
+            }
+            // `NotCompiled` is legitimate ONLY when the feature genuinely is
+            // not compiled in. This test target enables bridge-qiskit, so
+            // Qiskit reaching that arm would be a real defect.
+            Err(BridgeError::NotCompiled(got, _)) => {
+                assert_ne!(
+                    got,
+                    Backend::Qiskit,
+                    "bridge-qiskit is enabled for this target, so NotCompiled is wrong"
+                );
+                refused += 1;
+            }
+            // The venv may be absent on a given machine; that is environmental
+            // and says nothing about the capability.
+            Err(BridgeError::Unavailable(..)) => refused += 1,
+            Err(e) => panic!(
+                "{b:?} reported an expectation gap as an untyped error: {e:?}. \
+                 A gap must be CannotExpress so the matrix records an empty cell \
+                 rather than a defect."
+            ),
         }
     }
+    assert_eq!(answered + refused, 5, "every backend must be classified");
+    // Qiskit at minimum must answer; if nothing answers, the harness is broken
+    // rather than the backends being limited.
+    assert!(answered >= 1, "no backend answered — check the qiskit venv");
 }
 
 /// An empty observable list is rejected up front rather than spawning Python

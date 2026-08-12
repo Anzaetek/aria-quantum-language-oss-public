@@ -242,6 +242,9 @@ pub fn expectation_qasm2(
         // cannot silently get a truncated answer when they asked for an exact
         // one.
         Backend::Ppvm => ppvm::expectation(qasm, observables, None),
+        // Stim's tableau, reached through the tsim venv — exact integers, and
+        // Clifford-only by construction. See `tsim::expectation`.
+        Backend::Tsim => tsim::expectation(qasm, observables),
         other => Err(BridgeError::CannotExpress(
             other,
             format!(

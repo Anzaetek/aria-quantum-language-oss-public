@@ -410,7 +410,11 @@ if [ "${ARIA_NWAY:-0}" = "1" ]; then
   # arithmetic errors; ppvm catches a shared misunderstanding of the method.
   cargo test -p omega-bridges --features bridge-qiskit,bridge-ppvm \
     --test ppvm_expectation -- --nocapture
-  echo "  OK: counts (derived gate), expectations (1e-12), truncation bound, ppvm same-algorithm anchor"
+  # Stim's tableau as the same-algorithm anchor for the stabilizer backend.
+  # Clifford-only, EXACT (integer expectation values, no float slack).
+  cargo test -p omega-bridges --features bridge-qiskit,bridge-tsim \
+    --test stim_expectation -- --nocapture
+  echo "  OK: counts, expectations (1e-12), truncation bound, ppvm + stim same-algorithm anchors"
 else
   skipped "N-way counts matrix — set ARIA_NWAY=1 with the qiskit venv"
 fi
