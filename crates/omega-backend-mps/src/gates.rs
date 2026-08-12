@@ -44,6 +44,21 @@ pub fn sdg() -> Gate1Q {
     [ONE, ZERO, ZERO, NEG_I]
 }
 
+/// `√X` = ½·[[1+i, 1−i], [1−i, 1+i]] — the exact Qiskit `SXGate`. See the
+/// statevector backend's `gates::sx` for why this is not `U3(π/2,−π/2,π/2)`.
+pub fn sx() -> Gate1Q {
+    let a = Complex64::new(0.5, 0.5);
+    let b = Complex64::new(0.5, -0.5);
+    [a, b, b, a]
+}
+
+/// `√X†` — conjugate transpose of [`sx`].
+pub fn sxdg() -> Gate1Q {
+    let a = Complex64::new(0.5, -0.5);
+    let b = Complex64::new(0.5, 0.5);
+    [a, b, b, a]
+}
+
 pub fn t() -> Gate1Q {
     [ONE, ZERO, ZERO, ei(std::f64::consts::PI / 4.0)]
 }

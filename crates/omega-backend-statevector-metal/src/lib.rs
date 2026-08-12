@@ -1421,6 +1421,13 @@ pub(crate) fn apply_op(
         GateKind::Z => state.apply_z(q0()),
         GateKind::S => state.apply_s(q0()),
         GateKind::Sdg => state.apply_sdg(q0()),
+        // sx / sxdg go through the GENERIC 1q path with their exact matrices.
+        // No dedicated kernel and deliberately NOT routed via apply_u3: that
+        // would introduce the e^{iπ/4} global phase this variant exists to
+        // avoid (|Δ| = 0.541), and a GPU statevector is exactly where a
+        // statevector comparison would notice.
+        GateKind::Sx => state.apply_1q(q0(), &[Complex64::new(0.5, 0.5), Complex64::new(0.5, -0.5), Complex64::new(0.5, -0.5), Complex64::new(0.5, 0.5)]),
+        GateKind::Sxdg => state.apply_1q(q0(), &[Complex64::new(0.5, -0.5), Complex64::new(0.5, 0.5), Complex64::new(0.5, 0.5), Complex64::new(0.5, -0.5)]),
         GateKind::T => state.apply_t(q0()),
         GateKind::Tdg => state.apply_tdg(q0()),
 

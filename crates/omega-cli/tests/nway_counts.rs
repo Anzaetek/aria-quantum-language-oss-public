@@ -358,15 +358,14 @@ struct Row {
 /// legitimately empty cell. They are real gaps, they are in the report, and
 /// they are counted separately from the cells that were compared.
 #[allow(dead_code)]
-const NOT_LOWERABLE: &[(&str, &str)] = &[(
-    "03_sqrt_x.qasm",
-    "`sx` / `sxdg` have no GateKind. They are exactly \
-     `e^{±iπ/4}·u3(π/2, ∓π/2, ±π/2)` (verified against Qiskit), so lowering to \
-     U3 is correct for counts and WRONG by a global phase for any statevector \
-     comparison. Choosing between an aliased lowering and a new GateKind \
-     threaded through six backends (CPU/MPS/Pauli/CUDA/Metal/OpenCL) is a \
-     design decision, so it is planned rather than slipped in here.",
-)];
+const NOT_LOWERABLE: &[(&str, &str)] = &[];
+
+// EMPTY as of the `GateKind::Sx` / `Sxdg` work — `03_sqrt_x.qasm` was the only
+// entry and it now lowers natively. The list stays because the mechanism is
+// the point: it fails when a NEW gap appears AND when a listed one starts
+// working, so it cannot rot. It caught this very change ("is listed in
+// NOT_LOWERABLE but now lowers cleanly") rather than silently suppressing a
+// fixture that had begun to pass.
 
 #[cfg(feature = "bridge-qiskit")]
 #[test]

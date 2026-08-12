@@ -217,6 +217,15 @@ fn apply_op_dagger(
         GateKind::Sdg => {
             state.apply_diagonal(q0, Complex64::new(1.0, 0.0), Complex64::new(0.0, 1.0))
         }
+        // sx† = sxdg.
+        GateKind::Sx => {
+            let u = gates::sxdg();
+            state.apply_1q(q0, u[0], u[1], u[2], u[3])
+        }
+        GateKind::Sxdg => {
+            let u = gates::sx();
+            state.apply_1q(q0, u[0], u[1], u[2], u[3])
+        }
         GateKind::T => state.apply_diagonal(
             q0,
             Complex64::new(1.0, 0.0),

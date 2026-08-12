@@ -703,6 +703,8 @@ fn apply_gate_mps(
         GateKind::Z => mps.apply_1q(op.qubits[0].0 as usize, &gates::z()),
         GateKind::S => mps.apply_1q(op.qubits[0].0 as usize, &gates::s()),
         GateKind::Sdg => mps.apply_1q(op.qubits[0].0 as usize, &gates::sdg()),
+        GateKind::Sx => mps.apply_1q(op.qubits[0].0 as usize, &gates::sx()),
+        GateKind::Sxdg => mps.apply_1q(op.qubits[0].0 as usize, &gates::sxdg()),
         GateKind::T => mps.apply_1q(op.qubits[0].0 as usize, &gates::t()),
         GateKind::Tdg => mps.apply_1q(op.qubits[0].0 as usize, &gates::tdg()),
         GateKind::Id => {}

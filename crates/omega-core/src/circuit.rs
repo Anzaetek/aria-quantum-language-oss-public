@@ -39,6 +39,30 @@ pub enum GateKind {
     Sdg,
     T,
     Tdg,
+    /// `√X` — Stim's `SQRT_X`, Qiskit's `SXGate`.
+    ///
+    /// **A first-class variant rather than an alias for
+    /// `U3(π/2, −π/2, π/2)`, for two independent reasons.**
+    ///
+    /// 1. **It is CLIFFORD.** `sx·sx = X` exactly. Lowering it to `U3` throws
+    ///    that away at the type level: `PauliBackend` rejects `U3` outright as
+    ///    non-Clifford, so an all-Clifford `sx` circuit would be refused by the
+    ///    stabilizer backend — precisely the engine such circuits belong on.
+    /// 2. **The alias is off by a global phase**, `sx = e^{iπ/4}·U3(π/2, −π/2,
+    ///    π/2)`; measured `|sx − U3| = 0.541`, `det(sx) = i` vs `det(U3) = 1`.
+    ///    Invisible in counts and expectations, but a global factor on a
+    ///    *sub-block* becomes a **relative** phase under control — the same
+    ///    argument this repo already settled for the photonics `hwp` global
+    ///    `i`, which moved 0.413 of probability in a 4-mode MZI.
+    ///
+    /// Clifford action (Stim's canonical tableau and an independent
+    /// conjugation both agree): `X → +X`, `Y → +Z`, `Z → −Y`.
+    Sx,
+    /// `√X†` — Stim's `SQRT_X_DAG`, Qiskit's `SXdgGate`. See [`GateKind::Sx`].
+    ///
+    /// Clifford action: `X → +X`, `Y → −Z`, `Z → +Y`. Verified
+    /// `sxdg = sx†` and `sx·sxdg = I` to 0.000e+00.
+    Sxdg,
     Id,
 
     // Single-qubit rotation gates (1 param)
@@ -102,6 +126,8 @@ impl GateKind {
             | GateKind::Sdg
             | GateKind::T
             | GateKind::Tdg
+            | GateKind::Sx
+            | GateKind::Sxdg
             | GateKind::Id
             | GateKind::Rx
             | GateKind::Ry

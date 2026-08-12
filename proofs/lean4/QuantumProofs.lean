@@ -12,6 +12,7 @@
 
 import QuantumProofs.Basic
 import QuantumProofs.Gates
+import QuantumProofs.SqrtX
 import QuantumProofs.CircuitSemantics
 import QuantumProofs.Adjoint
 import QuantumProofs.QFT

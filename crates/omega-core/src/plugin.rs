@@ -284,6 +284,18 @@ pub fn gate_kind_to_ffi(gate: &GateKind) -> Result<u32> {
         GateKind::Sdg => GATE_SDG,
         GateKind::T => GATE_T,
         GateKind::Tdg => GATE_TDG,
+        // No GATE_SX / GATE_SXDG in the plugin ABI. Deliberately NOT encoded
+        // as U3: the ABI is a stable wire contract, and silently substituting
+        // a different gate (correct only up to a global phase, and not
+        // Clifford on the far side) would make a plugin compute something the
+        // caller did not ask for. Adding the constants is an ABI VERSION bump,
+        // so until a plugin needs them this is an honest refusal.
+        GateKind::Sx | GateKind::Sxdg => {
+            return Err(crate::error::OmegaError::Unsupported(format!(
+                "gate {gate:?} has no plugin-ABI encoding; adding GATE_SX / \
+                 GATE_SXDG requires an ABI version bump"
+            )))
+        }
         GateKind::Id => GATE_ID,
         GateKind::Rx => GATE_RX,
         GateKind::Ry => GATE_RY,

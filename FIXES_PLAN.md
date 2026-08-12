@@ -2552,6 +2552,72 @@ would have produced a confidently wrong anchor:
 > exactly `0.00e+00` for a `t`→`tdg` mutation). Before trusting a test, ask what
 > symmetry its fixture has.
 
+### K10. `sx` / `sxdg` — resolved as a native `GateKind`, not a `U3` alias
+
+K7 left this open as "a design decision, so it is planned rather than slipped
+in". Decided 2026-08-11: **native variants**. The deciding fact was not the one
+the framing anticipated.
+
+**The framing was about the global phase.** `sx = e^{iπ/4}·U3(π/2, −π/2, π/2)`,
+verified three ways (closed form, eigendecomposition `√X`, Qiskit) to 1.6e-16,
+with `|sx − U3| = 0.541` and `det(sx) = i` vs `det(U3) = 1`. Real, but invisible
+in counts and expectations — so on its own it argues only for care in
+statevector comparisons.
+
+**The deciding fact is Clifford-ness.** `omega-backend-pauli/src/sim.rs` rejects
+`U3` *categorically* as non-Clifford. `sx·sx = X` exactly, so `sx` IS Clifford;
+aliasing it to `U3` would make the stabilizer backend refuse an all-Clifford
+circuit — precisely the engine such circuits belong on. That is a capability
+regression, not a phase nicety.
+
+Two supporting observations: a global factor on a **sub-block** becomes a
+*relative* phase under control, the same argument this repo already settled for
+the photonics `hwp` global `i`; and full CI showed both tsim's and ppvm's gate
+sets already accept `sx`/`sxdg`/`p`, so the in-tree lowering was the only thing
+in the pipeline that could not.
+
+**Measured effect on the counts lane:**
+
+| engine | before | after |
+|---|---|---|
+| statevector | 13/14 | **14/14** |
+| mps | 13/14 | **14/14** |
+| pauli | 7/14 | **8/14** |
+
+`NOT_LOWERABLE` is now empty — and it earned its keep on the way out, failing
+with *"03_sqrt_x.qasm is listed in NOT_LOWERABLE but now lowers cleanly"* rather
+than silently suppressing a fixture that had started to pass. The list stays for
+the mechanism.
+
+**Formal artefact.** `proofs/lean4/QuantumProofs/SqrtX.lean` proves the Clifford
+conjugation rules the tableau encodes — `sx: X → +X, Y → +Z, Z → −Y`; `sxdg:
+X → +X, Y → −Z, Z → +Y` — plus `SX·SX = X` and `SX·SXdg = I`. Sorry-free.
+Mutation-tested: flipping `sqrtX_conj_Z` to `= Y` makes Lean fail with
+`unsolved goals`, so the proofs are load-bearing rather than `simp` closing a
+vacuous statement.
+
+The tableau closed form (`x' = x XOR z`, `z' = z`, `sign ^= z AND NOT x` for
+`sx`, `z AND x` for `sxdg`) was derived from that action and checked against all
+four Pauli inputs — **not** by analogy with `s()`. The two gates need
+*different* sign conditions, and mutation-testing the copy-paste error
+(`sxdg`'s condition pasted into `sx`) shows why it matters: `sx|0⟩` reports
+`⟨Y⟩ = +1` instead of `−1`. Note `sx_twice_is_x` **passes** under that mutation,
+because a global sign squares away — the eigenstate-sign tests are what
+discriminate.
+
+**GPU:** Metal and OpenCL route through their generic `apply_1q` with the exact
+matrix, deliberately not `apply_u3`. **CUDA is untouched** and will fail to
+compile under `--features cuda` with `non-exhaustive patterns`; that is the
+intended state, and `CUDA_TODO.md` names all six sites, the matrices, and the
+trap that `sx` is NOT diagonal so must not join the `diagonal_factor` fusion
+classifier.
+
+**Not encoded in the plugin ABI.** There is no `GATE_SX` constant, and
+`gate_kind_to_ffi` refuses rather than substituting `U3` — the ABI is a stable
+wire contract, and silently sending a different gate would make a plugin compute
+something the caller did not ask for. Adding the constants is an ABI version
+bump.
+
 ### K9. The CI crate list is a hand-maintained gate, and it had holes
 
 Found while checking that the step-3 regression tests would actually run.
