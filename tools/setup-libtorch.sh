@@ -190,6 +190,15 @@ elif [ -n "$LIBTORCH_URL" ]; then
   got="$(cat "$LIBTORCH_DIR/build-version" 2>/dev/null || echo '?')"
   [ "${got%%+*}" = "$LIBTORCH_VERSION" ] || { echo "ERROR: got '$got', want $LIBTORCH_VERSION" >&2; exit 1; }
   echo "==> installed libtorch $got at $LIBTORCH_DIR"
+elif [ "$uname_s/$uname_m" = "Linux/aarch64" ]; then
+  # Reached only when a stale $LIBTORCH_DIR/build-version made the 0b pip route
+  # skip (its gate is `[ ! -f build-version ]`). pytorch.org has no aarch64 C++
+  # dist, so point at the pip route rather than a nonexistent download.
+  echo "ERROR: $LIBTORCH_DIR holds '$have_ver' (want $LIBTORCH_VERSION${WANT_LOCAL:++$WANT_LOCAL}), and" >&2
+  echo "  no aarch64 C++ dist exists upstream. Clear it so the pip-wheel route runs:" >&2
+  echo "    rm -rf \"$LIBTORCH_DIR\" \"${ARIA_TORCH_VENV:-$REPO_DIR/.venv-libtorch}\"" >&2
+  echo "  then re-run${WANT_LOCAL:+ with ARIA_TCH_CUDA=1 ARIA_TCH_CUDA_VER=$WANT_LOCAL}:  $0" >&2
+  exit 1
 else
   echo "ERROR: no auto-download URL for $uname_s/$uname_m." >&2
   echo "  Download libtorch $LIBTORCH_VERSION (CPU) from https://pytorch.org/get-started/locally/" >&2
