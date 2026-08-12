@@ -1717,6 +1717,43 @@ mod tests {
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     #[test]
+    fn sx_pins_exact_phase_and_dagger_composes_to_identity() {
+        // Drives the apply_op / apply_op_dagger Sx arms directly. Pins the
+        // EXACT Qiskit √X phase — the U3(π/2,−π/2,π/2) alias would differ by
+        // e^{−iπ/4} and fail the first two asserts.
+        let op = |gate| omega_core::circuit::GateOp {
+            gate,
+            qubits: smallvec::smallvec![omega_core::circuit::Qubit(0)],
+            params: Default::default(),
+            classical_bit: None,
+            condition: None,
+        };
+        let params = ParameterBinding::new();
+
+        // √X|0⟩ = ½[(1+i), (1−i)].
+        let mut state = new_state(1);
+        apply_op(&mut state, &op(GateKind::Sx), &params).expect("Sx");
+        let v = state.read_state().expect("read");
+        assert!((v[0] - Complex64::new(0.5, 0.5)).norm() < 1e-5, "amp0 = {:?}", v[0]);
+        assert!((v[1] - Complex64::new(0.5, -0.5)).norm() < 1e-5, "amp1 = {:?}", v[1]);
+
+        // √X·√X = X: |0⟩ → |1⟩.
+        apply_op(&mut state, &op(GateKind::Sx), &params).expect("Sx^2");
+        let v = state.read_state().expect("read");
+        assert!(v[0].norm() < 1e-5, "amp0 = {:?}", v[0]);
+        assert!((v[1] - Complex64::new(1.0, 0.0)).norm() < 1e-5, "amp1 = {:?}", v[1]);
+
+        // √X†·√X = I: a fresh |0⟩ round-trips back to |0⟩.
+        let mut state = new_state(1);
+        apply_op(&mut state, &op(GateKind::Sx), &params).expect("Sx");
+        apply_op(&mut state, &op(GateKind::Sxdg), &params).expect("Sxdg");
+        let v = state.read_state().expect("read");
+        assert!((v[0] - Complex64::new(1.0, 0.0)).norm() < 1e-5, "amp0 = {:?}", v[0]);
+        assert!(v[1].norm() < 1e-5, "amp1 = {:?}", v[1]);
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    #[test]
     fn cx_creates_bell_pair() {
         let mut state = new_state(2);
         state.apply_h(0).expect("H");
@@ -2083,6 +2120,18 @@ mod tests {
                 gate: GateKind::Ry,
                 qubits: smallvec::smallvec![Qubit(q)],
                 params: smallvec::smallvec![ParamExpr::Symbol(q)],
+                classical_bit: None,
+                condition: None,
+            });
+        }
+        // Non-parametric √X / √X† in the middle of the ansatz: adds no gradient
+        // symbols but forces the adjoint's Sx/Sxdg arms (forward Sx→sx, dagger
+        // Sx→sxdg) to agree with the CPU reference bit-for-bit.
+        for (q, gate) in [(0u32, GateKind::Sx), (1u32, GateKind::Sxdg)] {
+            circuit.ops.push(GateOp {
+                gate,
+                qubits: smallvec::smallvec![Qubit(q)],
+                params: smallvec::smallvec![],
                 classical_bit: None,
                 condition: None,
             });
