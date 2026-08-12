@@ -285,6 +285,12 @@ pub fn to_qasm3(circuit: &Circuit) -> String {
     lines.push(String::new());
 
     for inst in &circuit.instructions {
+        // Where this instruction's output starts, so a classical guard can wrap
+        // everything it produced. Same line-range approach as `to_qasm`, and
+        // for the same reason: RBS expands to several statements, and guarding
+        // only the first would leave the rest unguarded.
+        let emitted_from = lines.len();
+
         match inst.gate.kind {
             GateKind::Barrier => {
                 let qrefs: Vec<String> = inst.qubits.iter().map(|q| q.to_string()).collect();
@@ -335,6 +341,32 @@ pub fn to_qasm3(circuit: &Circuit) -> String {
                 } else {
                     lines.push(format!("// unsupported gate: {:?}", inst.gate.kind));
                 }
+            }
+        }
+
+        // OpenQASM 3's `if (c[i] == V)` addresses a SINGLE BIT — exactly
+        // what an Aria condition is — so unlike the 2.0 path there is nothing
+        // to refuse and no register-width restriction.
+        //
+        // This gap made `to_qasm`'s refusal message HARMFUL: it told users to
+        // come here for single-bit guards, and this function had zero
+        // references to `inst.condition`, emitting every guarded instruction
+        // bare. Following our own advice produced the silently wrong circuit
+        // Part H measured as {"11": 2002, "10": 1998} against a true
+        // {"00": 1995, "11": 2005}. Misdirection is worse than silence.
+        //
+        // Comment lines are left unwrapped: prefixing `// rbs(...)` with a
+        // guard reads as though the condition applies to a statement that is
+        // not there.
+        if let Some((clbit, value)) = &inst.condition {
+            for line in lines.iter_mut().skip(emitted_from) {
+                if line.starts_with("//") || line.is_empty() {
+                    continue;
+                }
+                *line = format!(
+                    "if ({}[{}] == {}) {}",
+                    clbit.register, clbit.index, value, line
+                );
             }
         }
     }

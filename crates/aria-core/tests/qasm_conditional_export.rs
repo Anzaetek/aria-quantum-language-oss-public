@@ -117,84 +117,49 @@ fn a_wide_register_without_a_guard_still_exports() {
     assert!(qasm.contains("x q[1];"), "got:\n{qasm}");
 }
 
-/// QASM 3 is the documented escape hatch, so it must actually be one.
+/// **QASM 3 is the escape hatch `to_qasm` names, so it must actually be one.**
 ///
-/// `to_qasm3` is infallible today and does not emit `if` at all — so this
-/// records the CURRENT state honestly rather than asserting a capability that
-/// does not exist. If the refusal message points at `to_qasm3`, that path had
-/// better at least accept the circuit.
+/// This test previously asserted the ABSENCE of `if` in the QASM 3 path, and
+/// documented that as honesty about a missing feature. It was honest about the
+/// test and wrong about the product: `to_qasm`'s refusal message told users to
+/// come here for single-bit guards, and `to_qasm3` emitted every guarded
+/// instruction BARE. Following our own advice produced the silently wrong
+/// circuit Part H measured — misdirection, which is worse than the silence it
+/// replaced.
+///
+/// The absence-assertion was written as a canary that would "fail loudly when
+/// the gap closes". It did its job; this is the inversion.
 #[test]
-fn to_qasm3_accepts_what_qasm2_refuses() {
-    let out = to_qasm3(&feedforward("c", 2));
+fn to_qasm3_emits_the_single_bit_guard_qasm2_cannot() {
+    // The 2-bit register QASM 2.0 must refuse: OpenQASM 3 addresses one bit.
+    let c = feedforward("c", 2);
+    assert!(
+        to_qasm(&c).is_err(),
+        "QASM 2.0 must still refuse a single-bit guard on a 2-bit register"
+    );
+
+    let out = to_qasm3(&c);
     assert!(out.contains("OPENQASM 3.0;"), "got:\n{out}");
-    // NOTE: to_qasm3 does not yet emit `if (c[i] == V)` either — its doc
-    // comment says so ("no classical control flow"). The QASM2 refusal points
-    // at it as the right *destination*, and closing that gap is tracked
-    // separately. Asserting the `if` here would be asserting a feature that
-    // does not exist, which is how a test starts lying about capability.
     assert!(
-        !out.contains("if ("),
-        "to_qasm3 has gained `if` emission — update the QASM2 refusal message \
-         and this test, which deliberately records its ABSENCE"
+        out.contains("if (c[0] == 1) x q[1];"),
+        "QASM 3 must carry the guard the 2.0 path cannot express — that is the \
+         entire premise of `to_qasm`'s refusal message. Got:\n{out}"
+    );
+    // And the guarded gate must not ALSO appear bare.
+    assert!(
+        !out.lines().any(|l| l.trim() == "x q[1];"),
+        "found an UNGUARDED `x q[1];` — the guard was dropped:\n{out}"
     );
 }
 
-/// **Round-trip through the real parser**, not just a substring check.
-///
-/// Asserting that the emitted text *contains* `if (c == 1) x q[1];` only proves
-/// we wrote what we meant to write. Re-parsing proves a consumer can read it
-/// back and recovers the guard — which is the property the export exists for,
-/// and the one the original defect broke while leaving the file perfectly
-/// well-formed.
+/// A size-1 register works too, so the fix is not special-cased to the wide
+/// case that motivated it.
 #[test]
-fn an_exported_guard_survives_reparsing() {
-    let qasm = to_qasm(&feedforward("c", 1)).expect("size-1 creg is expressible");
-    let ir = omega_parser::lower_to_ir(&qasm).expect("our own export must re-parse");
-
-    let guarded: Vec<_> = ir
-        .ops
-        .iter()
-        .filter(|op| op.condition.is_some())
-        .collect();
-    assert_eq!(
-        guarded.len(),
-        1,
-        "exactly one op should come back conditioned; got {} in:\n{qasm}",
-        guarded.len()
-    );
-    // (start_bit, num_bits, expected) — a size-1 creg at bit 0, expecting 1.
-    assert_eq!(guarded[0].condition, Some((0, 1, 1)));
-    assert_eq!(
-        format!("{:?}", guarded[0].gate),
-        "X",
-        "the X is the guarded op"
-    );
-}
-
-/// A conditioned `barrier` is refused, because QASM 2.0's `if` takes a gate
-/// application, measurement or reset — and a barrier is none of those.
-///
-/// **Measured against Qiskit 2.5.1**, not assumed: `if (c==1) barrier q;` is
-/// rejected with "needed a gate application, measurement or reset", while
-/// guarded gate / reset / measure are all accepted.
-///
-/// Our own pest grammar happens to ADMIT it (`barrier q` parses as a gate
-/// application), so a round-trip through `omega-parser` alone would not have
-/// caught this. The export exists for interchange, so the consumer that
-/// matters is the other toolchain.
-#[test]
-fn a_conditioned_barrier_is_refused() {
-    let mut c = feedforward("c", 1);
-    c.instructions.push(Instruction {
-        gate: GateDef::new(GateKind::Barrier),
-        qubits: vec![Qubit::new("q", 0), Qubit::new("q", 1)],
-        clbits: vec![],
-        condition: Some((Clbit::new("c", 0), 1)),
-    });
-    let err = to_qasm(&c).expect_err("a guarded barrier is not valid QASM 2.0");
+fn to_qasm3_guards_a_size_one_register_as_well() {
+    let out = to_qasm3(&feedforward("c", 1));
     assert!(
-        err.contains("barrier") && err.contains("gate application"),
-        "the refusal must say why a barrier cannot be guarded; got:\n{err}"
+        out.contains("if (c[0] == 1) x q[1];"),
+        "got:\n{out}"
     );
 }
 
@@ -225,5 +190,69 @@ fn the_aria_emitter_carries_the_guard_too() {
     assert!(
         !bare,
         "found a BARE `apply X on q[1]` — the guard was dropped. Full output:\n{src}"
+    );
+}
+
+/// **The Aria emitter's output must RE-PARSE**, not merely contain the right
+/// substring.
+///
+/// `the_aria_emitter_carries_the_guard_too` is a substring check — the exact
+/// standard its sibling `an_exported_guard_survives_reparsing` states three
+/// lines away, and it could not see either of these:
+///
+/// 1. `RESET` was emitted as `-- reset q[0]`, a comment, so a channel that
+///    changes measurement statistics vanished on round trip.
+/// 2. A guarded comment line became `when m[0] == 1 { -- reset q[0] }`, and
+///    since `--` runs to end-of-line the closing brace was commented out and
+///    the file no longer parsed at all.
+///
+/// Both shipped in the commit that made RESET spellable.
+#[test]
+fn aria_emitter_output_reparses_with_guards_and_reset() {
+    use aria_core::ast::{parse_aria_circuit, to_aria_source, GateKind as GK};
+
+    let mut c = feedforward("c", 1);
+    // A guarded RESET — pins defect 1.
+    c.instructions.push(Instruction {
+        gate: GateDef::new(GateKind::Reset),
+        qubits: vec![Qubit::new("q", 0)],
+        clbits: vec![],
+        condition: Some((Clbit::new("c", 0), 1)),
+    });
+    // A guarded BARRIER — pins defect 2. This is load-bearing and was missing:
+    // once RESET became a real statement, NOTHING in the fixture emitted a
+    // `--` comment any more, so the comment-wrapping mutation passed. The
+    // Aria emitter still writes `-- barrier …`, so this is the case that
+    // exercises the path.
+    c.instructions.push(Instruction {
+        gate: GateDef::new(GateKind::Barrier),
+        qubits: vec![Qubit::new("q", 0), Qubit::new("q", 1)],
+        clbits: vec![],
+        condition: Some((Clbit::new("c", 0), 1)),
+    });
+
+    let src = to_aria_source(&c, "Feedforward");
+    let back = parse_aria_circuit(&src, "Feedforward").unwrap_or_else(|e| {
+        panic!("the Aria emitter's own output must re-parse; got {e}\n\n{src}")
+    });
+
+    // The RESET survived as an instruction, not a comment.
+    let resets: Vec<_> = back
+        .instructions
+        .iter()
+        .filter(|i| i.gate.kind == GK::Reset)
+        .collect();
+    assert_eq!(
+        resets.len(),
+        1,
+        "RESET must round-trip as an instruction. Emitting it as `-- reset` \
+         deletes a channel silently. Source was:\n{src}"
+    );
+
+    // And the guards survived.
+    let guarded = back.instructions.iter().filter(|i| i.condition.is_some()).count();
+    assert!(
+        guarded >= 1,
+        "at least one guard must survive the round trip; source was:\n{src}"
     );
 }
