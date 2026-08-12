@@ -3,7 +3,7 @@
 // Replaces the captured `cuLaunchHostFunc` host callback with a
 // pure-device kernel: for each measurement output `i`,
 //
-//     coeffs[i] = 2 · (float(predictions[i]) - y_label[i])
+//     coeffs[i] = 2 · (real(predictions[i]) - y_label[i])
 //
 // Both `predictions` (one f64 per output, populated by the in-graph
 // `pauli_z_expectation_to_slot` kernels) and `y_label` (one f32
@@ -24,13 +24,13 @@ extern "C" {
 
 __global__ void compute_residual_coeffs(
     const double* predictions,
-    const float* y_label,
-    float* coeffs,
+    const real* y_label,
+    real* coeffs,
     unsigned int num_outputs
 ) {
     unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= num_outputs) return;
-    coeffs[gid] = 2.0f * ((float)predictions[gid] - y_label[gid]);
+    coeffs[gid] = 2.0 * ((real)predictions[gid] - y_label[gid]);
 }
 
 } // extern "C"

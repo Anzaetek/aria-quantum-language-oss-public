@@ -21,16 +21,16 @@ struct DiagonalPauliSumParams {
 };
 
 __global__ void apply_diagonal_pauli_sum(
-    const float2* psi,
-    float2* nu,
+    const real2* psi,
+    real2* nu,
     DiagonalPauliSumParams p,
     const unsigned int* sign_masks,
-    const float* coeffs,
+    const real* coeffs,
     unsigned long long dim
 ) {
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (gid >= dim) { return; }
-    float scale = 0.0f;
+    real scale = 0.0;
     unsigned int gid_lo = (unsigned int)(gid & 0xFFFFFFFFULL);
     for (unsigned int k = 0u; k < p.num_terms; ++k) {
         // Only the low 32 bits of `gid` matter — sign_masks are u32 and
@@ -39,8 +39,8 @@ __global__ void apply_diagonal_pauli_sum(
         unsigned int parity = __popc(gid_lo & sign_masks[k]) & 1u;
         scale += (parity == 0u) ? coeffs[k] : -coeffs[k];
     }
-    float2 amp = psi[gid];
-    nu[gid] = make_float2(amp.x * scale, amp.y * scale);
+    real2 amp = psi[gid];
+    nu[gid] = make_real2(amp.x * scale, amp.y * scale);
 }
 
 } // extern "C"

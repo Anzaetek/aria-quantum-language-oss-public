@@ -35,20 +35,20 @@ extern "C" {
 // constant (1024). Threads beyond `len` read 0 so the in-block scan
 // is well-defined on the partial-final-block.
 __global__ void cdf_block_scan_pass1(
-    float* data,
-    float* block_totals,
+    real* data,
+    real* block_totals,
     unsigned long long len
 ) {
-    extern __shared__ float buf[];
+    extern __shared__ real buf[];
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned int tid = threadIdx.x;
 
-    float v = (gid < len) ? data[gid] : 0.0f;
+    real v = (gid < len) ? data[gid] : 0.0;
     buf[tid] = v;
     __syncthreads();
 
     for (unsigned int offset = 1; offset < blockDim.x; offset *= 2) {
-        float add = (tid >= offset) ? buf[tid - offset] : 0.0f;
+        real add = (tid >= offset) ? buf[tid - offset] : 0.0;
         __syncthreads();
         buf[tid] += add;
         __syncthreads();
@@ -71,13 +71,13 @@ __global__ void cdf_block_scan_pass1(
 // by this read-time conversion so the cross-block scan can recurse
 // uniformly in inclusive-scan terms.)
 __global__ void cdf_block_scan_pass2_from_inclusive(
-    float* data,
-    const float* block_totals_inclusive,
+    real* data,
+    const real* block_totals_inclusive,
     unsigned long long len
 ) {
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (gid >= len) { return; }
-    float offset = (blockIdx.x == 0) ? 0.0f : block_totals_inclusive[blockIdx.x - 1];
+    real offset = (blockIdx.x == 0) ? 0.0 : block_totals_inclusive[blockIdx.x - 1];
     data[gid] += offset;
 }
 

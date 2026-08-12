@@ -50,28 +50,28 @@ extern "C" {
 
 struct Apply1qParams {
     unsigned int qubit;
-    float u00_re; float u00_im;
-    float u01_re; float u01_im;
-    float u10_re; float u10_im;
-    float u11_re; float u11_im;
+    real u00_re; real u00_im;
+    real u01_re; real u01_im;
+    real u10_re; real u10_im;
+    real u11_re; real u11_im;
 };
 
-__device__ inline float2 cmul_local(float2 a, float2 b) {
-    return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+__device__ inline real2 cmul_local(real2 a, real2 b) {
+    return make_real2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-__device__ inline float2 cadd_local(float2 a, float2 b) {
-    return make_float2(a.x + b.x, a.y + b.y);
+__device__ inline real2 cadd_local(real2 a, real2 b) {
+    return make_real2(a.x + b.x, a.y + b.y);
 }
 
 // Conjugate-of-a × b = ν*·x for inner product.
-__device__ inline float2 cmul_conj_local(float2 a, float2 b) {
-    return make_float2(a.x * b.x + a.y * b.y, a.x * b.y - a.y * b.x);
+__device__ inline real2 cmul_conj_local(real2 a, real2 b) {
+    return make_real2(a.x * b.x + a.y * b.y, a.x * b.y - a.y * b.x);
 }
 
 __global__ void apply_1q_inner_product_accumulate_pooled(
-    const float2* phi,
-    const float2* nu,
+    const real2* phi,
+    const real2* nu,
     const Apply1qParams* deriv_1q_pool,
     unsigned int deriv_slot,
     double* grad_dev,
@@ -80,11 +80,11 @@ __global__ void apply_1q_inner_product_accumulate_pooled(
     unsigned int accum_slot,
     unsigned long long pairs
 ) {
-    extern __shared__ float2 sdata_g2[];
+    extern __shared__ real2 sdata_g2[];
     unsigned int tid = threadIdx.x;
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + tid;
 
-    float2 partial = make_float2(0.0f, 0.0f);
+    real2 partial = make_real2(0.0, 0.0);
     if (gid < pairs) {
         Apply1qParams params = deriv_1q_pool[deriv_slot];
         unsigned long long mask = 1ULL << params.qubit;
@@ -93,21 +93,21 @@ __global__ void apply_1q_inner_product_accumulate_pooled(
         unsigned long long i0 = low_bits | high;
         unsigned long long i1 = i0 | mask;
 
-        float2 a = phi[i0];
-        float2 b = phi[i1];
-        float2 u00 = make_float2(params.u00_re, params.u00_im);
-        float2 u01 = make_float2(params.u01_re, params.u01_im);
-        float2 u10 = make_float2(params.u10_re, params.u10_im);
-        float2 u11 = make_float2(params.u11_re, params.u11_im);
+        real2 a = phi[i0];
+        real2 b = phi[i1];
+        real2 u00 = make_real2(params.u00_re, params.u00_im);
+        real2 u01 = make_real2(params.u01_re, params.u01_im);
+        real2 u10 = make_real2(params.u10_re, params.u10_im);
+        real2 u11 = make_real2(params.u11_re, params.u11_im);
 
-        float2 a_prime = cadd_local(cmul_local(u00, a), cmul_local(u01, b));
-        float2 b_prime = cadd_local(cmul_local(u10, a), cmul_local(u11, b));
+        real2 a_prime = cadd_local(cmul_local(u00, a), cmul_local(u01, b));
+        real2 b_prime = cadd_local(cmul_local(u10, a), cmul_local(u11, b));
 
-        float2 nv0 = nu[i0];
-        float2 nv1 = nu[i1];
+        real2 nv0 = nu[i0];
+        real2 nv1 = nu[i1];
 
-        float2 c0 = cmul_conj_local(nv0, a_prime);
-        float2 c1 = cmul_conj_local(nv1, b_prime);
+        real2 c0 = cmul_conj_local(nv0, a_prime);
+        real2 c1 = cmul_conj_local(nv1, b_prime);
         partial = cadd_local(c0, c1);
     }
 

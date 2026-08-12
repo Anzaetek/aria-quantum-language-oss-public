@@ -30,23 +30,23 @@ extern "C" {
 
 struct Apply1qParams {
     unsigned int qubit;
-    float u00_re; float u00_im;
-    float u01_re; float u01_im;
-    float u10_re; float u10_im;
-    float u11_re; float u11_im;
+    real u00_re; real u00_im;
+    real u01_re; real u01_im;
+    real u10_re; real u10_im;
+    real u11_re; real u11_im;
 };
 
-__device__ inline float2 cmul_pyt(float2 a, float2 b) {
-    return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+__device__ inline real2 cmul_pyt(real2 a, real2 b) {
+    return make_real2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-__device__ inline float2 cadd_pyt(float2 a, float2 b) {
-    return make_float2(a.x + b.x, a.y + b.y);
+__device__ inline real2 cadd_pyt(real2 a, real2 b) {
+    return make_real2(a.x + b.x, a.y + b.y);
 }
 
 __global__ void pauli_y_accumulate_then_dagger_both_pooled(
-    float2* phi,
-    float2* nu,
+    real2* phi,
+    real2* nu,
     const Apply1qParams* dagger_pool,
     unsigned int dagger_slot,
     double* grad_dev,
@@ -55,16 +55,16 @@ __global__ void pauli_y_accumulate_then_dagger_both_pooled(
     unsigned int accum_slot,
     unsigned long long pairs
 ) {
-    extern __shared__ float sdata_pyt[];
+    extern __shared__ real sdata_pyt[];
     unsigned int tid = threadIdx.x;
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + tid;
 
     Apply1qParams params = dagger_pool[dagger_slot];
 
-    float partial = 0.0f;
+    real partial = 0.0;
     bool active = (gid < pairs);
     unsigned long long i0 = 0, i1 = 0;
-    float2 phi0, phi1, nu0, nu1;
+    real2 phi0, phi1, nu0, nu1;
     if (active) {
         unsigned long long mask = 1ULL << params.qubit;
         unsigned long long low_bits = gid & (mask - 1ULL);
@@ -102,10 +102,10 @@ __global__ void pauli_y_accumulate_then_dagger_both_pooled(
     // independent of these writes (each thread already cached its
     // pair amplitudes in registers).
     if (active) {
-        float2 u00 = make_float2(params.u00_re, params.u00_im);
-        float2 u01 = make_float2(params.u01_re, params.u01_im);
-        float2 u10 = make_float2(params.u10_re, params.u10_im);
-        float2 u11 = make_float2(params.u11_re, params.u11_im);
+        real2 u00 = make_real2(params.u00_re, params.u00_im);
+        real2 u01 = make_real2(params.u01_re, params.u01_im);
+        real2 u10 = make_real2(params.u10_re, params.u10_im);
+        real2 u11 = make_real2(params.u11_re, params.u11_im);
         // φ' = U† φ
         phi[i0] = cadd_pyt(cmul_pyt(u00, phi0), cmul_pyt(u01, phi1));
         phi[i1] = cadd_pyt(cmul_pyt(u10, phi0), cmul_pyt(u11, phi1));

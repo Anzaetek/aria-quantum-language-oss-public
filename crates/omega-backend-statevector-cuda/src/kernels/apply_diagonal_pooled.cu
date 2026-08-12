@@ -14,14 +14,14 @@ extern "C" {
 
 struct DiagonalParams {
     unsigned int qubit;
-    float d0_re;
-    float d0_im;
-    float d1_re;
-    float d1_im;
+    real d0_re;
+    real d0_im;
+    real d1_re;
+    real d1_im;
 };
 
 __global__ void apply_diagonal_pooled(
-    float2* state,
+    real2* state,
     const DiagonalParams* pool,
     unsigned int slot,
     unsigned long long dim
@@ -29,12 +29,12 @@ __global__ void apply_diagonal_pooled(
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (gid >= dim) { return; }
     DiagonalParams params = pool[slot];
-    float2 amp = state[gid];
+    real2 amp = state[gid];
     unsigned int bit = (unsigned int)((gid >> params.qubit) & 1ULL);
-    float2 d = (bit == 0u)
-        ? make_float2(params.d0_re, params.d0_im)
-        : make_float2(params.d1_re, params.d1_im);
-    state[gid] = make_float2(
+    real2 d = (bit == 0u)
+        ? make_real2(params.d0_re, params.d0_im)
+        : make_real2(params.d1_re, params.d1_im);
+    state[gid] = make_real2(
         amp.x * d.x - amp.y * d.y,
         amp.x * d.y + amp.y * d.x
     );

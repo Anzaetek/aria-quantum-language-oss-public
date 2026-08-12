@@ -31,35 +31,35 @@ struct PauliZChainEntry {
 };
 
 __global__ void pauli_z_chain_accumulate(
-    const float2* phi,
-    const float2* nu,
+    const real2* phi,
+    const real2* nu,
     double* grad_dev,
     const PauliZChainEntry* pool,
     unsigned int start,
     unsigned int count,
     unsigned long long dim
 ) {
-    extern __shared__ float2 sdata_pz[];
+    extern __shared__ real2 sdata_pz[];
     unsigned int k = blockIdx.y;
     if (k >= count) { return; }
     PauliZChainEntry entry = pool[start + k];
 
     unsigned long long gid = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
 
-    float2 partial = make_float2(0.0f, 0.0f);
+    real2 partial = make_real2(0.0, 0.0);
     if (gid < dim) {
-        float2 phi_v = phi[gid];
-        float2 nu_v = nu[gid];
+        real2 phi_v = phi[gid];
+        real2 nu_v = nu[gid];
         // ⟨ν|Z_q|φ⟩ contribution for this amplitude:
         //   Σ_i ν*[i] · (Z_q[i,i] · φ[i])
         // where Z_q[i,i] = +1 if bit q of i is 0, else -1.
-        // ν*[i] · φ[i] = make_float2(Re, Im) where
+        // ν*[i] · φ[i] = make_real2(Re, Im) where
         //   Re = ν.x·φ.x + ν.y·φ.y
         //   Im = ν.x·φ.y - ν.y·φ.x
-        float sign = ((gid >> entry.qubit) & 1ULL) ? -1.0f : 1.0f;
-        float re = nu_v.x * phi_v.x + nu_v.y * phi_v.y;
-        float im = nu_v.x * phi_v.y - nu_v.y * phi_v.x;
-        partial = make_float2(sign * re, sign * im);
+        real sign = ((gid >> entry.qubit) & 1ULL) ? -1.0 : 1.0;
+        real re = nu_v.x * phi_v.x + nu_v.y * phi_v.y;
+        real im = nu_v.x * phi_v.y - nu_v.y * phi_v.x;
+        partial = make_real2(sign * re, sign * im);
     }
 
     sdata_pz[threadIdx.x] = partial;

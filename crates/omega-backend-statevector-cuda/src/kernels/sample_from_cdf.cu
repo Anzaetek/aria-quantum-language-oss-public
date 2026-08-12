@@ -17,8 +17,8 @@
 extern "C" {
 
 __global__ void sample_from_cdf(
-    const float* cdf,
-    const float* uniforms,
+    const real* cdf,
+    const real* uniforms,
     unsigned int* counts,
     unsigned long long dim,
     unsigned long long num_shots
@@ -26,7 +26,7 @@ __global__ void sample_from_cdf(
     unsigned long long shot = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     if (shot >= num_shots) { return; }
 
-    float u = uniforms[shot];
+    real u = uniforms[shot];
 
     // Binary search: smallest `lo` with `cdf[lo] >= u`. Loop
     // invariants: cdf is monotonically non-decreasing; target index
