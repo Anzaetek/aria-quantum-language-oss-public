@@ -289,7 +289,25 @@ must be a parse error, never an index panic in a backend.
 
 ---
 
-## P6 — Silent-failure philosophy is inconsistent between two files
+## P6 — Silent-failure philosophy is inconsistent between two files — **FIXED 2026-08-13**
+
+The two silent paths now return errors, and both were checked against Qiskit
+2.5.1 first — it refuses the equivalents (`'zz' is not defined in this scope`),
+so this is not a house style.
+
+The condition-literal rule is a **deliberate divergence**, stated in the error
+message: Qiskit ACCEPTS `if (c == 2)` on `creg c[1]` because that is a
+register-valued comparison, well-formed and merely unsatisfiable. Aria's
+condition names a single `Clbit`, so the literal is out of domain rather than
+false. A register-wide comparison is a separate feature this representation does
+not carry.
+
+**The `is_runtime_cond` name-based routing is NOT fixed** — see the follow-up at
+the end of this document.
+
+The original description follows.
+
+
 
 `backends/omega.rs` **silently** drops a condition whose clbit is unmapped, and
 **silently** retargets an unknown qubit to index 0. `aria-runtime/src/lower.rs`
@@ -319,3 +337,22 @@ defects are fixed means every remaining failure is genuinely undecided.
 **Fix the enumeration, not the instance.** If a fix does not come with a
 mechanism that would have found it, the same bug is already sitting one door
 over.
+
+---
+
+## Still open after P0-P2, P4, P6
+
+* **P3** was superseded rather than implemented as written. It asked for "one
+  enumeration, compiler-enforced"; that now exists twice — `every_emitted_gate_is_readable.rs`
+  (QASM2) and `every_photonic_gate_round_trips.rs` (OPTICQASM), both verified to
+  produce `error[E0004]` when a `GateKind` is added. The source-scraping guard
+  P3 warned against was never shipped.
+* **P5** — round-trip gaps: a guarded `measure`/`reset` still cannot re-parse.
+* **P6 residual — `is_runtime_cond` routes by register NAME.**
+  `Expr::Index(name, _) if name.starts_with('m') || name == "c"` decides whether
+  a condition is runtime or compile-time. A creg named `flags` therefore routes
+  to compile-time evaluation and fails obscurely, while the emitter happily
+  writes `when flags[0] == 1`. This is a naming-convention dependency in a place
+  that should consult the declared registers, and it is the same class as
+  `RegisterDecl::polarized` being a flag rather than a convention. Fixing it
+  means threading the circuit's creg list into the check.
