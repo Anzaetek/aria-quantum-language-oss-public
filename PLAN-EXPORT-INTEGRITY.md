@@ -348,6 +348,10 @@ over.
   produce `error[E0004]` when a `GateKind` is added. The source-scraping guard
   P3 warned against was never shipped.
 * **P5** — round-trip gaps: a guarded `measure`/`reset` still cannot re-parse.
+* ~~**P6 residual — `is_runtime_cond` routes by register NAME.**~~ **FIXED
+  2026-08-13**: it now consults the circuit's declared classical registers.
+  Original description below.
+
 * **P6 residual — `is_runtime_cond` routes by register NAME.**
   `Expr::Index(name, _) if name.starts_with('m') || name == "c"` decides whether
   a condition is runtime or compile-time. A creg named `flags` therefore routes

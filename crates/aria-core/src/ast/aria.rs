@@ -1677,18 +1677,38 @@ fn extract_simple_clbit_cond(e: &Expr, scope: &Scope) -> Option<(Clbit, u64)> {
     Some((Clbit::new(&name, idx as usize), v as u64))
 }
 
-fn is_runtime_cond(e: &Expr) -> bool {
+/// Is this `when` condition a RUNTIME guard (on measured classical bits) or a
+/// compile-time one (on loop variables and constants)?
+///
+/// Decided by consulting the circuit's DECLARED classical registers.
+///
+/// It used to be decided by the register's NAME:
+/// `name.starts_with('m') || name == "c"`. A creg called `flags` therefore
+/// routed to compile-time evaluation and failed obscurely — while the emitter
+/// happily wrote `when flags[0] == 1`, so the language could express a circuit
+/// its own lowering mis-handled. Meanwhile a loop variable named `mask` was
+/// treated as a measurement.
+///
+/// Same class as `RegisterDecl::polarized` being a flag rather than a naming
+/// convention: a convention does not survive a rename, and the failure is
+/// silent-adjacent.
+fn is_runtime_cond(e: &Expr, circ: &Circuit) -> bool {
+    let is_creg = |name: &str| {
+        circ.registers
+            .iter()
+            .any(|r| r.kind == RegisterKind::Classical && r.name == name)
+    };
     match e {
-        Expr::Index(name, _) if name.starts_with('m') || name == "c" => true,
+        Expr::Index(name, _) => is_creg(name),
         Expr::CmpEq(a, b)
         | Expr::CmpNe(a, b)
         | Expr::CmpLt(a, b)
         | Expr::CmpLe(a, b)
         | Expr::CmpGt(a, b)
-        | Expr::CmpGe(a, b) => is_runtime_cond(a) || is_runtime_cond(b),
-        Expr::Neg(a) => is_runtime_cond(a),
+        | Expr::CmpGe(a, b) => is_runtime_cond(a, circ) || is_runtime_cond(b, circ),
+        Expr::Neg(a) => is_runtime_cond(a, circ),
         Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => {
-            is_runtime_cond(a) || is_runtime_cond(b)
+            is_runtime_cond(a, circ) || is_runtime_cond(b, circ)
         }
         _ => false,
     }
@@ -1826,7 +1846,7 @@ fn lower_stmt(
             }
         }
         Stmt::When { cond, body } => {
-            let runtime = is_runtime_cond(cond);
+            let runtime = is_runtime_cond(cond, circ);
             if runtime {
                 // A runtime guard must become a per-instruction classical
                 // condition. If it cannot, refuse: lowering the body
