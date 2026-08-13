@@ -182,7 +182,18 @@ away. Make it re-parse. That change alone catches P1b.
 
 ---
 
-## P2 — Correct a false claim in a commit message
+## P2 — Correct a false claim in a commit message — **DONE 2026-08-13**
+
+Re-measured before writing anything: both mutations passed the entire
+`aria-runtime` suite (0 failing targets each), so the claim in `b0745c0` was
+false as described. `crates/aria-runtime/tests/crz_and_reset_lower_correctly.rs`
+now drives `run_counts` and `expectation` — the runtime's public surface — and
+both mutations fail. The correction is stated in that commit's message, since
+the original claim is in the permanent record.
+
+The original description follows.
+
+
 
 `b0745c0` states: *"turning Reset into a Barrier [in `aria-runtime/src/lower.rs`]
 left ALL FIVE TESTS PASSING… Re-ran both mutations: each is now caught by
