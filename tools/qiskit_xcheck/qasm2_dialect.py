@@ -5,18 +5,27 @@
 Reads a file of `====<name>` separated QASM2 blocks emitted by
 `crates/aria-core/tests/qasm2_qiskit_dialect.rs` and checks two things per gate:
 
-1. **Qiskit loads it.** Against `LEGACY_CUSTOM_INSTRUCTIONS`, which is Qiskit's
-   real QASM2 dialect — its own `qasm2.dumps` output does not survive the strict
-   loader either (measured: `cp`, `rxx`, `rzz`, `ryy`, `sx`, `p`, `cswap` all
-   fail `qasm2.loads` when Qiskit itself wrote them). Demanding strict-qelib1
-   conformance would therefore be demanding something Qiskit does not do.
+1. **Qiskit loads it**, against `LEGACY_CUSTOM_INSTRUCTIONS`.
 
 2. **It means the same thing.** The loaded circuit's `Operator` is compared
    against the operator of Qiskit's own native gate. Loading proves nothing
    about semantics — a wrong parameter order, a swapped control, or a `crz`
-   emitted where `cp` was meant all load perfectly.
+   emitted where `cp` was meant all load perfectly. This is the check that
+   matters; the others only localise a failure.
 
-Check 2 is the one that matters; check 1 only localises a failure.
+3. **The STRICT `qasm2.loads` also accepts it**, except where noted.
+
+Check 3 was originally argued against on the grounds that Qiskit's own
+`qasm2.dumps` output does not survive its strict loader (measured: `cp`, `rxx`,
+`rzz`, `ryy`, `sx`, `p`, `cswap`, `swap` all fail when Qiskit itself wrote them),
+so demanding it would demand something Qiskit does not do.
+
+That reasoning was wrong about the goal. Matching Qiskit byte-for-byte would
+inherit Qiskit's own round-trip defect. Emitting qelib1 spellings (`p` -> `u1`,
+`cp` -> `cu1`) and preamble `gate` definitions (`swap`, `cswap`, `rxx`, `rzz`,
+`ryy`) makes the file readable by any spec-conformant QASM2 parser — a superset
+of Qiskit's legacy mode — while still loading in Qiskit and producing the
+identical operator. 24 of 25 pass; `sx` is exempt for a stated reason.
 
 Exit status is 0 only if every gate passes both.
 """
@@ -72,7 +81,15 @@ def main():
               file=sys.stderr)
         return 1
 
-    failures, checked = [], 0
+    # Spellings that cannot be written in strict qelib1, with the reason.
+    # `sx` is not in qelib1 and cannot be DEFINED in it: the natural body
+    # `sdg; h; sdg` is u3(pi/2, -pi/2, pi/2), which differs from `sx` by a global
+    # phase e^{i*pi/4} (measured: max|delta| = 5.412e-01 vs qiskit's native sx),
+    # and QASM 2.0 has no syntax for a global phase. Emitting the u3 form would
+    # silently substitute a different operator.
+    STRICT_EXEMPT = {"sx"}
+
+    failures, checked, strict_ok = [], 0, 0
     for block in blocks:
         name, src = block.split("\n", 1)
         name = name.strip()
@@ -82,13 +99,29 @@ def main():
             continue
         nq, build = NATIVE[name]
 
+        # Load for the OPERATOR comparison with the STRICT parser where possible.
+        #
+        # This is not a detail. The legacy parser's BUILTINS SHADOW a file's own
+        # `gate` definitions, so a wrong definition body is invisible to it —
+        # measured with a deliberately broken `gate swap q0,q1 { cx; cx; cx; }`:
+        #
+        #   strict loader: max|delta| vs native swap = 1.000e+00  (honours ours)
+        #   legacy loader: max|delta| vs native swap = 0.000e+00  (uses builtin)
+        #
+        # So comparing in legacy mode was comparing qiskit's builtin against
+        # qiskit's builtin — guaranteed to agree, and blind to exactly the
+        # definitions this harness now checks. A wrong `swap`, `cswap`, `rxx`,
+        # `rzz` or `ryy` body passed it.
         try:
-            loaded = qasm2.loads(
-                src, custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS)
-        except Exception as e:
-            failures.append(f"{name}: qiskit CANNOT LOAD our QASM2 — "
-                            f"{type(e).__name__}: {str(e).splitlines()[0]}\n{src}")
-            continue
+            loaded = qasm2.loads(src)
+        except Exception:
+            try:
+                loaded = qasm2.loads(
+                    src, custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS)
+            except Exception as e:
+                failures.append(f"{name}: qiskit CANNOT LOAD our QASM2 — "
+                                f"{type(e).__name__}: {str(e).splitlines()[0]}\n{src}")
+                continue
 
         ref = QuantumCircuit(nq)
         build(ref)
@@ -98,6 +131,25 @@ def main():
             failures.append(f"{name}: operators not comparable ({e}) — "
                             f"probably a qubit-count mismatch:\n{src}")
             continue
+
+        # Strict-loadability is a SEPARATE, stronger property than "qiskit reads
+        # it". qiskit's own `qasm2.dumps` output does not survive `qasm2.loads`;
+        # ours is emitted in qelib1-only forms so that it does, which makes the
+        # file readable by any spec-conformant QASM2 parser rather than only by
+        # qiskit's legacy mode.
+        try:
+            qasm2.loads(src)
+            strict_ok += 1
+            if name in STRICT_EXEMPT:
+                failures.append(
+                    f"{name}: now loads in the STRICT parser — remove it from "
+                    f"STRICT_EXEMPT, the exemption has outlived its reason")
+        except Exception as e:
+            if name not in STRICT_EXEMPT:
+                failures.append(
+                    f"{name}: does not load in the strict qelib1 parser — "
+                    f"{str(e).splitlines()[0]}\nEmit a qelib1 spelling or a "
+                    f"preamble `gate` definition.\n{src}")
 
         if delta > TOL:
             failures.append(
@@ -121,7 +173,9 @@ def main():
         return 1
 
     print(f"  qasm2 dialect OK: {checked} gates load in qiskit AND match its "
-          f"own gate operators (tol {TOL:.0e})")
+          f"own gate operators (tol {TOL:.0e}); "
+          f"{strict_ok}/{checked} also load in the STRICT qelib1 parser "
+          f"(exempt: {sorted(STRICT_EXEMPT)})")
     return 0
 
 

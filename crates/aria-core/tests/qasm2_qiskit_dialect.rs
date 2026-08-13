@@ -33,14 +33,35 @@
 //! Aligning with "Qiskit's QASM2" means aligning with the dialect Qiskit
 //! actually writes and reads.
 //!
-//! # The one deliberate divergence: `u`
+//! # We now aim HIGHER than qiskit's own output
 //!
-//! Qiskit emits `u(θ,φ,λ)`, which is **not** in qelib1, so its own strict loader
-//! rejects it. We emit `u3(θ,φ,λ)`, which **is** in qelib1 and loads under both
-//! parsers. That is a divergence in the direction of *more* portability, and it
-//! is kept on purpose: matching Qiskit here would mean deliberately emitting a
-//! spelling that fewer tools accept, for no gain. Qiskit's legacy loader reads
-//! `u3` and produces the identical operator — which the Python half asserts.
+//! The table above was the starting point, not the target. Since qiskit cannot
+//! reload its own emission, matching it byte-for-byte would inherit that defect.
+//! Instead every spelling is emitted in a form the **strict** parser accepts,
+//! which is a superset of what qiskit's legacy mode reads:
+//!
+//! ```text
+//!   p      -> u1        (in qelib1; operator-identical, max|delta| = 0)
+//!   cp     -> cu1       (in qelib1; operator-identical, max|delta| = 0)
+//!   swap   -> gate def  (`swap` is NOT in qelib1 — measured, not assumed)
+//!   cswap  -> gate def
+//!   rxx    -> gate def
+//!   rzz    -> gate def
+//!   ryy    -> gate def, qelib1-only body (qiskit's uses `sxdg`, not in qelib1)
+//!   u      -> u3        (qiskit emits `u`, which is not in qelib1)
+//! ```
+//!
+//! Result: **24 of 25 gates load in `qasm2.loads`**, against 3 of 10 before.
+//!
+//! # The one that cannot be fixed: `sx`
+//!
+//! `sx` is not in qelib1 and **cannot be defined in it**. The natural body
+//! `sdg a; h a; sdg a;` is `u3(pi/2, -pi/2, pi/2)`, which differs from `sx` by a
+//! global phase `e^{i*pi/4}` — measured as max|delta| = 5.412e-01 against
+//! qiskit's native `sx`. QASM 2.0 has no syntax for a global phase, so an exact
+//! `sx` is not expressible. A bare `sx` (legacy-only, exactly what qiskit emits)
+//! is the honest choice; emitting the u3 form would silently substitute a
+//! different operator.
 
 use aria_core::ast::nodes::*;
 use aria_core::ast::qasm::to_qasm;
@@ -115,27 +136,39 @@ fn emit_the_qiskit_dialect_corpus() {
     std::fs::write(&path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 
-/// `ryy` carries Qiskit's own `gate` definition, byte-for-byte.
+/// `ryy` carries a **qelib1-only** `gate` definition.
 ///
-/// Without it the export loads **nowhere** — measured: qiskit's strict loader,
-/// qiskit's legacy loader, and `omega-parser` all refused a bare `ryy(θ)`.
+/// This test previously pinned qiskit's definition byte-for-byte, on the
+/// reasoning that copying what qiskit writes IS the alignment. Measuring
+/// strict-loadability reversed it: qiskit's body uses `sxdg`, **`sxdg` is not in
+/// qelib1**, and qiskit's own strict parser therefore rejects qiskit's own
+/// output (`'sxdg' is not defined in this scope`).
+///
+/// The `rx(±pi/2)`-conjugated body uses only qelib1 gates, loads in BOTH qiskit
+/// parsers, and is exact — max|delta| = 1.214e-16 against `RYYGate(0.7)`.
+/// Matching the spelling would have cost the property that made matching worth
+/// doing.
+///
+/// Without any definition the export loads NOWHERE: qiskit strict, qiskit
+/// legacy and `omega-parser` all refused a bare `ryy(θ)`.
 #[test]
-fn ryy_is_emitted_with_qiskits_own_gate_definition() {
+fn ryy_is_emitted_with_a_qelib1_only_gate_definition() {
     let text = emit_one(GateKind::RYY, vec![0.7], 2);
     assert!(
-        text.contains(
-            "gate ryy(param0) q0,q1 { sxdg q0; sxdg q1; cx q0,q1; rz(param0) q1; \
-             cx q0,q1; sx q0; sx q1; }"
-        ),
-        "the preamble must reproduce `qasm2.dumps`'s definition verbatim — \
-         an equivalent decomposition of our own choosing is not alignment:\n{text}"
+        text.contains("gate ryy(param0) q0,q1 {"),
+        "the preamble must define ryy:\n{text}"
     );
-    // And the definition must actually be usable, not just present.
+    assert!(
+        !text.contains("sxdg") && !text.contains("sx "),
+        "the body must avoid sx/sxdg — neither is in qelib1, which is exactly why \
+         qiskit's own definition is not strict-loadable:\n{text}"
+    );
+    // The definition must be usable, not merely present.
     let ir = omega_parser::lower_to_ir(&text).expect("must parse");
     assert_eq!(
         ir.ops.len(),
         7,
-        "the ryy body should expand to sxdg,sxdg,cx,rz,cx,sx,sx:\n{text}"
+        "the ryy body should expand to rx,rx,cx,rz,cx,rx,rx:\n{text}"
     );
 }
 

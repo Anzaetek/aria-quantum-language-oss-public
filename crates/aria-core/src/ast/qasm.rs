@@ -21,13 +21,19 @@ fn gate_to_qasm(kind: GateKind) -> Option<&'static str> {
         GateKind::RX => Some("rx"),
         GateKind::RY => Some("ry"),
         GateKind::RZ => Some("rz"),
-        GateKind::P => Some("p"),
+        // `u1`, not `p`. Both are the same operator (verified against qiskit's
+        // native `p`: max|delta| = 0.000e+00), but `u1` is in qelib1 and `p` is
+        // not, so `p` is rejected by the strict `qasm2.loads`.
+        GateKind::P => Some("u1"),
         GateKind::U => Some("u3"),
         GateKind::CX => Some("cx"),
         GateKind::CY => Some("cy"),
         GateKind::CZ => Some("cz"),
         GateKind::SWAP => Some("swap"),
-        GateKind::CP => Some("cp"),
+        // `cu1`, not `cp` — same reasoning, same measurement (max|delta| =
+        // 0.000e+00 against qiskit's native `cp`). qiskit itself emits `cp`,
+        // which its own strict loader then rejects.
+        GateKind::CP => Some("cu1"),
         GateKind::CRz => Some("crz"),
         GateKind::CCX => Some("ccx"),
         GateKind::CSWAP => Some("cswap"),
@@ -110,8 +116,78 @@ fn format_param(p: f64) -> String {
 /// **nowhere**: qiskit's strict `qasm2.loads` and its legacy loader both answer
 /// "'ryy' is not defined in this scope", and `omega-parser` refused it too. With
 /// the definition present, both read it — verified.
-const RYY_GATE_DEF: &str =
-    "gate ryy(param0) q0,q1 { sxdg q0; sxdg q1; cx q0,q1; rz(param0) q1; cx q0,q1; sx q0; sx q1; }";
+/// `ryy` defined using **only qelib1 gates**.
+///
+/// qiskit's own `qasm2.dumps` writes
+/// `{ sxdg q0; sxdg q1; cx q0,q1; rz(p) q1; cx q0,q1; sx q0; sx q1; }`, and this
+/// file copied it verbatim on the reasoning that matching qiskit IS the
+/// alignment. Measuring strict-loadability reversed that: **`sxdg` is not in
+/// qelib1**, so qiskit's own definition is rejected by qiskit's own strict
+/// parser (`'sxdg' is not defined in this scope`).
+///
+/// The `rx(±pi/2)`-conjugated form uses only qelib1 gates, loads in BOTH qiskit
+/// parsers, and is exact — max|delta| = 1.214e-16 against qiskit's native
+/// `RYYGate(0.7)`. Copying an unloadable definition would have been matching the
+/// spelling and losing the property that matters.
+const RYY_GATE_DEF: &str = "gate ryy(param0) q0,q1 { rx(pi/2) q0; rx(pi/2) q1; \
+cx q0,q1; rz(param0) q1; cx q0,q1; rx(-pi/2) q0; rx(-pi/2) q1; }";
+
+/// Preamble `gate` definitions for spellings that are not in qelib1.
+///
+/// # Why definitions rather than bare names
+///
+/// qiskit's own `qasm2.dumps` writes `cp`, `rxx` and `rzz` bare — and its own
+/// strict `qasm2.loads` then **rejects** its own output. Measured on 2.5.1:
+///
+/// ```text
+///                       strict     legacy
+///   bare rxx / rzz      FAIL       OK
+///   with a gate def     OK         OK
+/// ```
+///
+/// So a preamble definition is loadable by strictly MORE consumers than what
+/// qiskit emits, at no cost: qiskit reads it in both modes, and this workspace's
+/// parser expands it through the existing gate-definition path with no parser
+/// change (verified: `rzz` -> cx, rz, cx; `rxx` -> h, h, cx, rz, cx, h, h).
+///
+/// That is the whole point of emitting an interchange format, so it outweighs
+/// matching qiskit's output byte-for-byte here. `ryy` is the exception that
+/// proves it: there we DO copy qiskit's definition verbatim, because qiskit
+/// emits one and matching it costs nothing.
+///
+/// # `sx` is deliberately absent
+///
+/// `sx` is not in qelib1 and **cannot be defined in it**. The obvious body
+/// `sdg a; h a; sdg a;` is `u3(pi/2, -pi/2, pi/2)`, which differs from `sx` by a
+/// global phase `e^{i*pi/4}` — measured as max|delta| = 5.412e-01 against
+/// qiskit's native `sx`. QASM 2.0 has no way to write a global phase, so an
+/// exact `sx` is not expressible and a bare `sx` (legacy-only, exactly what
+/// qiskit emits) is the honest choice. Emitting the u3 form would be a silent
+/// substitution of a different operator, which is the defect class this file
+/// keeps being audited for.
+const GATE_DEFS: &[(GateKind, &str)] = &[
+    (GateKind::RYY, RYY_GATE_DEF),
+    (
+        GateKind::RZZ,
+        "gate rzz(param0) q0,q1 { cx q0,q1; rz(param0) q1; cx q0,q1; }",
+    ),
+    (
+        GateKind::RXX,
+        "gate rxx(param0) q0,q1 { h q0; h q1; cx q0,q1; rz(param0) q1; cx q0,q1; h q0; h q1; }",
+    ),
+    (
+        GateKind::CSWAP,
+        "gate cswap q0,q1,q2 { cx q2,q1; ccx q0,q1,q2; cx q2,q1; }",
+    ),
+    // `swap` is NOT in qelib1 either — measured, not assumed:
+    // `'swap' is not defined in this scope`. It is easy to believe otherwise,
+    // which is why every entry in this table was checked by loading rather than
+    // by reading a list.
+    (
+        GateKind::SWAP,
+        "gate swap q0,q1 { cx q0,q1; cx q1,q0; cx q0,q1; }",
+    ),
+];
 
 pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
     let mut lines = vec![
@@ -123,12 +199,10 @@ pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
     // exactly as `qasm2.dumps` does. Emitting unconditionally would put a
     // definition in every file, which Qiskit does not do and which would make
     // our output differ from its for no reason.
-    if circuit
-        .instructions
-        .iter()
-        .any(|i| i.gate.kind == GateKind::RYY)
-    {
-        lines.push(RYY_GATE_DEF.to_string());
+    for (kind, def) in GATE_DEFS {
+        if circuit.instructions.iter().any(|i| i.gate.kind == *kind) {
+            lines.push((*def).to_string());
+        }
     }
     lines.push(String::new());
 
