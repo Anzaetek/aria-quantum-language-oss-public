@@ -1,8 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # PLAN — OPTICQASM export/import integrity
 
-**Status: O1, O2, O3 and O5 are IMPLEMENTED (2026-08-13). O4 and O6 remain
-open.** Written as a plan first, after the measurements below and before any
+**Status: O1–O5 IMPLEMENTED (2026-08-13). O6 remains open.** Written as a plan first, after the measurements below and before any
 code; this header is the only part edited after the fact, so the reasoning
 below is what was decided *before* the work, not a retrospective. Companion to `PLAN-EXPORT-INTEGRITY.md`,
 which covers the same defect class on the qubit (QASM2/QASM3/Aria) side; this
@@ -165,9 +164,9 @@ pattern its sibling already established.
 | O1 emitter refuses instead of corrupting | **done** | `opticqasm.rs` returns `Result`; D4/D5 tests, both mutation-verified |
 | O2 reader refuses instead of skipping | **done, after a false start** | statement-based, not line-based — see below; `opticqasm_reader_agreement.rs` |
 | O3 CV gates **import** | **done** | `omega_parser::lower_opticqasm_cv`; 8 unit tests + 5 cross-crate, 6 mutations verified |
-| O4 emit `hwp`/`pbs` + `pol` | **open** | needs new `GateKind`s in `aria-core` — see below |
+| O4 emit `hwp`/`pbs` + `pol` | **done** | `GateKind::HalfWavePlate`/`PolarizingBeamSplitter` + `RegisterDecl::polarized`; the two `KNOWN_ASYMMETRIC` entries moved into `ACCEPT`, which the plan named as the completion signal |
 | O5 cross-backend agreement | **done (CV)** | **17/17 piquasso fixture cases agree**, amps 1e-13, probs 1e-14, **0 skipped**; DV/Perceval arm still open |
-| O6 exhaustive-`match` guard | **open** | |
+| O6 exhaustive-`match` guard | **done for QASM2**, open for OPTICQASM | `every_emitted_gate_is_readable.rs`; adding a `GateKind` gives `error[E0004]` until answered — verified, not assumed |
 
 ### What the adversarial review caught, after these were called done
 

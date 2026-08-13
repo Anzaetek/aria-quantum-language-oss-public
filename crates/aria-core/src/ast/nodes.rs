@@ -63,6 +63,27 @@ pub enum GateKind {
     Squeezing,
     Displacement,
     Kerr,
+    /// Half-wave plate at angle θ, acting on ONE spatial mode's H/V pair.
+    ///
+    /// Not a primitive downstream: `omega-parser` expands it into phase
+    /// shifters and a beam splitter on the polarization sub-modes
+    /// (`PS(π)` on V, `BSrx(2θ, 0)`, then `PS(π/2)` on both). It exists in this
+    /// AST so that an OPTICQASM file naming `hwp` can be re-emitted as `hwp`
+    /// rather than as its expansion — the AST is the only layer that can
+    /// round-trip the spelling, because the IR never sees it.
+    ///
+    /// Only meaningful on a register declared `polarized`; see
+    /// [`RegisterDecl::polarized`].
+    HalfWavePlate,
+    /// Polarizing beam splitter across TWO spatial modes.
+    ///
+    /// **Swaps H between the two spatial modes and transmits V** — Perceval's
+    /// convention, pinned in `test_perceval_conventions.py`. Note this is the
+    /// opposite of the common "transmits H, reflects V" phrasing, which is why
+    /// the pin is against a read of the actual matrix rather than a description.
+    ///
+    /// Takes no parameters, unlike every other photonic gate here.
+    PolarizingBeamSplitter,
 }
 
 impl GateKind {
@@ -295,6 +316,15 @@ pub struct RegisterDecl {
     pub name: String,
     pub size: usize,
     pub kind: RegisterKind,
+    /// Photonic only: this register's modes each carry an H and a V
+    /// polarization, so it occupies `2 * size` OPTICAL modes indexed `2s + p`
+    /// with `p = 0` meaning H. `size` continues to count SPATIAL modes.
+    ///
+    /// A flag rather than a naming convention on purpose: a convention does not
+    /// survive a rename, and getting this wrong is silent — `photon q[N] pol;`
+    /// and `photon q[N];` both parse, both refuse nothing, and every mode index
+    /// means something different between them.
+    pub polarized: bool,
 }
 
 impl RegisterDecl {
@@ -400,10 +430,25 @@ impl Circuit {
 
     /// Add a quantum register and return its qubits.
     pub fn qreg(&mut self, name: &str, size: usize) -> Vec<Qubit> {
+        self.qreg_inner(name, size, false)
+    }
+
+    /// Add a POLARIZED photonic register: `size` spatial modes, each carrying
+    /// an H and a V sub-mode, so `2 * size` optical modes downstream.
+    ///
+    /// Separate constructor rather than a parameter on [`Circuit::qreg`] so
+    /// that every existing caller keeps its meaning — a register that silently
+    /// became polarized would reinterpret every mode index in the circuit.
+    pub fn qreg_polarized(&mut self, name: &str, size: usize) -> Vec<Qubit> {
+        self.qreg_inner(name, size, true)
+    }
+
+    fn qreg_inner(&mut self, name: &str, size: usize, polarized: bool) -> Vec<Qubit> {
         let reg = RegisterDecl {
             name: name.to_string(),
             size,
             kind: RegisterKind::Quantum,
+            polarized,
         };
         let qubits = reg.qubits();
         self.registers.push(reg);
@@ -416,6 +461,7 @@ impl Circuit {
             name: name.to_string(),
             size,
             kind: RegisterKind::Classical,
+            polarized: false,
         };
         let clbits = reg.clbits();
         self.registers.push(reg);
@@ -569,6 +615,10 @@ impl Circuit {
                 let new_reg = RegisterDecl {
                     name: new_name,
                     size: reg.size,
+                    // Carried, not defaulted: dropping it here would turn a
+                    // polarization circuit into a plain one on composition,
+                    // halving every mode's meaning with no diagnostic.
+                    polarized: reg.polarized,
                     kind: RegisterKind::Quantum,
                 };
                 result.registers.push(new_reg);

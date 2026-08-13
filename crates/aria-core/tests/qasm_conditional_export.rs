@@ -35,11 +35,13 @@ fn feedforward(creg_name: &str, creg_size: usize) -> Circuit {
         name: "q".into(),
         size: 2,
         kind: RegisterKind::Quantum,
+        polarized: false,
     });
     c.registers.push(RegisterDecl {
         name: creg_name.into(),
         size: creg_size,
         kind: RegisterKind::Classical,
+        polarized: false,
     });
     let q = |i: usize| Qubit::new("q", i);
     let cb = Clbit::new(creg_name, 0);

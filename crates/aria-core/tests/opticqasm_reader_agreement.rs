@@ -23,12 +23,14 @@
 //!
 //! # What is compared, and what is deliberately not
 //!
-//! Only **accept vs reject**. The two produce different data types and have
-//! genuinely different scopes — `omega-parser` implements `hwp`/`pbs` and the
-//! `pol` register marker, which the `aria-core` AST cannot represent yet
-//! (PLAN-OPTICQASM-INTEGRITY O4). Those live in `KNOWN_ASYMMETRIC` with the
-//! reason stated, so the exemption is visible and finite instead of a silently
-//! weakened assertion.
+//! Only **accept vs reject**. The two produce different data types, so
+//! comparing contents would mean inventing a correspondence; comparing validity
+//! is the property that actually matters.
+//!
+//! `KNOWN_ASYMMETRIC` exists for genuine, reasoned scope differences and is
+//! **currently empty**. It held the polarization cases — `pol`, `hwp`, `pbs` —
+//! until O4 gave the `aria-core` AST the gates and the register flag to
+//! represent them. They are now in `ACCEPT`.
 
 use aria_core::ast::opticqasm::from_opticqasm;
 use omega_parser::{lower_opticqasm_cv, parse_opticqasm};
@@ -77,6 +79,20 @@ const ACCEPT: &[(&str, &str)] = &[
     ("bs alias", "OPTICQASM 1.0;\nphoton q[2];\nbs(1.2, 0.3) q[0], q[1];\n"),
     ("two registers", "OPTICQASM 1.0;\nphoton a[1];\nphoton b[1];\nps(0.5) b[0];\n"),
     ("negative parameter", "OPTICQASM 1.0;\nphoton q[1];\ndisplace(-0.7, -0.1) q[0];\n"),
+    // Moved here from KNOWN_ASYMMETRIC when O4 landed. That move IS the signal
+    // O4 is done — the plan says so explicitly, rather than us asserting it.
+    (
+        "polarization register",
+        "OPTICQASM 1.0;\nphoton q[2] pol;\nps(0.5) q[0];\n",
+    ),
+    (
+        "half-wave plate",
+        "OPTICQASM 1.0;\nphoton q[1] pol;\nhwp(0.4) q[0];\n",
+    ),
+    (
+        "polarizing beam splitter (no parameter list)",
+        "OPTICQASM 1.0;\nphoton q[2] pol;\npbs q[0], q[1];\n",
+    ),
 ];
 
 /// Sources both readers must REJECT.
@@ -115,23 +131,31 @@ const REJECT: &[(&str, &str)] = &[
         "bs_ry — named by the grammar, implemented nowhere",
         "OPTICQASM 1.0;\nphoton q[2];\nbs_ry(1.2, 0.3) q[0], q[1];\n",
     ),
+    // A polarization gate on a plain register. Both readers must refuse: the
+    // file is grammatical, so nothing downstream could detect that every mode
+    // index means something other than intended.
+    (
+        "hwp on a non-polarized register",
+        "OPTICQASM 1.0;\nphoton q[1];\nhwp(0.4) q[0];\n",
+    ),
+    (
+        "pbs on a non-polarized register",
+        "OPTICQASM 1.0;\nphoton q[2];\npbs q[0], q[1];\n",
+    ),
+    // `pbs` spans two spatial modes; one is an arity error, not a shorthand.
+    (
+        "pbs on a single mode",
+        "OPTICQASM 1.0;\nphoton q[2] pol;\npbs q[0];\n",
+    ),
 ];
 
-/// Genuine, bounded scope differences. Each names the reason.
-const KNOWN_ASYMMETRIC: &[(&str, &str, &str)] = &[
-    (
-        "polarization register",
-        "OPTICQASM 1.0;\nphoton q[2] pol;\nps(0.5) q[0];\n",
-        "the aria-core AST cannot carry the H/V mode mapping (O4), so it refuses \
-         rather than silently reinterpret every mode index",
-    ),
-    (
-        "half-wave plate",
-        "OPTICQASM 1.0;\nphoton q[1] pol;\nhwp(0.4) q[0];\n",
-        "aria-core has no polarization GateKind (O4); omega-parser expands hwp \
-         into phase shifters and beam splitters",
-    ),
-];
+/// Genuine, bounded scope differences, each naming its reason.
+///
+/// **Empty since O4.** It held the polarization cases — `pol`, `hwp`, `pbs` —
+/// which `omega-parser` read and the `aria-core` AST could not represent. They
+/// now live in `ACCEPT`, and `the_known_scope_differences_are_exactly_these`
+/// failing is what reported that the gap had closed.
+const KNOWN_ASYMMETRIC: &[(&str, &str, &str)] = &[];
 
 #[test]
 fn both_readers_accept_the_same_valid_sources() {
@@ -183,15 +207,32 @@ fn both_readers_reject_the_same_invalid_sources() {
     );
 }
 
-/// Pins the exemptions so they cannot quietly grow. If one of these starts
-/// working on both sides — because O4 landed — this test fails and the case
-/// moves into `ACCEPT`, which is the correct way to find out.
+/// Pins the exemptions so they cannot quietly grow.
+///
+/// **This test would pass vacuously if it only looped.** With `KNOWN_ASYMMETRIC`
+/// empty the `for` body never runs, so every assertion inside it is unreachable
+/// and the test proves nothing — the precise shape of defect this file exists to
+/// catch, one level up. The emptiness is therefore asserted directly, and the
+/// loop only runs if something is ever added back.
 #[test]
 fn the_known_scope_differences_are_exactly_these() {
+    assert!(
+        KNOWN_ASYMMETRIC.is_empty(),
+        "{} scope difference(s) are declared: {:?}\n\
+         Each is an input one reader of this dialect accepts and the other does \
+         not, so a file's validity depends on which function you called. That may \
+         be justified, but it must be justified out loud — and this assertion is \
+         what forces the list to be read rather than accumulated.",
+        KNOWN_ASYMMETRIC.len(),
+        KNOWN_ASYMMETRIC.iter().map(|(n, _, _)| *n).collect::<Vec<_>>()
+    );
+
+    // Runs only if an entry is added back. Each must still BE asymmetric —
+    // an exemption that has quietly become symmetric is a stale exemption.
     for (name, src, why) in KNOWN_ASYMMETRIC {
         assert!(
             from_opticqasm(src).is_err(),
-            "{name}: aria-core now accepts this — if O4 landed, move it to ACCEPT ({why})"
+            "{name}: aria-core now accepts this — move it to ACCEPT ({why})"
         );
         assert!(
             omega_accepts(src).is_ok(),
@@ -205,6 +246,10 @@ fn the_known_scope_differences_are_exactly_these() {
 /// masquerade as agreement.
 #[test]
 fn the_corpus_is_not_empty() {
-    assert!(ACCEPT.len() >= 10, "accept corpus shrank to {}", ACCEPT.len());
-    assert!(REJECT.len() >= 10, "reject corpus shrank to {}", REJECT.len());
+    // Floors well below the actual counts (13 and 13). A floor sitting exactly
+    // on the count is how a shrinking corpus passes — see the OPTICQASM
+    // acceptance test, which shipped with `>= 10` against exactly 10 surviving
+    // cases.
+    assert!(ACCEPT.len() >= 12, "accept corpus shrank to {}", ACCEPT.len());
+    assert!(REJECT.len() >= 12, "reject corpus shrank to {}", REJECT.len());
 }

@@ -72,7 +72,8 @@ fn spec(kind: &GateKind) -> Spec {
         Barrier | Reset | Measure => Spec::NotQasm2,
         // Photonic: the OPTICQASM lane, guarded by
         // `opticqasm_readable_by_parser.rs` and `opticqasm_reader_agreement.rs`.
-        BeamSplitter | PhaseShifter | Squeezing | Displacement | Kerr => Spec::NotQasm2,
+        BeamSplitter | PhaseShifter | Squeezing | Displacement | Kerr
+        | HalfWavePlate | PolarizingBeamSplitter => Spec::NotQasm2,
     }
 }
 
@@ -183,5 +184,68 @@ fn nothing_this_workspace_emits_is_unreadable_by_everything() {
          emitting a preamble `gate` definition (as `to_qasm` does for `ryy`, \
          copying qiskit's own `qasm2.dumps` output) or by emitting an equivalent \
          built from spellings that are in qelib1."
+    );
+}
+
+/// `to_qasm` must REFUSE what QASM2 cannot represent, not comment it out.
+///
+/// Measured before this: a `HalfWavePlate` exported as
+/// `// unsupported gate: HalfWavePlate` and nothing else — an `Ok` result, a
+/// file that parses, refuses nothing, and is missing an operation. Identical in
+/// shape to the `to_opticqasm` defect (`// unsupported:`) and to the Aria
+/// emitter's `-- reset`, which is three emitters with the same bug.
+///
+/// This exists because the fix alone was not enough: mutating the refusal back
+/// into a comment left the whole suite GREEN, so the fix had no test that could
+/// fail. Found by mutating, not by review.
+#[test]
+fn to_qasm_refuses_gates_it_cannot_represent() {
+    let mut c = Circuit::new("c");
+    let q = c.qreg_polarized("q", 1);
+    c.apply(
+        GateDef::with_params(GateKind::HalfWavePlate, vec![0.4]),
+        vec![q[0].clone()],
+    );
+    let err = to_qasm(&c).expect_err("a photonic gate is not QASM2");
+    assert!(
+        err.contains("HalfWavePlate"),
+        "the error must name the gate: {err}"
+    );
+    assert!(
+        err.contains("OPTICQASM") || err.contains("to_opticqasm"),
+        "and point at the lane that CAN represent it: {err}"
+    );
+}
+
+/// `to_qasm` must refuse a symbolic parameter rather than emitting a hard zero.
+///
+/// Measured before this: `rz(theta)` emitted as `rz(0) q[0];` — a well-formed
+/// file that every parser accepts and that computes something else. The only
+/// defect in this family that produces a WRONG NUMBER rather than a missing
+/// operation, which makes it the hardest to notice downstream.
+#[test]
+fn to_qasm_refuses_a_symbolic_parameter_rather_than_zeroing_it() {
+    let mut c = Circuit::new("c");
+    let q = c.qreg("q", 1);
+    c.apply(
+        GateDef {
+            kind: GateKind::RZ,
+            params: vec![aria_core::ast::expr::ParamExpr::Symbol("theta".into())],
+            label: None,
+        },
+        vec![q[0].clone()],
+    );
+    let err = to_qasm(&c).expect_err("QASM2 has no syntax for a symbolic parameter");
+    assert!(
+        err.contains("symbolic"),
+        "the error must say WHY, so a caller knows to bind it: {err}"
+    );
+    // Guard the guard: the old behaviour was a SUCCESSFUL emit of `rz(0)`.
+    // Asserting only `is_err()` would still pass if the emitter started
+    // refusing for some unrelated reason.
+    assert!(
+        !err.contains("cannot represent `RZ`"),
+        "rz IS representable in QASM2 — the refusal must be about the parameter, \
+         not the gate: {err}"
     );
 }

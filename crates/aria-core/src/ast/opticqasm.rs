@@ -61,6 +61,36 @@ fn num(params: &[super::expr::ParamExpr], i: usize, gate: &str, arity: usize) ->
     })
 }
 
+/// A polarization gate is meaningless on a register that does not carry H/V.
+///
+/// Refusing here is what stops the emitter producing the file described above:
+/// `hwp` under a plain `photon q[N];` declaration. There is no way for a reader
+/// to detect that, because both forms are grammatical.
+fn polarized_check(circuit: &Circuit, inst: &Instruction, gate: &str) -> Result<(), String> {
+    for q in &inst.qubits {
+        let reg = circuit
+            .registers
+            .iter()
+            .find(|r| r.name == q.register)
+            .ok_or_else(|| format!("`{gate}` names undeclared register `{}`", q.register))?;
+        if !reg.polarized {
+            return Err(format!(
+                "`{gate}` is a polarization element but `{}` is not a polarized register. \
+                 Declare it with `Circuit::qreg_polarized` so it emits as \
+                 `photon {}[{}] pol;` — under a plain declaration the same file would \
+                 parse and every mode index would mean something else ({} optical modes \
+                 instead of {}).",
+                reg.name,
+                reg.name,
+                reg.size,
+                2 * reg.size,
+                reg.size
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Convert a photonic Circuit to OPTICQASM 1.0.
 ///
 /// Refuses any gate outside the photonic set rather than emitting a comment —
@@ -71,7 +101,15 @@ pub fn to_opticqasm(circuit: &Circuit) -> Result<String, String> {
 
     for reg in &circuit.registers {
         if reg.kind == RegisterKind::Quantum {
-            lines.push(format!("photon {}[{}];", reg.name, reg.size));
+            // The `pol` marker is NOT decoration, and it is why O4 could not be
+            // "just emit hwp/pbs": `photon q[N] pol;` declares N SPATIAL modes
+            // each carrying H and V — 2N optical modes indexed 2s+p — while
+            // `photon q[N];` declares N optical modes. Emitting a polarization
+            // gate under a plain declaration yields a file that parses, refuses
+            // nothing, and means something different in every mode index. The
+            // marker and the gates land together or not at all.
+            let marker = if reg.polarized { " pol" } else { "" };
+            lines.push(format!("photon {}[{}]{marker};", reg.name, reg.size));
         }
     }
 
@@ -105,6 +143,27 @@ pub fn to_opticqasm(circuit: &Circuit) -> Result<String, String> {
                 modes
             ),
             GateKind::Kerr => format!("kerr({}) {};", num(ps, 0, "kerr", 1)?, modes),
+            // Polarization elements. `omega-parser` reads both and expands them
+            // into phase shifters and beam splitters on the H/V sub-modes; the
+            // expansion means the spelling cannot survive a round trip through
+            // the IR, so this AST is the only layer that can re-emit `hwp` as
+            // `hwp` rather than as four ops.
+            GateKind::HalfWavePlate => {
+                polarized_check(circuit, inst, "hwp")?;
+                format!("hwp({}) {};", num(ps, 0, "hwp", 1)?, modes)
+            }
+            // `pbs` takes no parameters, unlike every other gate here — the
+            // grammar makes the parameter list optional precisely for it.
+            GateKind::PolarizingBeamSplitter => {
+                polarized_check(circuit, inst, "pbs")?;
+                if !ps.is_empty() {
+                    return Err(format!(
+                        "OPTICQASM `pbs` takes no parameters, got {}",
+                        ps.len()
+                    ));
+                }
+                format!("pbs {};", modes)
+            }
             // A barrier has no operational meaning to lose, so dropping it to a
             // comment costs nothing. Every other gate does have one.
             GateKind::Barrier => format!("// barrier {};", modes),
@@ -169,7 +228,8 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
 
     // Declared registers, so mode references can be validated instead of
     // invented.
-    let mut regs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut regs: std::collections::HashMap<String, (usize, bool)> =
+        std::collections::HashMap::new();
     let mut seen_header = false;
 
     for (stmt, line) in statements(src) {
@@ -192,24 +252,18 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
             let size: usize = caps[2]
                 .parse()
                 .map_err(|e| format!("line {line}: bad register size: {e}"))?;
-            if caps.get(3).is_some() {
-                // Representing polarization in the aria-core AST needs register
-                // metadata the AST does not carry yet (PLAN-OPTICQASM-INTEGRITY
-                // O4). Refusing is the honest interim: accepting would silently
-                // reinterpret every mode index, since `pol` means 2N optical
-                // modes and a plain declaration means N.
-                return Err(format!(
-                    "line {line}: `photon {name}[{size}] pol;` — polarization registers are \
-                     read by `omega-parser` but the aria-core AST cannot yet carry the H/V \
-                     mode mapping, and accepting this would silently reinterpret every mode \
-                     index (pol means {} optical modes, not {size}).",
-                    2 * size
-                ));
-            }
-            if regs.insert(name.clone(), size).is_some() {
+            let polarized = caps.get(3).is_some();
+            if regs.insert(name.clone(), (size, polarized)).is_some() {
                 return Err(format!("line {line}: register `{name}` declared twice"));
             }
-            circuit.qreg(&name, size);
+            // `size` stays SPATIAL modes on both sides, matching the
+            // declaration; the doubling to optical modes happens in
+            // `omega-parser`'s lowering and nowhere else, so the two agree.
+            if polarized {
+                circuit.qreg_polarized(&name, size);
+            } else {
+                circuit.qreg(&name, size);
+            }
             continue;
         }
 
@@ -262,7 +316,7 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
             let index: usize = m[2]
                 .parse()
                 .map_err(|e| format!("line {line}: bad mode index: {e}"))?;
-            let size = regs.get(reg).ok_or_else(|| {
+            let (size, _pol) = regs.get(reg).ok_or_else(|| {
                 format!("line {line}: undefined photon register `{reg}`")
             })?;
             if index >= *size {
@@ -320,12 +374,15 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
             // perceval bridge, but the aria-core AST has no GateKind for
             // either. Naming them explicitly beats "unknown gate", which would
             // suggest the operation does not exist.
-            "hwp" | "pbs" => {
-                return Err(format!(
-                    "line {line}: `{gate_name}` is a polarization element that `omega-parser` \
-                     reads and the perceval bridge executes, but the aria-core AST has no \
-                     GateKind for it yet (PLAN-OPTICQASM-INTEGRITY O4)."
-                ))
+            "hwp" => {
+                check(1, 1)?;
+                polarized_regs_only(&regs, &qubits, "hwp", line)?;
+                GateDef::with_params(GateKind::HalfWavePlate, params)
+            }
+            "pbs" => {
+                check(0, 2)?;
+                polarized_regs_only(&regs, &qubits, "pbs", line)?;
+                GateDef::new(GateKind::PolarizingBeamSplitter)
             }
             // Never skip: skipping an unknown gate parses the file
             // "successfully" into a circuit missing an operation, which then
@@ -345,6 +402,33 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
         return Err("empty input: an OPTICQASM file must open with `OPTICQASM <version>;`".into());
     }
     Ok(circuit)
+}
+
+/// A polarization gate on a non-polarized register is refused on IMPORT too.
+///
+/// Symmetry with the emitter is the point: if only one side checked, the two
+/// readers of this dialect would disagree about validity — the defect
+/// `opticqasm_reader_agreement.rs` exists to prevent.
+fn polarized_regs_only(
+    regs: &std::collections::HashMap<String, (usize, bool)>,
+    qubits: &[Qubit],
+    gate: &str,
+    line: usize,
+) -> Result<(), String> {
+    for q in qubits {
+        match regs.get(&q.register) {
+            Some((_, true)) => {}
+            _ => {
+                return Err(format!(
+                    "line {line}: `{gate}` is a polarization element but `{}` was not \
+                     declared `pol`. Under a plain declaration every mode index means \
+                     something different, and nothing downstream can detect it.",
+                    q.register
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The grammar's `number` rule: `"-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)?`.
@@ -514,21 +598,41 @@ mod tests {
     /// D7: this exact input returned `Ok` with ZERO registers and ZERO
     /// operations — the worst defect in the file, because nothing downstream
     /// had any way to notice.
+    ///
+    /// The assertion is deliberately on the CONTENT, not on acceptance. Before
+    /// O4 this input was refused, and the test asserted the refusal; when O4
+    /// landed and the input became legitimately readable, that assertion failed
+    /// and had to be rewritten — which is right, but it means "it was refused"
+    /// was never the real invariant. The invariant is that a grammatical
+    /// polarization circuit is either refused with a reason or parsed IN FULL,
+    /// and never silently reduced to nothing.
     #[test]
-    fn polarization_declaration_is_never_silently_dropped() {
+    fn polarization_circuit_is_parsed_in_full_never_silently_emptied() {
         let src = "OPTICQASM 1.0;\nphoton q[2] pol;\npbs q[0], q[1];\n";
-        match from_opticqasm(src) {
-            Ok(c) => panic!(
-                "accepted a polarization circuit as {} registers / {} ops — \
-                 the old code returned Ok(0, 0) here",
-                c.registers.len(),
-                c.instructions.len()
-            ),
-            Err(e) => assert!(
-                e.contains("pol"),
-                "must refuse because of the pol marker specifically: {e}"
-            ),
-        }
+        let c = from_opticqasm(src).expect("O4: polarization is readable");
+        assert_eq!(c.registers.len(), 1, "register lost:\n{src}");
+        assert_eq!(c.instructions.len(), 1, "the pbs was dropped:\n{src}");
+        assert_eq!(c.instructions[0].gate.kind, GateKind::PolarizingBeamSplitter);
+        assert_eq!(c.instructions[0].qubits.len(), 2, "pbs spans two spatial modes");
+        assert!(
+            c.registers[0].polarized,
+            "the `pol` marker was dropped — the register would re-emit as \
+             `photon q[2];` and every mode index would change meaning"
+        );
+        // `size` counts SPATIAL modes on both sides of the boundary; the
+        // doubling to optical modes happens in omega-parser's lowering and
+        // nowhere else.
+        assert_eq!(c.registers[0].size, 2, "size must stay spatial, not doubled here");
+    }
+
+    /// A polarization gate on a NON-polarized register is refused. Accepting it
+    /// is undetectable downstream: both declarations are grammatical, and the
+    /// only difference is what every mode index means.
+    #[test]
+    fn polarization_gate_needs_a_polarized_register() {
+        let err = from_opticqasm("OPTICQASM 1.0;\nphoton q[2];\npbs q[0], q[1];\n")
+            .expect_err("pbs on a plain register must be refused");
+        assert!(err.contains("pol"), "the error must name the marker: {err}");
     }
 
     /// D7, second half: a parameter-less gate application is grammatical
