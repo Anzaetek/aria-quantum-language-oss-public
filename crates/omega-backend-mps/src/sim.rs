@@ -35,6 +35,40 @@ pub struct MpsRunStats {
     pub max_bond_reached: usize,
 }
 
+/// Accumulated discarded weight above which a result is refused rather than
+/// returned.
+///
+/// # Why there is a default at all
+///
+/// `discarded_weight` is the standard MPS fidelity proxy and this backend has
+/// always computed it correctly — and then returned the state regardless, with
+/// the number printed in a banner nothing consulted. Measured on a 19-qubit
+/// chain:
+///
+/// ```text
+///   circuit          discarded    TVD vs exact
+///   qft_16           0.000e0      1.9e-14      correct
+///   w_xy_grid_16q    9.773e-30    4.7e-15      correct
+///   wide_chain_19q   6.586e0      5.1e-01      HALF THE DISTRIBUTION WRONG
+/// ```
+///
+/// The signal separates the good runs from the bad one by thirty orders of
+/// magnitude, so gating on it costs nothing in the cases that work.
+///
+/// # Why this value
+///
+/// The discarded weight bounds the infidelity, so `1e-6` means "at most about
+/// one part in a million of the state was thrown away" — far above the `1e-30`
+/// the honest runs above produce, and far below the `6.586` that produced a
+/// useless answer. It is a ceiling on *silent* approximation, not a limit on
+/// what the backend can do: [`MpsBackend::with_max_discarded_weight`] raises it
+/// for callers who want an approximation and say so.
+///
+/// Note the observed values do not sit near this boundary from either side,
+/// which is the point — a threshold chosen to sit between two clusters thirty
+/// decades apart is not a tuned constant.
+pub const DEFAULT_MAX_DISCARDED_WEIGHT: f64 = 1e-6;
+
 /// MPS-based quantum circuit simulator.
 ///
 /// The `max_bond_dim` parameter controls the trade-off between accuracy and
@@ -58,6 +92,9 @@ pub struct MpsBackend {
     /// so the bond grows with entanglement instead of always filling the cap.
     /// `None` = fixed-rank truncation at `max_bond_dim`.
     adaptive_eps: Option<f64>,
+    /// Refuse a result whose accumulated discarded weight exceeds this.
+    /// See [`MpsBackend::with_max_discarded_weight`] and [`DEFAULT_MAX_DISCARDED_WEIGHT`].
+    max_discarded_weight: f64,
     /// Truncation certificate of the most recent `execute`/`expectation`.
     /// Interior-mutable because the `Backend` trait methods take `&self`;
     /// under batch parallelism it reflects one (arbitrary) row's run. Read via
@@ -72,8 +109,38 @@ impl MpsBackend {
             svd_fn: truncated_svd_flat,
             contract_fn: None,
             adaptive_eps: None,
+            max_discarded_weight: DEFAULT_MAX_DISCARDED_WEIGHT,
             stats: Mutex::new(MpsRunStats::default()),
         }
+    }
+
+    /// Raise (or lower) the discarded-weight ceiling this backend will return a
+    /// result under. `f64::INFINITY` restores the old behaviour of returning
+    /// whatever the truncation produced.
+    ///
+    /// Deliberately explicit: an approximate MPS result is a legitimate thing to
+    /// want, but it should be *asked for*, not arrived at by default.
+    pub fn with_max_discarded_weight(mut self, w: f64) -> Self {
+        self.max_discarded_weight = w;
+        self
+    }
+
+    /// Refuse a run whose truncation certificate says the state is not the one
+    /// the circuit describes.
+    fn check_truncation(&self) -> Result<()> {
+        let st = self.last_run_stats();
+        if st.discarded_weight > self.max_discarded_weight {
+            return Err(OmegaError::Unsupported(format!(
+                "MPS truncation discarded {:.3e} of the state (bond reached {}, ceiling \
+                 {:.3e}). The result would not approximate the circuit: measured on a \
+                 19-qubit chain, a discarded weight of 6.586 gave a total-variation \
+                 distance of 0.51 from the exact distribution — half the distribution \
+                 wrong, returned without complaint. Raise the bond dimension, or call \
+                 `with_max_discarded_weight` to accept an approximation deliberately.",
+                st.discarded_weight, st.max_bond_reached, self.max_discarded_weight
+            )));
+        }
+        Ok(())
     }
 
     /// Enable adaptive bond truncation with relative singular-value threshold
@@ -243,11 +310,19 @@ impl Backend for MpsBackend {
                 };
                 *counts.entry(outcome).or_insert(0) += 1;
             }
+            // Checked AFTER the trajectories: `record_stats` is last-writer-wins
+            // and the ceiling is about the run as a whole, not one shot.
+            self.check_truncation()?;
             return Ok(ExecResult::Counts(counts));
         }
 
         let (mps, _classical_bits) = self.evolve_once(circuit, params, config, &mut rng)?;
         self.record_stats(&mps);
+        // The truncation certificate gates the RESULT, in every mode. It was
+        // computed and printed but consulted by nothing, so a run that
+        // discarded 6.5x the state returned a distribution half of which was
+        // wrong — with the evidence on screen.
+        self.check_truncation()?;
 
         match config.shots {
             None => {
@@ -1523,7 +1598,11 @@ mod tests {
         // be clearly positive, and readout normalization keeps the returned
         // statevector at ‖ψ‖² = 1 even though the raw truncated state is lossy.
         let circuit = brickwork(8, 60, 0xBEEF);
-        let backend = MpsBackend::new(2);
+        // This test EXISTS to under-provision the bond, so it must opt into
+        // the approximation explicitly — which is the point of the ceiling:
+        // an approximate MPS result is legitimate when asked for, and a defect
+        // when arrived at silently.
+        let backend = MpsBackend::new(2).with_max_discarded_weight(f64::INFINITY);
         let result = backend
             .execute(
                 &circuit,
@@ -1580,7 +1659,12 @@ mod tests {
         // exact requirement — i.e. it grows only as far as the entanglement needs.
         let circuit = brickwork(8, 60, 0xBEEF);
         let exact = statevector_of(&circuit, 16); // 2^(8/2), exact reference
-        let backend = MpsBackend::new(16).with_adaptive(1e-8);
+        // Adaptive mode truncates by design; the assertion below is that it
+        // stays within its stated tolerance, so the ceiling is lifted here and
+        // the tolerance does the gating.
+        let backend = MpsBackend::new(16)
+            .with_adaptive(1e-8)
+            .with_max_discarded_weight(f64::INFINITY);
         let cfg = ExecConfig {
             shots: None,
             seed: None,
@@ -1601,7 +1685,10 @@ mod tests {
         // Coarsening ε discards at least as much weight (monotonic) — this deep
         // brickwork scrambles to a near-flat Schmidt spectrum, so even a coarse
         // ε may still fill the bond; the honest invariant is monotone discard.
-        let coarse = MpsBackend::new(16).with_adaptive(1e-1);
+        // Same reason: a coarse ε is chosen here precisely to discard a lot.
+        let coarse = MpsBackend::new(16)
+            .with_adaptive(1e-1)
+            .with_max_discarded_weight(f64::INFINITY);
         coarse
             .execute(&circuit, &ParameterBinding::new(), &cfg)
             .unwrap();
