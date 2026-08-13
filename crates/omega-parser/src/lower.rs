@@ -418,10 +418,22 @@ impl LowerCtx {
                     body_params.push(self.lower_expr(p, &inner_params, &params)?);
                 }
 
+                // The `cp`/`cu1` widening and the arity check both live at
+                // the top-level path below, and this path used to reach neither.
+                // `gate mycp(t) a,b { cp(t) a,b; }` therefore produced a CU3 with
+                // ONE parameter, and the statevector backend indexed
+                // `resolved[2]` and PANICKED. Measured, along with plain
+                // `cu3(0.7) a,b;` and `u3(0.7) a;` at top level — three ways for
+                // a malformed QASM2 file to crash the process instead of being
+                // refused.
                 let gate = name_to_gate(&body_app.name)?;
+                let body_params = widen_cp_params(&body_app.name, body_params)?;
+                let body_qubits: smallvec::SmallVec<[Qubit; 3]> =
+                    body_qubits.into_iter().collect();
+                check_gate_arity(&body_app.name, &gate, body_params.len(), body_qubits.len())?;
                 self.ops.push(GateOp {
                     gate,
-                    qubits: body_qubits.into_iter().collect(),
+                    qubits: body_qubits,
                     params: body_params,
                     classical_bit: None,
                     condition: None,
@@ -447,23 +459,7 @@ impl LowerCtx {
         // Synthesised BEFORE the `inv @` handling below so the inverse path
         // sees an ordinary CU3: `U3(θ,φ,λ)† = U3(−θ,−λ,−φ)`, which at
         // `(0,0,λ)` gives `U3(0,−λ,0) = diag(1, e^{−iλ})` — correct.
-        let params = if matches!(app.name.as_str(), "cp" | "cu1") {
-            if params.len() != 1 {
-                return Err(format!(
-                    "{} expects 1 parameter, got {}",
-                    app.name,
-                    params.len()
-                ));
-            }
-            let mut widened: smallvec::SmallVec<[ParamExpr; 3]> =
-                smallvec::SmallVec::with_capacity(3);
-            widened.push(ParamExpr::Concrete(0.0));
-            widened.push(ParamExpr::Concrete(0.0));
-            widened.push(params[0].clone());
-            widened
-        } else {
-            params
-        };
+        let params = widen_cp_params(&app.name, params)?;
 
         // Resolve qubits
         let mut qubits: smallvec::SmallVec<[Qubit; 3]> = smallvec::SmallVec::new();
@@ -554,6 +550,8 @@ impl LowerCtx {
             }
             return Ok(());
         }
+
+        check_gate_arity(&app.name, &gate, params.len(), qubits.len())?;
 
         // Resolve modifiers. With no modifiers this is the original
         // single-op emit (total_pow=1, inv_parity=false).
@@ -922,6 +920,87 @@ fn invert_gate_with_params(
         ),
     }
 }
+/// `cp(λ)` / `cu1(λ)` widened to the `CU3(0, 0, λ)` that omega actually has.
+///
+/// Extracted so BOTH the top-level path and the user-defined-gate body path use
+/// it. The body path reached neither this nor the arity check, so
+/// `gate mycp(t) a,b { cp(t) a,b; }` produced a CU3 carrying one parameter and
+/// the statevector backend panicked indexing `resolved[2]`.
+fn widen_cp_params(
+    name: &str,
+    params: smallvec::SmallVec<[ParamExpr; 3]>,
+) -> Result<smallvec::SmallVec<[ParamExpr; 3]>, String> {
+    if !matches!(name, "cp" | "cu1") {
+        return Ok(params);
+    }
+    if params.len() != 1 {
+        return Err(format!("{name} expects 1 parameter, got {}", params.len()));
+    }
+    let mut widened: smallvec::SmallVec<[ParamExpr; 3]> = smallvec::SmallVec::with_capacity(3);
+    widened.push(ParamExpr::Concrete(0.0));
+    widened.push(ParamExpr::Concrete(0.0));
+    widened.push(params[0].clone());
+    Ok(widened)
+}
+
+/// Refuse a wrong parameter or qubit count at LOWERING.
+///
+/// There was no arity validation anywhere between the parser and the backend's
+/// array index, so a malformed but grammatical file crashed the process.
+/// Measured before this, all three panicking in `omega-backend-statevector`:
+///
+/// ```text
+///   gate mycp(t) a,b { cp(t) a,b; }  ->  CU3 with 1 param  -> PANIC
+///   cu3(0.7) q[0], q[1];             ->  CU3 with 1 param  -> PANIC
+///   u3(0.7) q[0];                    ->  U3  with 1 param  -> PANIC
+/// ```
+///
+/// A wrong arity is a malformed input, and malformed input must be an error,
+/// never a panic — a parser that crashes on bad input cannot be pointed at
+/// anything untrusted.
+///
+/// Photonic gates are validated on their own path (`lower_opticqasm_stmt`) and
+/// `Barrier`/`Measure`/`Reset` are not gate applications, so both are skipped
+/// here rather than given wrong expectations.
+fn check_gate_arity(
+    name: &str,
+    gate: &GateKind,
+    n_params: usize,
+    n_qubits: usize,
+) -> Result<(), String> {
+    use GateKind::*;
+    // (params, qubits). `None` means "not checked here", with the reason above.
+    let want: Option<(usize, usize)> = match gate {
+        Id | X | Y | Z | H | S | Sdg | T | Tdg | Sx | Sxdg => Some((0, 1)),
+        Rx | Ry | Rz | U1 => Some((1, 1)),
+        U2 => Some((2, 1)),
+        U3 => Some((3, 1)),
+        CX | CY | CZ | Swap => Some((0, 2)),
+        CU3 => Some((3, 2)),
+        CRz => Some((1, 2)),
+        Rbs => Some((1, 2)),
+        CCX | CSwap => Some((0, 3)),
+        Barrier | Measure | Reset => None,
+        PhaseShifter | BeamSplitterRx => None,
+        // A user-supplied opaque gate: the parser knows nothing about its
+        // signature, so there is nothing to check against. Named rather than
+        // swept into a `_` arm, so a NEW GateKind still fails to compile here.
+        Custom(_) => None,
+    };
+    let Some((wp, wq)) = want else {
+        return Ok(());
+    };
+    if n_params != wp {
+        return Err(format!(
+            "`{name}` takes {wp} parameter(s), got {n_params}"
+        ));
+    }
+    if n_qubits != wq {
+        return Err(format!("`{name}` acts on {wq} qubit(s), got {n_qubits}"));
+    }
+    Ok(())
+}
+
 
 /// Map a gate name string to a GateKind.
 fn name_to_gate(name: &str) -> Result<GateKind, String> {
