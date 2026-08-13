@@ -520,6 +520,21 @@ if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
             && "$QK_PY" tools/qiskit_xcheck/compare.py /tmp/aria_xcheck.txt \
             && echo "  qiskit cross-check OK" \
             || { echo "  QISKIT CROSS-CHECK FAILED"; exit 1; }
+
+        # Is our QASM2 the same DIALECT qiskit speaks? The check above compares
+        # simulation results; this one compares the interchange format, which is
+        # a different failure surface — an export qiskit cannot load, or loads as
+        # a different circuit, never reaches a simulator to disagree.
+        #
+        # Both halves are needed. The Rust test writes the corpus and asserts
+        # what needs no python; the python half asserts the claim that does —
+        # that qiskit's Operator for OUR file equals its Operator for its OWN
+        # native gate. Loading proves nothing on its own: emitting `crz` where
+        # `cp` was meant loads perfectly and is a different circuit (measured,
+        # max|Δ| = 3.482e-01).
+        cargo test -q -p aria-core --test qasm2_qiskit_dialect \
+            && "$QK_PY" tools/qiskit_xcheck/qasm2_dialect.py target/qasm2_dialect_corpus.txt \
+            || { echo "  QASM2 DIALECT CHECK FAILED"; exit 1; }
     fi
 else
     QISKIT_XCHECK_SKIPPED="ARIA_QISKIT_XCHECK not set"
