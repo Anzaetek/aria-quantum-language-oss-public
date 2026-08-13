@@ -315,11 +315,26 @@ pub fn try_to_omega_ir(circuit: &Circuit) -> Result<OmegaCircuitIR, String> {
             ));
         };
         {
+            // `.unwrap_or(0)` silently RETARGETED an unknown qubit to index 0.
+            // Measured: `x zz[7]` on a circuit declaring only `q[2]` produced an
+            // X on qubit 0 — a different circuit, executed confidently.
+            //
+            // Qiskit refuses the equivalent (`'zz' is not defined in this
+            // scope`), and `aria-runtime/src/lower.rs` already returned an error
+            // here, so this file was the odd one out in its own crate family.
             let qubits: Vec<u32> = inst
                 .qubits
                 .iter()
-                .map(|q| qubit_map.get(q).copied().unwrap_or(0))
-                .collect();
+                .map(|q| {
+                    qubit_map.get(q).copied().ok_or_else(|| {
+                        format!(
+                            "gate `{:?}` names undeclared qubit `{q}`; it was previously \
+                             retargeted to qubit 0, which silently changed the circuit",
+                            inst.gate.kind
+                        )
+                    })
+                })
+                .collect::<Result<_, String>>()?;
 
             let classical_bit = inst.clbits.first().and_then(|c| clbit_map.get(c).copied());
 
@@ -351,10 +366,44 @@ pub fn try_to_omega_ir(circuit: &Circuit) -> Result<OmegaCircuitIR, String> {
             } else {
                 inst.gate.params.iter().map(&to_param).collect()
             };
-            let condition = inst
-                .condition
-                .as_ref()
-                .and_then(|(cl, v)| clbit_map.get(cl).copied().map(|idx| (idx, *v)));
+            // `.and_then` DROPPED the condition when the clbit was unmapped, so
+            // a guarded gate silently became unconditional — it then executed on
+            // every shot instead of some. Measured: `Ok`, condition `None`.
+            // Qiskit refuses the equivalent (`'zz' is not defined in this scope`).
+            let condition = match inst.condition.as_ref() {
+                None => None,
+                Some((cl, v)) => {
+                    let idx = clbit_map.get(cl).copied().ok_or_else(|| {
+                        format!(
+                            "gate `{:?}` is conditioned on undeclared classical bit `{cl}`; \
+                             the condition was previously DROPPED, which made the gate \
+                             unconditional",
+                            inst.gate.kind
+                        )
+                    })?;
+                    // A `condition` names one BIT, whose only values are 0 and 1,
+                    // so a literal above 1 can never fire and is out of domain
+                    // rather than merely unsatisfiable.
+                    //
+                    // This is NOT a divergence from Qiskit. Qiskit accepts
+                    // `if (c==2)` on `creg c[1]` (measured), but that is a
+                    // REGISTER-valued comparison — well-formed over the
+                    // register's value space, just unsatisfiable. Aria's
+                    // condition is per-bit, so the same literal is a type error
+                    // here. A register-wide comparison is a separate feature this
+                    // representation does not carry.
+                    if *v > 1 {
+                        return Err(format!(
+                            "condition `{cl} == {v}` names a single classical BIT, whose \
+                             only values are 0 and 1, so it can never fire. (Qiskit's \
+                             `if (c == {v})` compares a whole register and is merely \
+                             unsatisfiable on a 1-bit creg; Aria conditions are per-bit, \
+                             which makes this out of domain rather than just false.)"
+                        ));
+                    }
+                    Some((idx, *v))
+                }
+            };
             ops.push(OmegaGateOp {
                 gate: omega_gate,
                 qubits,
