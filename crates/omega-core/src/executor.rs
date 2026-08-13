@@ -171,14 +171,74 @@ pub fn needs_collapse(circuit: &CircuitIR) -> bool {
 /// Lives here because it had been copy-pasted into three backends, and a
 /// fourth copy is a fourth chance to key counts differently from the rest.
 pub fn creg_to_u64(classical_bits: &[u8]) -> u64 {
+    // Callers must have gone through `check_counts_width` first. The `break`
+    // below is what silently produced wrong results for 65+ qubits, so it is
+    // now an assertion in debug builds rather than a quiet fact.
+    debug_assert!(
+        classical_bits.len() <= MAX_COUNTS_QUBITS,
+        "creg_to_u64 called with {} bits; the counts key holds {MAX_COUNTS_QUBITS}. \
+         Call `check_counts_width` before producing counts.",
+        classical_bits.len()
+    );
     let mut bits = 0u64;
     for (i, b) in classical_bits.iter().enumerate() {
-        if i >= 64 {
+        if i >= MAX_COUNTS_QUBITS {
             break;
         }
         bits |= ((*b as u64) & 1) << i;
     }
     bits
+}
+
+/// How many qubits an [`ExecResult::Counts`] key can represent.
+///
+/// The key is a `u64`, so 64 — one bit per qubit.
+pub const MAX_COUNTS_QUBITS: usize = 64;
+
+/// Refuse to produce counts that the key cannot represent.
+///
+/// # The defect this exists for
+///
+/// `ExecResult::Counts` is keyed by `u64` and nothing checked the qubit count
+/// against it, so every bit above 63 was silently dropped and a **confident
+/// wrong answer** was returned. Measured on a GHZ chain, one lost bit per qubit
+/// above 64:
+///
+/// ```text
+///   63 qubits:  |0…0>, |1…1>        correct
+///   64 qubits:  |0…0>, |1…1>        correct
+///   65 qubits:  |0…0>, |0 1^64>     one leading zero
+///   66 qubits:  |0…0>, |00 1^64>    two leading zeros
+///  128 qubits:  |0…0>, |0^64 1^64>  the reported symptom
+/// ```
+///
+/// It was reported as an MPS defect. It is not: the same GHZ at 65 qubits
+/// truncates identically on the stabilizer backend. Any backend returning counts
+/// above 64 qubits is affected, and the physics in all of them is correct — only
+/// the reporting was lossy.
+///
+/// # Why refusing, rather than widening the key, comes first
+///
+/// Widening to a bitset touches every backend and the wire format, and needs a
+/// decision that is not obviously "wider is better": counts over a 2^128 space
+/// are a sparse sample, and a caller at that scale usually wants marginals or an
+/// expectation value. That decision can be taken carefully. Returning a wrong
+/// answer in the meantime cannot wait for it.
+///
+/// Expectation values, statevectors and probability vectors are unaffected —
+/// this is a property of the counts KEY, not of any simulation.
+pub fn check_counts_width(n_qubits: usize) -> crate::error::Result<()> {
+    if n_qubits > MAX_COUNTS_QUBITS {
+        return Err(crate::error::OmegaError::Unsupported(format!(
+            "counts are keyed by a {MAX_COUNTS_QUBITS}-bit integer, so a shot \
+             outcome over {n_qubits} qubits cannot be represented — every bit \
+             above {MAX_COUNTS_QUBITS} would be silently dropped and the counts \
+             would be wrong rather than merely truncated. \
+             Use `--expectation` (unaffected), reduce the register, or measure \
+             at most {MAX_COUNTS_QUBITS} qubits into a classical register."
+        )));
+    }
+    Ok(())
 }
 
 /// The `(qubit, classical_bit)` pairs a circuit's `measure` statements

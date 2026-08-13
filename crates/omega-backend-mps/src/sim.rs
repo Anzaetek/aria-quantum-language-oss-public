@@ -215,6 +215,16 @@ impl Backend for MpsBackend {
         // MPS backend was right and this one was wrong in a way that still
         // agreed with itself.
         let by_creg = mps_collapses(circuit, config);
+        // A shot outcome is keyed by a u64, so a register wider than 64
+        // qubits cannot be represented and every high bit would be silently
+        // dropped — a confident wrong answer, not a truncated one. Refused here
+        // rather than at the key-construction site so the message names the
+        // circuit, and refused in EVERY backend that can exceed 64 qubits
+        // because this is a property of the result type, not of any simulator.
+        if config.shots.is_some() {
+            omega_core::executor::check_counts_width(circuit.num_qubits as usize)?;
+        }
+
         if let (true, Some(shots)) = (by_creg || circuit_has_reset(circuit), config.shots) {
             let mut counts = HashMap::new();
             for _ in 0..shots {
