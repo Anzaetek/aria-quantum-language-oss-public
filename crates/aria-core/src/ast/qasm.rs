@@ -190,18 +190,49 @@ pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
                     let params = if inst.gate.params.is_empty() {
                         String::new()
                     } else {
-                        let ps: Vec<String> = inst
-                            .gate
-                            .params
-                            .iter()
-                            .map(|p| format_param(p.try_as_f64().unwrap_or(0.0)))
-                            .collect();
+                        // `.unwrap_or(0.0)` here turned a symbolic angle into a
+                        // hard ZERO: `rz(theta)` was emitted as `rz(0) q[0];`, a
+                        // well-formed file that every parser accepts and that
+                        // computes something else. QASM2 has no syntax for a
+                        // symbolic parameter, which is a real limitation of the
+                        // format and must be stated rather than silently
+                        // resolved. Same defect as `to_opticqasm`'s, same fix.
+                        let mut ps: Vec<String> = Vec::with_capacity(inst.gate.params.len());
+                        for (i, p) in inst.gate.params.iter().enumerate() {
+                            let v = p.try_as_f64().ok_or_else(|| {
+                                format!(
+                                    "QASM2 cannot express the symbolic parameter `{p:?}` \
+                                     (argument {i} of `{qasm_name}`): the format has no \
+                                     syntax for one. Bind it to a concrete value before \
+                                     exporting."
+                                )
+                            })?;
+                            ps.push(format_param(v));
+                        }
                         format!("({})", ps.join(", "))
                     };
                     let qrefs: Vec<String> = inst.qubits.iter().map(|q| q.to_string()).collect();
                     lines.push(format!("{qasm_name}{params} {};", qrefs.join(", ")));
                 } else {
-                    lines.push(format!("// unsupported gate: {:?}", inst.gate.kind));
+                    // Emitting `// unsupported gate: X` produced a QASM2 file
+                    // that parses, refuses nothing, and is MISSING an
+                    // operation — the export silently became a different
+                    // circuit. Measured: a HalfWavePlate exported as
+                    // `// unsupported gate: HalfWavePlate` and nothing else.
+                    return Err(format!(
+                        "QASM2 cannot represent `{:?}` (on {}). The photonic gates \
+                         (BeamSplitter, PhaseShifter, Squeezing, Displacement, Kerr, \
+                         HalfWavePlate, PolarizingBeamSplitter) belong to the OPTICQASM \
+                         lane — use `to_opticqasm`. Previously this was emitted as an \
+                         `// unsupported gate:` comment, which re-imported as a circuit \
+                         silently missing the operation.",
+                        inst.gate.kind,
+                        inst.qubits
+                            .iter()
+                            .map(|q| q.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
                 }
             }
         }

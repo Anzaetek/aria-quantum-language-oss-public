@@ -30,7 +30,7 @@
 //! as a statement about the language.
 
 use aria_core::ast::nodes::*;
-use aria_core::ast::opticqasm::to_opticqasm;
+use aria_core::ast::opticqasm::{from_opticqasm, to_opticqasm};
 use omega_parser::{lower_opticqasm_cv, parse_opticqasm, CvOp};
 
 /// Emit a one-gate circuit and return the OPTICQASM text.
@@ -167,4 +167,80 @@ fn the_bs_alias_lowers_on_both_profiles() {
         cv.ops,
         vec![CvOp::BeamSplitter { a: 0, b: 1, theta: 1.2, phi: 0.3 }]
     );
+}
+
+/// **O4: polarization round-trips, and the `pol` marker travels with it.**
+///
+/// The mode-count assertion is the point, not decoration. D3 in
+/// `PLAN-OPTICQASM-INTEGRITY.md` is that `photon q[N] pol;` means N SPATIAL
+/// modes carrying H and V — `2N` optical modes indexed `2s+p` — while
+/// `photon q[N];` means N optical modes. A test that emitted `hwp` and asserted
+/// the text contains `"hwp"` would pass with the marker dropped, and the file
+/// would parse, refuse nothing, and mean something different in every index.
+///
+/// So this asserts on the LOWERED mode count: 2 spatial modes must become 4
+/// optical ones. That number is what changes if the marker goes missing.
+#[test]
+fn polarization_survives_emit_and_reimport_with_its_mode_semantics() {
+    let mut c = Circuit::new("photonic");
+    let m = c.qreg_polarized("q", 2);
+    c.apply(
+        GateDef::with_params(GateKind::HalfWavePlate, vec![0.4]),
+        vec![m[0].clone()],
+    );
+    c.apply(
+        GateDef::new(GateKind::PolarizingBeamSplitter),
+        vec![m[0].clone(), m[1].clone()],
+    );
+    let text = to_opticqasm(&c).expect("O4: polarization is emittable");
+    assert!(
+        text.contains("photon q[2] pol;"),
+        "the `pol` marker must be emitted with the gates:\n{text}"
+    );
+
+    // The DV lowering is what knows the H/V mapping, so it is the honest place
+    // to check the semantics survived.
+    let program = parse_opticqasm(&text)
+        .unwrap_or_else(|e| panic!("our own polarization output does not parse: {e}\n{text}"));
+    let ir = omega_parser::lower::lower_opticqasm(&program)
+        .unwrap_or_else(|e| panic!("our own polarization output does not lower: {e}\n{text}"));
+    assert_eq!(
+        ir.num_qubits, 4,
+        "2 spatial modes must occupy 4 optical modes — if this says 2, the `pol` \
+         marker was dropped and every mode index now means something else:\n{text}"
+    );
+    // `hwp` and `pbs` are EXPANDED by the lowering (into phase shifters and
+    // beam splitters), so the IR carries neither spelling. That is why the
+    // aria-core AST needed the variants at all: it is the only layer that can
+    // re-emit `hwp` as `hwp` instead of as its four ops.
+    assert!(
+        ir.ops.len() > 2,
+        "hwp/pbs should expand into several primitive ops, got {}:\n{text}",
+        ir.ops.len()
+    );
+
+    // And the aria-core reader recovers the SPELLING, which the IR cannot.
+    let back = from_opticqasm(&text).expect("re-import");
+    let kinds: Vec<_> = back.instructions.iter().map(|i| i.gate.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![GateKind::HalfWavePlate, GateKind::PolarizingBeamSplitter],
+        "the spellings must survive the AST round trip:\n{text}"
+    );
+    assert!(back.registers[0].polarized, "the pol flag was lost on re-import");
+}
+
+/// `pbs` is emitted with no parameter list at all, which the grammar allows
+/// only for it. `pbs() q[0], q[1];` would be a different, wrong shape.
+#[test]
+fn pbs_is_emitted_without_a_parameter_list() {
+    let mut c = Circuit::new("photonic");
+    let m = c.qreg_polarized("q", 2);
+    c.apply(
+        GateDef::new(GateKind::PolarizingBeamSplitter),
+        vec![m[0].clone(), m[1].clone()],
+    );
+    let text = to_opticqasm(&c).unwrap();
+    assert!(text.contains("pbs q[0], q[1];"), "{text}");
+    assert!(!text.contains("pbs("), "pbs takes no parameters:\n{text}");
 }
