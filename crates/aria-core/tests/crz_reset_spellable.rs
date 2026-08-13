@@ -251,11 +251,20 @@ circuit C {
 /// **The CP round trip closes** — `to_qasm` output is readable by our own
 /// parser.
 ///
-/// `aria-core` emits `cp` for `GateKind::CP`, and `omega-parser` had no `cp`
+/// `aria-core` emitted `cp` for `GateKind::CP`, and `omega-parser` had no `cp`
 /// entry, so exporting a CP circuit produced a file this repository could not
-/// read back ("unknown gate: cp"). The QASM was valid qelib1 and Qiskit
-/// accepted it — only the round trip was broken, with both ends looking
-/// healthy.
+/// read back ("unknown gate: cp"). Only the round trip was broken, with both
+/// ends looking healthy.
+///
+/// **The emitter now writes `cu1`, not `cp`**, and the original doc comment
+/// here — "valid qelib1 which Qiskit accepted" — was wrong as stated. Measured
+/// on qiskit 2.5.1: `cp` is **not** in qelib1, the strict `qasm2.loads` rejects
+/// it, and only the legacy loader accepts it. `cu1` IS in qelib1, loads under
+/// both, and is operator-identical (max|delta| = 0.000e+00 against qiskit's
+/// native `cp`).
+///
+/// The parser still reads BOTH spellings — reading widely and writing narrowly
+/// is the right asymmetry for an interchange format.
 ///
 /// `CP(λ) == CU3(0, 0, λ)` exactly (`U3(0,0,λ) = diag(1, e^{iλ}) = P(λ)`), so
 /// the parser resolves `cp` to CU3 and widens the single angle to three.
@@ -269,7 +278,22 @@ circuit C {
 "#;
     let c = parse_aria_circuit(SRC, "C").unwrap();
     let qasm = to_qasm(&c).expect("CP is expressible in QASM 2.0");
-    assert!(qasm.contains("cp"), "expected `cp` in:\n{qasm}");
+    assert!(
+        qasm.contains("cu1("),
+        "expected the qelib1 spelling `cu1` (not `cp`, which strict qasm2.loads \
+         rejects) in:\n{qasm}"
+    );
+    assert!(
+        !qasm.contains("cp("),
+        "`cp` is not in qelib1; emitting it makes the file strict-unloadable:\n{qasm}"
+    );
+
+    // The parser must still accept the OLD spelling from other producers —
+    // qiskit's own `dumps` writes `cp`, so refusing it would break reading what
+    // qiskit writes.
+    let legacy = qasm.replace("cu1(", "cp(");
+    omega_parser::lower_to_ir(&legacy)
+        .expect("`cp` must still be READABLE even though we no longer write it");
 
     let ir = omega_parser::lower_to_ir(&qasm)
         .expect("our own export must re-parse — this is what #23 fixed");

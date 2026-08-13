@@ -269,7 +269,19 @@ must be a parse error, never an index panic in a backend.
 
 ---
 
-## P5 — Round-trip gaps, in priority order
+## P5 — Round-trip gaps — items 2 and 3 **DONE 2026-08-13**
+
+Items 2 and 3 were right, and went further than written: **every** spelling that
+strict `qasm2.loads` rejected is now emitted in a qelib1 form, so 24 of 25 gates
+load in the strict parser (was 3 of 10). `p`->`u1` and `cp`->`cu1` are exact
+name swaps; `swap`, `cswap`, `rxx`, `rzz` and `ryy` get preamble `gate`
+definitions. `sx` is the sole exemption and is inexpressible, not unfixed.
+
+Item 1 (guarded `measure`/`reset`) remains open.
+
+The original description follows.
+
+
 
 1. **Guarded `measure` / `reset` cannot re-parse.** Qiskit accepts both (measured),
    we emit both, and our grammar admits neither — `if_stmt` takes only
