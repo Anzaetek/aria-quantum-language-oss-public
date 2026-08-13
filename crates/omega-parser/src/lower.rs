@@ -466,12 +466,93 @@ impl LowerCtx {
         };
 
         // Resolve qubits
-        let mut qubits = smallvec::SmallVec::new();
+        let mut qubits: smallvec::SmallVec<[Qubit; 3]> = smallvec::SmallVec::new();
         for qr in &app.qubits {
             let qs = self.resolve_qubit(qr)?;
             for q in qs {
                 qubits.push(q);
             }
+        }
+
+        // `rxx(θ)` / `rzz(θ)` are DECOMPOSED here into ops that already exist
+        // rather than becoming new `GateKind` variants.
+        //
+        // Why decompose: these are interchange spellings, not new capabilities.
+        // The goal is that a QASM2 file round-trips, not that the engine gains a
+        // primitive. New variants would cost seven backends and re-open the CUDA
+        // non-exhaustive-match problem for a gate nobody asked to accelerate.
+        // The parser already decomposes this way for polarization
+        // (`lower_half_wave_plate`), so there is precedent and no new dispatch
+        // surface.
+        //
+        // Verified against Qiskit 2.5.1's own gate matrices via `Operator(qc).data`
+        // at θ = 0.7:
+        //
+        //   RZZ(θ) = cx q0,q1 ; rz(θ) q1 ; cx q0,q1        max|Δ| = 0.000e+00
+        //   RXX(θ) = h⊗h ; RZZ(θ) ; h⊗h                    max|Δ| = 3.331e-16
+        //
+        // Before this, `aria-core` emitted `rxx`/`rzz` and this parser answered
+        // "unknown gate" — a file Qiskit's legacy loader reads and we could not.
+        //
+        // `ryy` is deliberately NOT handled. Measured on qiskit 2.5.1: the
+        // strict `qasm2.loads` rejects all of rxx/ryy/rzz/cp, and the LEGACY
+        // `from_qasm_str` accepts rxx/rzz/cp but rejects `ryy` — "'ryy' is not
+        // defined in this scope". So no Qiskit loader reads `ryy`. Teaching this
+        // parser to read it would make the round trip work for us alone while
+        // every other toolchain still could not load the file, which is worse
+        // than the status quo because it would look fixed. What to do about
+        // EMITTING it is a separate decision (see PLAN-EXPORT-INTEGRITY.md).
+        //
+        // θ appears EXACTLY ONCE in each decomposition (the `h` conjugators are
+        // constants), so a symbolic angle differentiates correctly: `adjoint.rs`
+        // accumulates per-symbol contributions with `+=` and there is nothing
+        // here to double-count.
+        if matches!(app.name.as_str(), "rxx" | "rzz") {
+            if params.len() != 1 {
+                return Err(format!(
+                    "{} expects 1 parameter, got {}",
+                    app.name,
+                    params.len()
+                ));
+            }
+            if qubits.len() != 2 {
+                return Err(format!(
+                    "{} acts on 2 qubits, got {}",
+                    app.name,
+                    qubits.len()
+                ));
+            }
+            // `inv @ rzz(θ) == rzz(−θ)`: the decomposition is parameterised by θ,
+            // so negating the ANGLE is equivalent to reversing the sequence.
+            let theta = if inv_parity {
+                ParamExpr::Negate(Box::new(params[0].clone()))
+            } else {
+                params[0].clone()
+            };
+            let (a, b) = (qubits[0].clone(), qubits[1].clone());
+            let mut push = |gate: GateKind, qs: &[Qubit], ps: &[ParamExpr]| {
+                self.ops.push(GateOp {
+                    gate,
+                    qubits: qs.iter().cloned().collect(),
+                    params: ps.iter().cloned().collect(),
+                    classical_bit: None,
+                    condition: None,
+                });
+            };
+            for _ in 0..total_pow {
+                if app.name == "rxx" {
+                    push(GateKind::H, &[a.clone()], &[]);
+                    push(GateKind::H, &[b.clone()], &[]);
+                }
+                push(GateKind::CX, &[a.clone(), b.clone()], &[]);
+                push(GateKind::Rz, &[b.clone()], std::slice::from_ref(&theta));
+                push(GateKind::CX, &[a.clone(), b.clone()], &[]);
+                if app.name == "rxx" {
+                    push(GateKind::H, &[a.clone()], &[]);
+                    push(GateKind::H, &[b.clone()], &[]);
+                }
+            }
+            return Ok(());
         }
 
         // Resolve modifiers. With no modifiers this is the original
@@ -880,6 +961,12 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         // qelib1's controlled-phase. CP(λ) == CU3(0, 0, λ) exactly; the
         // 1 -> 3 parameter widening happens in `lower_gate_app`.
         "cu3" | "cp" | "cu1" => Ok(GateKind::CU3),
+        // Placeholder only: `rxx`/`rzz` never reach the single-op push —
+        // `lower_gate_app` intercepts them above and emits a decomposition. The
+        // entry exists so `name_to_gate` does not reject the name first.
+        // `ryy` is absent on purpose: no Qiskit loader reads it (measured), so
+        // reading it here would fix the round trip for us alone.
+        "rxx" | "rzz" => Ok(GateKind::CX),
         "ccx" | "toffoli" => Ok(GateKind::CCX),
         "cswap" | "fredkin" => Ok(GateKind::CSwap),
         "measure" => Ok(GateKind::Measure),
