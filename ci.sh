@@ -278,6 +278,28 @@ if [ "${ARIA_TCH:-1}" = "1" ]; then
       echo "        with LIBTORCH=/path/to/libtorch."
     fi
   fi
+  # `tch-env.sh` EXPORTS DYLD_LIBRARY_PATH / LD_LIBRARY_PATH, and everything
+  # sourcing it inherits those for the rest of the run. That leak is what broke
+  # this script: the aria-py stage's venv python then loaded the standalone
+  # libtorch 2.7.0 C++ libraries off DYLD_LIBRARY_PATH instead of the ones
+  # bundled inside its own pip `torch`, and the ABI mismatch surfaced as
+  #
+  #   ImportError: dlopen(.../torch/_C.cpython-313-darwin.so):
+  #     symbol not found in flat namespace '__PyObject_NextNotImplemented'
+  #
+  # which reads like a broken wheel and is not one — `import torch` succeeds in
+  # that venv with a clean environment.
+  #
+  # The export was never doing useful work here anyway. macOS SIP strips DYLD_*
+  # when exec'ing a protected binary, which is exactly why the cargo invocation
+  # below passes it INLINE. A venv python is not SIP-protected, so it is the one
+  # process that does inherit it — the variable is stripped where it was wanted
+  # and honoured where it was not.
+  #
+  # LIBTORCH and RUSTFLAGS must survive (the inline invocation derives from
+  # them); the loader paths must not.
+  unset DYLD_LIBRARY_PATH LD_LIBRARY_PATH || true
+
   if [ -n "${LIBTORCH:-}" ] && [ -f "${LIBTORCH}/build-version" ]; then
     # Apple clang >= 21 rejects libtorch 2.7's std::is_arithmetic specialization
     # (c10/util/strong_type.h); demote it or torch-sys will not compile. macOS
