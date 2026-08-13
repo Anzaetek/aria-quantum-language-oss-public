@@ -233,7 +233,17 @@ each failure is a decision that has been deferred silently.
 
 ---
 
-## P4 — A latent panic
+## P4 — A latent panic — **FIXED 2026-08-13**
+
+Confirmed by execution before fixing: all three panicked in
+`omega-backend-statevector`, not merely lowered wrong. Both paths now go through
+a shared `widen_cp_params` and a `check_gate_arity` whose `match` over `GateKind`
+has no `_` arm, so a new kind must be given a signature or declared unchecked.
+`crates/omega-parser/tests/gate_arity_is_validated.rs`; three mutations verified.
+
+The original description follows.
+
+
 
 `lower_gate_app`'s `cp`/`cu1` widening is **bypassed on the user-defined-gate
 body path**. `gate mycp(t) a,b { cp(t) a,b; }` produces a `CU3` op with **one**
