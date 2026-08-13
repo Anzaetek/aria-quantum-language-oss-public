@@ -77,6 +77,16 @@ impl Backend for StatevectorBackend {
         // `stochastic_evolution` is the noisy backend's predicate, which had
         // been correct all along (`collapses(..) || circuit_has_reset(..)`);
         // reuse it rather than keep a second, weaker copy in step.
+        // A shot outcome is keyed by a u64, so a register wider than 64
+        // qubits cannot be represented and every high bit would be silently
+        // dropped — a confident wrong answer, not a truncated one. Refused here
+        // rather than at the key-construction site so the message names the
+        // circuit, and refused in EVERY backend that can exceed 64 qubits
+        // because this is a property of the result type, not of any simulator.
+        if config.shots.is_some() {
+            omega_core::executor::check_counts_width(circuit.num_qubits as usize)?;
+        }
+
         if let (true, Some(shots)) = (stochastic_evolution(circuit, config), config.shots) {
             let by_creg = collapses(circuit, config);
             let mut counts: HashMap<u64, u32> = HashMap::new();

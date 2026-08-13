@@ -1022,7 +1022,13 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         "rx" => Ok(GateKind::Rx),
         "ry" => Ok(GateKind::Ry),
         "rz" => Ok(GateKind::Rz),
-        "u3" | "U" => Ok(GateKind::U3),
+        // `u` is OpenQASM 3's spelling and what qiskit's `qasm2.dumps` writes;
+        // `u3` is qelib1's. They are the SAME operator — verified against
+        // qiskit 2.5.1, max|delta| = 0.000e+00 — so this is a spelling, not a
+        // gate. Without it, files from qiskit's unitary-synthesis path (whose
+        // `gate unitary_… { u(…) … }` bodies are full of `u`) were rejected
+        // with "unknown gate: u".
+        "u3" | "U" | "u" => Ok(GateKind::U3),
         "u2" => Ok(GateKind::U2),
         // `p(λ)` is qelib1's phase gate. Qiskit's `PhaseGate(λ)` and
         // `U1Gate(λ)` are **bit-identical** — `diag(1, e^{iλ})`, verified at

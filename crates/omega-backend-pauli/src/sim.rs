@@ -53,6 +53,16 @@ impl Backend for PauliBackend {
 
         let n = circuit.num_qubits as usize;
 
+        // A shot outcome is keyed by a u64, so a register wider than 64
+        // qubits cannot be represented and every high bit would be silently
+        // dropped — a confident wrong answer, not a truncated one. Refused here
+        // rather than at the key-construction site so the message names the
+        // circuit, and refused in EVERY backend that can exceed 64 qubits
+        // because this is a property of the result type, not of any simulator.
+        if config.shots.is_some() {
+            omega_core::executor::check_counts_width(circuit.num_qubits as usize)?;
+        }
+
         match config.shots {
             Some(shots) => {
                 // Sampling mode: efficient for stabilizer states
