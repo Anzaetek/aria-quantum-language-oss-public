@@ -298,6 +298,48 @@ Requires a way to know a register is polarization-carrying — decide when
 implementing; `aria-core`'s `Circuit` has no such flag today, and inventing one
 is the only genuinely new design in this plan.
 
+### O4 design, worked out after O1–O3 landed
+
+O4 said "emit `hwp`/`pbs`, and the `pol` marker with them". Three measured facts
+change what that means:
+
+**1. `aria-core` has no polarization gate at all.** `GateKind` (`ast/nodes.rs`)
+carries `BeamSplitter`, `PhaseShifter`, `Squeezing`, `Displacement`, `Kerr` —
+and nothing for a wave plate or a polarizing beam splitter. So this is not
+"teach the emitter a spelling"; it is adding AST variants, and every `match` over
+`GateKind` in `aria-core` has to answer for them.
+
+**2. The round trip through the IR can never return them anyway.**
+`omega-parser` does not keep `hwp`/`pbs` as primitives — `lower_half_wave_plate`
+**expands** each into phase shifters and beam splitters on the H/V sub-modes
+(`PS(π)` on V, `BSrx(2θ, 0)`, then `PS(π/2)` on both), and `pbs` into
+`PS(π) · BSrx(π/2, π)`. By the time anything reaches the IR the spelling is gone,
+exactly as a decomposed gate is gone. So:
+
+* OPTICQASM → IR → OPTICQASM will emit the **expansion**, not `hwp`. That is
+  correct behaviour, not a defect, but it must be stated or someone will file it
+  as one.
+* The only path that can round-trip the spelling is
+  OPTICQASM → `aria-core` AST → OPTICQASM, which is precisely why the AST needs
+  the variants.
+
+**3. `pol` is not optional decoration.** `photon q[N] pol;` means N *spatial*
+modes carrying H and V — `2N` optical modes indexed `2s+p`. `photon q[N];` means
+N optical modes. Emitting `hwp` under a plain declaration produces a file that
+parses, refuses nothing, and means something different. So the register flag and
+the gates land together or not at all.
+
+**Scope, then:** add `GateKind::HalfWavePlate` and `PolarizingBeamSplitter` to
+`aria-core`; add a polarization flag to `RegisterDecl` (not a naming convention
+on the register — a flag, so it survives a rename); emit both the marker and the
+gates; and extend `opticqasm_reader_agreement.rs` by moving the two
+`KNOWN_ASYMMETRIC` entries into `ACCEPT`, which is the test telling us O4 is
+actually done rather than us asserting it.
+
+Note `hwp` refuses a symbolic angle in `omega-parser` because the expansion is
+built at lowering time. The emitter inherits that limit and must say so rather
+than resolve it to 0 — the D5 defect, one door over again.
+
 ### O5 — hand-over tests against the real emulators
 
 **The acceptance criterion for this entire plan: one OPTICQASM source, executed
