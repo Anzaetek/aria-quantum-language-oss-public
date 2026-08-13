@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # PLAN — OPTICQASM export/import integrity
 
-**Status: O1–O5 IMPLEMENTED (2026-08-13). O6 remains open.** Written as a plan first, after the measurements below and before any
+**Status: O1–O6 all IMPLEMENTED (2026-08-13).** The plan is complete; what
+remains is recorded at the end as follow-up, not as unfinished plan items. Written as a plan first, after the measurements below and before any
 code; this header is the only part edited after the fact, so the reasoning
 below is what was decided *before* the work, not a retrospective. Companion to `PLAN-EXPORT-INTEGRITY.md`,
 which covers the same defect class on the qubit (QASM2/QASM3/Aria) side; this
@@ -165,8 +166,8 @@ pattern its sibling already established.
 | O2 reader refuses instead of skipping | **done, after a false start** | statement-based, not line-based — see below; `opticqasm_reader_agreement.rs` |
 | O3 CV gates **import** | **done** | `omega_parser::lower_opticqasm_cv`; 8 unit tests + 5 cross-crate, 6 mutations verified |
 | O4 emit `hwp`/`pbs` + `pol` | **done** | `GateKind::HalfWavePlate`/`PolarizingBeamSplitter` + `RegisterDecl::polarized`; the two `KNOWN_ASYMMETRIC` entries moved into `ACCEPT`, which the plan named as the completion signal |
-| O5 cross-backend agreement | **done (CV)** | **17/17 piquasso fixture cases agree**, amps 1e-13, probs 1e-14, **0 skipped**; DV/Perceval arm still open |
-| O6 exhaustive-`match` guard | **done for QASM2**, open for OPTICQASM | `every_emitted_gate_is_readable.rs`; adding a `GateKind` gives `error[E0004]` until answered — verified, not assumed |
+| O5 cross-backend agreement | **done, both arms** | CV: 17/17 piquasso fixture cases, amps 1e-13, probs 1e-14, 0 skipped. DV: our emitted OPTICQASM on Perceval 1.2.4 vs `omega-backend-photonics`, incl. polarization, at a 6σ L2 gate |
+| O6 exhaustive-`match` guard | **done, both lanes** | `every_emitted_gate_is_readable.rs` (QASM2) and `every_photonic_gate_round_trips.rs` (OPTICQASM); adding a `GateKind` gives `error[E0004]` until answered — verified on both, not assumed |
 
 ### What the adversarial review caught, after these were called done
 
@@ -410,3 +411,33 @@ without exercising what it names.
 * **The emulator hand-over must compare numbers, not acceptance.** "Perceval
   loaded it" is not the claim; "Perceval computed the same distribution" is.
   A wrong beamsplitter convention loads perfectly.
+
+---
+
+## Follow-up, after the plan closed
+
+Recorded so the completion above is not read as "nothing is left".
+
+* **`CvOp::Squeeze`'s `phi` is unpinned.** The piquasso fixture carries only `r`
+  and the built-in executor refuses `phi != 0`, so a sign or convention error in
+  `phi` is invisible to everything here. Documented as an untested intention in
+  `cv.rs`, not as a fact.
+* **`CvOp::BeamSplitter`'s unitary is unpinned.** No CV executor takes it and the
+  fixture is single-mode. The DV side is pinned to Perceval; the CV side is
+  pinned to nothing. **Do not build a CV beamsplitter executor before pinning it
+  against piquasso**, or the two profiles can read the same text differently
+  with no test failing.
+* **What the DV agreement test cannot see.** Both backends read the *same*
+  emitted text, so an emitter bug that is symmetric — a swapped `bs_rx(theta,
+  phi)` argument order, say — feeds both sides the same wrong circuit and they
+  agree. That class is covered on the QASM2 side by comparing against Qiskit's
+  *native* gate operators (`tools/qiskit_xcheck/qasm2_dialect.py`); the photonic
+  lane has no equivalent native-construction reference yet.
+* **Two fixture facts worth keeping**, both found by mutation rather than review:
+  a single-mode phase ahead of a beam splitter is a **global** phase on a product
+  Fock input and therefore unobservable — deleting the `PS(π)` from the `hwp`
+  expansion passed with one plate and with both H and V populated, and only
+  failed once a **second** plate created the superposition it could act on. And
+  `decode_fock_string` renders `|0,2>` while the Perceval runner returns `0,2`;
+  comparing them raw gives an L2 of 9.0e-1 that reads exactly like a convention
+  error and is not one.

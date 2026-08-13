@@ -2617,8 +2617,11 @@ dependencies = [
 name = "omega-bridges"
 version = "0.1.0"
 dependencies = [
+ "aria-core",
  "base64",
+ "omega-backend-photonics",
  "omega-core",
+ "omega-parser",
  "serde_json",
  "smallvec",
  "tempfile",
