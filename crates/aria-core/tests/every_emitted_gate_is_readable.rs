@@ -57,17 +57,12 @@ fn spec(kind: &GateKind) -> Spec {
         // Decomposed by `omega-parser` into cx/rz (+ h conjugators) rather than
         // becoming IR primitives — interchange spellings, not new capabilities.
         RXX | RZZ => Spec::RoundTrips(1, 2),
-        RYY => Spec::EmittedButUnreadable(
-            1,
-            2,
-            "qiskit 2.5.1 rejects `ryy` in BOTH the strict `qasm2.loads` and the \
-             legacy `from_qasm_str` — it is not in qelib1. Teaching omega-parser \
-             to read it would fix the round trip for us ALONE while every other \
-             toolchain still could not load the file: strictly worse than the \
-             gap, because it would look fixed. The real fix is to stop EMITTING \
-             it (export the rx(pi/2)-conjugated rzz, which every consumer reads) \
-             — a change to the emitter, tracked separately.",
-        ),
+        // Emitted with Qiskit's own `gate ryy(param0) q0,q1 {...}` definition in
+        // the preamble, byte-for-byte as `qasm2.dumps` writes it — `ryy` is in
+        // neither qelib1 nor LEGACY_CUSTOM_INSTRUCTIONS, so a bare `ryy` loads
+        // nowhere. With the definition, Qiskit's legacy loader and omega-parser
+        // both read it.
+        RYY => Spec::RoundTrips(1, 2),
         RBS => Spec::NotQasm2, // Givens rotation; no qelib1 spelling.
         // Three-qubit.
         CCX | CSWAP => Spec::RoundTrips(0, 3),
@@ -151,14 +146,19 @@ fn every_qasm2_gate_aria_core_emits_is_read_back_by_omega_parser() {
     );
 }
 
-/// The exemption list is exactly one entry, and it stays visible.
+/// **The exemption list is empty, and this test exists to keep it that way.**
 ///
-/// If `ryy` ever becomes readable — because the emitter switched to the
-/// conjugated `rzz`, or because qelib1 grew it — this test fails and the entry
-/// moves to `RoundTrips`. That is the correct way to find out, rather than an
-/// exemption quietly outliving its reason.
+/// It held exactly one entry — `RYY` — until the emitter learned to write
+/// Qiskit's `gate ryy(...)` definition. The guard is what reported that: it
+/// failed with "RYY is now READABLE — move it to Spec::RoundTrips and delete the
+/// exemption", which is the intended way to discover the gap closed, rather than
+/// an exemption quietly outliving its reason.
+///
+/// Anything added to `EmittedButUnreadable` is a file this workspace can write
+/// and nothing can read. That should be hard to do quietly, hence the assertion
+/// on the whole list rather than on individual entries.
 #[test]
-fn the_only_unreadable_export_is_ryy_and_the_reason_still_holds() {
+fn nothing_this_workspace_emits_is_unreadable_by_everything() {
     let mut exempt = Vec::new();
     for kind in ALL {
         if let Spec::EmittedButUnreadable(np, nq, why) = spec(kind) {
@@ -176,11 +176,12 @@ fn the_only_unreadable_export_is_ryy_and_the_reason_still_holds() {
             );
         }
     }
-    assert_eq!(
-        exempt,
-        vec!["RYY"],
-        "the set of knowingly-unreadable exports changed; each one is a file this \
-         workspace can write and nothing can read, so the list must not grow \
-         quietly"
+    assert!(
+        exempt.is_empty(),
+        "these exports are readable by nothing, including us: {exempt:?}\n\
+         Each is a file this workspace can write and no consumer can load. Fix by \
+         emitting a preamble `gate` definition (as `to_qasm` does for `ryy`, \
+         copying qiskit's own `qasm2.dumps` output) or by emitting an equivalent \
+         built from spellings that are in qelib1."
     );
 }

@@ -89,12 +89,48 @@ fn format_param(p: f64) -> String {
 /// So a size-1 register gets the `if`; anything wider is refused, naming the
 /// register and bit and pointing at [`to_qasm3`], whose `if (c[i] == V)` can
 /// address a single bit.
+/// Qiskit's own `gate` definition for `ryy`, reproduced verbatim.
+///
+/// `ryy` is **not** in qelib1, and it is **not** in
+/// `qiskit.qasm2.LEGACY_CUSTOM_INSTRUCTIONS` either — measured on qiskit 2.5.1,
+/// that set is exactly:
+///
+/// ```text
+/// c3sqrtx c3x c4x ccx ch cp crx cry crz cswap csx cu cu1 cu3 cx cy cz delay
+/// h id p rc3x rccx rx rxx ry rz rzz s sdg swap sx sxdg t tdg u u0 u1 u2 u3 x y z
+/// ```
+///
+/// So Qiskit does not emit a bare `ryy`. `qasm2.dumps` writes this definition
+/// into the preamble and then calls it — and this string is a byte-for-byte copy
+/// of what it produces, which is the point: aligning with Qiskit's QASM2 means
+/// writing what Qiskit writes, not a decomposition of our own choosing that
+/// happens to be equivalent.
+///
+/// Before this, `to_qasm` emitted a bare `ryy(θ)`. Measured, that file loaded
+/// **nowhere**: qiskit's strict `qasm2.loads` and its legacy loader both answer
+/// "'ryy' is not defined in this scope", and `omega-parser` refused it too. With
+/// the definition present, both read it — verified.
+const RYY_GATE_DEF: &str =
+    "gate ryy(param0) q0,q1 { sxdg q0; sxdg q1; cx q0,q1; rz(param0) q1; cx q0,q1; sx q0; sx q1; }";
+
 pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
     let mut lines = vec![
         "OPENQASM 2.0;".to_string(),
         "include \"qelib1.inc\";".to_string(),
-        String::new(),
     ];
+
+    // Preamble definitions for gates outside qelib1, emitted only when used —
+    // exactly as `qasm2.dumps` does. Emitting unconditionally would put a
+    // definition in every file, which Qiskit does not do and which would make
+    // our output differ from its for no reason.
+    if circuit
+        .instructions
+        .iter()
+        .any(|i| i.gate.kind == GateKind::RYY)
+    {
+        lines.push(RYY_GATE_DEF.to_string());
+    }
+    lines.push(String::new());
 
     for reg in &circuit.registers {
         let kw = match reg.kind {
