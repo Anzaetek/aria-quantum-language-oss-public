@@ -43,3 +43,11 @@ smallvec = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+# Test-only. `opticqasm_perceval_agreement.rs` drives OUR emitted OPTICQASM
+# through both Perceval and this workspace's photonic backend and compares the
+# numbers — the DV half of PLAN-OPTICQASM-INTEGRITY.md O5. The emitter lives in
+# aria-core and the lowering in omega-parser, neither of which this crate needs
+# at runtime.
+aria-core = { path = "../aria-core" }
+omega-parser = { path = "../omega-parser" }
+omega-backend-photonics = { path = "../omega-backend-photonics" }
