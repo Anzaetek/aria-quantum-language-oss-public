@@ -13,6 +13,7 @@
 import QuantumProofs.Basic
 import QuantumProofs.Gates
 import QuantumProofs.SqrtX
+import QuantumProofs.MpsTruncation
 import QuantumProofs.CircuitSemantics
 import QuantumProofs.Adjoint
 import QuantumProofs.QFT
