@@ -52,11 +52,18 @@ accept anything — measured: `--backend mps:2 --strict-truncation 0.5` errored 
 1e-6 instead of accepting. Stats are recorded only on success, so the refusal
 also discarded the certificate the CLI wanted to print.
 
-Fixed by moving the policy to one place: the backend ceiling is lifted in
-`aria-runtime`, and `report_mps_truncation` applies
-`DEFAULT_MAX_DISCARDED_WEIGHT` when no flag is given and the user's value when
-one is. Verified across all three paths — accept, refuse-at-user-bound,
-refuse-at-default — with the certificate printed in each.
+**That fix then removed a gate of its own**, and this paragraph described the
+broken intermediate state until now. Lifting the backend ceiling and putting the
+policy in `report_mps_truncation` left every path that does NOT call it —
+`train`, `tune`, `predict`, and every library caller — with no truncation gate
+at all. Measured: `aria train --backend mps:2` trained to completion on a state
+whose certificate was 4.375, optimizing an observable already wrong at step 0.
+
+The policy is now back in the library (`set_mps_discard_ceiling` /
+`mps_discard_ceiling`, applied by `make_mps`), so every path is gated; the CLI
+sets it from `--strict-truncation` before anything runs, on every subcommand
+that takes `--backend` rather than only `run`. Verified: accept at 5.0, refuse
+at 0.5, refuse at the default, and `train` gated in both directions.
 
 ### M2 — the CLI knob *(premise corrected; smaller than revision 1 claimed)*
 
