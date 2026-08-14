@@ -65,7 +65,17 @@ measure_assign_v3 = { cbit_ref ~ "=" ~ "measure" ~ qubit_ref ~ ";" }
 barrier_stmt = { "barrier" ~ qubit_list_app ~ ";" }
 reset_stmt   = { "reset" ~ qubit_ref ~ ";" }
 
-if_stmt = { "if" ~ "(" ~ ident ~ "==" ~ integer ~ ")" ~ gate_app_stmt }
+// A guard may wrap a gate application, a `measure`, or a `reset`.
+//
+// It accepted only `gate_app_stmt`, so `if (c==1) measure q[0] -> c[0];` was a
+// PARSE error here while qiskit accepts it and this workspace's own emitter
+// produces it — a file we write, that we cannot read. (`reset` parsed, because
+// it looks like a gate application, and then died at lowering with "unknown
+// gate: reset".)
+// ORDER MATTERS: pest's `|` is an ordered choice, and `gate_app_stmt` would
+// match `reset q[0];` as a gate application named `reset` — which parsed, then
+// died at lowering with "unknown gate: reset". The specific forms go first.
+if_stmt = { "if" ~ "(" ~ ident ~ "==" ~ integer ~ ")" ~ (measure_stmt | reset_stmt | gate_app_stmt) }
 
 // Expressions (for gate parameters)
 expr = { prefix_op? ~ atom ~ (bin_op ~ prefix_op? ~ atom)* }

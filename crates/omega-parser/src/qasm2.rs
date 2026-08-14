@@ -158,12 +158,30 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt
             let mut it = inner.into_inner();
             let creg = it.next().unwrap().as_str().to_string();
             let value: u64 = it.next().unwrap().as_str().parse().unwrap();
+            // The guarded statement may be a gate application, a `measure` or
+            // a `reset` — the grammar used to admit only the first, so
+            // `if (c==1) measure q[0] -> c[0];` never parsed.
             let then_stmt = it.next().unwrap();
-            let app = parse_gate_app(then_stmt)?;
+            let then = match then_stmt.as_rule() {
+                Rule::gate_app_stmt => Qasm2Stmt::GateApp(parse_gate_app(then_stmt)?),
+                Rule::measure_stmt => {
+                    let mut m = then_stmt.into_inner();
+                    let qubit = parse_qubit_ref(m.next().unwrap())?;
+                    let cbit = parse_cbit_ref(m.next().unwrap())?;
+                    Qasm2Stmt::Measure { qubit, cbit }
+                }
+                Rule::reset_stmt => {
+                    let qr = then_stmt.into_inner().next().unwrap();
+                    Qasm2Stmt::Reset(parse_qubit_ref(qr)?)
+                }
+                other => {
+                    return Err(format!("unexpected statement after `if (...)`: {other:?}"))
+                }
+            };
             Ok(Some(Qasm2Stmt::If {
                 creg,
                 value,
-                then: Box::new(Qasm2Stmt::GateApp(app)),
+                then: Box::new(then),
             }))
         }
         Rule::reset_stmt => {
