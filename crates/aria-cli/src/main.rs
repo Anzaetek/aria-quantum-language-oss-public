@@ -424,14 +424,23 @@ fn report_mps_truncation(strict: Option<f64>) -> Result<(), String> {
             stats.discarded_weight, stats.max_bond_reached
         );
     }
-    if let Some(eps) = strict {
-        if stats.discarded_weight > eps {
-            return Err(format!(
-                "MPS discarded weight {:.3e} exceeds --strict-truncation {eps:.3e}; \
-                 raise --backend mps:<chi> / mps:auto:<ceiling> or loosen the bound",
-                stats.discarded_weight
-            ));
-        }
+    // `--strict-truncation` OVERRIDES the default; absent, the backend's default
+    // ceiling still applies. Both directions matter: a user who asks to accept a
+    // large discard must be able to, and a user who asks for nothing must not
+    // silently receive a state the truncation destroyed.
+    let ceiling = strict.unwrap_or(aria_runtime::DEFAULT_MAX_DISCARDED_WEIGHT);
+    if stats.discarded_weight > ceiling {
+        let knob = if strict.is_some() {
+            format!("--strict-truncation {ceiling:.3e}")
+        } else {
+            format!("the default ceiling {ceiling:.3e}")
+        };
+        return Err(format!(
+            "MPS discarded weight {:.3e} exceeds {knob}; raise \
+             --backend mps:<chi> / mps:auto:<ceiling>, or pass a larger \
+             --strict-truncation to accept the approximation deliberately",
+            stats.discarded_weight
+        ));
     }
     Ok(())
 }

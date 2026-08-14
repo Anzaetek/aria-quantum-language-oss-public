@@ -1,126 +1,156 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# PLAN — fixing the MPS backend
+# PLAN — fixing the MPS backend (revision 2)
 
-**Status: PLAN. Not implemented.** Written after the measurements below.
+**Status: PLAN, revised after adversarial review.** Revision 1 reached a correct
+conclusion by the same method that produced the wrong diagnosis before it —
+asserting from a bound instead of measuring — and three of its four action items
+were aimed at things that are not true. Both are recorded rather than quietly
+replaced.
 
-## The headline: there is no kernel bug, and I said there was
+## The conclusion, and how it is actually established
 
-Yesterday's note (task #29) recorded "MPS is structurally wrong on
-`wide_chain_19q` — TVD barely improves with χ". **That inference was wrong**,
-and it is corrected here before anything is built on it.
+There is **no MPS kernel bug**. `wide_chain_19q` is genuine truncation loss.
 
-The reasoning was: TVD vs the exact statevector went 0.594 → 0.539 → 0.510 as χ
-went 16 → 32 → 64, and ordinary truncation error should collapse over a 4× bond
-increase, so something structural must be broken.
+Revision 1 argued this from "19 qubits ⇒ max Schmidt rank 2⁹ = 512, so χ=64 is
+⅛ of exact". That is a worst-case *bound*, not a property of this circuit, and
+asserting from it is exactly the error being corrected. The measurement that
+settles it, done in review by profiling the Schmidt spectrum along the actual
+split schedule:
 
-The step I skipped was checking what χ this circuit actually needs. **On 19
-qubits the maximum Schmidt rank is 2⁹ = 512.** χ=64 is one eighth of exact, on a
-circuit with 135 two-qubit gates and depth 196 — deep enough to scramble. Slow
-convergence at ⅛ of the required bond is not evidence of a defect.
+* the exact state reaches Schmidt rank **512** at cut 8 — it does saturate the
+  bound, which revision 1 assumed rather than checked;
+* **39% of Schmidt weight sits beyond rank 64** at the worst split;
+* a canonical-gauge TEBD — the best *any* χ-capped MPS can do — still gives TVD
+  **0.459 at χ=64** and **0.351 at χ=128**.
 
-### The decisive measurement
+No gauge, no kernel and no implementation returns a good answer at χ ≤ 128 on
+this circuit. The flat TVD trend is what genuine truncation looks like here.
 
-Same gate vocabulary as the failing circuit (`u`, `t`, `tdg`, `cx`), deep enough
-to scramble, but on few enough qubits that **χ ≥ 2^(n/2) makes truncation
-mathematically impossible**:
+Also corrected: the circuit is not "deep enough to scramble" as revision 1 called
+it. It is a structured compute–uncompute ladder measuring **two qubits**.
 
-| n | layers | χ (exact) | TVD vs statevector | ‖ψ‖² | discarded |
-|---|---|---|---|---|---|
-| 8 | 24 | 16 | 3.573e-15 | 1.00000000 | 8.8e-33 |
-| 10 | 24 | 32 | 5.762e-15 | 1.00000000 | 1.4e-32 |
-| 12 | 20 | 64 | 6.578e-15 | 1.00000000 | 2.3e-32 |
+### The user-visible output is worse than the TVD suggested
 
-Exact to machine precision, norm exactly 1, discarded weight at the rounding
-floor. **The kernel is correct.** The one-sided Jacobi SVD that replaced the old
-normal-equations kernel is doing its job.
+Revision 1 quoted TVD 0.51 over the full 2¹⁹ distribution — which the circuit
+never measures. On the two measured bits the exact marginal is
+`(0.876, 0.124, ~0, ~0)`; at χ=64 we produce `(0.456, 0.061, 0.425, 0.058)` —
+**48% of the weight on an outcome of probability ~1e-30**. The refusal is
+justified on what a user actually sees, which is a stronger statement than the
+one that was made.
 
-And at 19 qubits the trend is consistent with genuine truncation, not corruption:
+## What is actually wrong
 
-| χ | TVD | discarded | wall |
-|---|---|---|---|
-| 64 | 5.096e-1 | 6.586 | 51.7 s |
-| 128 | 4.814e-1 | 4.801 | 341.4 s |
+### M1 — silently approximate answers *(landed, and it regressed the other CLI)*
 
-Improving, slowly, exactly as an under-provisioned bond should on a scrambling
-circuit — and costing 6.6× the time for a 2× bond.
+The truncation certificate gated nothing, so a run that discarded 6.586 of the
+state returned that distribution. Now gated.
 
-## So what is actually wrong
+**The gate broke `aria --strict-truncation`.** `make_mps` never lifted the
+backend ceiling, so the backend refused at 1e-6 before the CLI's own check ran
+and the documented "I accept this much approximation" knob could no longer
+accept anything — measured: `--backend mps:2 --strict-truncation 0.5` errored at
+1e-6 instead of accepting. Stats are recorded only on success, so the refusal
+also discarded the certificate the CLI wanted to print.
 
-Three things, none of them the simulator's arithmetic.
+Fixed by moving the policy to one place: the backend ceiling is lifted in
+`aria-runtime`, and `report_mps_truncation` applies
+`DEFAULT_MAX_DISCARDED_WEIGHT` when no flag is given and the user's value when
+one is. Verified across all three paths — accept, refuse-at-user-bound,
+refuse-at-default — with the certificate printed in each.
 
-### M1 — a silently approximate answer *(already fixed, recorded for completeness)*
+### M2 — the CLI knob *(premise corrected; smaller than revision 1 claimed)*
 
-The truncation certificate was computed, printed, and consulted by nothing, so a
-run that discarded 6.586 of the state returned a distribution half of which was
-wrong. Now gated by `DEFAULT_MAX_DISCARDED_WEIGHT`, with
-`with_max_discarded_weight` to opt into an approximation deliberately.
+Revision 1 said "`--help` and the docs advertise `mps:auto`/`mps:<chi>`, and
+`with_adaptive` is unreachable from the CLI". Both false, and they conflate two
+binaries:
 
-### M2 — **the user cannot ask for a correct answer**
+* `omega-run --help` lists only `statevector, mps, pauli, photonics, pauliprop`
+  — it advertises nothing it rejects. The document that describes the grammar
+  describes the **`aria`** CLI, where the knob **works today**.
+* `with_adaptive` is reachable: `aria run --backend mps:auto`.
 
-This is the real defect now, and it is a usability one with a correctness
-consequence.
+So the real gap is narrow: **`omega-run` alone cannot select χ**, while `aria`
+can. And the fix is not to write a parser — `BackendSel::parse` already
+implements the whole grammar with its defaults. Writing a second one at
+"several sites", as revision 1 proposed, is the inconsistency mechanism it
+warned about.
 
-`omega-run --backend mps` hardcodes `MpsBackend::new(64)`. The `--help` text and
-the backend documentation both advertise `mps:auto` and `mps:<chi>`; the
-dispatcher matches the literal string `"mps"` and rejects everything else as an
-unknown backend. So:
+**Do:** have `omega-run` use the existing `BackendSel::parse`. Sites revision 1
+missed: the noise-model gate `matches!(chosen, "statevector" | "sv" | "mps")`
+(a `mps:512 --noise` run would be spuriously rejected), the `--list-backends`
+names, and the `NoisyMpsBackend::with_model(64, …)` construction.
 
-* a user whose circuit needs χ=512 has **no way to say so** through the CLI;
-* after M1, that user now gets a refusal instead of a wrong answer — which is
-  better, but leaves them with no route to a right one;
-* the documentation describes a knob that does not exist, which is its own
-  defect and was mistaken for a fix during this investigation.
+### M3 — **withdrawn: the mechanism does not exist**
 
-`MpsBackend::with_adaptive` exists and is unreachable from the CLI.
+Revision 1 claimed "with a fixed χ every split is contracted at full bond even
+when the Schmidt spectrum is nearly rank-1". `svd.rs` already drops σ below
+threshold, so bonds *do* collapse on trivial spectra — and revision 1's own
+evidence contradicted it, since `qft_16` reaching `max_bond_reached=1` is that
+mechanism working. Measured: `qft_16` on fixed `mps` runs in **0.005 s**.
 
-**Fix:** parse `mps`, `mps:auto`, `mps:auto:<ceiling>`, `mps:<chi>` in the
-backend selector, everywhere `"mps"` is currently matched — there are several
-sites (execute, expectation, gradient, functional gradient), and fixing one is
-how this becomes inconsistent. Then the `--help` text describes reality.
+Adaptive mode would not help the circuit in question either: its ranks go
+2, 4, 8, … 512, saturating any ceiling immediately, so `mps:auto` would be
+*slower*.
 
-### M3 — fixed bond does full-χ work regardless of entanglement
+Where the time actually goes: 135 CX become **1555 splits** through the swap
+network, because a distance-17 CX costs 33 splits. At saturated χ=64 each split
+is ~250 Mflop of scalar Jacobi, giving ≈46 s — consistent with the measurement,
+so there is no separate hidden performance defect.
 
-The reported "~2000× slower than an external simulator" on `wide_chain_19q` is
-partly this: with a fixed χ every split is contracted at full bond even when the
-Schmidt spectrum is nearly rank-1. `qft_16` reaching `max_bond_reached=1` shows
-the spectrum can be trivial while the cost is not.
+**The lever nobody named is qubit ordering.** An interleaved mapping
+(0, 8, 1, 9, …) cuts the required rank from 512 to **265**. That is the real
+performance item, and it is a different piece of work from anything revision 1
+proposed.
 
-Adaptive mode already implements the remedy. Once M2 exposes it, the question
-becomes what the **default** should be — and that is a real decision, not an
-implementation detail:
+### M4 — the certificate is uncalibrated and its documentation overclaims *(new)*
 
-* `mps` meaning fixed χ=64 is predictable and is what every existing measurement
-  in this repository was taken with;
-* `mps` meaning adaptive is faster and more accurate on low-entanglement
-  circuits and slower to explain when a result changes.
+`discarded_weight > 1` is legal — it is a sum over ~1555 per-split fractions,
+not a probability — so 6.586 is not an accumulation bug. Two real problems:
 
-**Recommendation: leave the default alone, expose the alternatives.** Changing
-what a bare `--backend mps` means would silently change every previously
-recorded number, which is the class of thing this repository keeps getting
-burned by.
+* the doc comment says "the discarded weight bounds the infidelity". That
+  theorem holds for **canonical-gauge** truncation, and this MPS is explicitly
+  non-canonical. Measured on the same trajectory: canonical certificate 0.664
+  vs ours 6.402 — a 10× gauge inflation. Conservative *here*; nothing proves it
+  cannot understate elsewhere, which would let a bad run pass the 1e-6 gate.
+* the message "discarded 6.586e0 of the state" is innumerate — you cannot
+  discard 659% of a state. Reword to name it as an accumulated per-split sum.
 
-## What must be true before any of this is called done
+### M5 — the refusal costs a full run *(new)*
 
-* **No performance change may alter a result.** M3 touches contraction order and
-  truncation; every change gets the exact-bond equivalence test above (n = 8,
-  10, 12 at χ = 2^(n/2)) plus the cross-backend comparison against Qiskit.
-* **The exactness test belongs in the suite**, not in a scratch file. It is the
-  thing that distinguishes "the bond is too small" from "the kernel is broken",
-  and its absence is why a wrong diagnosis survived a day.
-* **`wide_chain_19q` stays a fixture** — as a circuit that must be *refused* at
-  χ=64 and *correct* at χ=512, not as a circuit that must be fast.
+The check fires after evolution completes: 46 s of compute, then the error. On
+the per-trajectory path it fires after `shots ×` full evolutions. The
+certificate crosses 1e-6 within the first truncating splits, so an early abort
+would refuse in milliseconds.
+
+## Tests — the gap revision 1 lectured about and then left open
+
+Revision 1's exactness tests run at χ = 2^(n/2), where ~1e-32 is dropped. The
+rank-cap bookkeeping runs but **no meaningful σ is ever discarded**, so the
+lossy path — the only path anything interesting happens on — stays untested. A
+wrong-column repack or a gauge pathology would pass every test proposed.
+
+**Required:**
+1. Exact-bond equivalence (n = 8, 10, 12 at χ = 2^(n/2)), with
+   `max_bond_reached == χ` asserted so the fixture provably saturates. Keep;
+   move out of a scratch file into the suite.
+2. **A test where truncation is active and meaningful** — matched-χ comparison
+   against a canonical-compression reference on a mildly-truncating circuit.
+   This is the missing one. Measured residual today: ours 0.505 vs canonical
+   0.459 at χ=64, and 0.474 vs **0.351** at χ=128 — real, modest here,
+   unbounded in principle.
+3. `wide_chain_19q` as a **refusal** fixture. Not as a "correct at χ=512"
+   fixture: χ³ scaling puts that at ~6 hours.
 
 ## What could make this pass for the wrong reason
 
-* **Testing the kernel only where truncation happens.** Every disagreement is
-  then attributable to truncation and the test cannot fail for a kernel reason.
-  The exact-bond cases are the whole point.
-* **Testing exactness only on shallow or product-like circuits.** `qft_16` on
-  |0…0⟩ reaches bond 1 — it would pass with almost any kernel. The fixture has
-  to actually saturate the bond, which is why the table above reports
-  `max_bond_reached` equal to χ in every row.
-* **Believing a fast result.** `mps:auto` returning in 0.00 s looked like a fix
-  and was an unimplemented CLI flag producing no output at all.
-* **Trusting the trend instead of the bound.** The error that produced the wrong
-  diagnosis was reading a convergence *rate* without checking the χ the circuit
-  requires. Any future claim about MPS accuracy states 2^(n/2) alongside it.
+* **Trusting a bound instead of measuring.** This is now twice. Any claim about
+  what χ a circuit needs is measured from its Schmidt spectrum, not inferred
+  from 2^(n/2).
+* **Testing only where truncation cannot happen** — see the tests section.
+* **Believing the external comparison.** The 0.027 s reference this all started
+  from is almost certainly a wrong answer: no faithful MPS tracks rank 265–512
+  in 27 ms, and canonical TEBD at χ=128 already has TVD 0.35. The report shows
+  no counts. Before any performance target is set against that number, it must
+  be checked for correctness — an unfaithful fast result is not a target.
+* **Quoting a TVD over states the circuit never measures.** Report the marginal
+  over the measured register.

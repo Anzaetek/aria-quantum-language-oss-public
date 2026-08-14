@@ -74,3 +74,7 @@ pub use remote::{
     expectation_remote, expectation_remote_batch, remote_stats, reset_remote_stats,
     run_counts_remote, Remote, RemoteStats,
 };
+
+/// Re-exported so a front end can apply the same default ceiling the backend
+/// would, instead of hard-coding a second copy of the number.
+pub use omega_backend_mps::DEFAULT_MAX_DISCARDED_WEIGHT;
