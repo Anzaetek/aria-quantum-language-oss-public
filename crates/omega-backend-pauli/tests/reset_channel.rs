@@ -30,7 +30,7 @@ fn g(kind: GateKind, qubits: &[u32]) -> GateOp {
     }
 }
 
-fn counts(c: &CircuitIR, seed: u64) -> HashMap<u64, u32> {
+fn counts(c: &CircuitIR, seed: u64) -> HashMap<omega_core::outcome::Outcome, u32> {
     let cfg = ExecConfig {
         shots: Some(SHOTS),
         seed: Some(seed),
@@ -43,8 +43,13 @@ fn counts(c: &CircuitIR, seed: u64) -> HashMap<u64, u32> {
         .clone()
 }
 
-fn ones(m: &HashMap<u64, u32>, bit: u64) -> u32 {
-    m.iter().filter(|(k, _)| *k & bit != 0).map(|(_, v)| v).sum()
+fn ones(m: &HashMap<omega_core::outcome::Outcome, u32>, bit: u64) -> u32 {
+    // `bit` is a MASK in the old u64 convention; read the matching index.
+    let idx = bit.trailing_zeros();
+    m.iter()
+        .filter(|(k, _)| k.bit(idx) == 1)
+        .map(|(_, v)| v)
+        .sum()
 }
 
 fn bell_reset0() -> CircuitIR {

@@ -61,8 +61,17 @@ fn circuit(n: usize) -> aria_core::ast::nodes::Circuit {
     circuit_pair(n, 40, 41)
 }
 
-fn check(counts: HashMap<u64, u32>, shots: u32, lo: f64, what: &str) {
-    let wide: Vec<u64> = counts.keys().copied().filter(|k| *k > 0b11).collect();
+fn check(
+    counts: HashMap<omega_core::outcome::Outcome, u32>,
+    shots: u32,
+    lo: f64,
+    what: &str,
+) {
+    let wide: Vec<String> = counts
+        .keys()
+        .filter(|o| o.width() > 2 || o.as_u64().unwrap_or(u64::MAX) > 0b11)
+        .map(|o| o.to_bitstring())
+        .collect();
     assert!(
         wide.is_empty(),
         "{what}: {} keys exceed the 2-bit creg (e.g. {:?}). Either the backend \
@@ -73,7 +82,11 @@ fn check(counts: HashMap<u64, u32>, shots: u32, lo: f64, what: &str) {
     );
     let total: u32 = counts.values().sum();
     assert_eq!(total, shots, "{what}: shots went missing");
-    let f01 = *counts.get(&0b01).unwrap_or(&0) as f64 / total as f64;
+    let w = counts.keys().next().map(|o| o.width()).unwrap_or(2);
+    let f01 = *counts
+        .get(&omega_core::outcome::Outcome::from_u64(0b01, w))
+        .unwrap_or(&0) as f64
+        / total as f64;
     assert!(
         f01 > lo,
         "{what}: |01> took {f01:.3} of the shots, expected ~0.85. Near 0.15 \
@@ -82,7 +95,10 @@ fn check(counts: HashMap<u64, u32>, shots: u32, lo: f64, what: &str) {
     );
 }
 
-fn counts_of(r: Result<ExecResult, String>, what: &str) -> HashMap<u64, u32> {
+fn counts_of(
+    r: Result<ExecResult, String>,
+    what: &str,
+) -> HashMap<omega_core::outcome::Outcome, u32> {
     match r.unwrap_or_else(|e| panic!("{what}: {e}")) {
         ExecResult::Counts(c) => c,
         o => panic!("{what}: {o:?}"),

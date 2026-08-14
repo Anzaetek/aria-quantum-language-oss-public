@@ -241,8 +241,21 @@ fn flatten_result(result: ExecResult) -> FfiExecResult {
             let mut bitstrings = Vec::with_capacity(map.len());
             let mut counts = Vec::with_capacity(map.len());
             for (bs, ct) in map {
-                bitstrings.push(bs);
-                counts.push(ct);
+                // The plugin ABI carries `*mut u64`. A reference plugin that
+                // truncated here would model the exact defect this type
+                // removed, so an outcome that does not fit is dropped and said
+                // out loud instead.
+                match bs.as_u64() {
+                    Some(k) => {
+                        bitstrings.push(k);
+                        counts.push(ct);
+                    }
+                    None => eprintln!(
+                        "[refplugin] dropping a {}-qubit outcome: the plugin ABI \
+                         carries u64 bitstrings",
+                        bs.width()
+                    ),
+                }
             }
             let (bp, n) = leak(bitstrings);
             let (cp, _) = leak(counts);

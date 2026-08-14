@@ -160,7 +160,7 @@ impl LoadedBackend {
         }
 
         let mut ffi_result = unsafe { ffi_result.assume_init() };
-        let result = unflatten_result(&ffi_result);
+        let result = unflatten_result(&ffi_result, circuit.num_qubits);
 
         // Free the FFI result. Pass a genuine `&mut` — a plugin's `free_result`
         // is allowed to write (e.g. null the pointers it frees), and a `*mut`
@@ -351,15 +351,30 @@ fn flatten_circuit(circuit: &CircuitIR, params: &ParameterBinding) -> Result<Vec
 }
 
 /// Convert FFI result back to ExecResult.
-fn unflatten_result(ffi: &FfiExecResult) -> Result<ExecResult> {
+///
+/// `num_qubits` is the width to interpret the plugin's keys at. The plugin
+/// protocol carries `*mut u64` bitstrings and no width, and it is a **published
+/// ABI that third-party plugins compile against** — so it cannot be widened
+/// unilaterally, and a plugin therefore cannot report an outcome over more than
+/// 64 qubits at all. That limit is enforced explicitly below rather than left
+/// to a silent truncation, which is the whole defect this type replaced.
+fn unflatten_result(ffi: &FfiExecResult, num_qubits: u32) -> Result<ExecResult> {
     match ffi.result_type {
         FfiResultType::Counts => {
+            if num_qubits > 64 {
+                return Err(OmegaError::Unsupported(format!(
+                    "a plugin backend returned counts for a {num_qubits}-qubit \
+                     circuit, but the plugin ABI carries outcomes as u64 and \
+                     cannot express more than 64 bits. Interpreting them would \
+                     silently drop every bit above 63."
+                )));
+            }
             let mut counts = HashMap::new();
             unsafe {
                 for i in 0..ffi.num_entries as usize {
                     let bs = *ffi.bitstrings.add(i);
                     let ct = *ffi.counts.add(i);
-                    counts.insert(bs, ct);
+                    counts.insert(crate::outcome::Outcome::from_u64(bs, num_qubits), ct);
                 }
             }
             Ok(ExecResult::Counts(counts))

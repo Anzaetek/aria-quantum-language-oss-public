@@ -143,7 +143,11 @@ fn the_old_silent_answer_differed_from_truth_by_the_full_half_range() {
     // c0 records q0's measurement; the guard fires exactly when c0 == 1, and
     // that is also when q1 is flipped. So P(q1 = 1) = P(c0 = 1), and
     // <Z1> = 1 - 2*P(c0 = 1).
-    let p1 = *counts.get(&1).unwrap_or(&0) as f64 / SHOTS as f64;
+    let w = counts.keys().next().map(|o| o.width()).unwrap_or(1);
+    let p1 = *counts
+        .get(&omega_core::outcome::Outcome::from_u64(1, w))
+        .unwrap_or(&0) as f64
+        / SHOTS as f64;
     let truth = 1.0 - 2.0 * p1;
     assert!(
         truth.abs() < 0.02,

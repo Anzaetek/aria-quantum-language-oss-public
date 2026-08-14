@@ -342,16 +342,27 @@ fn cmd_parse(raw: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `n_qubits` is no longer the render width — the key carries its own.
+///
+/// It is kept in the signature so callers need not all change, and is checked
+/// against the data rather than trusted. Padding a correct key to the caller's
+/// idea of the width is how a 2-bit outcome came to be printed as 1024
+/// characters, and no type error catches it.
 fn print_counts(res: ExecResult, n_qubits: usize) {
     match res {
         ExecResult::Counts(counts) => {
-            let mut rows: Vec<(u64, u32)> = counts.into_iter().collect();
+            debug_assert!(
+                counts.is_empty() || counts.keys().all(|o| o.width() as usize == n_qubits),
+                "print_counts was told {n_qubits} qubits but the outcomes are \
+                 {:?} wide",
+                counts.keys().map(|o| o.width()).collect::<std::collections::BTreeSet<_>>()
+            );
+            let mut rows: Vec<_> = counts.into_iter().collect();
             rows.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
-            let w = n_qubits.max(1);
             let total: u64 = rows.iter().map(|(_, c)| *c as u64).sum::<u64>().max(1);
             for (state, count) in rows {
                 let p = count as f64 / total as f64;
-                println!("|{state:0w$b}>  {count}  ({p:.4})");
+                println!("|{}>  {count}  ({p:.4})", state.to_bitstring());
             }
         }
         other => println!("{other:?}"),

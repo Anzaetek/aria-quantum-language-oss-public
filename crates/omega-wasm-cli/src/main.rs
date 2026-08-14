@@ -1262,7 +1262,10 @@ fn sample_circuit(circuit: &CircuitIR, params: &[f64], _n_vars: usize) -> Vec<(u
     let backend = StatevectorBackend::new();
     match backend.execute(circuit, &binding, &cfg) {
         Ok(ExecResult::Counts(c)) => {
-            let mut v: Vec<(u64, u32)> = c.into_iter().collect();
+            let mut v: Vec<(u64, u32)> = c
+                .into_iter()
+                .filter_map(|(o, n)| o.as_u64().map(|k| (k, n)))
+                .collect();
             v.sort_by_key(|b| std::cmp::Reverse(b.1));
             v
         }

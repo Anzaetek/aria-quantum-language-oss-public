@@ -354,12 +354,25 @@ fn add_host_functions(linker: &mut Linker<StoreData>) -> Result<()> {
                 match state.execute_with_shots(circuit_id as u32, &params, shots as u32, Some(42)) {
                     Ok(counts) => {
                         let mut sorted: Vec<_> = counts.into_iter().collect();
-                        sorted.sort_by_key(|&(k, _)| k);
+                        sorted.sort_by(|a, b| a.0.cmp(&b.0));
                         let n = sorted.len().min(max_entries as usize);
                         let mut out = Vec::with_capacity(n * 2);
-                        for &(bits, count) in sorted.iter().take(n) {
-                            out.push(bits as f64);
-                            out.push(count as f64);
+                        for (bits, count) in sorted.iter().take(n) {
+                            // The guest ABI is an f64 array, so an outcome that
+                            // does not fit a u64 cannot cross it. Skipped and
+                            // reported rather than truncated — a guest cannot
+                            // tell a truncated key from a real one.
+                            match bits.as_u64() {
+                                Some(k) => {
+                                    out.push(k as f64);
+                                    out.push(*count as f64);
+                                }
+                                None => eprintln!(
+                                    "omega_execute_shots: dropping a {}-qubit outcome; \
+                                     the guest ABI carries f64 keys",
+                                    bits.width()
+                                ),
+                            }
                         }
                         write_f64_array(&mut caller, counts_out_ptr, &out);
                         n as i32

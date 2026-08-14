@@ -3,6 +3,7 @@
 //! Every mode produces a single JSON object on stdout (or, for `jsonl`, one
 //! object per line). Stderr stays human-readable.
 
+use omega_core::outcome::Outcome;
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
@@ -35,9 +36,13 @@ impl Format {
 
 /// Format a bitstring as "00101" (MSB = highest qubit index) for gate-based
 /// circuits, or "n0,n1,..." Fock string for photonics.
-fn format_bits(bits: u64, num_qubits: u32, circuit_type: &CircuitType) -> String {
+fn format_bits(o: &Outcome, num_qubits: u32, circuit_type: &CircuitType) -> String {
     match circuit_type {
         CircuitType::Photonic => {
+            // Photonic keys are packed occupancies (4 bits per mode), not one
+            // bit per qubit, so they are read as an integer. The dense Fock
+            // basis is bounded far below 2^64 entries.
+            let bits = o.as_u64().unwrap_or(0);
             let modes = num_qubits as usize;
             let mut out = Vec::with_capacity(modes);
             for m in 0..modes {
@@ -46,15 +51,15 @@ fn format_bits(bits: u64, num_qubits: u32, circuit_type: &CircuitType) -> String
             }
             out.join(",")
         }
-        CircuitType::GateBased => {
-            let w = num_qubits as usize;
-            format!("{:0>width$b}", bits, width = w)
-        }
+        // The WIDTH COMES FROM THE KEY, not from `num_qubits`. Those differ
+        // whenever the outcome is the classical register, and padding to
+        // `num_qubits` is what printed a 2-bit result as 1024 characters.
+        CircuitType::GateBased => o.to_bitstring(),
     }
 }
 
 pub fn counts_to_json(
-    counts: &HashMap<u64, u32>,
+    counts: &HashMap<Outcome, u32>,
     num_qubits: u32,
     shots: u32,
     circuit_type: &CircuitType,
@@ -63,7 +68,7 @@ pub fn counts_to_json(
     let mut entries: Vec<_> = counts.iter().collect();
     entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     for (bits, count) in entries {
-        map.insert(format_bits(*bits, num_qubits, circuit_type), json!(count));
+        map.insert(format_bits(bits, num_qubits, circuit_type), json!(count));
     }
     json!({
         "mode": "counts",
@@ -146,11 +151,11 @@ pub fn functional_gradient_to_json(
 }
 
 /// Emit per-shot JSONL samples, one line per shot, flattened from counts.
-pub fn emit_jsonl_counts(counts: &HashMap<u64, u32>, num_qubits: u32, circuit_type: &CircuitType) {
+pub fn emit_jsonl_counts(counts: &HashMap<Outcome, u32>, num_qubits: u32, circuit_type: &CircuitType) {
     let mut entries: Vec<_> = counts.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (bits, count) in entries {
-        let s = format_bits(*bits, num_qubits, circuit_type);
+        let s = format_bits(bits, num_qubits, circuit_type);
         for _ in 0..*count {
             let line = json!({"bits": s});
             println!("{}", line);
@@ -182,13 +187,13 @@ mod tests {
     #[test]
     fn format_bits_gate_based_is_msb_first_zero_padded() {
         // 3 qubits: bit 0b011 (decimal 3) → "011" — MSB on the left.
-        assert_eq!(format_bits(3, 3, &CircuitType::GateBased), "011");
+        assert_eq!(format_bits(&Outcome::from_u64(3, 3), 3, &CircuitType::GateBased), "011");
         // bit 0b100 (decimal 4) on 3 qubits → "100".
-        assert_eq!(format_bits(4, 3, &CircuitType::GateBased), "100");
+        assert_eq!(format_bits(&Outcome::from_u64(4, 3), 3, &CircuitType::GateBased), "100");
         // 5 qubits: 1 → "00001".
-        assert_eq!(format_bits(1, 5, &CircuitType::GateBased), "00001");
+        assert_eq!(format_bits(&Outcome::from_u64(1, 5), 5, &CircuitType::GateBased), "00001");
         // 5 qubits: all-ones (0b11111 = 31) → "11111".
-        assert_eq!(format_bits(31, 5, &CircuitType::GateBased), "11111");
+        assert_eq!(format_bits(&Outcome::from_u64(31, 5), 5, &CircuitType::GateBased), "11111");
     }
 
     #[test]
@@ -196,19 +201,22 @@ mod tests {
         // Photonic encoding: 4 bits per mode, LSB first.
         // 4 modes, mode 0 = 1 photon, mode 1 = 0, mode 2 = 2, mode 3 = 0
         // → bits = 0x0201 = 513. Output: "1,0,2,0".
-        let bits = 0x0201u64;
-        assert_eq!(format_bits(bits, 4, &CircuitType::Photonic), "1,0,2,0");
+        let bits = Outcome::from_u64(0x0201, 16);
+        assert_eq!(format_bits(&bits, 4, &CircuitType::Photonic), "1,0,2,0");
         // Two modes with 1 photon each (HOM).
-        assert_eq!(format_bits(0x11, 2, &CircuitType::Photonic), "1,1");
+        assert_eq!(
+            format_bits(&Outcome::from_u64(0x11, 8), 2, &CircuitType::Photonic),
+            "1,1"
+        );
     }
 
     #[test]
     fn counts_to_json_orders_by_count_then_lex() {
         // Two outcomes; the lower-count one must appear last regardless
         // of bit value.
-        let mut counts: HashMap<u64, u32> = HashMap::new();
-        counts.insert(0b00, 700);
-        counts.insert(0b11, 300);
+        let mut counts: HashMap<Outcome, u32> = HashMap::new();
+        counts.insert(Outcome::from_u64(0b00, 2), 700);
+        counts.insert(Outcome::from_u64(0b11, 2), 300);
         let v = counts_to_json(&counts, 2, 1000, &CircuitType::GateBased);
         assert_eq!(v["mode"], "counts");
         assert_eq!(v["shots"], 1000);
@@ -226,9 +234,9 @@ mod tests {
         // Two outcomes with equal counts — tie breaker is bit lex
         // (ascending). 0b01 < 0b10 in raw u64 ordering, so "01"
         // sorts before "10".
-        let mut counts: HashMap<u64, u32> = HashMap::new();
-        counts.insert(0b10, 500);
-        counts.insert(0b01, 500);
+        let mut counts: HashMap<Outcome, u32> = HashMap::new();
+        counts.insert(Outcome::from_u64(0b10, 2), 500);
+        counts.insert(Outcome::from_u64(0b01, 2), 500);
         let v = counts_to_json(&counts, 2, 1000, &CircuitType::GateBased);
         let keys: Vec<&String> = v["counts"].as_object().unwrap().keys().collect();
         assert_eq!(keys[0], "01");
@@ -294,8 +302,8 @@ mod tests {
     #[test]
     fn exec_result_to_json_dispatches_on_variant() {
         // Counts variant with shots
-        let mut c: HashMap<u64, u32> = HashMap::new();
-        c.insert(0, 10);
+        let mut c: HashMap<Outcome, u32> = HashMap::new();
+        c.insert(Outcome::from_u64(0, 1), 10);
         let v = exec_result_to_json(&ExecResult::Counts(c), 1, Some(10), &CircuitType::GateBased);
         assert_eq!(v["mode"], "counts");
 

@@ -614,15 +614,26 @@ fn main() {
         } else {
             num_modes
         };
-        let mut counts_u64: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut counts_u64: std::collections::HashMap<
+            omega_core::outcome::Outcome,
+            u32,
+        > = std::collections::HashMap::new();
         for (key, n) in &counts_str {
-            let mut bits: u64 = 0;
-            for (i, ch) in key.chars().enumerate() {
-                if ch == '1' {
-                    bits |= 1u64 << i;
-                }
-            }
-            *counts_u64.entry(bits).or_insert(0) += *n;
+            // The bridge's own key length IS the width — it is already the
+            // classical register's. Building an `Outcome` from it directly
+            // removes the u64 bottleneck this loop used to funnel through, and
+            // with it the 64-qubit ceiling on bridged results.
+            //
+            // The bridge emits LSB-first (character i is qubit i), which is why
+            // this reverses rather than calling `from_bitstring`, whose input is
+            // MSB-first like everything the CLI prints.
+            let bits: Vec<u8> = key
+                .chars()
+                .map(|c| if c == '1' { 1u8 } else { 0 })
+                .collect();
+            *counts_u64
+                .entry(omega_core::outcome::Outcome::from_bits(&bits))
+                .or_insert(0) += *n;
         }
         let result = omega_core::executor::ExecResult::Counts(counts_u64);
         match format {
@@ -1082,7 +1093,7 @@ fn main() {
         (needs_collapse, chosen, &noise_model, shots)
     {
         use std::collections::HashMap;
-        let mut agg: HashMap<u64, u32> = HashMap::new();
+        let mut agg: HashMap<omega_core::outcome::Outcome, u32> = HashMap::new();
         let base_seed = seed.unwrap_or(0xC0FFEE_u64);
         for s in 0..n_shots as u64 {
             let traj_seed = base_seed.wrapping_add(s).wrapping_mul(2654435761);
@@ -1329,7 +1340,9 @@ fn main() {
                     if circuit.circuit_type == CircuitType::Photonic {
                         for (encoded, count) in sorted.iter().take(20) {
                             let fock = omega_backend_photonics::sim::decode_fock_string(
-                                **encoded,
+                                // Photonic keys are packed occupancies, read as
+                                // an integer; the Fock basis is far below 2^64.
+                                encoded.as_u64().unwrap_or(0),
                                 num_modes as usize,
                             );
                             println!("{}: {}", fock, count);

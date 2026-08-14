@@ -191,10 +191,13 @@ fn main() {
         };
         if let Ok(ExecResult::Counts(m)) = cpu.execute(&c, &pb, &cfg) {
             let mut keys: Vec<_> = m.into_iter().collect();
-            keys.sort_by_key(|(k, _)| *k);
+            keys.sort_by(|a, b| a.0.cmp(&b.0));
             let body = keys
                 .iter()
-                .map(|(k, v)| format!("{k}:{v}"))
+                // The cross-check corpus is compared textually against the
+                // reference runner, so this must keep emitting the DECIMAL
+                // outcome it always did — `Outcome`'s Display is a bitstring.
+                .map(|(k, v)| format!("{}:{v}", k.as_u64().expect("xcheck circuits are narrow")))
                 .collect::<Vec<_>>()
                 .join(" ");
             println!("M {n} {FF_SHOTS} {} | {}", desc.join(" "), body);

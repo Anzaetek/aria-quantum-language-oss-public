@@ -394,10 +394,13 @@ fn gradient_descent(
     (values, iterations, last_cost)
 }
 
-fn pick_best_sample(qubo: &Qubo, counts: &HashMap<u64, u32>) -> (String, f64, u32) {
+fn pick_best_sample(
+    qubo: &Qubo,
+    counts: &HashMap<omega_core::outcome::Outcome, u32>,
+) -> (String, f64, u32) {
     let mut best: Option<(String, f64, u32)> = None;
-    for (&key, &count) in counts {
-        let x: Vec<bool> = (0..qubo.n).map(|i| (key >> i) & 1 == 1).collect();
+    for (key, &count) in counts {
+        let x: Vec<bool> = (0..qubo.n).map(|i| key.bit(i as u32) == 1).collect();
         let val = qubo.evaluate(&x);
         let bits = bits_to_str(&x);
         let candidate = (bits, val, count);

@@ -104,7 +104,9 @@ impl Backend for StatevectorBackend {
                 };
                 *counts.entry(key).or_insert(0) += 1;
             }
-            return Ok(ExecResult::Counts(counts));
+            // Dense statevector is bounded by 2^n memory long before 64 qubits,
+            // so a u64 key is always enough here; only the boundary widens.
+            return Ok(ExecResult::counts_from_u64(counts, omega_core::executor::counts_outcome_width(circuit, by_creg) as u32));
         }
 
         let (state, classical_bits) =
@@ -133,10 +135,13 @@ impl Backend for StatevectorBackend {
                     }
                     let mut counts = HashMap::new();
                     counts.insert(bits, shots);
-                    Ok(ExecResult::Counts(counts))
+                    Ok(ExecResult::counts_from_u64(
+                        counts,
+                        omega_core::executor::counts_outcome_width(circuit, true) as u32,
+                    ))
                 } else {
                     let counts = sample_counts(&state, n, shots, Some(rng.random()));
-                    Ok(ExecResult::Counts(counts))
+                    Ok(ExecResult::counts_from_u64(counts, n as u32))
                 }
             }
         }
@@ -401,7 +406,10 @@ impl Backend for NoisyStatevectorBackend {
                     };
                     *counts.entry(outcome).or_insert(0) += 1;
                 }
-                Ok(ExecResult::Counts(counts))
+                Ok(ExecResult::counts_from_u64(
+                    counts,
+                    omega_core::executor::counts_outcome_width(circuit, collapse) as u32,
+                ))
             }
             Some(shots) => {
                 // Fast path: no channel acts during evolution, so a single
@@ -412,7 +420,7 @@ impl Backend for NoisyStatevectorBackend {
                 if !self.model.readout.is_zero() {
                     counts = apply_readout_flip(counts, n, &self.model.readout, &mut rng);
                 }
-                Ok(ExecResult::Counts(counts))
+                Ok(ExecResult::counts_from_u64(counts, n as u32))
             }
         }
     }
@@ -1057,8 +1065,9 @@ mod tests {
         let counts = result.counts();
 
         // Should only have |00> and |11>
-        let c00 = counts.get(&0).copied().unwrap_or(0);
-        let c11 = counts.get(&3).copied().unwrap_or(0);
+        let key = |k: u64| omega_core::outcome::Outcome::from_u64(k, 2);
+        let c00 = counts.get(&key(0)).copied().unwrap_or(0);
+        let c11 = counts.get(&key(3)).copied().unwrap_or(0);
         assert!(c00 + c11 == 10000);
         // Each should be roughly 5000
         assert!(c00 > 4500 && c00 < 5500);
@@ -1515,8 +1524,8 @@ mod tests {
             )
             .unwrap();
         let m = counts.counts();
-        let q0_ones: u32 = m.iter().filter(|(k, _)| *k & 1 != 0).map(|(_, v)| v).sum();
-        let q1_ones: u32 = m.iter().filter(|(k, _)| *k & 2 != 0).map(|(_, v)| v).sum();
+        let q0_ones: u32 = m.iter().filter(|(k, _)| k.bit(0) == 1).map(|(_, v)| v).sum();
+        let q1_ones: u32 = m.iter().filter(|(k, _)| k.bit(1) == 1).map(|(_, v)| v).sum();
         assert_eq!(q0_ones, 0, "q0 must be |0⟩ on every shot, got {m:?}");
         assert!(
             q1_ones.abs_diff(2000) < 250,
@@ -1554,7 +1563,20 @@ mod tests {
         let total: u32 = counts.values().sum();
         assert_eq!(total, 2048);
         // Noiseless Bell state → only |00⟩ (0) and |11⟩ (3) appear.
-        assert!(counts.keys().all(|k| *k == 0 || *k == 3));
+        let bell = |k: u64| omega_core::outcome::Outcome::from_u64(k, 2);
+        assert!(counts.keys().all(|k| *k == bell(0) || *k == bell(3)));
+    }
+
+    /// Look up outcome `k` at the width the counts carry.
+    #[allow(dead_code)]
+    fn okey(
+        map: &std::collections::HashMap<omega_core::outcome::Outcome, u32>,
+        k: u64,
+    ) -> u32 {
+        let w = map.keys().next().map(|o| o.width()).unwrap_or(0);
+        map.get(&omega_core::outcome::Outcome::from_u64(k, w))
+            .copied()
+            .unwrap_or(0)
     }
 
     #[test]
@@ -1576,7 +1598,7 @@ mod tests {
             .execute(&circuit, &ParameterBinding::new(), &cfg)
             .unwrap();
         let counts = result.counts();
-        let p0 = *counts.get(&0).unwrap_or(&0) as f64 / 1024.0;
+        let p0 = okey(counts, 0) as f64 / 1024.0;
         assert!(
             p0 > 0.95,
             "γ=1 amplitude damping should drive to |0⟩, got P(|0⟩)={}",
@@ -1603,7 +1625,7 @@ mod tests {
             .execute(&circuit, &ParameterBinding::new(), &cfg)
             .unwrap();
         let counts = result.counts();
-        let p1 = *counts.get(&1).unwrap_or(&0) as f64 / 2000.0;
+        let p1 = okey(counts, 1) as f64 / 2000.0;
         // Every shot flipped 0 → 1, so P(1) ≈ 1.0
         assert!(
             p1 > 0.98,
@@ -1642,7 +1664,7 @@ mod tests {
             .execute(&circuit, &ParameterBinding::new(), &cfg)
             .unwrap();
         let counts = result.counts();
-        let p1 = *counts.get(&1).unwrap_or(&0) as f64 / 512.0;
+        let p1 = okey(counts, 1) as f64 / 512.0;
         assert!(
             p1 > 0.98,
             "pure-X Pauli channel on |0⟩ should give |1⟩, got P(|1⟩)={}",
@@ -1677,7 +1699,7 @@ mod tests {
             .execute(&circuit, &ParameterBinding::new(), &cfg)
             .unwrap();
         let counts = result.counts();
-        let p0 = *counts.get(&0).unwrap_or(&0) as f64 / 4096.0;
+        let p0 = okey(counts, 0) as f64 / 4096.0;
         // Populations unchanged by pure dephasing; tolerance loose for 4k samples.
         assert!(
             (p0 - 0.5).abs() < 0.05,

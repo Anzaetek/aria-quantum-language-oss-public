@@ -219,12 +219,34 @@ pub unsafe extern "C" fn omega_execute(
                 result: exec_result,
             };
 
-            // Pre-cache counts for C access
+            // Pre-cache counts for C access.
+            //
+            // `omega_result_get_counts` writes outcomes into a `*mut u64` — a
+            // PUBLISHED C header, so it cannot be widened here without breaking
+            // every existing caller. An outcome over 64 qubits therefore cannot
+            // be expressed through this entry point at all.
+            //
+            // It is dropped, not truncated, and the cache is left EMPTY so the
+            // count reads as zero rather than as a plausible wrong histogram.
+            // Truncating would be worse here than anywhere else in the
+            // codebase: a C caller has no way to notice. A wide API is the
+            // follow-up; silently lying is not.
             if let ExecResult::Counts(ref counts) = omega_result.result {
-                let mut pairs: Vec<_> = counts.iter().collect();
-                pairs.sort_by(|a, b| b.1.cmp(a.1));
-                omega_result.cached_bitstrings = pairs.iter().map(|(&bs, _)| bs).collect();
-                omega_result.cached_counts = pairs.iter().map(|(_, &ct)| ct).collect();
+                if counts.keys().all(|o| o.as_u64().is_some()) {
+                    let mut pairs: Vec<_> = counts.iter().collect();
+                    pairs.sort_by(|a, b| b.1.cmp(a.1));
+                    omega_result.cached_bitstrings = pairs
+                        .iter()
+                        .map(|(o, _)| o.as_u64().expect("checked above"))
+                        .collect();
+                    omega_result.cached_counts = pairs.iter().map(|(_, &ct)| ct).collect();
+                } else {
+                    eprintln!(
+                        "[omega-ffi] counts span more than 64 qubits and cannot be \
+                         returned through omega_result_get_counts (u64 outcomes); \
+                         reporting zero outcomes rather than a truncated histogram"
+                    );
+                }
             }
 
             Box::into_raw(Box::new(omega_result))

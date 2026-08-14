@@ -177,18 +177,29 @@ fn key_width(ir: &CircuitIR) -> usize {
 /// wrong register — and the matrix's first run scored `pauli` as fully in
 /// agreement. A conversion that silently discards information will eventually
 /// convert a wrong answer into a right-looking one.
-fn to_str_counts(counts: &HashMap<u64, u32>, width: usize) -> Result<StrCounts, String> {
+fn to_str_counts(
+    counts: &HashMap<omega_core::outcome::Outcome, u32>,
+    width: usize,
+) -> Result<StrCounts, String> {
     let mut out = StrCounts::new();
     for (k, v) in counts {
-        if width < 64 && *k >= (1u64 << width) {
+        // The key carries its own width, so a mismatch against the declared
+        // register is now directly checkable rather than inferred from the
+        // magnitude of an integer.
+        if k.width() as usize != width {
             return Err(format!(
-                "counts key {k} does not fit the declared {width}-bit register — \
-                 the engine is reporting over a different register than the \
-                 program declares. Truncating here would hide that."
+                "counts key |{}> is {} bits wide but the program declares a \
+                 {width}-bit register — the engine is reporting over a different \
+                 register than the program declares. Truncating here would hide \
+                 that.",
+                k.to_bitstring(),
+                k.width()
             ));
         }
+        // Bridge convention is LSB-first (character b is qubit b), the reverse
+        // of `to_bitstring`, which is MSB-first like everything printed.
         let s: String = (0..width)
-            .map(|b| if (k >> b) & 1 == 1 { '1' } else { '0' })
+            .map(|b| if k.bit(b as u32) == 1 { '1' } else { '0' })
             .collect();
         *out.entry(s).or_insert(0) += *v;
     }
@@ -747,8 +758,8 @@ fn projected_keys_match_the_bridge_convention_on_partial_measure() {
 /// test exists because exactly that happened: see [`to_str_counts`].
 #[test]
 fn bit_order_is_lsb_first_on_an_asymmetric_outcome() {
-    let mut raw: HashMap<u64, u32> = HashMap::new();
-    raw.insert(0b100, 1); // bit 2 set, bits 1 and 0 clear
+    let mut raw: HashMap<omega_core::outcome::Outcome, u32> = HashMap::new();
+    raw.insert(omega_core::outcome::Outcome::from_u64(0b100, 3), 1); // bit 2 set
     let out = to_str_counts(&raw, 3).expect("0b100 fits 3 bits");
     let key = out.keys().next().unwrap();
     assert_eq!(
@@ -764,10 +775,15 @@ fn bit_order_is_lsb_first_on_an_asymmetric_outcome() {
 /// the matrix's first run instead of scoring it as agreement.
 #[test]
 fn a_key_too_wide_for_its_register_is_refused() {
-    let mut raw: HashMap<u64, u32> = HashMap::new();
-    raw.insert(3, 10); // 0b11 in a 1-bit register
-    let err = to_str_counts(&raw, 1).expect_err("key 3 must not fit 1 bit");
-    assert!(err.contains("does not fit"), "unhelpful message: {err}");
+    // A 2-bit key offered against a 1-bit register. The key now CARRIES its
+    // width, so the mismatch is direct rather than inferred from magnitude.
+    let mut raw: HashMap<omega_core::outcome::Outcome, u32> = HashMap::new();
+    raw.insert(omega_core::outcome::Outcome::from_u64(3, 2), 10);
+    let err = to_str_counts(&raw, 1).expect_err("a 2-bit key must not fit 1 bit");
+    assert!(
+        err.contains("bits wide but the program declares"),
+        "unhelpful message: {err}"
+    );
 
     // ...and the correct width still works, so the guard is not just "always
     // refuses".

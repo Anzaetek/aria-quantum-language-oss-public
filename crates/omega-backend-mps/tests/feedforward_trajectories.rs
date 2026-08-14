@@ -35,6 +35,23 @@ use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, Qubit};
 use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode};
 use omega_core::params::ParameterBinding;
 
+/// Look up outcome `k` at the width the counts actually carry.
+///
+/// Keys are [`Outcome`]s now, which carry their own width — so `get(&0b11)` no
+/// longer type-checks, and 0b11 at width 2 is a different key from 0b11 at
+/// width 4. Reading the width off the map keeps these assertions about the
+/// value rather than about a width the test assumed.
+#[allow(dead_code)]
+fn okey(
+    map: &std::collections::HashMap<omega_core::outcome::Outcome, u32>,
+    k: u64,
+) -> u32 {
+    let w = map.keys().next().map(|o| o.width()).unwrap_or(0);
+    map.get(&omega_core::outcome::Outcome::from_u64(k, w))
+        .copied()
+        .unwrap_or(0)
+}
+
 const SHOTS: u32 = 20_000;
 
 fn op(gate: GateKind, qubits: &[u32], cbit: Option<u32>) -> GateOp {
@@ -66,7 +83,7 @@ fn feedforward_circuit() -> CircuitIR {
     ir
 }
 
-fn run(ir: &CircuitIR, seed: u64) -> HashMap<u64, u32> {
+fn run(ir: &CircuitIR, seed: u64) -> HashMap<omega_core::outcome::Outcome, u32> {
     let config = ExecConfig {
         shots: Some(SHOTS),
         seed: Some(seed),
@@ -103,7 +120,7 @@ fn feedforward_is_not_deterministic() {
         );
         let total: u32 = counts.values().sum();
         assert_eq!(total, SHOTS);
-        let p1 = *counts.get(&1).unwrap_or(&0) as f64 / total as f64;
+        let p1 = okey(&counts, 1) as f64 / total as f64;
         // 20000 shots, p = 1/2: sd = 0.0035, so ±0.02 is > 5 sigma.
         assert!(
             (p1 - 0.5).abs() < 0.02,
@@ -124,9 +141,11 @@ fn collapse_mode_keys_by_the_creg() {
     let counts = run(&feedforward_circuit(), 7);
     for key in counts.keys() {
         assert!(
-            *key <= 1,
-            "key {key} exceeds the 1-bit creg — counts are keyed over the \
-             qubit register, not the classical one. Full counts: {counts:?}"
+            key.width() == 1 && key.as_u64().unwrap_or(u64::MAX) <= 1,
+            "key |{}> ({} bits) exceeds the 1-bit creg — counts are keyed over \
+             the qubit register, not the classical one. Full counts: {counts:?}",
+            key.to_bitstring(),
+            key.width()
         );
     }
 }
@@ -143,7 +162,7 @@ fn dropping_the_guard_changes_the_distribution() {
     }
     let counts = run(&ir, 7);
     assert_eq!(
-        counts.get(&1).copied().unwrap_or(0),
+        okey(&counts, 1),
         SHOTS,
         "with the guard removed the X always fires, so c0 must be 1 on every \
          shot; got {counts:?}. If this ever returns ~50/50 the conditional \
@@ -173,5 +192,5 @@ fn skip_mode_still_keys_by_the_qubit_register() {
         panic!("expected counts")
     };
     // q1 = 1, q0 = 0 → basis index 0b10 = 2, over the QUBIT register.
-    assert_eq!(counts.get(&2).copied().unwrap_or(0), 1024, "got {counts:?}");
+    assert_eq!(okey(&counts, 2), 1024, "got {counts:?}");
 }

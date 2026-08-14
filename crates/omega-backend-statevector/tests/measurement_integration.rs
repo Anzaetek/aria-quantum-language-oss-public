@@ -461,12 +461,15 @@ fn test_collapse_counts_keyed_by_creg_overwrite() {
         .unwrap();
     let counts = result.counts();
     assert_eq!(counts.len(), 1, "single trajectory → single bucket");
-    let (&key, &count) = counts.iter().next().unwrap();
+    let (key, &count) = counts.iter().next().unwrap();
     assert_eq!(count, 1);
     // Key must be the creg state c0 = 1, not the 2-qubit basis index 0b10 = 2.
     assert_eq!(
-        key, 1,
-        "counts must key by creg state (c0=1), not qubit basis (q0=0, q1=1 → 0b10)"
+        key.as_u64(),
+        Some(1),
+        "counts must key by creg state (c0=1), not qubit basis (q0=0, q1=1 → 0b10); \
+         got |{}>",
+        key.to_bitstring()
     );
 }
 
@@ -499,11 +502,11 @@ fn test_collapse_counts_creg_state_distribution() {
             .execute(&circuit, &ParameterBinding::new(), &cfg)
             .unwrap();
         let c = r.counts();
-        for (&k, &v) in c {
-            match k {
-                0 => n0 += v,
-                1 => n1 += v,
-                other => panic!("unexpected creg key {other}"),
+        for (k, &v) in c {
+            match k.as_u64() {
+                Some(0) => n0 += v,
+                Some(1) => n1 += v,
+                _ => panic!("unexpected creg key |{}>", k.to_bitstring()),
             }
         }
     }

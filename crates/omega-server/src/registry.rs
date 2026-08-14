@@ -437,7 +437,7 @@ impl Registry {
                     .into_iter()
                     .map(|(bs, ct)| {
                         (
-                            format!("{:0>width$b}", bs, width = counts_width),
+                            bs.to_bitstring(),
                             ct,
                         )
                     })

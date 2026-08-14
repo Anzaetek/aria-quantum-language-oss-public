@@ -52,7 +52,10 @@ fn feedforward_circuit() -> CircuitIR {
     ir
 }
 
-fn run_collapse(ir: &CircuitIR, seed: u64) -> std::collections::HashMap<u64, u32> {
+fn run_collapse(
+    ir: &CircuitIR,
+    seed: u64,
+) -> std::collections::HashMap<omega_core::outcome::Outcome, u32> {
     let config = ExecConfig {
         shots: Some(SHOTS),
         seed: Some(seed),
@@ -73,9 +76,11 @@ fn collapse_mode_keys_fit_the_creg_width() {
     let counts = run_collapse(&feedforward_circuit(), 7);
     for key in counts.keys() {
         assert!(
-            *key <= 1,
-            "key {key} does not fit a 1-bit creg — the backend is keying over \
-             the qubit register. Full counts: {counts:?}"
+            key.width() == 1 && key.as_u64().unwrap_or(u64::MAX) <= 1,
+            "key |{}> ({} bits) does not fit a 1-bit creg — the backend is \
+             keying over the qubit register. Full counts: {counts:?}",
+            key.to_bitstring(),
+            key.width()
         );
     }
 }
@@ -87,7 +92,12 @@ fn collapse_mode_distribution_matches_the_guard() {
     let counts = run_collapse(&feedforward_circuit(), 7);
     let total: u32 = counts.values().sum();
     assert_eq!(total, SHOTS);
-    let p1 = *counts.get(&1).unwrap_or(&0) as f64 / total as f64;
+    // Keys carry their own width now; build the probe at the creg's.
+    let w = counts.keys().next().map(|o| o.width()).unwrap_or(1);
+    let p1 = *counts
+        .get(&omega_core::outcome::Outcome::from_u64(1, w))
+        .unwrap_or(&0) as f64
+        / total as f64;
     // Qiskit Aer on the same circuit: {"0": 9895, "1": 10105} at 20000 shots.
     // sd at p=1/2 is 0.0035, so ±0.02 is > 5 sigma.
     assert!(
@@ -118,5 +128,13 @@ fn skip_mode_still_keys_by_the_qubit_register() {
         panic!("expected counts")
     };
     // q1 = 1, q0 = 0 → basis index 0b10 = 2, over the QUBIT register.
-    assert_eq!(counts.get(&2).copied().unwrap_or(0), 1024, "got {counts:?}");
+    let w = counts.keys().next().map(|o| o.width()).unwrap_or(2);
+    assert_eq!(
+        counts
+            .get(&omega_core::outcome::Outcome::from_u64(2, w))
+            .copied()
+            .unwrap_or(0),
+        1024,
+        "got {counts:?}"
+    );
 }

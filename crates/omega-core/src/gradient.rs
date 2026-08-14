@@ -303,8 +303,8 @@ fn score_function_gradient(
     let mut grads: Vec<f64> = vec![0.0; symbol_ids.len()];
     let total_shots = shots as f64;
 
-    for (bitstring, count) in counts.iter() {
-        let bits = u64_to_bools(*bitstring, n);
+    for (outcome, count) in counts.iter() {
+        let bits: Vec<bool> = (0..n as u32).map(|i| outcome.bit(i) == 1).collect();
         let fx = f.evaluate(&bits);
         let weight = (*count as f64) / total_shots;
         if fx.abs() < 1e-15 {
@@ -327,10 +327,6 @@ fn score_function_gradient(
     }
 
     Ok(symbol_ids.into_iter().zip(grads).collect())
-}
-
-fn u64_to_bools(x: u64, n: usize) -> Vec<bool> {
-    (0..n).map(|i| (x >> i) & 1 == 1).collect()
 }
 
 /// Diagonal observable `|x⟩⟨x| = Π_i (1 + (-1)^{x_i} Z_i) / 2`.

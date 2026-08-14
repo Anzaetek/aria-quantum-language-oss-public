@@ -96,10 +96,19 @@ fn exact_probs(circuit: &CircuitIR) -> Vec<f64> {
 
 /// Total-variation distance between a sampled count distribution and an exact
 /// probability vector indexed by basis state.
-fn tvd(counts: &std::collections::HashMap<u64, u32>, exact: &[f64], total: u32) -> f64 {
+fn tvd(
+    counts: &std::collections::HashMap<omega_core::outcome::Outcome, u32>,
+    exact: &[f64],
+    total: u32,
+) -> f64 {
+    // Basis index i, at the width the counts actually carry. Looking it up at a
+    // different width finds nothing and silently reports TVD 1.0 as though the
+    // plugin disagreed with the oracle.
+    let width = counts.keys().next().map(|o| o.width()).unwrap_or(0);
     let mut diff = 0.0;
     for (i, &p) in exact.iter().enumerate() {
-        let c = counts.get(&(i as u64)).copied().unwrap_or(0) as f64 / total as f64;
+        let key = omega_core::outcome::Outcome::from_u64(i as u64, width);
+        let c = counts.get(&key).copied().unwrap_or(0) as f64 / total as f64;
         diff += (c - p).abs();
     }
     0.5 * diff

@@ -379,6 +379,21 @@ impl Backend for MpsBackend {
                     cbit_of[q as usize] = Some(c);
                 }
             }
+            // The outcome's width, decided once and shared by every branch.
+            //
+            // It must follow the predicate that selects the KEY, not the one
+            // that admitted the run. Those differ: the loop is entered for
+            // `by_creg || circuit_has_reset`, but a reset circuit with no
+            // `measure` is NOT keyed on the creg — there is no creg to key on.
+            // Computing the width from the entry condition gave
+            // `counts_outcome_width(.., true)` = 0 for exactly that shape, and
+            // every shot packed into an empty outcome. Measured: 0/4000 ones on
+            // a qubit that must be mixed.
+            let width = omega_core::executor::counts_outcome_width(
+                circuit,
+                by_creg || project_wide,
+            ) as u32;
+            let mut sbits: Vec<u8> = Vec::new();
             let mut counts = HashMap::new();
             for _ in 0..shots {
                 let (mps, cbits) = self.evolve_once(circuit, params, config, &mut rng)?;
@@ -389,7 +404,8 @@ impl Backend for MpsBackend {
                 // rather than what was recorded. Matches the statevector and
                 // noisy-MPS backends.
                 let outcome = if by_creg {
-                    mps_creg_to_u64(&cbits)
+                    // The creg IS the result; its own width is the key's.
+                    omega_core::outcome::Outcome::from_bits(&cbits[..width as usize])
                 } else if project_wide {
                     // A RESET circuit reaches this loop with `by_creg == false`,
                     // and the guard above admitted it at CREG width (because it
@@ -400,10 +416,12 @@ impl Backend for MpsBackend {
                     // qubits >= 64 silently aliased by masked shifts. Guard and
                     // sampler must use the same predicate; they did not.
                     let envs = mps.right_environments();
-                    mps.sample_with_envs_projected(&envs, &mut rng, &cbit_of)
+                    mps.sample_bits_with_envs_into(&envs, &mut rng, &mut sbits);
+                    Mps::pack_outcome(&sbits, Some(&cbit_of), width)
                 } else {
                     let envs = mps.right_environments();
-                    mps.sample_with_envs(&envs, &mut rng)
+                    mps.sample_bits_with_envs_into(&envs, &mut rng, &mut sbits);
+                    Mps::pack_outcome(&sbits, None, width)
                 };
                 *counts.entry(outcome).or_insert(0) += 1;
             }
@@ -448,19 +466,26 @@ impl Backend for MpsBackend {
                 // Same predicate the guard used — `collapse: false`, because
                 // this is the skip path.
                 let project = omega_core::executor::counts_keyed_on_creg(circuit, false);
+                let width =
+                    omega_core::executor::counts_outcome_width(circuit, project) as u32;
+                let mut sbits: Vec<u8> = Vec::new();
                 if project {
                     let mut cbit_of = vec![None; circuit.num_qubits as usize];
                     for &(q, c) in &pairs {
                         cbit_of[q as usize] = Some(c);
                     }
                     for _ in 0..shots {
-                        let outcome = mps.sample_with_envs_projected(&envs, &mut rng, &cbit_of);
-                        *counts.entry(outcome).or_insert(0) += 1;
+                        mps.sample_bits_with_envs_into(&envs, &mut rng, &mut sbits);
+                        *counts
+                            .entry(Mps::pack_outcome(&sbits, Some(&cbit_of), width))
+                            .or_insert(0) += 1;
                     }
                 } else {
                     for _ in 0..shots {
-                        let outcome = mps.sample_with_envs(&envs, &mut rng);
-                        *counts.entry(outcome).or_insert(0) += 1;
+                        mps.sample_bits_with_envs_into(&envs, &mut rng, &mut sbits);
+                        *counts
+                            .entry(Mps::pack_outcome(&sbits, None, width))
+                            .or_insert(0) += 1;
                     }
                 }
                 Ok(ExecResult::Counts(counts))
@@ -772,6 +797,12 @@ impl Backend for NoisyMpsBackend {
         }
         // Reused across shots; the sampling loop is hot.
         let mut bits: Vec<u8> = Vec::new();
+        // One width for every branch below, so the key and the width it is
+        // rendered at cannot disagree.
+        let width = omega_core::executor::counts_outcome_width(
+            circuit,
+            omega_core::executor::counts_keyed_on_creg(circuit, mps_collapses(circuit, config)),
+        ) as u32;
 
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -798,20 +829,24 @@ impl Backend for NoisyMpsBackend {
                     let outcome = if collapse {
                         // Mid-circuit measures recorded (readout-flipped) outcomes
                         // into the creg during evolution; key by the creg.
-                        mps_creg_to_u64(&cbits)
+                        omega_core::outcome::Outcome::from_bits(&cbits[..width as usize])
                     } else if project_wide {
                         let envs = mps.right_environments();
                         mps.sample_bits_with_envs_into(&envs, &mut rng, &mut bits);
                         if !self.model.readout.is_zero() {
                             flip_readout_bits(&mut bits, &self.model.readout, &mut rng);
                         }
-                        Mps::pack_bits(&bits, Some(&cbit_of))
+                        Mps::pack_outcome(&bits, Some(&cbit_of), width)
                     } else {
-                        let mut o = mps.sample(&mut rng);
+                        mps.sample_bits_with_envs_into(
+                            &mps.right_environments(),
+                            &mut rng,
+                            &mut bits,
+                        );
                         if !self.model.readout.is_zero() {
-                            o = flip_all_readout(o, n, &self.model.readout, &mut rng);
+                            flip_readout_bits(&mut bits, &self.model.readout, &mut rng);
                         }
-                        o
+                        Mps::pack_outcome(&bits, None, width)
                     };
                     self.record_stats(&mps);
                     *counts.entry(outcome).or_insert(0) += 1;
@@ -831,13 +866,13 @@ impl Backend for NoisyMpsBackend {
                         if !self.model.readout.is_zero() {
                             flip_readout_bits(&mut bits, &self.model.readout, &mut rng);
                         }
-                        Mps::pack_bits(&bits, Some(&cbit_of))
+                        Mps::pack_outcome(&bits, Some(&cbit_of), width)
                     } else {
-                        let mut o = mps.sample_with_envs(&envs, &mut rng);
+                        mps.sample_bits_with_envs_into(&envs, &mut rng, &mut bits);
                         if !self.model.readout.is_zero() {
-                            o = flip_all_readout(o, n, &self.model.readout, &mut rng);
+                            flip_readout_bits(&mut bits, &self.model.readout, &mut rng);
                         }
-                        o
+                        Mps::pack_outcome(&bits, None, width)
                     };
                     self.record_stats(&mps);
                     *counts.entry(outcome).or_insert(0) += 1;
@@ -986,19 +1021,12 @@ fn mps_collapses(circuit: &CircuitIR, config: &ExecConfig) -> bool {
     config.mid_circuit_mode == MidCircuitMode::Collapse && circuit.num_classical_bits > 0
 }
 
-/// Pack the classical register into a `u64` counts key. One definition for
-/// every backend — see [`omega_core::executor::creg_to_u64`].
-use omega_core::executor::creg_to_u64 as mps_creg_to_u64;
-
-/// Flip each qubit of a sampled outcome with its per-qubit (possibly
-/// asymmetric) readout-error probability.
 /// Readout error applied to **unpacked** per-site bits.
 ///
 /// Must run on the QUBIT index: `flip_prob(q, b)` is a property of qubit `q`'s
-/// detector. The packed variant below flips at the same positions the key is
-/// built at, which is only the same thing when the key is the qubit register —
-/// so above the 64-qubit cliff, where the key is the creg, flipping a packed
-/// key applies qubit q's error rate to classical bit q.
+/// detector, while the key is built on the classical index. Flipping a packed
+/// creg key would apply qubit q's error rate to classical bit q — the same
+/// thing, but only when the key IS the qubit register.
 fn flip_readout_bits<R: Rng>(bits: &mut [u8], readout: &ReadoutError, rng: &mut R) {
     for (q, b) in bits.iter_mut().enumerate() {
         let p = readout.flip_prob(q, *b);
@@ -1006,18 +1034,6 @@ fn flip_readout_bits<R: Rng>(bits: &mut [u8], readout: &ReadoutError, rng: &mut 
             *b ^= 1;
         }
     }
-}
-
-fn flip_all_readout<R: Rng>(bits: u64, n: usize, readout: &ReadoutError, rng: &mut R) -> u64 {
-    let mut flipped = bits;
-    for q in 0..n {
-        let true_bit = ((bits >> q) & 1) as u8;
-        let p = readout.flip_prob(q, true_bit);
-        if p > 0.0 && rng.random::<f64>() < p {
-            flipped ^= 1u64 << q;
-        }
-    }
-    flipped
 }
 
 /// True when the circuit contains a `Reset`, whose randomness must be redrawn
@@ -1361,14 +1377,15 @@ mod tests {
         let counts = result.counts();
 
         // GHZ state: only |000> and |111> should appear
+        let ghz = |k: u64| omega_core::outcome::Outcome::from_u64(k, 3);
         for bitstring in counts.keys() {
             assert!(
-                *bitstring == 0 || *bitstring == 7,
-                "unexpected bitstring: {bitstring}"
+                *bitstring == ghz(0) || *bitstring == ghz(7),
+                "unexpected bitstring: {bitstring:?}"
             );
         }
-        assert!(counts.contains_key(&0));
-        assert!(counts.contains_key(&7));
+        assert!(counts.contains_key(&ghz(0)));
+        assert!(counts.contains_key(&ghz(7)));
     }
 
     #[test]
@@ -1595,8 +1612,15 @@ mod tests {
 
     use omega_core::noise::{Depolarizing, NoiseModel, Rate};
 
-    fn p1_of(counts: &HashMap<u64, u32>, shots: u32) -> f64 {
-        *counts.get(&1).unwrap_or(&0) as f64 / shots as f64
+    fn p1_of(
+        counts: &HashMap<omega_core::outcome::Outcome, u32>,
+        shots: u32,
+    ) -> f64 {
+        let w = counts.keys().next().map(|o| o.width()).unwrap_or(1);
+        *counts
+            .get(&omega_core::outcome::Outcome::from_u64(1, w))
+            .unwrap_or(&0) as f64
+            / shots as f64
     }
 
     #[test]
@@ -1678,10 +1702,10 @@ mod tests {
         let mut q0_one = 0.0_f64;
         let mut q1_one = 0.0_f64;
         for (bits, c) in counts.iter() {
-            if bits & 1 != 0 {
+            if bits.bit(0) == 1 {
                 q0_one += *c as f64;
             }
-            if bits & 2 != 0 {
+            if bits.bit(1) == 1 {
                 q1_one += *c as f64;
             }
         }

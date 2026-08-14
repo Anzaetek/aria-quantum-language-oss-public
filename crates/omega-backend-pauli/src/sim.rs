@@ -12,9 +12,9 @@ use rand::{Rng, SeedableRng};
 use omega_core::circuit::*;
 use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
+use omega_core::outcome::Outcome;
 use omega_core::params::ParameterBinding;
 
-use omega_core::executor::creg_to_u64;
 
 use crate::stabilizer::pauli_mult_phase;
 use crate::stabilizer::{PauliRow, StabilizerTableau};
@@ -84,10 +84,21 @@ impl Backend for PauliBackend {
             )?;
         }
 
+        // One width for the key and for everything that renders it — the same
+        // predicate the guard above uses.
+        let width = omega_core::executor::counts_outcome_width(
+            circuit,
+            omega_core::executor::counts_keyed_on_creg(
+                circuit,
+                config.mid_circuit_mode == MidCircuitMode::Collapse
+                    && circuit.num_classical_bits > 0,
+            ),
+        ) as u32;
+
         match config.shots {
             Some(shots) => {
                 // Sampling mode: efficient for stabilizer states
-                let mut counts: HashMap<u64, u32> = HashMap::new();
+                let mut counts: HashMap<Outcome, u32> = HashMap::new();
                 let mut rng: StdRng = match config.seed {
                     Some(seed) => StdRng::seed_from_u64(seed),
                     None => rand::make_rng::<StdRng>(),
@@ -140,7 +151,7 @@ impl Backend for PauliBackend {
                     let bitstring = if config.mid_circuit_mode == MidCircuitMode::Collapse
                         && circuit.num_classical_bits > 0
                     {
-                        creg_to_u64(&classical_bits)
+                        Outcome::from_bits(&classical_bits[..width as usize])
                     } else if omega_core::executor::counts_keyed_on_creg(circuit, false) {
                         // Above 64 qubits the full-register key does not exist —
                         // `bits |= 1 << q` shifts out of range — so a measured
@@ -149,6 +160,8 @@ impl Backend for PauliBackend {
                         // tableau for the ones after it); only the reporting is
                         // narrowed. Same rule and same predicate as the MPS
                         // backend, so the two agree on what a wide run returns.
+                        // One width for the key and everything that renders
+                        // it — same predicate as the guard above.
                         let mut cbit_of = vec![None; n];
                         for (q, c) in omega_core::executor::measure_pairs(circuit) {
                             if (q as usize) < n {
@@ -177,23 +190,29 @@ impl Backend for PauliBackend {
                         // chain left to right and each site conditions the next,
                         // so every site must be drawn even when it is not
                         // reported. Different structure, different rule.)
-                        let mut bits = 0u64;
+                        // Built bit by bit at the CREG's width. The stabilizer
+                        // backend is the one that most easily exceeds 64
+                        // qubits, so it must not funnel through a u64: doing
+                        // that reintroduced the exact defect the key type
+                        // replaced, and a 128-qubit GHZ panicked on the first
+                        // word index.
+                        let mut o = Outcome::zeros(width);
                         for (q, target) in cbit_of.iter().enumerate() {
                             if let Some(c) = target {
                                 if tab.measure(q, &mut rng) {
-                                    bits |= 1u64 << *c;
+                                    o.set_bit(*c, 1);
                                 }
                             }
                         }
-                        bits
+                        o
                     } else {
-                        let mut bits = 0u64;
+                        let mut o = Outcome::zeros(width);
                         for q in 0..n {
                             if tab.measure(q, &mut rng) {
-                                bits |= 1 << q;
+                                o.set_bit(q as u32, 1);
                             }
                         }
-                        bits
+                        o
                     };
                     *counts.entry(bitstring).or_insert(0) += 1;
                 }
@@ -750,10 +769,11 @@ mod tests {
             };
             if let Ok(ExecResult::Counts(m)) = be.execute(&c, &ParameterBinding::new(), &shots) {
                 for (k, cnt) in m {
+                    let idx = k.as_u64().expect("sweep circuits are narrow") as usize;
                     assert!(
-                        truth[k as usize] > 1e-12,
-                        "{cnt} shots landed on bitstring {k} with true probability {} (n={n})",
-                        truth[k as usize]
+                        truth[idx] > 1e-12,
+                        "{cnt} shots landed on bitstring {k:?} with true probability {} (n={n})",
+                        truth[idx]
                     );
                 }
             }
@@ -1041,11 +1061,12 @@ mod tests {
         let counts = result.counts();
 
         // Bell state: only |00⟩ and |11⟩
+        let bell = |k: u64| omega_core::outcome::Outcome::from_u64(k, 2);
         for bs in counts.keys() {
-            assert!(*bs == 0 || *bs == 3, "unexpected bitstring: {bs}");
+            assert!(*bs == bell(0) || *bs == bell(3), "unexpected bitstring: {bs:?}");
         }
-        assert!(counts.contains_key(&0));
-        assert!(counts.contains_key(&3));
+        assert!(counts.contains_key(&bell(0)));
+        assert!(counts.contains_key(&bell(3)));
     }
 
     #[test]
@@ -1066,8 +1087,9 @@ mod tests {
         let result = backend.execute(&circuit, &params, &config).unwrap();
         let counts = result.counts();
 
+        let ghz = |k: u64| omega_core::outcome::Outcome::from_u64(k, 3);
         for bs in counts.keys() {
-            assert!(*bs == 0 || *bs == 7, "unexpected bitstring: {bs}");
+            assert!(*bs == ghz(0) || *bs == ghz(7), "unexpected bitstring: {bs:?}");
         }
     }
 
@@ -1088,7 +1110,7 @@ mod tests {
         let counts = result.counts();
         // X|0⟩ = |1⟩, always measure 1
         assert_eq!(counts.len(), 1);
-        assert_eq!(counts[&1], 100);
+        assert_eq!(counts[&omega_core::outcome::Outcome::from_u64(1, counts.keys().next().unwrap().width())], 100);
     }
 
     #[test]
@@ -1179,7 +1201,7 @@ mod tests {
         let result = backend.execute(&circuit, &params, &config).unwrap();
         let counts = result.counts();
         assert_eq!(counts.len(), 1, "should only have |0⟩");
-        assert_eq!(counts[&0], 100);
+        assert_eq!(counts[&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().unwrap().width())], 100);
     }
 
     #[test]
@@ -1199,7 +1221,7 @@ mod tests {
         let result = backend.execute(&circuit, &params, &config).unwrap();
         let counts = result.counts();
         assert_eq!(counts.len(), 1, "should only have |0⟩");
-        assert_eq!(counts[&0], 100);
+        assert_eq!(counts[&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().unwrap().width())], 100);
     }
 
     #[test]
@@ -1271,7 +1293,7 @@ mod tests {
             .unwrap();
         let counts = result.counts();
         // Should only have |0⟩
-        assert_eq!(counts.get(&0).copied().unwrap_or(0), 100);
+        assert_eq!(counts.get(&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().map(|o| o.width()).unwrap_or(1))).copied().unwrap_or(0), 100);
     }
 
     #[test]
@@ -1332,8 +1354,8 @@ mod tests {
 
         // creg values: c1c0 = 00 (0) and 11 (3). The anti-correlated 01 / 10
         // must be absent.
-        let c00 = counts.get(&0).copied().unwrap_or(0);
-        let c11 = counts.get(&3).copied().unwrap_or(0);
+        let c00 = counts.get(&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().map(|o| o.width()).unwrap_or(1))).copied().unwrap_or(0);
+        let c11 = counts.get(&omega_core::outcome::Outcome::from_u64(3, counts.keys().next().map(|o| o.width()).unwrap_or(1))).copied().unwrap_or(0);
         assert_eq!(
             c00 + c11,
             500,

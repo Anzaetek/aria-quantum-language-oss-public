@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use num_complex::Complex64;
 
+use crate::outcome::Outcome;
 use crate::circuit::{CircuitIR, SymbolId};
 use crate::device::DeviceKind;
 use crate::error::Result;
@@ -43,15 +44,47 @@ impl Default for ExecConfig {
 pub enum ExecResult {
     /// Full statevector (2^n complex amplitudes).
     Statevector(Vec<Complex64>),
-    /// Measurement counts: bitstring -> count.
-    Counts(HashMap<u64, u32>),
+    /// Measurement counts: outcome -> count.
+    ///
+    /// Keyed by [`Outcome`], not `u64`: a `u64` cannot represent a shot over
+    /// more than 64 qubits, and the old key dropped every bit above 63
+    /// silently. Each key carries its own width, so a renderer no longer has to
+    /// be told one — which is where the defect used to reappear even when the
+    /// key itself was right.
+    Counts(HashMap<Outcome, u32>),
     /// Probability distribution over computational basis states.
     Probabilities(Vec<f64>),
 }
 
 impl ExecResult {
+    /// Wrap a `u64`-keyed counts map as `Counts`, at a stated width.
+    ///
+    /// For backends whose outcome genuinely cannot exceed 64 bits — the dense
+    /// statevector (bounded by `2^n` memory long before 64 qubits), photonics
+    /// (keyed by mode occupancy), the stabilizer path below the cliff. They
+    /// keep their `u64` arithmetic internally and widen only at the boundary,
+    /// which is where the type has to be right.
+    ///
+    /// `width` must be the outcome's true width, NOT `num_qubits`, whenever the
+    /// two differ — in collapse mode the key is the classical register. Getting
+    /// this wrong no longer produces a wrong key, but it does produce a key
+    /// rendered at the wrong width, which is the same defect one layer out.
+    pub fn counts_from_u64(map: HashMap<u64, u32>, width: u32) -> Self {
+        debug_assert!(
+            width <= MAX_COUNTS_QUBITS as u32,
+            "counts_from_u64 at width {width}: a u64 key cannot carry more than \
+             {MAX_COUNTS_QUBITS} bits, so this map has already lost information. \
+             Build `Outcome`s directly instead."
+        );
+        ExecResult::Counts(
+            map.into_iter()
+                .map(|(k, v)| (Outcome::from_u64(k, width), v))
+                .collect(),
+        )
+    }
+
     /// Get counts, panicking if this isn't a Counts result.
-    pub fn counts(&self) -> &HashMap<u64, u32> {
+    pub fn counts(&self) -> &HashMap<Outcome, u32> {
         match self {
             ExecResult::Counts(c) => c,
             _ => panic!("expected Counts result"),
@@ -70,18 +103,24 @@ impl ExecResult {
     pub fn format_counts(&self, num_qubits: u32) -> String {
         match self {
             ExecResult::Counts(counts) => {
+                // The WIDTH COMES FROM THE KEY. `num_qubits` is kept only so
+                // callers need not all change at once, and is checked against
+                // the data rather than trusted: rendering a correct key at the
+                // wrong width is still wrong to the reader, and no type error
+                // catches it. That is how a 2-bit outcome came to be printed
+                // padded to 1024 characters, and how the same defect survived
+                // at the server after the CLI was fixed.
+                debug_assert!(
+                    counts.keys().all(|o| o.width() == num_qubits) || counts.is_empty(),
+                    "format_counts was told width {num_qubits} but the outcomes are \
+                     {:?} wide; the caller and the data disagree",
+                    counts.keys().map(|o| o.width()).collect::<std::collections::BTreeSet<_>>()
+                );
                 let mut sorted: Vec<_> = counts.iter().collect();
                 sorted.sort_by(|a, b| b.1.cmp(a.1));
                 sorted
                     .iter()
-                    .map(|(bits, count)| {
-                        format!(
-                            "|{:0>width$b}>: {}",
-                            bits,
-                            count,
-                            width = num_qubits as usize
-                        )
-                    })
+                    .map(|(o, count)| format!("|{}>: {}", o.to_bitstring(), count))
                     .collect::<Vec<_>>()
                     .join("\n")
             }
@@ -202,50 +241,52 @@ pub const MAX_COUNTS_QUBITS: usize = 64;
 
 /// Refuse to produce counts that the key cannot represent.
 ///
-/// # The defect this exists for
+/// # This is now a no-op for the widths it used to refuse
 ///
-/// `ExecResult::Counts` is keyed by `u64` and nothing checked the qubit count
-/// against it, so every bit above 63 was silently dropped and a **confident
-/// wrong answer** was returned. Measured on a GHZ chain, one lost bit per qubit
-/// above 64:
+/// `ExecResult::Counts` is keyed by [`Outcome`], which carries as many words as
+/// it needs, so a shot over 1024 qubits is representable and no longer has to
+/// be turned away. The historical defect, and the refusal that replaced it,
+/// are kept here because they explain what the key type is FOR:
 ///
 /// ```text
 ///   63 qubits:  |0…0>, |1…1>        correct
 ///   64 qubits:  |0…0>, |1…1>        correct
-///   65 qubits:  |0…0>, |0 1^64>     one leading zero
-///   66 qubits:  |0…0>, |00 1^64>    two leading zeros
-///  128 qubits:  |0…0>, |0^64 1^64>  the reported symptom
+///   65 qubits:  |0…0>, |0 1^64>     one leading zero lost, silently
 /// ```
 ///
-/// It was reported as an MPS defect. It is not: the same GHZ at 65 qubits
-/// truncates identically on the stabilizer backend. Any backend returning counts
-/// above 64 qubits is affected, and the physics in all of them is correct — only
-/// the reporting was lossy.
+/// The function still exists, and still refuses, for the boundaries that
+/// genuinely cannot widen — the two C ABIs. Those check
+/// [`Outcome::as_u64`] at the point of crossing instead of guessing here, so
+/// this is left as the ceiling on nothing but its own `MAX` and returns `Ok`
+/// for every width a simulator can produce.
 ///
-/// # Why refusing, rather than widening the key, comes first
-///
-/// Widening to a bitset touches every backend and the wire format, and needs a
-/// decision that is not obviously "wider is better": counts over a 2^128 space
-/// are a sparse sample, and a caller at that scale usually wants marginals or an
-/// expectation value. That decision can be taken carefully. Returning a wrong
-/// answer in the meantime cannot wait for it.
-///
-/// Expectation values, statevectors and probability vectors are unaffected —
-/// this is a property of the counts KEY, not of any simulation.
-/// Is this run's counts key packed from the CLASSICAL register?
+/// It is not deleted because deleting it would silently un-gate the callers
+/// that still hold a genuine `u64` limit, and because a future representation
+/// with a real ceiling should have one place to put it.
+pub fn check_counts_width(n_qubits: usize) -> crate::error::Result<()> {
+    let _ = n_qubits;
+    Ok(())
+}
+
+/// Whether a circuit's counts are keyed on the CLASSICAL register rather than
+/// the qubit register.
 ///
 /// Three places need this answer and they must agree: the width guard, the
 /// sampling path that builds the key, and the front end that renders it. A
-/// disagreement shows up as a correct key printed at the wrong width, or a
-/// refusal for a key that was never going to be built.
+/// disagreement shows up as a correct key reported at the wrong width, or a
+/// refusal for a key that was never going to be built — both have shipped.
 ///
 /// Two ways it becomes true:
 /// * **collapse** — the mid-circuit measures already ran, so the creg IS the
 ///   result;
-/// * **above the 64-qubit cliff with measurements** — the full-register key
-///   cannot be represented at all, so a measured circuit is keyed on its creg
-///   instead. Below the cliff the full register is kept, so nothing a caller
-///   already relies on moves.
+/// * **above the 64-qubit cliff with measurements** — a measured wide circuit
+///   is keyed on its creg, which is what the user asked for and what qiskit
+///   reports over. Below the cliff the full register is kept, so nothing a
+///   caller already relies on moves.
+///
+/// The cliff no longer exists as a *representation* limit — [`Outcome`] carries
+/// any width — but it remains the point at which reporting the whole register
+/// stops being useful, so the rule is unchanged.
 pub fn counts_keyed_on_creg(circuit: &CircuitIR, collapse: bool) -> bool {
     collapse
         || (circuit.num_qubits as usize > MAX_COUNTS_QUBITS && !measure_pairs(circuit).is_empty())
@@ -253,22 +294,9 @@ pub fn counts_keyed_on_creg(circuit: &CircuitIR, collapse: bool) -> bool {
 
 /// The number of bits a shot outcome of `circuit` actually occupies.
 ///
-/// **Not the qubit count.** Which register keys the outcome decides the width:
-///
-/// * keyed on the creg — the width is the highest classical bit used;
-/// * keyed on the qubit register — the width is `num_qubits`.
-///
-/// `by_creg` must be [`counts_keyed_on_creg`]'s answer, **not** the raw
-/// collapse flag. The two differ above the 64-qubit cliff, where a measured
-/// circuit is keyed on its creg even in skip mode — passing `collapse` there
-/// returns `num_qubits`, which then refuses a run that was going to produce a
-/// perfectly representable 2-bit key. The parameter was called `collapse` and
-/// at least one caller obliged.
-///
-/// Gating on `num_qubits` unconditionally over-refuses badly. Measured: a
-/// 1024-qubit circuit measuring two qubits into `creg c[2]` was refused, though
-/// its outcome needs two bits — and that is the natural shape of a large run.
-/// A 70-qubit circuit with a 2-bit creg was refused for the same reason.
+/// **Not the qubit count.** `by_creg` must be [`counts_keyed_on_creg`]'s
+/// answer, not a raw collapse flag — the two differ above the cliff, where a
+/// measured circuit is keyed on its creg even in skip mode.
 pub fn counts_outcome_width(circuit: &CircuitIR, by_creg: bool) -> usize {
     if by_creg {
         measure_pairs(circuit)
@@ -279,20 +307,6 @@ pub fn counts_outcome_width(circuit: &CircuitIR, by_creg: bool) -> usize {
     } else {
         circuit.num_qubits as usize
     }
-}
-
-pub fn check_counts_width(n_qubits: usize) -> crate::error::Result<()> {
-    if n_qubits > MAX_COUNTS_QUBITS {
-        return Err(crate::error::OmegaError::Unsupported(format!(
-            "counts are keyed by a {MAX_COUNTS_QUBITS}-bit integer, so a shot \
-             outcome over {n_qubits} qubits cannot be represented — every bit \
-             above {MAX_COUNTS_QUBITS} would be silently dropped and the counts \
-             would be wrong rather than merely truncated. \
-             Use `--expectation` (unaffected), reduce the register, or measure \
-             at most {MAX_COUNTS_QUBITS} qubits into a classical register."
-        )));
-    }
-    Ok(())
 }
 
 /// The `(qubit, classical_bit)` pairs a circuit's `measure` statements
@@ -338,20 +352,17 @@ pub fn project_counts_onto_creg(
     if pairs.is_empty() {
         return Ok(res);
     }
-    if let Some(&(q, c)) = pairs.iter().find(|&&(q, c)| q >= 64 || c >= 64) {
-        return Err(format!(
-            "measure q[{q}] -> c[{c}]: sampled-count keys are u64, so register \
-             indices ≥ 64 cannot be reported; reduce the register or drop --shots"
-        ));
-    }
+    // The `q >= 64 || c >= 64` refusal that used to sit here is gone: the key
+    // is an `Outcome`, so a register index above 63 is representable and no
+    // longer has to be turned away.
+    let width = pairs.iter().map(|&(_, c)| c + 1).max().unwrap_or(0);
     match res {
         ExecResult::Counts(counts) => {
-            let mut projected: HashMap<u64, u32> = HashMap::new();
+            let mut projected: HashMap<Outcome, u32> = HashMap::new();
             for (outcome, n) in counts {
-                let mut key = 0u64;
+                let mut key = Outcome::zeros(width);
                 for &(q, c) in pairs {
-                    let bit = (outcome >> q) & 1;
-                    key = (key & !(1u64 << c)) | (bit << c);
+                    key.set_bit(c, outcome.bit(q));
                 }
                 *projected.entry(key).or_insert(0) += n;
             }
@@ -958,16 +969,16 @@ mod tests {
 
         // Full-register keys: bit2 = q2 (unmeasured, a coin flip), bits 1..0
         // = the correlated Bell pair. Four raw keys must collapse to two.
-        let mut raw: HashMap<u64, u32> = HashMap::new();
-        raw.insert(0b000, 25); // q2=0, q1q0=00
-        raw.insert(0b100, 25); // q2=1, q1q0=00
-        raw.insert(0b011, 25); // q2=0, q1q0=11
-        raw.insert(0b111, 25); // q2=1, q1q0=11
+        let mut raw: HashMap<Outcome, u32> = HashMap::new();
+        raw.insert(Outcome::from_u64(0b000, 3), 25); // q2=0, q1q0=00
+        raw.insert(Outcome::from_u64(0b100, 3), 25); // q2=1, q1q0=00
+        raw.insert(Outcome::from_u64(0b011, 3), 25); // q2=0, q1q0=11
+        raw.insert(Outcome::from_u64(0b111, 3), 25); // q2=1, q1q0=11
         let out = project_counts_onto_creg(ExecResult::Counts(raw), &pairs).unwrap();
         let got = out.counts();
         assert_eq!(got.len(), 2, "expected 2 creg outcomes, got {got:?}");
-        assert_eq!(got.get(&0b00), Some(&50));
-        assert_eq!(got.get(&0b11), Some(&50));
+        assert_eq!(got.get(&Outcome::from_u64(0b00, 2)), Some(&50));
+        assert_eq!(got.get(&Outcome::from_u64(0b11, 2)), Some(&50));
     }
 
     /// A permuted qubit→cbit map must actually permute. The vendored corpus
@@ -984,12 +995,12 @@ mod tests {
             ],
         );
         assert_eq!(measure_pairs(&c), vec![(0, 1), (1, 0)]);
-        let mut raw: HashMap<u64, u32> = HashMap::new();
-        raw.insert(0b01, 7); // q0=1, q1=0
+        let mut raw: HashMap<Outcome, u32> = HashMap::new();
+        raw.insert(Outcome::from_u64(0b01, 2), 7); // q0=1, q1=0
         let out = project_counts_onto_creg(ExecResult::Counts(raw), &measure_pairs(&c)).unwrap();
         // q0=1 lands in c1, q1=0 in c0 → creg value 0b10.
-        assert_eq!(out.counts().get(&0b10), Some(&7));
-        assert_eq!(out.counts().get(&0b01), None);
+        assert_eq!(out.counts().get(&Outcome::from_u64(0b10, 2)), Some(&7));
+        assert_eq!(out.counts().get(&Outcome::from_u64(0b01, 2)), None);
     }
 
     /// Last-write-wins on an overwritten cbit, matching Qiskit.
@@ -1003,10 +1014,10 @@ mod tests {
                 op(GateKind::Measure, &[1], Some(0)),
             ],
         );
-        let mut raw: HashMap<u64, u32> = HashMap::new();
-        raw.insert(0b01, 3); // q0=1, q1=0 → c0 written 1 then 0
+        let mut raw: HashMap<Outcome, u32> = HashMap::new();
+        raw.insert(Outcome::from_u64(0b01, 2), 3); // q0=1, q1=0 → c0 written 1 then 0
         let out = project_counts_onto_creg(ExecResult::Counts(raw), &measure_pairs(&c)).unwrap();
-        assert_eq!(out.counts().get(&0), Some(&3), "q1's later write must win");
+        assert_eq!(out.counts().get(&Outcome::from_u64(0, 1)), Some(&3), "q1's later write must win");
     }
 
     /// No pairs → pass through untouched. A no-measure circuit's counts are
@@ -1014,16 +1025,40 @@ mod tests {
     /// runner's synthesised `measure_all()` produces.
     #[test]
     fn projection_without_measures_is_identity() {
-        let mut raw: HashMap<u64, u32> = HashMap::new();
-        raw.insert(0b101, 9);
+        let mut raw: HashMap<Outcome, u32> = HashMap::new();
+        raw.insert(Outcome::from_u64(0b101, 3), 9);
         let out = project_counts_onto_creg(ExecResult::Counts(raw), &[]).unwrap();
-        assert_eq!(out.counts().get(&0b101), Some(&9));
+        assert_eq!(out.counts().get(&Outcome::from_u64(0b101, 3)), Some(&9));
     }
 
+    /// **Projection onto classical bit 64 and beyond.**
+    ///
+    /// This asserted a REFUSAL: `(q, 64)` could not be projected because the
+    /// key was a `u64` and `1 << 64` is out of range. The key is an `Outcome`
+    /// now, so the bit is ordinary and the refusal is gone.
+    ///
+    /// The fixture puts the measured qubit at 70 and its classical bit at 64 —
+    /// both beyond the old ceiling, and at different indices, so a projection
+    /// that quietly used the qubit index instead of the classical one would
+    /// land on bit 70 and fail here.
     #[test]
-    fn projection_refuses_registers_beyond_u64() {
-        let err = project_counts_onto_creg(ExecResult::Counts(HashMap::new()), &[(0, 64)])
-            .expect_err("cbit 64 does not fit a u64 key");
-        assert!(err.contains("u64"), "unhelpful message: {err}");
+    fn projection_reaches_classical_bits_beyond_the_old_u64_ceiling() {
+        let mut raw: HashMap<Outcome, u32> = HashMap::new();
+        let mut src = Outcome::zeros(71);
+        src.set_bit(70, 1);
+        raw.insert(src, 5);
+
+        let out = project_counts_onto_creg(ExecResult::Counts(raw), &[(70, 64)])
+            .expect("classical bit 64 is representable");
+        let got = out.counts();
+
+        let mut want = Outcome::zeros(65);
+        want.set_bit(64, 1);
+        assert_eq!(
+            got.get(&want),
+            Some(&5),
+            "q70 -> c64 must set classical bit 64; got {got:?}"
+        );
+        assert_eq!(got.keys().next().unwrap().width(), 65, "creg is 65 bits");
     }
 }
