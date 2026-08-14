@@ -106,7 +106,34 @@ mode from the circuit:
 
 So the skip-mode refusal is not a guard bug. Making the skip path produce a
 narrow key would mean projecting onto the measured qubits at sample time, which
-is a real change to the sampling path and is **not** done here.
+is a real change to the sampling path.
+
+**That change has since landed** (MPS and stabilizer), and step 0 is closed. A
+measured circuit above the cliff is keyed on its creg in skip mode too —
+`counts_keyed_on_creg` — so `1024q, plain end-of-circuit measures` now runs and
+reports a 2-bit key rather than being refused. Only an *unmeasured* wide
+circuit is still refused, which is correct: there is no narrower register to
+report over.
+
+The review of that work found seven defects, all fixed in `d4d9be8`. Three are
+worth carrying forward as hazards for the steps below, because they are the
+shape of thing this document's final section is about:
+
+* **The same predicate must be used by the guard, the sampler and the
+  renderer.** Two of the seven were exactly this — the MPS reset branch chose
+  its outcome with `by_creg` while the guard admitting it used
+  `by_creg || circuit_has_reset`, and the server rendered at `num_qubits` after
+  the CLI renderers were fixed. `counts_outcome_width`'s second parameter is now
+  named `by_creg` rather than `collapse` for this reason.
+* **A projection applied twice is worse than one applied never.** `aria` called
+  `project_counts_onto_creg` unconditionally, so above the cliff it re-read
+  qubit positions out of a key that was already creg-packed: `|00>: 2000` where
+  the truth is 0.79/0.21.
+* **Every fixture mapped `q0 -> c0, q1 -> c1`**, under which "project onto the
+  creg" and "take the low bits of the register" are the same function — so the
+  whole suite stayed green with the projection destroyed. Fixtures for the
+  steps below must use a **non-identity** qubit -> cbit map, and cross the bit
+  order, or they test nothing.
 
 The display had the same defect and it is the hazard listed at the end of this
 document: the 2-bit outcome was rendered padded to 1024 characters, because the
@@ -134,6 +161,10 @@ must stay consistent.
 
 ## What could make this pass for the wrong reason
 
+* **An identity qubit -> cbit map.** Measured: with `q0 -> c0, q1 -> c1` the
+  entire projection can be replaced by `cbit_of[q] = q` and 145 tests still
+  pass. Put the reported pair somewhere other than q0/q1 and cross the bit
+  order.
 * **Testing only GHZ.** GHZ yields two outcomes and is nearly the easiest
   possible case — it was also the fixture that hid the original bug, since a
   truncated GHZ still has exactly two keys. At least one fixture must produce

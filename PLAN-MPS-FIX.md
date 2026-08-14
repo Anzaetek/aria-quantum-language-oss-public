@@ -124,10 +124,36 @@ not a probability — so 6.586 is not an accumulation bug. Two real problems:
 
 ### M5 — the refusal costs a full run — **FIXED 2026-08-14**
 
-42.9 s -> 0.63 s on `wide_chain_19q`. The certificate is monotonically
-non-decreasing, so stopping at the first crossing changes only how long a
-refusal takes, not which runs are refused — verified against the actual set
-rather than left as an argument.
+42.9 s -> 0.63 s on `wide_chain_19q`.
+
+**The justification above was wrong on the per-shot path, and is corrected
+here.** "The certificate is monotonically non-decreasing, so stopping at the
+first crossing changes only how long a refusal takes, not which runs are
+refused" is true *within one trajectory* — that is what `certificate_monotone`
+proves in `proofs/lean4/QuantumProofs/MpsTruncation.lean`, and the Lean theorem
+is fine. It does not carry across trajectories, and the shots path has many.
+
+`record_stats` was last-writer-wins, so the deferred `check_truncation` after
+the shot loop consulted only the **last** trajectory, while the early abort
+fires on the **first** one to cross. Those are different sets. Measured on a
+feed-forward fixture whose two branches certify 0.0 and 2.5 at χ=4: a 40-shot
+run at ceiling 1.0 was refused with the abort compiled in and accepted without
+it, whenever the final shot took the cheap branch.
+
+Fixed by making the stats worst-over-run (`reset_stats` per `execute`), which
+is also the right quantity on its own terms — a histogram is polluted by any
+bad trajectory, not just its last. Two further holes closed at the same time:
+
+* the abort sat at the **top** of the op loop, so the final split was never
+  tested by it; `evolve_once` now checks once more before returning;
+* the reported certificate was the last trajectory's, so
+  `--strict-truncation` printed a number that did not describe the run.
+
+Tests: `crates/omega-cli/tests/truncation_gates_every_trajectory.rs`, each
+mutation-tested (last-writer-wins and a missing `reset_stats` both fail it).
+The fixture uses **cz**, not `cx`: `cx` on |+>|+> is the identity, which makes
+the whole thing a product state that truncates nothing and passes every
+ceiling — measured (bond 1 at every χ) while writing it.
 
 Original description follows.
 
@@ -149,6 +175,12 @@ wrong-column repack or a gauge pathology would pass every test proposed.
 1. Exact-bond equivalence (n = 8, 10, 12 at χ = 2^(n/2)), with
    `max_bond_reached == χ` asserted so the fixture provably saturates. Keep;
    move out of a scratch file into the suite.
+
+   *Independently confirmed while fixing M5*: a 14-qubit graph state whose cut
+   6|7 crosses 7 CZ edges (rank 2^7 = 128) reaches `max_bond_reached` of
+   exactly 2 / 4 / 16 / 128 at χ = 2 / 4 / 16 / 128, with certificate
+   3.0 / 2.5 / 1.5 / **0.0**. The bond bookkeeping and the certificate both
+   track the true Schmidt rank, and χ = 2^(n/2) really is exact.
 2. **A test where truncation is active and meaningful** — matched-χ comparison
    against a canonical-compression reference on a mildly-truncating circuit.
    This is the missing one. Measured residual today: ours 0.505 vs canonical
