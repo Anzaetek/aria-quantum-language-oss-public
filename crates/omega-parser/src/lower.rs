@@ -304,8 +304,54 @@ impl LowerCtx {
                     .get(creg)
                     .ok_or_else(|| format!("undefined creg in if: {}", creg))?;
                 let before = self.ops.len();
-                if let Qasm2Stmt::GateApp(app) = then.as_ref() {
-                    self.lower_gate_app(app, &HashMap::new(), &[])?;
+                // Every guarded form must be LOWERED, not just gate
+                // applications. When the grammar was widened to admit
+                // `if (c==1) measure …` / `reset …` — which qiskit accepts and
+                // this workspace's own emitter produces — an `if let` here
+                // would have matched nothing and emitted NOTHING, turning a
+                // parse error into a silent drop. That is strictly worse: the
+                // circuit would run without the guarded operation and say so
+                // nowhere.
+                match then.as_ref() {
+                    Qasm2Stmt::GateApp(app) => self.lower_gate_app(app, &HashMap::new(), &[])?,
+                    // Delegates to the same arm the unguarded forms use, so a
+                    // change there cannot make the guarded form diverge.
+                    stmt @ (Qasm2Stmt::Measure { .. } | Qasm2Stmt::Reset(_)) => {
+                        self.lower_qasm2_stmt(stmt)?
+                    }
+                    other => {
+                        return Err(format!(
+                            "`if (...)` may guard a gate application, a measure or a \
+                             reset; got {other:?}"
+                        ))
+                    }
+                }
+                if self.ops.len() == before {
+                    return Err(format!(
+                        "`if ({creg} == {value})` guarded a statement that produced no \
+                         operation; refusing rather than dropping the guard silently"
+                    ));
+                }
+                // A guarded BARRIER is refused, matching qiskit 2.5.1, which
+                // answers "needed a gate application, measurement or reset" in
+                // BOTH its loaders. It reaches here because `barrier q[0];`
+                // matches `gate_app_stmt`, so the grammar cannot exclude it
+                // without excluding real gates too.
+                //
+                // This is the divergence that once made this workspace's own
+                // QASM2 export unloadable by qiskit: our grammar admitted a
+                // construct qiskit rejects, so the emitter produced it happily.
+                if self.ops[before..]
+                    .iter()
+                    .any(|op| op.gate == GateKind::Barrier)
+                {
+                    return Err(
+                        "`if (...) barrier ...` is not valid QASM 2.0: a guard may wrap a \
+                         gate application, a measurement or a reset. qiskit refuses it in \
+                         both its strict and legacy loaders, so emitting it would produce \
+                         a file the wider ecosystem cannot read."
+                            .to_string(),
+                    );
                 }
                 for op in &mut self.ops[before..] {
                     op.condition = Some((start_bit, size, *value));
