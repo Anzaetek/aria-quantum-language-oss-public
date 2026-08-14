@@ -62,8 +62,37 @@ Not chosen yet — this is the part to argue before writing code.
 3. **A newtype over either**, so the representation can change later without
    touching 49 files twice.
 
-**Leaning to (1) behind a newtype `Outcome`.** But the sampling-loop cost of (2)
-is a measurement, not a guess, and the measurement is cheap — do it first.
+### MEASURED 2026-08-14 — decision: (1) behind a newtype `Outcome`
+
+Key construction + `HashMap` insert, 1000 shots, ns per shot:
+
+| n | `u64` | `String` | `Box<[u64]>` | `SmallVec<[u64;1]>` |
+|---|---|---|---|---|
+| 64 | 40 | 157 | 88 | **75** |
+| 256 | 37 | 423 | 167 | **173** |
+| 1024 | 38 | 1308 | 386 | **394** |
+| 4096 | 32 | 4422 | 1197 | **1195** |
+
+Against the sampler itself (`omega-run --backend mps`, wall clock):
+
+* 1024 qubits: 20000 shots in 0.44 s = **22 µs/shot**. A `SmallVec` key is
+  0.39 µs — **1.8%**. A `String` key is 1.3 µs — 6%.
+* 20 qubits: 20000 shots in 0.01 s = **~0.5 µs/shot**. `SmallVec` costs ~35 ns
+  more than `u64` — ~7% of a very small number, and allocation-free, because
+  one word is inline.
+
+So `String` is 2–4× the cost of packed words and the gap **widens** with n,
+which is the opposite of what the "simplest, matches the wire" argument
+suggested. (1) wins on the measurement as well as on exactness.
+
+**A warning about this table.** The first run of it said `String` was *faster*
+than both packed forms at every width — 1221 ns vs 3079 for `Box<[u64]>` at
+n=1024. That was the benchmark, not the representation: the packing loop did
+`v[q / 64] |= (b as u64) << (q % 64)` per bit, so a divide, a modulo and a
+bounds check per qubit, while the `String` arm did a single `push`. Packing by
+64-bit chunks with a register accumulator reversed the result. A measurement
+taken to settle a design decision can be wrong in the direction of whichever
+arm you wrote carelessly, and this one nearly picked the design.
 
 ## The C ABI question
 
