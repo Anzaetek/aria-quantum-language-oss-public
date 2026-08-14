@@ -50,4 +50,9 @@ tempfile = "3.10"
 # at runtime.
 aria-core = { path = "../aria-core" }
 omega-parser = { path = "../omega-parser" }
+# Test-only: `pauliprop_vs_ppvm.rs` compares OUR Pauli-propagation backend
+# against ppvm's independent implementation of the same algorithm. The existing
+# ppvm test anchors ppvm against qiskit; nothing put our own backend on that
+# path, despite the doc comment saying that was the point.
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
 omega-backend-photonics = { path = "../omega-backend-photonics" }
