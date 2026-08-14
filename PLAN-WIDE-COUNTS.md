@@ -1,7 +1,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # PLAN — counts keys wider than 64 qubits
 
-**Status: PLAN. Not implemented.** Written after the measurements below.
+**Status: PLAN. Not implemented, and NOT fully reviewed** — the adversarial
+review of this document was cut short by a session limit before it reported. Its
+one parting note (the plugin protocol) turned out to be a real gap and is folded
+in below; the rest of the plan has not had a second pair of eyes.
 
 ## Why now
 
@@ -35,9 +38,14 @@ it forbids exactly the regime MPS exists for.
   (`{"0101": 42}`), and the `u64` is an internal bottleneck at the conversion,
   not a property of the protocol. This is much better than assumed and should be
   stated plainly: **no wire format change is required.**
-* **The C ABI is the hard boundary.** `omega_result_get_counts` and
-  `omega_result_get_counts_n` write outcomes into `*mut u64`. A `u64` cannot
-  hold a 1024-bit outcome, and this is a published C header.
+* **TWO C ABIs are hard boundaries**, not one:
+  * `omega-ffi` — `omega_result_get_counts` / `_n` write outcomes into
+    `*mut u64`. A published C header.
+  * **the plugin protocol** — `omega_core::ffi_types::FfiExecResult` also
+    carries `pub bitstrings: *mut u64`, consumed in `plugin.rs` and produced by
+    every backend plugin. This one was missed in the first draft of this plan
+    and is arguably the harder of the two: third-party plugins compile against
+    it, so a change is not ours alone to make.
 
 ## The decision the plan turns on: what replaces `u64`
 
@@ -71,8 +79,46 @@ Either way the old functions must not silently truncate. That is the whole
 defect being fixed, and repeating it at the C boundary would be worse, because
 a C caller has no way to notice.
 
+## A defect in the step-1 refusal, found while writing this
+
+`check_counts_width(circuit.num_qubits)` gates on the **qubit count**, but the
+outcome width depends on the mode:
+
+* **collapse** — the mid-circuit `measure`s already ran, so the CREG is the
+  result (`creg_to_u64`), and the width is the highest classical bit used;
+* **skip** — the final qubit register is sampled, so `num_qubits` is right.
+
+**FIXED 2026-08-14**, but the first statement of it was too broad and is
+corrected here.
+
+The claim was "a 1024-qubit circuit measuring 2 qubits is refused, and that is
+wrong". Half right. It depends which mode the run is in, and the CLI picks the
+mode from the circuit:
+
+```
+  1024q, mid-circuit measure + feed-forward -> COLLAPSE -> was refused, WRONG,
+                                               now runs and prints |00>/|11>
+  1024q, plain end-of-circuit measures      -> SKIP     -> still refused, and
+                                               CORRECT: the backend samples all
+                                               1024 qubits, so the key really is
+                                               1024 bits
+```
+
+So the skip-mode refusal is not a guard bug. Making the skip path produce a
+narrow key would mean projecting onto the measured qubits at sample time, which
+is a real change to the sampling path and is **not** done here.
+
+The display had the same defect and it is the hazard listed at the end of this
+document: the 2-bit outcome was rendered padded to 1024 characters, because the
+renderer took `num_qubits`. Fixed at every render site (text, JSON, JSONL).
+
+Note `project_counts_onto_creg` carries its own index-based 64 guard; the two
+must stay consistent.
+
 ## Order
 
+0. **Fix the mode-aware width first** (above). Independent of everything else
+   and unblocks the common large-circuit case immediately.
 1. **Measure option (2)'s sampling cost** — 1000 shots at 64, 256 and 1024
    qubits, string key vs current. Cheap, and it decides the representation.
 2. Introduce the `Outcome` newtype over the chosen representation, with `Hash`,

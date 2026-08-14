@@ -60,7 +60,10 @@ impl Backend for PauliBackend {
         // circuit, and refused in EVERY backend that can exceed 64 qubits
         // because this is a property of the result type, not of any simulator.
         if config.shots.is_some() {
-            omega_core::executor::check_counts_width(circuit.num_qubits as usize)?;
+            omega_core::executor::check_counts_width(
+                omega_core::executor::counts_outcome_width(circuit, omega_core::executor::needs_collapse(circuit)
+                    && config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse),
+            )?;
         }
 
         match config.shots {

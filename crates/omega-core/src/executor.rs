@@ -227,6 +227,30 @@ pub const MAX_COUNTS_QUBITS: usize = 64;
 ///
 /// Expectation values, statevectors and probability vectors are unaffected —
 /// this is a property of the counts KEY, not of any simulation.
+/// The number of bits a shot outcome of `circuit` actually occupies.
+///
+/// **Not the qubit count.** Which register keys the outcome depends on the mode:
+///
+/// * collapse — the mid-circuit `measure`s already ran, so the CREG is the
+///   result (`creg_to_u64`), and the width is the highest classical bit used;
+/// * skip — the final qubit register is sampled, so the width is `num_qubits`.
+///
+/// Gating on `num_qubits` in both cases over-refuses badly. Measured: a
+/// 1024-qubit circuit measuring two qubits into `creg c[2]` was refused, though
+/// its outcome needs two bits — and that is the natural shape of a large run.
+/// A 70-qubit circuit with a 2-bit creg was refused for the same reason.
+pub fn counts_outcome_width(circuit: &CircuitIR, collapse: bool) -> usize {
+    if collapse {
+        measure_pairs(circuit)
+            .iter()
+            .map(|&(_, c)| c as usize + 1)
+            .max()
+            .unwrap_or(0)
+    } else {
+        circuit.num_qubits as usize
+    }
+}
+
 pub fn check_counts_width(n_qubits: usize) -> crate::error::Result<()> {
     if n_qubits > MAX_COUNTS_QUBITS {
         return Err(crate::error::OmegaError::Unsupported(format!(
