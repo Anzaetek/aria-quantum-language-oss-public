@@ -19,6 +19,61 @@ mod qubo_mode;
 mod serialize;
 use serialize::Format;
 
+/// The value following a flag, or a clean refusal.
+///
+/// Every flag in every argument loop was written as `i += 1; args[i]`, which
+/// **panics** when the flag is last on the line. Measured:
+/// `omega-run c.qasm --backend mps:8 --shots 20 --noise` printed
+/// `index out of bounds: the len is 9 but the index is 9` and exited 101 — a
+/// Rust panic with a backtrace note, for a plain typo. A CLI that panics on
+/// bad input teaches the reader to distrust every other error it prints.
+fn flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
+    *i += 1;
+    match args.get(*i) {
+        Some(v) => v.clone(),
+        None => {
+            eprintln!("{flag} needs a value, but nothing followed it.");
+            eprintln!("Use --help for usage information.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// A flag's value parsed to `T`, or a clean refusal naming the flag, what it
+/// wanted, and what it got.
+///
+/// The `.expect("invalid shots number")` idiom this replaces also panicked, and
+/// said neither which flag nor what was actually passed.
+fn flag_parse<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str, what: &str) -> T {
+    let raw = flag_value(args, i, flag);
+    match raw.parse() {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("{flag} expects {what}, got {raw:?}.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// A comma-separated list parsed to `Vec<T>`, refusing cleanly on any element.
+fn flag_parse_list<T: std::str::FromStr>(
+    args: &[String],
+    i: &mut usize,
+    flag: &str,
+    what: &str,
+) -> Vec<T> {
+    let raw = flag_value(args, i, flag);
+    raw.split(',')
+        .map(|s| match s.trim().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("{flag} expects a comma-separated list of {what}; {:?} is not one.", s.trim());
+                std::process::exit(1);
+            }
+        })
+        .collect()
+}
+
 fn print_usage() {
     eprintln!("Usage: omega-run <circuit-file> [options]");
     eprintln!();
@@ -277,76 +332,54 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--shots" => {
-                i += 1;
-                shots = Some(args[i].parse().expect("invalid shots number"));
+                shots = Some(flag_parse(&args, &mut i, "--shots", "a whole number of shots"));
             }
             "--statevector" | "--exact" => {
                 shots = None;
             }
             "--seed" => {
-                i += 1;
-                seed = Some(args[i].parse().expect("invalid seed"));
+                seed = Some(flag_parse(&args, &mut i, "--seed", "an integer seed"));
             }
             "--backend" => {
-                i += 1;
-                backend_name = Some(args[i].clone());
+                backend_name = Some(flag_value(&args, &mut i, "--backend"));
             }
             "--backend-dir" => {
-                i += 1;
-                backend_dirs.push(args[i].clone());
+                backend_dirs.push(flag_value(&args, &mut i, "--backend-dir"));
             }
             "--bridge" => {
-                i += 1;
-                bridge_name = Some(args[i].clone());
+                bridge_name = Some(flag_value(&args, &mut i, "--bridge"));
             }
             "--device" => {
-                i += 1;
-                device_name = Some(args[i].clone());
+                device_name = Some(flag_value(&args, &mut i, "--device"));
             }
             "--input" => {
-                i += 1;
-                input_state = Some(
-                    args[i]
-                        .split(',')
-                        .map(|s| s.trim().parse().expect("invalid photon number"))
-                        .collect(),
-                );
+                input_state = Some(flag_parse_list(&args, &mut i, "--input", "photon numbers"));
             }
             "--expectation" => {
-                i += 1;
-                observable_str = Some(args[i].clone());
+                observable_str = Some(flag_value(&args, &mut i, "--expectation"));
             }
             "--gradient" => {
-                i += 1;
-                gradient_str = Some(args[i].clone());
+                gradient_str = Some(flag_value(&args, &mut i, "--gradient"));
             }
             "--gradient-of-fn" => {
-                i += 1;
-                gradient_fn_str = Some(args[i].clone());
+                gradient_fn_str = Some(flag_value(&args, &mut i, "--gradient-of-fn"));
             }
             "--score-fn-shots" => {
-                i += 1;
-                gradient_fn_shots = Some(args[i].parse().expect("invalid --score-fn-shots"));
+                gradient_fn_shots =
+                    Some(flag_parse(&args, &mut i, "--score-fn-shots", "a whole number of shots"));
             }
             "--params" => {
-                i += 1;
-                param_values = Some(
-                    args[i]
-                        .split(',')
-                        .map(|s| s.trim().parse().expect("invalid parameter value"))
-                        .collect(),
-                );
+                param_values =
+                    Some(flag_parse_list(&args, &mut i, "--params", "parameter values"));
             }
             "--method" => {
-                i += 1;
-                grad_method_name = Some(args[i].clone());
+                grad_method_name = Some(flag_value(&args, &mut i, "--method"));
             }
             "--format" => {
                 i += 1; // already consumed by parse_format above
             }
             "--noise" => {
-                i += 1;
-                noise_json = Some(args[i].clone());
+                noise_json = Some(flag_value(&args, &mut i, "--noise"));
             }
             other => {
                 eprintln!("Unknown argument: {}", other);
@@ -1317,24 +1350,20 @@ fn parse_qubo_args(args: &[String]) -> qubo_mode::QuboOptions {
     while i < args.len() {
         match args[i].as_str() {
             "--qubo" => {
-                i += 1;
-                path = Some(args[i].clone());
+                path = Some(flag_value(args, &mut i, "--qubo"));
             }
             "--qaoa-depth" => {
-                i += 1;
-                depth = args[i].parse().expect("invalid --qaoa-depth");
+                depth = flag_parse(args, &mut i, "--qaoa-depth", "a whole number of layers");
             }
             "--shots" => {
-                i += 1;
-                shots = args[i].parse().expect("invalid --shots");
+                shots = flag_parse(args, &mut i, "--shots", "a whole number of shots");
             }
             "--seed" => {
-                i += 1;
-                seed = Some(args[i].parse().expect("invalid --seed"));
+                seed = Some(flag_parse(args, &mut i, "--seed", "an integer seed"));
             }
             "--optimizer" => {
-                i += 1;
-                optimizer = match args[i].as_str() {
+                let raw = flag_value(args, &mut i, "--optimizer");
+                optimizer = match raw.as_str() {
                     "cma-es" | "cmaes" => qubo_mode::Optimizer::CmaEs,
                     "gradient" | "grad" => qubo_mode::Optimizer::Gradient,
                     other => {
@@ -1344,12 +1373,10 @@ fn parse_qubo_args(args: &[String]) -> qubo_mode::QuboOptions {
                 };
             }
             "--top-k" => {
-                i += 1;
-                top_k = args[i].parse().expect("invalid --top-k");
+                top_k = flag_parse(args, &mut i, "--top-k", "a whole number");
             }
             "--max-iters" => {
-                i += 1;
-                max_iters = args[i].parse().expect("invalid --max-iters");
+                max_iters = flag_parse(args, &mut i, "--max-iters", "a whole number");
             }
             "--format" => {
                 i += 1;
@@ -1386,16 +1413,13 @@ fn run_shor(args: &[String], format: Format) {
         match args[i].as_str() {
             "--shor" => {}
             "--N" | "--n" => {
-                i += 1;
-                n = Some(args[i].parse().expect("invalid --N"));
+                n = Some(flag_parse(args, &mut i, "--N", "a composite integer"));
             }
             "--seed" => {
-                i += 1;
-                seed = Some(args[i].parse().expect("invalid --seed"));
+                seed = Some(flag_parse(args, &mut i, "--seed", "an integer seed"));
             }
             "--max-attempts" => {
-                i += 1;
-                max_attempts = args[i].parse().expect("invalid --max-attempts");
+                max_attempts = flag_parse(args, &mut i, "--max-attempts", "a whole number");
             }
             "--format" => {
                 i += 1;
