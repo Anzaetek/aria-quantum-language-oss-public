@@ -250,7 +250,20 @@ fn make_tch() -> Result<Box<dyn Backend>, String> {
 /// Apple has no native f64, so on-GPU Jacobi SVD is deferred; see
 /// GPU_BACKEND_PLAN.md), engaging only above the bond-dim threshold.
 fn make_mps(chi: usize) -> MpsBackend {
-    let backend = MpsBackend::new(chi);
+    // The backend's own discarded-weight ceiling is LIFTED here, and the policy
+    // lives in this CLI instead — `report_mps_truncation` applies
+    // `DEFAULT_MAX_DISCARDED_WEIGHT` by default and honours `--strict-truncation`
+    // when given.
+    //
+    // Without this, the backend refused at 1e-6 before the CLI's check ran, so
+    // `--strict-truncation 0.5` — the documented "I accept this much
+    // approximation" knob — could no longer accept anything. Measured:
+    // `--backend mps:2 --strict-truncation 0.5` errored at the backend's 1e-6
+    // instead of accepting a 3.156 discard.
+    //
+    // A second consequence: stats are recorded only on success, so a backend
+    // refusal also lost the certificate the CLI wanted to report.
+    let backend = MpsBackend::new(chi).with_max_discarded_weight(f64::INFINITY);
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
     // Metal arm: the two-site θ-contraction runs on the GPU (SVD stays on CPU —
