@@ -57,12 +57,30 @@ pub struct MpsRunStats {
 ///
 /// # Why this value
 ///
-/// The discarded weight bounds the infidelity, so `1e-6` means "at most about
-/// one part in a million of the state was thrown away" — far above the `1e-30`
-/// the honest runs above produce, and far below the `6.586` that produced a
-/// useless answer. It is a ceiling on *silent* approximation, not a limit on
-/// what the backend can do: [`MpsBackend::with_max_discarded_weight`] raises it
-/// for callers who want an approximation and say so.
+/// `1e-6` sits far above the `1e-30` the honest runs above produce and far below
+/// the `6.586` that produced a useless answer. It is a ceiling on *silent*
+/// approximation, not a limit on what the backend can do:
+/// [`MpsBackend::with_max_discarded_weight`] raises it for callers who want an
+/// approximation and say so.
+///
+/// # What this number is, and is NOT
+///
+/// It is a **sum over splits** of each split's relative discarded weight
+/// (`mps.rs`), not a fraction of the state — which is why values above 1 are
+/// legal and why 6.586 is not an accumulation bug.
+///
+/// An earlier version of this comment said "the discarded weight bounds the
+/// infidelity". **That theorem is for canonical-gauge truncation, and this MPS
+/// is deliberately not held in canonical form** — `Mps::apply_2q` says so, and
+/// explains why: a per-split local renormalization would not restore the global
+/// norm.
+///
+/// So the certificate is a fidelity *proxy*, not a bound. Measured on one
+/// trajectory of the 19-qubit chain: the canonical-gauge certificate for the
+/// same truncation is 0.664 against our 6.402 — a ~10x gauge inflation. That is
+/// the conservative direction, and nothing establishes it cannot understate
+/// elsewhere, which would let a bad run pass this gate. Calibrating it against a
+/// canonical reference is open work.
 ///
 /// Note the observed values do not sit near this boundary from either side,
 /// which is the point — a threshold chosen to sit between two clusters thirty
@@ -131,13 +149,15 @@ impl MpsBackend {
         let st = self.last_run_stats();
         if st.discarded_weight > self.max_discarded_weight {
             return Err(OmegaError::Unsupported(format!(
-                "MPS truncation discarded {:.3e} of the state (bond reached {}, ceiling \
-                 {:.3e}). The result would not approximate the circuit: measured on a \
-                 19-qubit chain, a discarded weight of 6.586 gave a total-variation \
-                 distance of 0.51 from the exact distribution — half the distribution \
-                 wrong, returned without complaint. Raise the bond dimension, or call \
-                 `with_max_discarded_weight` to accept an approximation deliberately.",
-                st.discarded_weight, st.max_bond_reached, self.max_discarded_weight
+                "MPS truncation certificate {:.3e} exceeds the ceiling {:.3e} (bond \
+                 reached {}). This is the SUM over splits of each split's relative \
+                 discarded weight — not a fraction of the state, which is why it can \
+                 exceed 1. The result would not approximate the circuit: measured on a \
+                 19-qubit chain, a certificate of 6.586 put 48% of the probability on \
+                 an outcome whose true probability is ~1e-30. Raise the bond dimension \
+                 (`--backend mps:<chi>`), or call `with_max_discarded_weight` to accept \
+                 an approximation deliberately.",
+                st.discarded_weight, self.max_discarded_weight, st.max_bond_reached
             )));
         }
         Ok(())
