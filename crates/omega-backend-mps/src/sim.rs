@@ -413,8 +413,11 @@ impl Backend for MpsBackend {
                 };
                 *counts.entry(outcome).or_insert(0) += 1;
             }
-            // Checked AFTER the trajectories: `record_stats` is last-writer-wins
-            // and the ceiling is about the run as a whole, not one shot.
+            // Checked AFTER the trajectories: `record_stats` keeps the WORST
+            // certificate since `reset_stats`, and the ceiling is about the run
+            // as a whole rather than one shot. (It was last-writer-wins, which
+            // made this line consult only the final trajectory — see
+            // `record_stats`.)
             self.check_truncation()?;
             return Ok(ExecResult::Counts(counts));
         }
@@ -750,6 +753,32 @@ impl Backend for NoisyMpsBackend {
                 ),
             )?;
         }
+        // The guard above admits a wide run at CREG width, promising the key
+        // will be the creg. Both non-collapse arms below then built a FULL
+        // register key with `bit << q` — so the guard's predicate and the
+        // sampler's disagreed, exactly the defect fixed in `MpsBackend` while
+        // this backend was given only the guard. Measured before this fix:
+        //
+        //   70q, Bell on q40/q41 -> creg c[2], --noise:
+        //       |110000000000000000000000000000000000000000>: 110, |00>: 90
+        //   70q, x q[65]; measure q[65] -> c[0], --noise:
+        //       |10>: 50 of 50   (bit 65 masked to bit 1; truth is |1>)
+        //
+        // A confident wrong answer, and the noiseless run of the same file was
+        // correct — so adding `--noise` silently changed the meaning of the key.
+        let project_wide = omega_core::executor::counts_keyed_on_creg(circuit, false)
+            && !mps_collapses(circuit, config);
+        let mut cbit_of = vec![None; n];
+        if project_wide {
+            for (q, c) in omega_core::executor::measure_pairs(circuit) {
+                if (q as usize) < n {
+                    cbit_of[q as usize] = Some(c);
+                }
+            }
+        }
+        // Reused across shots; the sampling loop is hot.
+        let mut bits: Vec<u8> = Vec::new();
+
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => rand::make_rng::<StdRng>(),
@@ -776,6 +805,13 @@ impl Backend for NoisyMpsBackend {
                         // Mid-circuit measures recorded (readout-flipped) outcomes
                         // into the creg during evolution; key by the creg.
                         mps_creg_to_u64(&cbits)
+                    } else if project_wide {
+                        let envs = mps.right_environments();
+                        mps.sample_bits_with_envs_into(&envs, &mut rng, &mut bits);
+                        if !self.model.readout.is_zero() {
+                            flip_readout_bits(&mut bits, &self.model.readout, &mut rng);
+                        }
+                        Mps::pack_bits(&bits, Some(&cbit_of))
                     } else {
                         let mut o = mps.sample(&mut rng);
                         if !self.model.readout.is_zero() {
@@ -796,10 +832,19 @@ impl Backend for NoisyMpsBackend {
                 let envs = mps.right_environments();
                 let mut counts = HashMap::new();
                 for _ in 0..shots {
-                    let mut outcome = mps.sample_with_envs(&envs, &mut rng);
-                    if !self.model.readout.is_zero() {
-                        outcome = flip_all_readout(outcome, n, &self.model.readout, &mut rng);
-                    }
+                    let outcome = if project_wide {
+                        mps.sample_bits_with_envs_into(&envs, &mut rng, &mut bits);
+                        if !self.model.readout.is_zero() {
+                            flip_readout_bits(&mut bits, &self.model.readout, &mut rng);
+                        }
+                        Mps::pack_bits(&bits, Some(&cbit_of))
+                    } else {
+                        let mut o = mps.sample_with_envs(&envs, &mut rng);
+                        if !self.model.readout.is_zero() {
+                            o = flip_all_readout(o, n, &self.model.readout, &mut rng);
+                        }
+                        o
+                    };
                     self.record_stats(&mps);
                     *counts.entry(outcome).or_insert(0) += 1;
                 }
@@ -953,6 +998,22 @@ use omega_core::executor::creg_to_u64 as mps_creg_to_u64;
 
 /// Flip each qubit of a sampled outcome with its per-qubit (possibly
 /// asymmetric) readout-error probability.
+/// Readout error applied to **unpacked** per-site bits.
+///
+/// Must run on the QUBIT index: `flip_prob(q, b)` is a property of qubit `q`'s
+/// detector. The packed variant below flips at the same positions the key is
+/// built at, which is only the same thing when the key is the qubit register —
+/// so above the 64-qubit cliff, where the key is the creg, flipping a packed
+/// key applies qubit q's error rate to classical bit q.
+fn flip_readout_bits<R: Rng>(bits: &mut [u8], readout: &ReadoutError, rng: &mut R) {
+    for (q, b) in bits.iter_mut().enumerate() {
+        let p = readout.flip_prob(q, *b);
+        if p > 0.0 && rng.random::<f64>() < p {
+            *b ^= 1;
+        }
+    }
+}
+
 fn flip_all_readout<R: Rng>(bits: u64, n: usize, readout: &ReadoutError, rng: &mut R) -> u64 {
     let mut flipped = bits;
     for q in 0..n {

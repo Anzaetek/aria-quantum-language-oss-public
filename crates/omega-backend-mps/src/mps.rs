@@ -562,8 +562,53 @@ impl Mps {
         rng: &mut impl rand::Rng,
         cbit_of: Option<&[Option<u32>]>,
     ) -> u64 {
-        let zero = Complex64::new(0.0, 0.0);
+        let mut bits = Vec::new();
+        self.sample_bits_with_envs_into(envs, rng, &mut bits);
+        Self::pack_bits(&bits, cbit_of)
+    }
+
+    /// Pack per-site bits into a counts key.
+    ///
+    /// `cbit_of` is `Some` when the key is the CLASSICAL register: each site
+    /// lands at its classical index, and an unmeasured site is dropped. `None`
+    /// keys on the qubit register, which is only representable below 64 sites.
+    pub fn pack_bits(bits: &[u8], cbit_of: Option<&[Option<u32>]>) -> u64 {
         let mut result = 0u64;
+        for (q, bit) in bits.iter().enumerate() {
+            match cbit_of {
+                Some(map) => {
+                    if let Some(Some(c)) = map.get(q) {
+                        result |= ((*bit & 1) as u64) << *c;
+                    }
+                }
+                None => result |= ((*bit & 1) as u64) << q,
+            }
+        }
+        result
+    }
+
+    /// Sample a shot, writing **one bit per site** into `out`.
+    ///
+    /// Every site must be drawn even when it is not reported, because each
+    /// outcome conditions the ones after it — so the projection can only narrow
+    /// the KEY, never the work.
+    ///
+    /// Exposed unpacked because a caller may need to transform a bit before it
+    /// is placed: `NoisyMpsBackend` applies readout error per qubit, which has
+    /// to happen on the qubit index, while the key is built on the classical
+    /// index. Packing first would make readout flips land on creg positions.
+    ///
+    /// `out` is reused across shots; the sampling loop is hot and this keeps it
+    /// to one allocation per run rather than one per shot.
+    pub fn sample_bits_with_envs_into(
+        &self,
+        envs: &[Vec<Complex64>],
+        rng: &mut impl rand::Rng,
+        out: &mut Vec<u8>,
+    ) {
+        let zero = Complex64::new(0.0, 0.0);
+        out.clear();
+        out.resize(self.n, 0);
         let mut left_vec = vec![Complex64::new(1.0, 0.0)];
         // Scratch buffers recycled across sites (and, via the swap below,
         // with left_vec): this loop runs shots × n times, so per-site
@@ -600,17 +645,7 @@ impl Mps {
             } else {
                 1usize
             };
-            // Where the bit lands: at its classical index when projecting,
-            // otherwise at the qubit index. `None` means "not measured", so the
-            // bit is sampled (it conditions later sites) but not reported.
-            match cbit_of {
-                Some(map) => {
-                    if let Some(Some(c)) = map.get(q) {
-                        result |= (bit as u64) << *c;
-                    }
-                }
-                None => result |= (bit as u64) << q,
-            }
+            out[q] = bit as u8;
 
             // Condition on the outcome; rescale so the running prefix
             // stays O(1) (only probability *ratios* matter downstream).
@@ -621,8 +656,6 @@ impl Mps {
                 *v *= inv;
             }
         }
-
-        result
     }
 
     /// Left-environment matrix of sites `0..q` (row-major

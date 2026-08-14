@@ -599,11 +599,20 @@ fn main() {
         // counts the rest of omega-run uses, where bit 0 of the integer
         // is qubit 0; from there `serialize::format_bits` re-emits MSB-
         // first so the CLI output matches the in-process path.
+        // The bridge returns Qiskit-style keys, which are already the width of
+        // the CLASSICAL register — so their own length is the authority, and
+        // `num_modes` (the qubit count) is not. This preferred `num_modes`, so
+        // a 20-qubit circuit measuring 2 qubits printed 20-character keys: the
+        // same defect fixed at the CLI's native path and both server sites,
+        // still open on this one.
+        //
+        // `num_modes` remains the fallback for an empty histogram, where there
+        // is no key to measure.
         let inferred_qubits = counts_str.keys().map(|k| k.len() as u32).max().unwrap_or(0);
-        let display_qubits = if num_modes > 0 {
-            num_modes
-        } else {
+        let display_qubits = if inferred_qubits > 0 {
             inferred_qubits
+        } else {
+            num_modes
         };
         let mut counts_u64: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for (key, n) in &counts_str {

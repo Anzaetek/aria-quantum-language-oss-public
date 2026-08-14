@@ -530,6 +530,23 @@ fn backend_name(sel: &OmegaBackendSel) -> String {
     }
 }
 
+/// The width to zero-pad a counts key to, for one wire circuit.
+///
+/// A named function rather than a block inside the route, so a test can cover
+/// the same code the route runs. The first version of this fix put the
+/// computation inline and tested `exec_result_to_json` directly with a
+/// hand-computed width — which cannot catch the actual defect, since the defect
+/// was the CALLER passing `num_qubits`. Substituting `req.circuit.num_qubits`
+/// here survived the whole suite.
+fn counts_render_width(ir: &OmegaCircuitIR) -> u32 {
+    let core = translate_to_core_ir(ir);
+    let collapse = matches!(ir.mid_circuit_mode, OmegaMidCircuitMode::Collapse);
+    omega_core::executor::counts_outcome_width(
+        &core,
+        omega_core::executor::counts_keyed_on_creg(&core, collapse),
+    ) as u32
+}
+
 /// Render an `ExecResult` to the wire.
 ///
 /// `counts_width` is the width to zero-pad a counts key to, which is NOT always
@@ -649,16 +666,7 @@ pub async fn execute_quantum_route(
     if let Err(resp) = check_rights(&claims, rights::EXECUTE) {
         return resp;
     }
-    // The RENDER width for counts, which is the classical-register width in
-    // collapse mode rather than the qubit count. See `exec_result_to_json`.
-    let counts_width = {
-        let core = translate_to_core_ir(&req.circuit);
-        let collapse = matches!(req.circuit.mid_circuit_mode, OmegaMidCircuitMode::Collapse);
-        omega_core::executor::counts_outcome_width(
-            &core,
-            omega_core::executor::counts_keyed_on_creg(&core, collapse),
-        ) as u32
-    };
+    let counts_width = counts_render_width(&req.circuit);
     let mut timer = PhaseTimer::new();
     // Price and reserve before allocating anything. `_reservation` must stay
     // alive for the whole execution — dropping it returns the budget.
@@ -1047,11 +1055,10 @@ mod tests {
     #[test]
     fn collapse_mode_counts_are_rendered_at_the_creg_width() {
         let ir = wide_collapse_ir(20);
-        let core = translate_to_core_ir(&ir);
-        let width = omega_core::executor::counts_outcome_width(
-            &core,
-            omega_core::executor::counts_keyed_on_creg(&core, true),
-        ) as u32;
+        // The SAME function the route calls — not a hand-computed width, which
+        // is what let the original defect (the caller passing `num_qubits`)
+        // survive this test.
+        let width = counts_render_width(&ir);
         assert_eq!(width, 2, "the creg is 2 bits wide");
 
         let (result, _) = execute_quantum_ir(&ir, Some(200), Some(3)).expect("execute");
@@ -1082,11 +1089,7 @@ mod tests {
     #[test]
     fn skip_mode_counts_are_still_rendered_at_the_register_width() {
         let ir = bell_ir(OmegaBackendSel::Statevector);
-        let core = translate_to_core_ir(&ir);
-        let width = omega_core::executor::counts_outcome_width(
-            &core,
-            omega_core::executor::counts_keyed_on_creg(&core, false),
-        ) as u32;
+        let width = counts_render_width(&ir);
         assert_eq!(width, 2);
         let (result, _) = execute_quantum_ir(&ir, Some(100), Some(1)).expect("execute");
         let json = exec_result_to_json(&result, width);

@@ -424,6 +424,11 @@ impl Registry {
                 config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse,
             ),
         );
+        debug_assert!(
+            counts_width <= omega_core::executor::MAX_COUNTS_QUBITS,
+            "counts_width {counts_width} exceeds the key width; the backend \
+             should have refused this run before it reached rendering"
+        );
 
         // Serialize result to JSON
         match result {
