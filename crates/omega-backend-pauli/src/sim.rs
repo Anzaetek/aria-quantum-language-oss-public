@@ -60,9 +60,17 @@ impl Backend for PauliBackend {
         // circuit, and refused in EVERY backend that can exceed 64 qubits
         // because this is a property of the result type, not of any simulator.
         if config.shots.is_some() {
+            // Same predicate the sampling path below uses. Two different
+            // answers here would refuse a key the sampler was about to build
+            // correctly — which is exactly what happened when this guard was
+            // left on the old rule after the sampler learned to project.
+            let collapse = omega_core::executor::needs_collapse(circuit)
+                && config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse;
             omega_core::executor::check_counts_width(
-                omega_core::executor::counts_outcome_width(circuit, omega_core::executor::needs_collapse(circuit)
-                    && config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse),
+                omega_core::executor::counts_outcome_width(
+                    circuit,
+                    omega_core::executor::counts_keyed_on_creg(circuit, collapse),
+                ),
             )?;
         }
 
@@ -123,6 +131,39 @@ impl Backend for PauliBackend {
                         && circuit.num_classical_bits > 0
                     {
                         creg_to_u64(&classical_bits)
+                    } else if omega_core::executor::counts_keyed_on_creg(circuit, false) {
+                        // Above 64 qubits the full-register key does not exist —
+                        // `bits |= 1 << q` shifts out of range — so a measured
+                        // circuit is keyed on its CLASSICAL register instead.
+                        // Every qubit is still measured (each collapses the
+                        // tableau for the ones after it); only the reporting is
+                        // narrowed. Same rule and same predicate as the MPS
+                        // backend, so the two agree on what a wide run returns.
+                        let mut cbit_of = vec![None; n];
+                        for (q, c) in omega_core::executor::measure_pairs(circuit) {
+                            if (q as usize) < n {
+                                cbit_of[q as usize] = Some(c);
+                            }
+                        }
+                        // Only the MEASURED qubits are measured. Marginalising
+                        // over an unmeasured qubit is the same as never
+                        // measuring it, so the reported distribution is
+                        // unchanged — and at 1024 qubits this is the difference
+                        // between ~1.4 s per shot and a negligible one.
+                        //
+                        // (The MPS backend cannot do this: its sampler walks the
+                        // chain left to right and each site conditions the next,
+                        // so every site must be drawn even when it is not
+                        // reported. Different structure, different rule.)
+                        let mut bits = 0u64;
+                        for (q, target) in cbit_of.iter().enumerate() {
+                            if let Some(c) = target {
+                                if tab.measure(q, &mut rng) {
+                                    bits |= 1u64 << *c;
+                                }
+                            }
+                        }
+                        bits
                     } else {
                         let mut bits = 0u64;
                         for q in 0..n {
