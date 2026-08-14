@@ -64,8 +64,18 @@ impl Backend for PauliBackend {
             // answers here would refuse a key the sampler was about to build
             // correctly — which is exactly what happened when this guard was
             // left on the old rule after the sampler learned to project.
-            let collapse = omega_core::executor::needs_collapse(circuit)
-                && config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse;
+            //
+            // It said `needs_collapse(circuit) && mode == Collapse`, while the
+            // sampler keys on the creg for `mode == Collapse &&
+            // num_classical_bits > 0`. Those differ for a wide collapse-mode
+            // circuit that declares a creg but contains no `measure`:
+            // `needs_collapse` is false, so the guard priced the outcome at
+            // `num_qubits` and refused above 64 — while the sampler would have
+            // returned a perfectly representable creg-width key. Over-refusal,
+            // but the same guard/sampler split that produced wrong ANSWERS in
+            // the MPS backend twice.
+            let collapse = config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse
+                && circuit.num_classical_bits > 0;
             omega_core::executor::check_counts_width(
                 omega_core::executor::counts_outcome_width(
                     circuit,

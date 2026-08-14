@@ -268,20 +268,14 @@ impl MpsBackend {
                 }
             }
         }
-        // The abort above runs BEFORE each op, so the LAST op's split was never
-        // tested by it — a circuit crossing the ceiling only on its final gate
-        // escaped the early path entirely and relied on the caller remembering
-        // to call `check_truncation`. Test it here, so `evolve_once` never
-        // returns a chain that is already over the ceiling.
-        if mps.discarded_weight > self.max_discarded_weight {
-            return Err(OmegaError::Unsupported(format!(
-                "MPS truncation certificate {:.3e} exceeded the ceiling {:.3e} on the \
-                 circuit's final operation (bond reached {}). Raise the bond dimension \
-                 (`--backend mps:<chi>`), or call `with_max_discarded_weight` to accept \
-                 an approximation deliberately.",
-                mps.discarded_weight, self.max_discarded_weight, mps.max_bond_reached
-            )));
-        }
+        // No final check here. It would be redundant: `evolve_once` is called
+        // only from `execute`, and both call sites follow it with
+        // `record_stats` + `check_truncation`, which — now that stats are
+        // worst-over-run — already refuse every run such a check would refuse.
+        // A review measured it: reverting the block that used to sit here
+        // failed no test, because nothing could distinguish it. Untested code
+        // in a gate is worse than no code, so it is gone rather than pinned by
+        // a test written to justify it.
 
         Ok((mps, classical_bits))
     }

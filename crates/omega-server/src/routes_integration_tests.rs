@@ -1112,6 +1112,47 @@ async fn a_batch_of_only_unpriceable_rows_is_still_admitted() {
     );
 }
 
+/// **A statevector run must not be refused for want of a device budget on a
+/// machine that has no separate device memory.**
+///
+/// Device pools come from `nvidia-smi` alone, so on AMD / Intel / Apple OpenCL
+/// the probe finds no devices, the machine classifies `HostOnly`, and `admit`
+/// failed closed with "no memory budget for the requested device" — a 413 for
+/// **every** Statevector/Auto request, on exactly the hardware the `opencl`
+/// feature exists to serve. `/execute` could genuinely have run there.
+///
+/// This test is deliberately **not** `#[cfg(feature = "opencl")]`. A test that
+/// compiles away in the default build is a test that silently stops running,
+/// and this repository has shipped that before. Without the feature it pins
+/// the same invariant along the always-Cpu path, so it can never vanish; with
+/// the feature it also covers the device-target decision. `OMEGA_DEVICE` is not
+/// set here, so no device is claimed either way — the point is that a plain
+/// statevector request is admitted, which is what the defect broke.
+#[tokio::test]
+async fn a_statevector_run_is_admitted_on_a_machine_with_no_device_budget() {
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let body = serde_json::json!({
+        "circuit": {
+            "num_qubits": 2, "num_classical_bits": 0, "is_photonic": false,
+            "mid_circuit_mode": "Skip", "backend": "Statevector",
+            "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+        },
+        "shots": 16
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/execute", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a 2-qubit statevector run was refused; if this is 413 with \"no memory \
+         budget for the requested device\", pricing claimed a device pool the \
+         machine does not have"
+    );
+}
+
 #[tokio::test]
 async fn execute_pattern_is_admission_controlled() {
     // MBQC executed with NO admission at all: the simulator's state doubles per

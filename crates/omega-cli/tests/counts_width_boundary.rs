@@ -156,3 +156,50 @@ fn the_refusal_is_about_counts_not_about_size() {
         "<Z0> on a 128-qubit GHZ is 0 by symmetry, got {v}"
     );
 }
+
+/// **The stabilizer guard and its sampler must answer the same question.**
+///
+/// The guard tested `needs_collapse(circuit) && mode == Collapse`; the sampler
+/// keys on the creg for `mode == Collapse && num_classical_bits > 0`. They
+/// diverge for a wide collapse-mode circuit that declares a creg but contains
+/// no `measure`: `needs_collapse` is false, so the guard priced the outcome at
+/// `num_qubits` and refused above 64 — while the sampler would have built a
+/// perfectly representable creg-width key.
+///
+/// Over-refusal rather than a wrong answer, so it is the mild form. But it is
+/// the same guard/sampler split that produced *wrong answers* in the MPS
+/// backend twice, and the guard's own comment already claimed the two used the
+/// "same predicate".
+#[test]
+fn a_wide_collapse_circuit_with_a_creg_but_no_measures_is_not_refused() {
+    use omega_backend_pauli::PauliBackend;
+    use omega_core::executor::{Backend, ExecConfig, ExecResult, MidCircuitMode};
+    use omega_core::params::ParameterBinding;
+
+    // 70 qubits, a 2-bit creg, no `measure` anywhere.
+    let mut src = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[70];\ncreg c[2];\n".to_string();
+    for i in 0..70 {
+        src.push_str(&format!("h q[{i}];\n"));
+    }
+    let ir = omega_parser::lower_to_ir(&src).expect("lower");
+    let cfg = ExecConfig {
+        shots: Some(50),
+        seed: Some(2),
+        mid_circuit_mode: MidCircuitMode::Collapse,
+    };
+    let r = PauliBackend::new().execute(&ir, &ParameterBinding::default(), &cfg);
+    let counts = match r {
+        Ok(ExecResult::Counts(c)) => c,
+        Ok(o) => panic!("{o:?}"),
+        Err(e) => panic!(
+            "refused a run the sampler would have keyed on a 2-bit creg: {e}\n\
+             The guard priced the outcome at num_qubits because `needs_collapse` \
+             is false without a measure, while the sampler keys on the creg for \
+             any collapse-mode circuit that has one."
+        ),
+    };
+    // Nothing was measured, so every shot records the creg's initial value.
+    assert_eq!(counts.values().sum::<u32>(), 50);
+    let wide: Vec<u64> = counts.keys().copied().filter(|k| *k > 0b11).collect();
+    assert!(wide.is_empty(), "keys outside the 2-bit creg: {wide:?}");
+}

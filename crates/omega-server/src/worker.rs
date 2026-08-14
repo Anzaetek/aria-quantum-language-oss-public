@@ -778,7 +778,7 @@ impl Governor {
     }
 
     /// Whether this machine has a budget for `target` at all.
-    fn has_pool_for(&self, target: ExecTarget) -> bool {
+    pub fn has_pool_for(&self, target: ExecTarget) -> bool {
         if self.pools.iter().any(|p| p.id == PoolId::Unified) {
             return true;
         }
