@@ -115,7 +115,16 @@ not a probability — so 6.586 is not an accumulation bug. Two real problems:
 * the message "discarded 6.586e0 of the state" is innumerate — you cannot
   discard 659% of a state. Reword to name it as an accumulated per-split sum.
 
-### M5 — the refusal costs a full run *(new)*
+### M5 — the refusal costs a full run — **FIXED 2026-08-14**
+
+42.9 s -> 0.63 s on `wide_chain_19q`. The certificate is monotonically
+non-decreasing, so stopping at the first crossing changes only how long a
+refusal takes, not which runs are refused — verified against the actual set
+rather than left as an argument.
+
+Original description follows.
+
+
 
 The check fires after evolution completes: 46 s of compute, then the error. On
 the per-trajectory path it fires after `shots ×` full evolutions. The
