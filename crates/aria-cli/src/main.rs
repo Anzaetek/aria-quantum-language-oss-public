@@ -250,6 +250,29 @@ fn print_counts(res: ExecResult, n_qubits: usize) {
     }
 }
 
+/// Apply `--strict-truncation` to the MPS ceiling every backend will enforce.
+///
+/// Called by every subcommand that takes `--backend`, not just `run`. The flag
+/// briefly worked only in `run`, which meant `train`/`tune`/`predict` could not
+/// opt into an approximation at all while still being gated by the default —
+/// an asymmetry with no reason behind it.
+fn apply_strict_truncation(a: &Args) -> Result<Option<f64>, String> {
+    let eps: Option<f64> = a
+        .opt("strict-truncation")
+        .map(|s| {
+            s.parse::<f64>()
+                .map_err(|_| format!("bad --strict-truncation '{s}'"))
+        })
+        .transpose()?;
+    if let Some(v) = eps {
+        if v.is_nan() || v < 0.0 {
+            return Err(format!("--strict-truncation must be ≥ 0 (got {v})"));
+        }
+        aria_runtime::run::set_mps_discard_ceiling(v);
+    }
+    Ok(eps)
+}
+
 fn cmd_run(raw: &[String]) -> Result<(), String> {
     let a = parse_args(raw, &["statevector"])?;
     let path = a.first_positional("<file.aria>")?;
@@ -269,13 +292,7 @@ fn cmd_run(raw: &[String]) -> Result<(), String> {
     // Opt-in fail-loud: exit non-zero when an MPS run's accumulated discarded
     // weight exceeds this. Default (absent) preserves exit-code semantics for
     // every existing backend/flag combination.
-    let strict_truncation: Option<f64> = a
-        .opt("strict-truncation")
-        .map(|s| {
-            s.parse::<f64>()
-                .map_err(|_| format!("bad --strict-truncation '{s}'"))
-        })
-        .transpose()?;
+    let strict_truncation = apply_strict_truncation(&a)?;
 
     // Per-gate noise model (trajectory simulation). Parsed here so a bad spec
     // or a channel that can't be applied fails loudly — `--noise` must never be
@@ -428,20 +445,13 @@ fn report_mps_truncation(strict: Option<f64>) -> Result<(), String> {
     // ceiling still applies. Both directions matter: a user who asks to accept a
     // large discard must be able to, and a user who asks for nothing must not
     // silently receive a state the truncation destroyed.
-    let ceiling = strict.unwrap_or(aria_runtime::DEFAULT_MAX_DISCARDED_WEIGHT);
-    if stats.discarded_weight > ceiling {
-        let knob = if strict.is_some() {
-            format!("--strict-truncation {ceiling:.3e}")
-        } else {
-            format!("the default ceiling {ceiling:.3e}")
-        };
-        return Err(format!(
-            "MPS discarded weight {:.3e} exceeds {knob}; raise \
-             --backend mps:<chi> / mps:auto:<ceiling>, or pass a larger \
-             --strict-truncation to accept the approximation deliberately",
-            stats.discarded_weight
-        ));
-    }
+    // No check here. The BACKEND enforces the ceiling — see
+    // `aria_runtime::run::set_mps_discard_ceiling`, called above — so a run that
+    // reaches this point is already within it. Re-checking would be a second
+    // policy that could disagree with the first.
+    //
+    // This function now only REPORTS the certificate, which is what it is for.
+    let _ = strict;
     Ok(())
 }
 
@@ -480,6 +490,7 @@ fn cmd_train(raw: &[String]) -> Result<(), String> {
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("train requires --circuit NAME")?;
     let ints = parse_kv_i64(a.all("int").into_iter())?;
+    apply_strict_truncation(&a)?;
     let sel = BackendSel::parse(a.opt("backend").unwrap_or("sim"))?;
 
     // Supervised dataset training: `aria train f.aria --circuit C --data X.csv
@@ -723,6 +734,7 @@ fn cmd_predict(raw: &[String]) -> Result<(), String> {
     let data_path = a
         .opt("data")
         .ok_or("predict requires --data X.csv (the feature matrix)")?;
+    apply_strict_truncation(&a)?;
     let sel = BackendSel::parse(a.opt("backend").unwrap_or("sim"))?;
 
     let model = aria_runtime::TrainedModel::load(model_path)?;
@@ -910,6 +922,7 @@ fn cmd_tune(raw: &[String]) -> Result<(), String> {
         .opt("observable")
         .ok_or("tune requires --observable OBS (e.g. \"Z0\")")?;
     let data_path = a.opt("data").ok_or("tune requires --data X.csv")?;
+    apply_strict_truncation(&a)?;
     let sel = BackendSel::parse(a.opt("backend").unwrap_or("sim"))?;
     let space = parse_space(spec)?;
 

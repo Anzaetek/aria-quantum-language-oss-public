@@ -249,21 +249,44 @@ fn make_tch() -> Result<Box<dyn Backend>, String> {
 /// two-site θ-contraction is routed to the GPU instead (SVD stays on CPU —
 /// Apple has no native f64, so on-GPU Jacobi SVD is deferred; see
 /// GPU_BACKEND_PLAN.md), engaging only above the bond-dim threshold.
+/// Process-wide ceiling on an MPS run's truncation certificate.
+///
+/// Stored as `f64` bits so a front end can set it once, before any run.
+static MPS_DISCARD_CEILING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
+    // `f64::to_bits` is not const-callable on all supported toolchains, so the
+    // sentinel 0 means "unset" and resolves to the backend default on read.
+    0,
+);
+
+/// Raise (or lower) the discarded-weight ceiling every MPS backend built here
+/// will enforce. `f64::INFINITY` accepts any truncation.
+///
+/// **This is a library-level policy, deliberately.** It briefly lived in the
+/// `aria` CLI's post-run reporting instead, and that left `train`, `tune`,
+/// `predict` and every library caller of `run_counts`/`expectation` with NO
+/// truncation gate — they never call the CLI's reporter. Measured: `aria train
+/// --backend mps:2` trained to completion on a state whose certificate was
+/// 4.375, optimizing an observable that was already wrong at step 0
+/// (`<O>` = -0.029 against -0.009 exact). Fixing one gate had removed another.
+pub fn set_mps_discard_ceiling(w: f64) {
+    MPS_DISCARD_CEILING.store(w.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The ceiling in force, defaulting to the backend's.
+pub fn mps_discard_ceiling() -> f64 {
+    let bits = MPS_DISCARD_CEILING.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 {
+        omega_backend_mps::DEFAULT_MAX_DISCARDED_WEIGHT
+    } else {
+        f64::from_bits(bits)
+    }
+}
+
 fn make_mps(chi: usize) -> MpsBackend {
-    // The backend's own discarded-weight ceiling is LIFTED here, and the policy
-    // lives in this CLI instead — `report_mps_truncation` applies
-    // `DEFAULT_MAX_DISCARDED_WEIGHT` by default and honours `--strict-truncation`
-    // when given.
-    //
-    // Without this, the backend refused at 1e-6 before the CLI's check ran, so
-    // `--strict-truncation 0.5` — the documented "I accept this much
-    // approximation" knob — could no longer accept anything. Measured:
-    // `--backend mps:2 --strict-truncation 0.5` errored at the backend's 1e-6
-    // instead of accepting a 3.156 discard.
-    //
-    // A second consequence: stats are recorded only on success, so a backend
-    // refusal also lost the certificate the CLI wanted to report.
-    let backend = MpsBackend::new(chi).with_max_discarded_weight(f64::INFINITY);
+    // Every MPS backend built in this crate carries the ceiling, so the gate
+    // applies on every path — run, train, tune, predict, and library callers —
+    // not only the one CLI subcommand that happens to report afterwards.
+    let backend = MpsBackend::new(chi).with_max_discarded_weight(mps_discard_ceiling());
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
     // Metal arm: the two-site θ-contraction runs on the GPU (SVD stays on CPU —
