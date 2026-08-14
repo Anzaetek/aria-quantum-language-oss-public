@@ -1,7 +1,37 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # PLAN — three admission defects in `omega-server`'s governor
 
-**Status: PLAN, not implemented, not yet adversarially reviewed.**
+**Status: IMPLEMENTED and reviewed.** The adversarial review confirmed all
+three defects, found **two more of the same class** that this plan missed (D1,
+D2 below), refuted the plan's proposed test observable, refuted its G3 option
+analysis, and corrected its severity call on G2. All of that is folded in
+below, marked, rather than quietly rewritten.
+
+**What the review changed, in one place:**
+
+* **D1 (missed, default build, and the plan's G1 fix would have IMPORTED it).**
+  `admit_batch`'s `max_by_key(estimate_peak_bytes(..).unwrap_or(u64::MAX))`
+  makes an **unpriceable** row *win*, and `Governor::admit` then reserves 0
+  bytes for an unpriceable-by-kind shape — deliberately, so the plugin path
+  works. Together they erase the price of everything else in the batch. This
+  plan said "reuse `admit_batch`", which would have carried it into
+  `/gradient`. Both are fixed together.
+* **D2 (missed, default build).** `/gradient` priced the row's *declared*
+  backend's cost kind but always executes the dense CPU adjoint, so a
+  `Stabilizer` row was priced as a tableau and a `Plugin` row at 1 MiB.
+* **The ceiling was checked on the winning row only**, so a 1-qubit unpriceable
+  row walked a wide dense row past `OMEGA_MAX_QUBITS`.
+* **The test observable proposed below was unreachable.** `governor()` is a
+  process-wide `OnceLock` with no setter or reset, and a `Reservation` drops
+  when the handler returns, so "assert the reserved amount" cannot be written.
+  The house pattern — a route-level test asserting `413` — is what these use.
+* **G3 had a cheaper correct option the plan missed**, and the plan's claim
+  that "unifying the lookups cannot fix it" was true only of unifying the
+  *lookup*. Unifying the **open attempt** does fix it. Implemented that way.
+* **G2's severity hedge was wrong in the opposite direction**: Apple Silicon
+  classifies HostOnly, not Unified, where G2's live symptom is *over*-refusal.
+
+Original plan follows, unedited except where marked.
 
 Three defects were filed against the admission path as requests without patches
 (G1, G2, G3 below; two of the three turn on where routing should live, which is

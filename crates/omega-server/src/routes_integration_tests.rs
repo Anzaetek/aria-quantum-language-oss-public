@@ -978,6 +978,141 @@ async fn quantum_expectation_prices_every_row_not_just_the_widest() {
 }
 
 #[tokio::test]
+async fn quantum_gradient_prices_every_row_not_just_the_first() {
+    // `/gradient` priced `circuits[0]` and then looped over the whole batch —
+    // the hole `admit_batch` was written to close, three functions above it.
+    // The expensive row is SECOND on purpose: first-row-widest is the one
+    // ordering under which the defect is invisible, and a caller has no reason
+    // to sort a batch.
+    //
+    // Symbolic params so admission is what refuses: the per-row symbol checks
+    // run inside the loop, after the reservation.
+    //
+    // Mutation-tested by pricing `&shapes[..1]` again: the test process is
+    // **SIGKILLed**. That is the defect demonstrating itself — row 0 admits the
+    // batch on a 2-qubit reservation and the adjoint then asks the allocator
+    // for 2 x 2^40 x 16 B. The refusal below is the whole point.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let cheap = serde_json::json!({
+        "num_qubits": 2, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": "Statevector",
+        "ops": [{"gate": "Ry", "qubits": [0], "params": [{"symbol": "t"}], "classical_bit": null, "condition": null}]
+    });
+    let wide = serde_json::json!({
+        "num_qubits": 40, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": "Statevector",
+        "ops": [{"gate": "Ry", "qubits": [0], "params": [{"symbol": "t"}], "classical_bit": null, "condition": null}]
+    });
+    let body = serde_json::json!({
+        "circuits": [cheap, wide], "observable": "Z0", "param_values": [["t", 0.3]]
+    })
+    .to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/gradient", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a 40-qubit adjoint in row 1 must be priced; pricing row 0 admits it on \
+         a 2-qubit reservation and then allocates forward + backward state"
+    );
+}
+
+#[tokio::test]
+async fn an_unpriceable_row_does_not_erase_the_price_of_the_batch() {
+    // `max_by_key(estimate_peak_bytes(..).unwrap_or(u64::MAX))` made an
+    // unpriceable row WIN, and `admit` reserves 0 bytes for an
+    // unpriceable-by-kind shape (deliberately — it is the plugin path). A
+    // 1-qubit plugin row therefore erased the price of a 40-qubit dense row
+    // beside it. No plugin need exist: `resolve_backend` returns the declared
+    // backend verbatim and existence is checked only at execution.
+    //
+    // The expensive row is PHOTONIC, not a wide dense register. A 40-qubit
+    // dense row would be refused by the qubit ceiling whatever the pricing
+    // does, so it cannot tell the two apart — measured: restoring the
+    // `unwrap_or(u64::MAX)` selection left such a test green. Photonic cost is
+    // combinatorial in photons and is explicitly NOT dense-driven, so the
+    // ceiling never fires and only the price can refuse it.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let photonic = serde_json::json!({
+        "num_qubits": 26, "num_classical_bits": 0, "is_photonic": true,
+        "mid_circuit_mode": "Skip", "backend": "Photonic",
+        "ops": [{"gate": "PhaseShifter", "qubits": [0], "params": [0.5], "classical_bit": null, "condition": null}]
+    });
+    let plugin = serde_json::json!({
+        "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": {"Plugin": {"name": "nonexistent"}},
+        "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+    });
+    let body = serde_json::json!({ "circuits": [photonic, plugin], "observable": "Z0" }).to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the photonic row must still be priced when an unpriceable row shares \
+         the batch; admitting here reserves ~1 MiB and then allocates hundreds \
+         of GB"
+    );
+}
+
+#[tokio::test]
+async fn the_qubit_ceiling_applies_to_every_row_of_a_batch() {
+    // `admit` checks the ceiling on the single shape it is handed, so it was
+    // enforced at the WINNING row's width. A 1-qubit unpriceable row winning
+    // selection walked a 40-qubit dense row past OMEGA_MAX_QUBITS.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let plugin = serde_json::json!({
+        "num_qubits": 1, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": {"Plugin": {"name": "nonexistent"}},
+        "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+    });
+    let very_wide = serde_json::json!({
+        "num_qubits": 60, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": "Statevector",
+        "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+    });
+    // Unpriceable row FIRST, so it is the one `admit` would have seen.
+    let body = serde_json::json!({ "circuits": [plugin, very_wide], "observable": "Z0" }).to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a 60-qubit dense row must be refused whatever else shares its batch"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_of_only_unpriceable_rows_is_still_admitted() {
+    // Guard the guard. The plugin path is unpriceable BY DESIGN and must keep
+    // working — a fix that refuses it would trade one defect for a worse one,
+    // which has happened here before.
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+    let plugin = serde_json::json!({
+        "num_qubits": 2, "num_classical_bits": 0, "is_photonic": false,
+        "mid_circuit_mode": "Skip", "backend": {"Plugin": {"name": "nonexistent"}},
+        "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
+    });
+    let body = serde_json::json!({ "circuits": [plugin], "observable": "Z0" }).to_string();
+    let resp = app
+        .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "admission must not refuse an unpriceable-by-design row; it should fail \
+         later, on the missing plugin, not at the governor"
+    );
+}
+
+#[tokio::test]
 async fn execute_pattern_is_admission_controlled() {
     // MBQC executed with NO admission at all: the simulator's state doubles per
     // activated vertex (omega-backend-photonics/src/mbqc.rs:148) and vertices /
