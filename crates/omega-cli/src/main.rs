@@ -142,6 +142,26 @@ fn parse_format(args: &[String]) -> Format {
 /// loading is **opt-in** — there is no implicit `~/.omega/backends` probe, so a
 /// mistyped `--backend NAME` never dlopens code the user didn't ask for.
 /// Missing directories are harmless — `load_dir` returns `Ok(0)` for them.
+/// Build an `MpsBackend` from a `--backend mps…` selector.
+///
+/// The grammar lives in `omega_backend_mps::select` — one parser, shared with
+/// the other front end, rather than a second copy that drifts. Before this,
+/// this binary matched the literal string `"mps"` and hardcoded chi=64 at six
+/// sites, so a user whose circuit needed a larger bond had no way to ask for
+/// one; after the truncation gate landed they got a refusal with no route to a
+/// correct answer.
+fn mps_backend_from(name: &str) -> Option<MpsBackend> {
+    match omega_backend_mps::select::parse_mps(name) {
+        Ok(Some(omega_backend_mps::select::MpsSelect::Fixed { chi })) => Some(MpsBackend::new(chi)),
+        Ok(Some(omega_backend_mps::select::MpsSelect::Auto { max_chi })) => {
+            Some(MpsBackend::new(max_chi).with_adaptive(omega_backend_mps::select::AUTO_EPS))
+        }
+        // A malformed selector (`mps:0`, `mps:banana`) is refused by the caller's
+        // unknown-backend path with the parser's own message.
+        _ => None,
+    }
+}
+
 fn build_plugin_registry(explicit_dirs: &[String]) -> omega_core::plugin::BackendRegistry {
     let mut registry = omega_core::plugin::BackendRegistry::new();
     let mut dirs: Vec<std::path::PathBuf> =
@@ -216,7 +236,16 @@ fn main() {
     // works without a circuit argument.
     if args.iter().any(|a| a == "--list-backends") {
         let registry = build_plugin_registry(&scan_backend_dirs(&args));
-        for name in ["statevector", "mps", "pauli", "pauliprop", "photonics"] {
+        for name in [
+            "statevector",
+            "mps",
+            "mps:<chi>",
+            "mps:auto",
+            "mps:auto:<ceiling>",
+            "pauli",
+            "pauliprop",
+            "photonics",
+        ] {
             println!("builtin  {name}");
         }
         for name in registry.list() {
@@ -583,8 +612,8 @@ fn main() {
                 &functional,
                 &method,
             ),
-            "mps" => compute_functional_gradient(
-                &MpsBackend::new(64),
+            m if omega_backend_mps::select::is_mps(m) => compute_functional_gradient(
+                &mps_backend_from(m).expect("is_mps implies parse_mps"),
                 &circuit,
                 &params,
                 &functional,
@@ -763,8 +792,8 @@ fn main() {
                     )
                 }
             }
-            "mps" => compute_gradient(
-                &MpsBackend::new(64),
+            m if omega_backend_mps::select::is_mps(m) => compute_gradient(
+                &mps_backend_from(m).expect("is_mps implies parse_mps"),
                 &circuit,
                 &params,
                 &observable,
@@ -839,7 +868,9 @@ fn main() {
             "statevector" | "sv" => {
                 StatevectorBackend::new().expectation(&circuit, &params, &observable)
             }
-            "mps" => MpsBackend::new(64).expectation(&circuit, &params, &observable),
+            m if omega_backend_mps::select::is_mps(m) => mps_backend_from(m)
+                .expect("is_mps implies parse_mps")
+                .expectation(&circuit, &params, &observable),
             "pauliprop" | "pp" => {
                 let backend = match &exp_noise {
                     Some(model) => PauliPropBackend::new().with_noise(model.clone()),
@@ -901,7 +932,11 @@ fn main() {
     // — a user who passed `--noise` would believe they measured a noisy circuit
     // when they did not. Fail loudly instead of dropping the model on the floor.
     // (pauliprop applies noise to `--expectation`, handled in that mode above.)
-    if noise_model.is_some() && !matches!(chosen, "statevector" | "sv" | "mps") {
+    // `is_mps`, not `== "mps"`: writing the literal here would spuriously
+    // reject `--backend mps:512 --noise …`.
+    if noise_model.is_some()
+        && !(matches!(chosen, "statevector" | "sv") || omega_backend_mps::select::is_mps(chosen))
+    {
         eprintln!(
             "--noise sampling is supported on --backend statevector or mps (got '{chosen}'); \
              this backend cannot apply a noise model to sampled counts. Re-run with \
@@ -1089,15 +1124,23 @@ fn main() {
                     StatevectorBackend::new().execute(&circuit, &params, &config)
                 }
             }
-            "mps" => {
+            m if omega_backend_mps::select::is_mps(m) => {
                 if let Some(model) = &noise_model {
                     info(format!("Noise model: {:?}", model));
-                    omega_backend_mps::NoisyMpsBackend::with_model(64, model.clone())
+                    omega_backend_mps::NoisyMpsBackend::with_model(
+                        match omega_backend_mps::select::parse_mps(chosen) {
+                            Ok(Some(omega_backend_mps::select::MpsSelect::Fixed { chi })) => chi,
+                            Ok(Some(omega_backend_mps::select::MpsSelect::Auto { max_chi })) => max_chi,
+                            _ => omega_backend_mps::select::DEFAULT_CHI,
+                        },
+                        model.clone(),
+                    )
                         .execute(&circuit, &params, &config)
                 } else {
                     // Hold the concrete backend so its truncation certificate
                     // can be reported to stderr (stdout/exit unchanged — K14).
-                    let backend = MpsBackend::new(64);
+                    let backend = mps_backend_from(chosen)
+                        .expect("dispatch arm is guarded by is_mps");
                     let r = backend.execute(&circuit, &params, &config);
                     let stats = backend.last_run_stats();
                     // Report REAL truncation only; a ~1e-28 rounding tail isn't
@@ -1162,8 +1205,8 @@ fn main() {
                         format!(" Plugins: {}.", plugins.join(", "))
                     };
                     eprintln!(
-                        "Unknown backend: {}. Builtins: statevector, mps, pauli, pauliprop, \
-                         photonics.{}",
+                        "Unknown backend: {}. Builtins: statevector, mps, mps:<chi>, \
+                         mps:auto, mps:auto:<ceiling>, pauli, pauliprop, photonics.{}",
                         other, plugin_note
                     );
                     std::process::exit(1);
