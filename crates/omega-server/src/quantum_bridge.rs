@@ -338,6 +338,22 @@ fn exec_target_for(sel: &OmegaBackendSel) -> crate::worker::ExecTarget {
     {
         if matches!(sel, OmegaBackendSel::Statevector | OmegaBackendSel::Auto)
             && opencl_statevector_available()
+            // Only claim the device pool if there IS one. Device pools come
+            // from `nvidia-smi` alone (`topology.rs`), so on AMD, Intel or
+            // Apple OpenCL — the main reasons to run this feature — the probe
+            // finds no devices, the machine classifies `HostOnly`, and
+            // `admit` fails closed on "no memory budget for the requested
+            // device". That refusal is right for a DISCRETE card with no
+            // budget (it is how a 64 GB job reaches a 24 GB card) and wrong
+            // here, where there is no separate device memory to protect: it
+            // 413'd every Statevector request on hardware where OpenCL works.
+            //
+            // Falling back to `Cpu` prices the same single physical pool at
+            // 16 B/amplitude rather than the device's 8, so it over-prices —
+            // the safe direction, and the only one available without a device
+            // budget to debit.
+            && crate::worker::governor()
+                .has_pool_for(crate::worker::ExecTarget::Device(0))
         {
             return crate::worker::ExecTarget::Device(0);
         }
