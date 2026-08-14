@@ -211,6 +211,26 @@ impl MpsBackend {
         let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
 
         for op in &circuit.ops {
+            // Abort as soon as the truncation certificate passes the ceiling,
+            // rather than after the whole circuit.
+            //
+            // The check ran only once, after evolution finished — so a run that
+            // was already unusable at split 3 still paid for all 1555 of them:
+            // ~43 s of compute, then the refusal, and on the per-shot path that
+            // cost was per shot. The certificate is monotonically non-decreasing
+            // (each split adds a non-negative term), so stopping at the first
+            // crossing changes nothing about WHICH runs are refused — only how
+            // long they take to say so.
+            if mps.discarded_weight > self.max_discarded_weight {
+                return Err(OmegaError::Unsupported(format!(
+                    "MPS truncation certificate {:.3e} exceeded the ceiling {:.3e} partway \
+                     through the circuit (bond reached {}); stopped there rather than \
+                     finishing a run whose result would be refused. Raise the bond \
+                     dimension (`--backend mps:<chi>`), or call \
+                     `with_max_discarded_weight` to accept an approximation deliberately.",
+                    mps.discarded_weight, self.max_discarded_weight, mps.max_bond_reached
+                )));
+            }
             if !op.condition_satisfied(&classical_bits) {
                 continue;
             }
@@ -576,6 +596,26 @@ impl NoisyMpsBackend {
         let mut classical_bits = vec![0u8; circuit.num_classical_bits as usize];
 
         for op in &circuit.ops {
+            // Abort as soon as the truncation certificate passes the ceiling,
+            // rather than after the whole circuit.
+            //
+            // The check ran only once, after evolution finished — so a run that
+            // was already unusable at split 3 still paid for all 1555 of them:
+            // ~43 s of compute, then the refusal, and on the per-shot path that
+            // cost was per shot. The certificate is monotonically non-decreasing
+            // (each split adds a non-negative term), so stopping at the first
+            // crossing changes nothing about WHICH runs are refused — only how
+            // long they take to say so.
+            if mps.discarded_weight > self.max_discarded_weight {
+                return Err(OmegaError::Unsupported(format!(
+                    "MPS truncation certificate {:.3e} exceeded the ceiling {:.3e} partway \
+                     through the circuit (bond reached {}); stopped there rather than \
+                     finishing a run whose result would be refused. Raise the bond \
+                     dimension (`--backend mps:<chi>`), or call \
+                     `with_max_discarded_weight` to accept an approximation deliberately.",
+                    mps.discarded_weight, self.max_discarded_weight, mps.max_bond_reached
+                )));
+            }
             if !op.condition_satisfied(&classical_bits) {
                 continue;
             }
