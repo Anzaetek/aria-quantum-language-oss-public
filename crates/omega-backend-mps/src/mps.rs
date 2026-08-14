@@ -528,7 +528,40 @@ impl Mps {
 
     /// Sample a measurement outcome using precomputed right environments
     /// (see [`Mps::right_environments`]).
+    /// Sample a shot, packing **only the measured qubits** into the key.
+    ///
+    /// `cbit_of[q]` is `Some(c)` when qubit `q` is measured into classical bit
+    /// `c`, and `None` otherwise. The walk over the chain is identical to
+    /// [`Self::sample_with_envs`] — every qubit is still sampled, because each
+    /// outcome conditions the ones after it — but the returned key carries the
+    /// measured bits at their classical positions.
+    ///
+    /// # Why this exists
+    ///
+    /// `sample_with_envs` builds its key with `result |= bit << q` over all `n`
+    /// qubits, which cannot represent more than 64 and shifts out of range above
+    /// that. So a 1024-qubit circuit measuring two qubits was refused, though
+    /// its outcome is two bits wide. Keying on the classical register is also
+    /// what qiskit reports over, which is what makes the two comparable.
+    pub fn sample_with_envs_projected(
+        &self,
+        envs: &[Vec<Complex64>],
+        rng: &mut impl rand::Rng,
+        cbit_of: &[Option<u32>],
+    ) -> u64 {
+        self.sample_inner(envs, rng, Some(cbit_of))
+    }
+
     pub fn sample_with_envs(&self, envs: &[Vec<Complex64>], rng: &mut impl rand::Rng) -> u64 {
+        self.sample_inner(envs, rng, None)
+    }
+
+    fn sample_inner(
+        &self,
+        envs: &[Vec<Complex64>],
+        rng: &mut impl rand::Rng,
+        cbit_of: Option<&[Option<u32>]>,
+    ) -> u64 {
         let zero = Complex64::new(0.0, 0.0);
         let mut result = 0u64;
         let mut left_vec = vec![Complex64::new(1.0, 0.0)];
@@ -567,7 +600,17 @@ impl Mps {
             } else {
                 1usize
             };
-            result |= (bit as u64) << q;
+            // Where the bit lands: at its classical index when projecting,
+            // otherwise at the qubit index. `None` means "not measured", so the
+            // bit is sampled (it conditions later sites) but not reported.
+            match cbit_of {
+                Some(map) => {
+                    if let Some(Some(c)) = map.get(q) {
+                        result |= (bit as u64) << *c;
+                    }
+                }
+                None => result |= (bit as u64) << q,
+            }
 
             // Condition on the outcome; rescale so the running prefix
             // stays O(1) (only probability *ratios* matter downstream).

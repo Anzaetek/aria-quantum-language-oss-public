@@ -309,8 +309,15 @@ impl Backend for MpsBackend {
         // circuit, and refused in EVERY backend that can exceed 64 qubits
         // because this is a property of the result type, not of any simulator.
         if config.shots.is_some() {
+            // Above the cliff a measured circuit is keyed on the creg (see the
+            // sampling path below), so the width follows the creg in that case
+            // too — not only in collapse mode.
+            let keyed_on_creg = omega_core::executor::counts_keyed_on_creg(
+                circuit,
+                by_creg || circuit_has_reset(circuit),
+            );
             omega_core::executor::check_counts_width(
-                omega_core::executor::counts_outcome_width(circuit, by_creg || circuit_has_reset(circuit)),
+                omega_core::executor::counts_outcome_width(circuit, keyed_on_creg),
             )?;
         }
 
@@ -356,9 +363,34 @@ impl Backend for MpsBackend {
                 // the outcomes drawn — compute once, reuse for every shot.
                 let envs = mps.right_environments();
                 let mut counts = HashMap::new();
-                for _ in 0..shots {
-                    let outcome = mps.sample_with_envs(&envs, &mut rng);
-                    *counts.entry(outcome).or_insert(0) += 1;
+                // Above 64 qubits the full-register key does not exist — the
+                // shift `bit << q` runs out of range — so a wide circuit
+                // measuring a narrow register is keyed on the CLASSICAL
+                // register instead. That is the outcome the user asked for, it
+                // is what qiskit reports over, and it is the difference between
+                // a 1024-qubit run working and being refused.
+                //
+                // Applied ONLY above the cliff, deliberately: at or below 64
+                // qubits the existing full-register key is unchanged, so no
+                // result any caller already relies on moves.
+                let pairs = omega_core::executor::measure_pairs(circuit);
+                // Same predicate the guard used — `collapse: false`, because
+                // this is the skip path.
+                let project = omega_core::executor::counts_keyed_on_creg(circuit, false);
+                if project {
+                    let mut cbit_of = vec![None; circuit.num_qubits as usize];
+                    for &(q, c) in &pairs {
+                        cbit_of[q as usize] = Some(c);
+                    }
+                    for _ in 0..shots {
+                        let outcome = mps.sample_with_envs_projected(&envs, &mut rng, &cbit_of);
+                        *counts.entry(outcome).or_insert(0) += 1;
+                    }
+                } else {
+                    for _ in 0..shots {
+                        let outcome = mps.sample_with_envs(&envs, &mut rng);
+                        *counts.entry(outcome).or_insert(0) += 1;
+                    }
                 }
                 Ok(ExecResult::Counts(counts))
             }
