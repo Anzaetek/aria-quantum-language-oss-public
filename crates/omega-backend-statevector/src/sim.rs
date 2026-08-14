@@ -84,7 +84,9 @@ impl Backend for StatevectorBackend {
         // circuit, and refused in EVERY backend that can exceed 64 qubits
         // because this is a property of the result type, not of any simulator.
         if config.shots.is_some() {
-            omega_core::executor::check_counts_width(circuit.num_qubits as usize)?;
+            omega_core::executor::check_counts_width(
+                omega_core::executor::counts_outcome_width(circuit, collapses(circuit, config)),
+            )?;
         }
 
         if let (true, Some(shots)) = (stochastic_evolution(circuit, config), config.shots) {

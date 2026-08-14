@@ -440,6 +440,16 @@ fn main() {
     };
 
     let num_modes = circuit.num_qubits;
+    // Width to RENDER a counts key at. Not always `num_qubits`: in collapse mode
+    // the key is packed from the CLASSICAL register, so a 1024-qubit circuit
+    // measuring two qubits produces a 2-bit outcome — which was being printed
+    // padded to 1024 characters. A key that is correct internally and displayed
+    // at the wrong width is still wrong to the reader, and no type error catches
+    // it.
+    let counts_display_width = omega_core::executor::counts_outcome_width(
+        &circuit,
+        omega_core::executor::needs_collapse(&circuit),
+    ) as u32;
     info(format!(
         "Circuit: {} {}, {} ops, type: {:?}",
         num_modes,
@@ -1246,13 +1256,17 @@ fn main() {
 
     match format {
         Format::Json => {
-            let v =
-                serialize::exec_result_to_json(&result, num_modes, shots, &circuit.circuit_type);
+            let v = serialize::exec_result_to_json(
+                &result,
+                counts_display_width,
+                shots,
+                &circuit.circuit_type,
+            );
             println!("{}", v);
         }
         Format::Jsonl => match &result {
             omega_core::executor::ExecResult::Counts(counts) => {
-                serialize::emit_jsonl_counts(counts, num_modes, &circuit.circuit_type);
+                serialize::emit_jsonl_counts(counts, counts_display_width, &circuit.circuit_type);
             }
             other => {
                 // Non-counts results don't decompose into per-shot lines; emit a single JSON doc.
@@ -1276,11 +1290,11 @@ fn main() {
                             println!("{}: {}", fock, count);
                         }
                     } else {
-                        println!("{}", result.format_counts(num_modes));
+                        println!("{}", result.format_counts(counts_display_width));
                     }
                 }
                 _ => {
-                    println!("{}", result.format_counts(num_modes));
+                    println!("{}", result.format_counts(counts_display_width));
                 }
             }
         }

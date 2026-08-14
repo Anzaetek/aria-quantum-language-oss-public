@@ -309,7 +309,9 @@ impl Backend for MpsBackend {
         // circuit, and refused in EVERY backend that can exceed 64 qubits
         // because this is a property of the result type, not of any simulator.
         if config.shots.is_some() {
-            omega_core::executor::check_counts_width(circuit.num_qubits as usize)?;
+            omega_core::executor::check_counts_width(
+                omega_core::executor::counts_outcome_width(circuit, by_creg || circuit_has_reset(circuit)),
+            )?;
         }
 
         if let (true, Some(shots)) = (by_creg || circuit_has_reset(circuit), config.shots) {
