@@ -9,6 +9,18 @@ use aria_core::ast::{parse_aria, Circuit};
 use aria_runtime::{expectation, run_counts, statevector, BackendSel};
 use num_complex::Complex64;
 
+/// Probe key `k` at the width the counts actually carry.
+///
+/// Outcomes carry their own width now, so `map.get(&0b11)` no longer type-checks
+/// and — more to the point — 0b11 at width 2 is a different key from 0b11 at
+/// width 4. Reading the width off the map keeps these assertions about the
+/// VALUE rather than about a width the test guessed.
+fn probe(map: &std::collections::HashMap<omega_core::outcome::Outcome, u32>, k: u64) -> u32 {
+    let w = map.keys().next().map(|o| o.width()).unwrap_or(0);
+    *map.get(&omega_core::outcome::Outcome::from_u64(k, w))
+        .unwrap_or(&0)
+}
+
 const SIM: BackendSel = BackendSel::Sim;
 const TOL: f64 = 1e-10;
 
@@ -68,8 +80,8 @@ fn bell_counts_are_balanced_and_correlated() {
     if let omega_core::executor::ExecResult::Counts(map) = res {
         let total: u64 = map.values().map(|&v| v as u64).sum();
         assert_eq!(total, 8192);
-        let n00 = *map.get(&0b00).unwrap_or(&0) as f64;
-        let n11 = *map.get(&0b11).unwrap_or(&0) as f64;
+        let n00 = probe(&map, 0b00) as f64;
+        let n11 = probe(&map, 0b11) as f64;
         assert_eq!(n00 + n11, 8192.0, "no |01>/|10> outcomes for a Bell state");
         assert!((n00 / 8192.0 - 0.5).abs() < 0.05, "P(00)={}", n00 / 8192.0);
         assert!((n11 / 8192.0 - 0.5).abs() < 0.05, "P(11)={}", n11 / 8192.0);
@@ -116,8 +128,8 @@ fn mps_backend_agrees_with_sim_on_bell() {
     let c = example("bell.aria", "Bell", &[]);
     let res = run_counts(&c, &no_binds(), 8192, Some(2), BackendSel::Mps { chi: 64 }).unwrap();
     if let omega_core::executor::ExecResult::Counts(map) = res {
-        let n00 = *map.get(&0b00).unwrap_or(&0) as f64;
-        let n11 = *map.get(&0b11).unwrap_or(&0) as f64;
+        let n00 = probe(&map, 0b00) as f64;
+        let n11 = probe(&map, 0b11) as f64;
         assert_eq!(n00 + n11, 8192.0, "MPS Bell produced |01>/|10> outcomes");
         assert!((n00 / 8192.0 - 0.5).abs() < 0.05);
     } else {
@@ -140,11 +152,11 @@ fn partial_measurement_counts_are_keyed_over_creg() {
             let total: u64 = map.values().map(|&v| v as u64).sum();
             assert_eq!(total, 8192);
             assert!(
-                map.keys().all(|&k| k <= 1),
+                map.keys().all(|o| o.as_u64().unwrap_or(u64::MAX) <= 1),
                 "{}: expected creg-width outcomes, got {map:?}",
                 sel.name()
             );
-            let p1 = *map.get(&1).unwrap_or(&0) as f64 / 8192.0;
+            let p1 = probe(&map, 1) as f64 / 8192.0;
             assert!(
                 (p1 - 0.2).abs() < 0.02,
                 "{}: P(|1>) = {p1}, expected 0.20",
@@ -168,9 +180,9 @@ fn counts_width_agrees_with_projection_for_symbolic_params() {
     assert_eq!(aria_runtime::counts_width(&c, &binds), 1);
     let res = run_counts(&c, &binds, 4096, Some(5), SIM).unwrap();
     if let omega_core::executor::ExecResult::Counts(map) = res {
-        assert!(map.keys().all(|&k| k <= 1), "creg-width keys, got {map:?}");
+        assert!(map.keys().all(|o| o.as_u64().unwrap_or(u64::MAX) <= 1), "creg-width keys, got {map:?}");
         // P(|1>) = sin²(sin(2)/2) ≈ 0.1935
-        let p1 = *map.get(&1).unwrap_or(&0) as f64 / 4096.0;
+        let p1 = probe(&map, 1) as f64 / 4096.0;
         let expect = (2.0f64.sin() / 2.0).sin().powi(2);
         assert!(
             (p1 - expect).abs() < 0.03,
@@ -181,14 +193,42 @@ fn counts_width_agrees_with_projection_for_symbolic_params() {
     }
 }
 
+/// **Measuring into classical bit 64 works.**
+///
+/// This test used to assert the opposite — that projecting onto creg bit 64
+/// must be a loud error, because counts keys were `u64` and the shift would
+/// either panic in debug or silently mask the key in release. Refusing was the
+/// right answer for a `u64` key and the wrong answer in general: bit 64 is an
+/// ordinary bit of an ordinary register.
+///
+/// The key is an `Outcome` now, so the two outcomes appear at their real
+/// positions. Note the fixture: `H` on a single qubit measured into c[64] means
+/// the ONLY difference between the two keys is bit 64 — the exact bit the old
+/// representation could not hold. Under truncation both collapse to all-zeros
+/// and the histogram has one entry.
 #[test]
-fn measure_into_clbit_64_or_higher_is_a_loud_error() {
-    // Counts keys are u64: projecting onto creg bit 64 must error, not
-    // overflow the shift (debug panic / silently masked key in release).
+fn measure_into_clbit_64_or_higher_is_supported() {
     let src = "circuit Wide() {\n  qreg q[1]\n  creg c[65]\n  apply H on q[0]\n  measure q[0] -> c[64]\n}\n";
     let c = inline(src, "Wide");
-    let err = run_counts(&c, &no_binds(), 16, Some(1), SIM).unwrap_err();
-    assert!(err.contains("64"), "error should name the bad index: {err}");
+    let res = run_counts(&c, &no_binds(), 64, Some(1), SIM).expect("bit 64 is representable");
+    let omega_core::executor::ExecResult::Counts(map) = res else {
+        panic!("expected counts")
+    };
+    let mut keys: Vec<String> = map.keys().map(|o| o.to_bitstring()).collect();
+    keys.sort();
+    let zeros = "0".repeat(65);
+    let mut one = vec![b'0'; 65];
+    one[0] = b'1'; // MSB-first: bit 64 is the leftmost of 65
+    let one = String::from_utf8(one).unwrap();
+    assert_eq!(
+        keys,
+        vec![zeros, one],
+        "the two outcomes differ ONLY at bit 64; one entry here means the key \
+         was truncated to 64 bits and they collapsed together"
+    );
+    for o in map.keys() {
+        assert_eq!(o.width(), 65, "the creg is 65 bits wide");
+    }
 }
 
 #[test]
@@ -201,7 +241,7 @@ fn permuted_measure_targets_follow_the_mapping() {
     if let omega_core::executor::ExecResult::Counts(map) = res {
         let p = |mask: u64| {
             map.iter()
-                .filter(|(k, _)| *k & mask != 0)
+                .filter(|(k, _)| k.as_u64().unwrap_or(0) & mask != 0)
                 .map(|(_, &v)| v as f64)
                 .sum::<f64>()
                 / 8192.0

@@ -365,11 +365,21 @@ fn execute_report_native(
                 .execute_with_shots(cid, params, shots, Some(42))
                 .map_err(|e| e.to_string())?;
             let mut sorted: Vec<_> = counts.into_iter().collect();
-            sorted.sort_by_key(|&(k, _)| k);
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
             let mut payload = Vec::with_capacity(sorted.len() * 2);
             for (bits, c) in &sorted {
-                payload.push(*bits as f64);
-                payload.push(*c as f64);
+                // f64 payload, so a >64-qubit outcome cannot cross this
+                // boundary; skipped and reported rather than truncated.
+                match bits.as_u64() {
+                    Some(k) => {
+                        payload.push(k as f64);
+                        payload.push(*c as f64);
+                    }
+                    None => eprintln!(
+                        "harness: dropping a {}-qubit outcome; the payload is f64",
+                        bits.width()
+                    ),
+                }
             }
             Ok((payload, sorted.len() as f64))
         }

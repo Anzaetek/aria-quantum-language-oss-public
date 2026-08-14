@@ -284,14 +284,14 @@ struct RankedSample {
 
 fn rank_samples(
     qubo: &Qubo,
-    counts: &HashMap<u64, u32>,
+    counts: &HashMap<omega_core::outcome::Outcome, u32>,
     shots: u32,
     top_k: usize,
 ) -> Vec<RankedSample> {
     let mut items: Vec<RankedSample> = counts
         .iter()
-        .map(|(&key, &count)| {
-            let x: Vec<bool> = (0..qubo.n).map(|i| (key >> i) & 1 == 1).collect();
+        .map(|(key, &count)| {
+            let x: Vec<bool> = (0..qubo.n).map(|i| key.bit(i as u32) == 1).collect();
             RankedSample {
                 bits: bits_vec_to_string(&x),
                 value: qubo.evaluate(&x),
@@ -551,10 +551,10 @@ mod tests {
         //   |00> = bits 0 → f = 0
         //   |10> = bits 1 → f = -1
         //   |01> = bits 2 → f = -1
-        let mut counts: HashMap<u64, u32> = HashMap::new();
-        counts.insert(0, 100);
-        counts.insert(1, 200);
-        counts.insert(2, 200);
+        let mut counts: HashMap<omega_core::outcome::Outcome, u32> = HashMap::new();
+        counts.insert(omega_core::outcome::Outcome::from_u64(0, 2), 100);
+        counts.insert(omega_core::outcome::Outcome::from_u64(1, 2), 200);
+        counts.insert(omega_core::outcome::Outcome::from_u64(2, 2), 200);
 
         let ranked = rank_samples(&q, &counts, 500, 5);
         // Lowest value first; ties broken by higher count, then bits lex.
@@ -571,9 +571,9 @@ mod tests {
     #[test]
     fn rank_samples_truncates_to_top_k() {
         let q = Qubo::new(2);
-        let mut counts: HashMap<u64, u32> = HashMap::new();
+        let mut counts: HashMap<omega_core::outcome::Outcome, u32> = HashMap::new();
         for bits in 0..4 {
-            counts.insert(bits, 25);
+            counts.insert(omega_core::outcome::Outcome::from_u64(bits, 2), 25);
         }
         let ranked = rank_samples(&q, &counts, 100, 2);
         assert_eq!(ranked.len(), 2);

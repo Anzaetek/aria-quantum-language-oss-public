@@ -35,7 +35,7 @@ fn src(n: usize) -> String {
     s
 }
 
-fn counts(ir: &omega_core::circuit::CircuitIR, seed: u64) -> HashMap<u64, u32> {
+fn counts(ir: &omega_core::circuit::CircuitIR, seed: u64) -> HashMap<omega_core::outcome::Outcome, u32> {
     let cfg = ExecConfig {
         shots: Some(4000),
         seed: Some(seed),
@@ -61,9 +61,11 @@ fn the_projected_marginal_is_the_bell_distribution() {
 
     // Below the cliff the key is the full register; marginalise by hand onto
     // the two measured qubits, which is what the projection does above it.
+    // Marginalise onto qubits 0 and 1 — the two the circuit measures.
     let mut marginal: HashMap<u64, u32> = HashMap::new();
     for (k, v) in &full {
-        *marginal.entry(k & 0b11).or_insert(0) += v;
+        let two = (k.bit(0) as u64) | ((k.bit(1) as u64) << 1);
+        *marginal.entry(two).or_insert(0) += v;
     }
     let total: u32 = marginal.values().sum();
     assert_eq!(total, 4000);
@@ -102,7 +104,7 @@ fn unmeasured_qubits_do_not_reach_the_key() {
     // Below the cliff the FULL key is still used, so this documents the
     // pre-cliff behaviour the projection deliberately does not change.
     assert!(
-        full.keys().any(|k| k >> 2 != 0),
+        full.keys().any(|k| (2..k.width()).any(|i| k.bit(i) == 1)),
         "below 64 qubits the full register is still reported — if this fails, the \
          projection was applied where it should not be, changing existing results"
     );
@@ -152,9 +154,9 @@ fn stabilizer_projected_counts_are_the_bell_distribution() {
         };
         for (k, v) in &c {
             total += v;
-            match k {
-                0b00 => zeros += v,
-                0b11 => {}
+            match k.as_u64() {
+                Some(0b00) => zeros += v,
+                Some(0b11) => {}
                 // Anything else is not a Bell outcome. This is the assertion
                 // that a mis-projection fails: taking the wrong qubits still
                 // yields two-bit keys, but not these two.
@@ -268,9 +270,9 @@ fn mps_projected_counts_above_the_cliff_are_anticorrelated() {
         };
         for (k, v) in &c {
             total += v;
-            match k {
-                0b01 => n01 += v,
-                0b10 => n10 += v,
+            match k.as_u64() {
+                Some(0b01) => n01 += v,
+                Some(0b10) => n10 += v,
                 _ => other += v,
             }
         }
@@ -322,8 +324,8 @@ fn mps_reset_circuit_above_the_cliff_is_also_projected() {
         ExecResult::Counts(c) => c,
         o => panic!("{o:?}"),
     };
-    let bad: Vec<u64> = c.keys().copied().filter(|k| *k != 0b01 && *k != 0b10).collect();
-    let n01 = *c.get(&0b01).unwrap_or(&0);
+    let bad: Vec<String> = c.keys().filter(|o| o.as_u64() != Some(0b01) && o.as_u64() != Some(0b10)).map(|o| o.to_bitstring()).collect();
+    let n01 = *c.get(&omega_core::outcome::Outcome::from_u64(0b01, 2)).unwrap_or(&0);
     assert!(
         bad.is_empty(),
         "reset path emitted keys outside the 2-bit creg's anti-correlated \
@@ -364,14 +366,14 @@ fn the_wide_fixture_would_expose_an_identity_map() {
     // Full-register keys here. q10 and q11 must agree in every single shot...
     for k in c.keys() {
         assert_ne!(
-            (k >> 10) & 1,
-            (k >> 11) & 1,
+            k.bit(10),
+            k.bit(11),
             "fixture no longer anti-correlates the reported pair"
         );
     }
     // ...and q0, which an identity map would report instead, must take BOTH
     // values, so reading it in place of the pair is detectable.
-    let q0: std::collections::HashSet<u64> = c.keys().map(|k| k & 1).collect();
+    let q0: std::collections::HashSet<u8> = c.keys().map(|k| k.bit(0)).collect();
     assert_eq!(
         q0.len(),
         2,
@@ -398,7 +400,7 @@ fn the_wide_fixture_would_expose_an_identity_map() {
 // backend above the cliff, which is why a guard-only fix looked complete.
 // ---------------------------------------------------------------------------
 
-fn noisy_counts(src: &str, shots: u32, seed: u64) -> HashMap<u64, u32> {
+fn noisy_counts(src: &str, shots: u32, seed: u64) -> HashMap<omega_core::outcome::Outcome, u32> {
     use omega_backend_mps::NoisyMpsBackend;
     use omega_core::noise::{NoiseModel, ReadoutError};
 
@@ -433,7 +435,11 @@ fn noisy_counts(src: &str, shots: u32, seed: u64) -> HashMap<u64, u32> {
 fn the_noisy_backend_projects_above_the_cliff() {
     let c = noisy_counts(&wide_src(70), 400, 5);
 
-    let too_wide: Vec<u64> = c.keys().copied().filter(|k| *k > 0b11).collect();
+    let too_wide: Vec<String> = c
+        .keys()
+        .filter(|o| o.as_u64().unwrap_or(u64::MAX) > 0b11)
+        .map(|o| o.to_bitstring())
+        .collect();
     assert!(
         too_wide.is_empty(),
         "keys outside the 2-bit creg: {too_wide:?} — the guard admitted this run \
@@ -441,7 +447,7 @@ fn the_noisy_backend_projects_above_the_cliff() {
     );
     let total: u32 = c.values().sum();
     assert_eq!(total, 400);
-    let n01 = *c.get(&0b01).unwrap_or(&0) as f64 / total as f64;
+    let n01 = *c.get(&omega_core::outcome::Outcome::from_u64(0b01, 2)).unwrap_or(&0) as f64 / total as f64;
     // 0.85 ideal, softened by 2% readout on each of the two reported bits.
     assert!(
         n01 > 0.70,
@@ -462,13 +468,22 @@ fn a_qubit_above_the_cliff_does_not_alias_into_a_low_bit() {
     let src = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[70];\ncreg c[1];\n\
                x q[65];\nmeasure q[65] -> c[0];\n";
     let c = noisy_counts(src, 200, 9);
-    let bad: Vec<u64> = c.keys().copied().filter(|k| *k > 1).collect();
+    let bad: Vec<String> = c
+        .keys()
+        .filter(|o| o.as_u64().unwrap_or(u64::MAX) > 1)
+        .map(|o| o.to_bitstring())
+        .collect();
     assert!(
         bad.is_empty(),
         "a 1-bit creg produced {bad:?}. A key of 2 is bit 65 aliased to bit 1 by \
          a masked shift"
     );
-    let ones = *c.get(&1).unwrap_or(&0);
+    // Width 1: the creg is one bit. Probing at width 2 finds nothing and
+    // reports 0, which reads as "the fix is broken" when it is the probe that
+    // is — Outcome equality includes the width, deliberately.
+    let ones = *c
+        .get(&omega_core::outcome::Outcome::from_u64(1, 1))
+        .unwrap_or(&0);
     assert!(
         ones > 180,
         "q65 is |1>, so ~98% of 200 shots should read 1 at 2% readout error; got \

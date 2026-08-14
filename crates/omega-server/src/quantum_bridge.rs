@@ -710,11 +710,23 @@ fn counts_render_width(ir: &OmegaCircuitIR) -> u32 {
 fn exec_result_to_json(result: &ExecResult, counts_width: u32) -> serde_json::Value {
     match result {
         ExecResult::Counts(counts) => {
+            // The width now comes from the KEY. `counts_width` is kept only to
+            // check the caller against the data: a route that computes a width
+            // disagreeing with what the backend produced is a bug worth seeing,
+            // and it is exactly the disagreement that printed a 2-bit outcome
+            // at 20 characters.
+            debug_assert!(
+                counts.is_empty() || counts.keys().all(|o| o.width() == counts_width),
+                "route computed width {counts_width} but the outcomes are {:?} wide",
+                counts.keys().map(|o| o.width()).collect::<std::collections::BTreeSet<_>>()
+            );
             let map: std::collections::HashMap<String, u32> = counts
                 .iter()
                 .map(|(bs, ct)| {
                     (
-                        format!("{:0>width$b}", bs, width = counts_width as usize),
+                        // The key carries its own width now; padding to a
+                        // caller-supplied one is the defect this replaces.
+                        bs.to_bitstring(),
                         *ct,
                     )
                 })

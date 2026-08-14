@@ -136,7 +136,7 @@ impl HostState {
         params: &[f64],
         shots: u32,
         seed: Option<u64>,
-    ) -> Result<HashMap<u64, u32>> {
+    ) -> Result<HashMap<omega_core::outcome::Outcome, u32>> {
         let circuit = self.circuits.get(&circuit_id).ok_or_else(|| {
             omega_core::error::OmegaError::InvalidCircuit(format!(
                 "circuit {} not found",
@@ -226,8 +226,10 @@ impl HostState {
         let result = backend.execute(circuit, &binding, &config)?;
         let creg_value: u64 = match result {
             // Collapse-mode counts are keyed by creg state (see
-            // `crates/omega-backend-statevector/src/sim.rs`).
-            ExecResult::Counts(c) => c.keys().copied().next().unwrap_or(0),
+            // `crates/omega-backend-statevector/src/sim.rs`). This host reads
+            // the creg into a u64, so a register wider than 64 bits cannot be
+            // reported here — `as_u64` returns None rather than truncating.
+            ExecResult::Counts(c) => c.keys().next().and_then(|o| o.as_u64()).unwrap_or(0),
             _ => 0,
         };
         let n = circuit.num_classical_bits as usize;
@@ -432,8 +434,9 @@ mod tests {
         let cid = state.register_circuit(make_bell_circuit());
         let counts = state.execute_with_shots(cid, &[], 1000, Some(42)).unwrap();
         // Bell state: only |00⟩ and |11⟩
-        let c00 = counts.get(&0).copied().unwrap_or(0);
-        let c11 = counts.get(&3).copied().unwrap_or(0);
+        let bell = |k: u64| omega_core::outcome::Outcome::from_u64(k, 2);
+        let c00 = counts.get(&bell(0)).copied().unwrap_or(0);
+        let c11 = counts.get(&bell(3)).copied().unwrap_or(0);
         assert_eq!(c00 + c11, 1000);
         assert!(c00 > 400 && c00 < 600);
     }

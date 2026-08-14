@@ -24,7 +24,10 @@ use omega_core::circuit::{GateKind, GateOp, Qubit};
 use omega_core::executor::{creg_to_u64, Backend, ExecConfig, ExecResult, MidCircuitMode};
 use omega_core::params::ParameterBinding;
 
-fn counts(src: &str, mode: MidCircuitMode) -> std::collections::HashMap<u64, u32> {
+fn counts(
+    src: &str,
+    mode: MidCircuitMode,
+) -> std::collections::HashMap<omega_core::outcome::Outcome, u32> {
     let ir = omega_parser::lower_to_ir(src).expect("lower");
     let cfg = ExecConfig {
         shots: Some(200),
@@ -59,7 +62,11 @@ fn a_seventy_bit_creg_with_two_measured_bits_runs() {
     let src = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[4];\ncreg c[70];\n\
                h q[0];\ncx q[0], q[1];\nmeasure q[0] -> c[0];\nmeasure q[1] -> c[1];\n";
     let c = counts(src, MidCircuitMode::Collapse);
-    let bad: Vec<u64> = c.keys().copied().filter(|k| *k != 0 && *k != 0b11).collect();
+    let bad: Vec<String> = c
+        .keys()
+        .filter(|o| o.as_u64().unwrap_or(u64::MAX) != 0 && o.as_u64() != Some(0b11))
+        .map(|o| o.to_bitstring())
+        .collect();
     assert!(bad.is_empty(), "Bell pair keyed on a wide creg gave {bad:?}");
     assert_eq!(c.values().sum::<u32>(), 200);
 }
@@ -75,7 +82,11 @@ fn a_condition_over_a_wide_creg_neither_panics_nor_wraps() {
                h q[0];\nmeasure q[0] -> c[0];\nif(c==1) x q[3];\n\
                measure q[3] -> c[1];\n";
     let c = counts(src, MidCircuitMode::Collapse);
-    let bad: Vec<u64> = c.keys().copied().filter(|k| *k != 0 && *k != 0b11).collect();
+    let bad: Vec<String> = c
+        .keys()
+        .filter(|o| o.as_u64().unwrap_or(u64::MAX) != 0 && o.as_u64() != Some(0b11))
+        .map(|o| o.to_bitstring())
+        .collect();
     assert!(
         bad.is_empty(),
         "q3 must equal q0 in every shot (the guard copies it), got keys {bad:?} \

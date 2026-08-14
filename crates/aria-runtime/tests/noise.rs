@@ -33,7 +33,12 @@ fn damp_circuit() -> Circuit {
 
 fn p1(res: &ExecResult, shots: u32) -> f64 {
     match res {
-        ExecResult::Counts(c) => *c.get(&1).unwrap_or(&0) as f64 / shots as f64,
+        ExecResult::Counts(c) => {
+            let w = c.keys().next().map(|o| o.width()).unwrap_or(1);
+            *c.get(&omega_core::outcome::Outcome::from_u64(1, w))
+                .unwrap_or(&0) as f64
+                / shots as f64
+        }
         other => panic!("expected counts, got {other:?}"),
     }
 }

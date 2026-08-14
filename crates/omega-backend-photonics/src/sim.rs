@@ -137,7 +137,9 @@ impl Backend for PhotonicsBackend {
             Some(shots) => {
                 // Sample from the distribution
                 let counts = sample_from_distribution(&distribution, shots, config.seed)?;
-                Ok(ExecResult::Counts(counts))
+                // Photonic keys index Fock basis states, not qubits, and the
+                // dense distribution is bounded well below 2^64 entries.
+                Ok(ExecResult::counts_from_u64(counts, circuit.num_qubits))
             }
         }
     }
@@ -470,12 +472,16 @@ mod tests {
         let counts = result.counts();
 
         // Encode |1,1> = 0x11 = 17
-        let count_11 = counts.get(&0x11).copied().unwrap_or(0);
+        // Photonic keys pack 4 bits of occupancy per mode; the width is the
+        // mode count, as `counts_from_u64` records it.
+        let w = counts.keys().next().map(|o| o.width()).unwrap_or(2);
+        let key = |k: u64| omega_core::outcome::Outcome::from_u64(k, w);
+        let count_11 = counts.get(&key(0x11)).copied().unwrap_or(0);
         assert_eq!(count_11, 0, "HOM: |1,1> should have 0 counts");
 
         // All shots should be |2,0> or |0,2>
-        let count_20 = counts.get(&0x02).copied().unwrap_or(0); // 2 in mode 0 = 0x02
-        let count_02 = counts.get(&0x20).copied().unwrap_or(0); // 2 in mode 1 = 0x20
+        let count_20 = counts.get(&key(0x02)).copied().unwrap_or(0); // 2 in mode 0
+        let count_02 = counts.get(&key(0x20)).copied().unwrap_or(0); // 2 in mode 1
         assert_eq!(count_20 + count_02, 1000);
     }
 

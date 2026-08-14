@@ -187,7 +187,13 @@ circuit C {
         panic!("expected counts")
     };
     assert_eq!(
-        counts.get(&0).copied().unwrap_or(0),
+        counts
+            .get(&omega_core::outcome::Outcome::from_u64(
+                0,
+                counts.keys().next().map(|o| o.width()).unwrap_or(1),
+            ))
+            .copied()
+            .unwrap_or(0),
         512,
         "X then RESET must leave |0> on every shot; got {counts:?}. A RESET \
          that lowered to a no-op would report 512 ones instead."

@@ -567,6 +567,31 @@ impl Mps {
         Self::pack_bits(&bits, cbit_of)
     }
 
+    /// Pack per-site bits into an [`Outcome`] of `width` bits.
+    ///
+    /// This is the wide-capable form: unlike [`Self::pack_bits`], it has no
+    /// 64-site ceiling, which is the point of the whole exercise — a 1024-qubit
+    /// chain has a perfectly well-defined shot outcome and only the key type
+    /// ever prevented reporting it.
+    pub fn pack_outcome(
+        bits: &[u8],
+        cbit_of: Option<&[Option<u32>]>,
+        width: u32,
+    ) -> omega_core::outcome::Outcome {
+        match cbit_of {
+            None => omega_core::outcome::Outcome::from_bits(&bits[..width as usize]),
+            Some(map) => {
+                let mut o = omega_core::outcome::Outcome::zeros(width);
+                for (q, bit) in bits.iter().enumerate() {
+                    if let Some(Some(c)) = map.get(q) {
+                        o.set_bit(*c, *bit);
+                    }
+                }
+                o
+            }
+        }
+    }
+
     /// Pack per-site bits into a counts key.
     ///
     /// `cbit_of` is `Some` when the key is the CLASSICAL register: each site

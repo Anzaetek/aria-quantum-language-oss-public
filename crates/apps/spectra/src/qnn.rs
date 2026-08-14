@@ -500,8 +500,8 @@ impl<'a> DmqLane<'a> {
         for (state, &c) in &counts {
             let mut corr = 0.0;
             for k in 0..6u32 {
-                let zk = 1 - 2 * ((state >> k) & 1) as i64;
-                let zk1 = 1 - 2 * ((state >> (k + 1)) & 1) as i64;
+                let zk = 1 - 2 * state.bit(k) as i64;
+                let zk1 = 1 - 2 * state.bit(k + 1) as i64;
                 corr += (zk * zk1) as f64;
             }
             acc += corr * c as f64;

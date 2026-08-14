@@ -56,7 +56,7 @@ fn g(kind: GateKind, qubits: &[u32], bit: Option<u32>) -> GateOp {
     }
 }
 
-fn counts(c: &CircuitIR, seed: u64) -> HashMap<u64, u32> {
+fn counts(c: &CircuitIR, seed: u64) -> HashMap<omega_core::outcome::Outcome, u32> {
     let cfg = ExecConfig {
         shots: Some(SHOTS),
         seed: Some(seed),
@@ -70,9 +70,11 @@ fn counts(c: &CircuitIR, seed: u64) -> HashMap<u64, u32> {
 }
 
 /// Shots whose key has `bit` set.
-fn ones(m: &HashMap<u64, u32>, bit: u64) -> u32 {
+fn ones(m: &HashMap<omega_core::outcome::Outcome, u32>, bit: u64) -> u32 {
+    // `bit` is a MASK in the old u64 convention; read the matching index.
+    let idx = bit.trailing_zeros();
     m.iter()
-        .filter(|(k, _)| *k & bit != 0)
+        .filter(|(k, _)| k.bit(idx) == 1)
         .map(|(_, v)| v)
         .sum()
 }
@@ -252,13 +254,16 @@ fn collapse_measurement_is_sampled_per_shot_not_once_per_run() {
     for (k, v) in &counts {
         assert!(
             *v < SHOTS,
-            "outcome {k:02b} took all {SHOTS} shots — one trajectory replayed, \
-             not sampled per shot"
+            "outcome |{}> took all {SHOTS} shots — one trajectory replayed, \
+             not sampled per shot",
+            k.to_bitstring()
         );
     }
     // q1 must track q0: only 00 and 11 are reachable.
-    let c00 = *counts.get(&0b00).unwrap_or(&0);
-    let c11 = *counts.get(&0b11).unwrap_or(&0);
+    let w = counts.keys().next().map(|o| o.width()).unwrap_or(2);
+    let key = |k: u64| omega_core::outcome::Outcome::from_u64(k, w);
+    let c00 = *counts.get(&key(0b00)).unwrap_or(&0);
+    let c11 = *counts.get(&key(0b11)).unwrap_or(&0);
     assert_eq!(
         c00 + c11,
         SHOTS,

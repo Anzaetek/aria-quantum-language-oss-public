@@ -175,7 +175,7 @@ pub fn run_counts(
     backend: SimBackend,
     shots: u32,
     seed: u64,
-) -> Result<std::collections::HashMap<u64, u32>, String> {
+) -> Result<std::collections::HashMap<omega_core::outcome::Outcome, u32>, String> {
     let ir = to_omega_core_ir(circuit);
     let cfg = ExecConfig {
         shots: Some(shots),
@@ -212,7 +212,7 @@ pub fn syndrome_bits(
         .into_iter()
         .max_by_key(|(_, c)| *c)
         .map(|(k, _)| k)
-        .unwrap_or(0);
+        .unwrap_or_else(|| omega_core::outcome::Outcome::zeros(0));
     let key_base = match backend {
         SimBackend::Statevector => 0,
         SimBackend::Stabilizer | SimBackend::Mps => n_data,
@@ -221,7 +221,7 @@ pub fn syndrome_bits(
         SimBackend::PauliProp => n_data,
     };
     Ok((0..n_syndrome)
-        .map(|i| ((key >> (key_base + i)) & 1) as u8)
+        .map(|i| key.bit((key_base + i) as u32))
         .collect())
 }
 
