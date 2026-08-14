@@ -193,35 +193,65 @@ fn stabilizer_projected_counts_are_the_bell_distribution() {
 //     "project onto the creg" and "take the low bits of the register" are the
 //     same function.
 //
-// The Bell pair therefore sits on q40/q41 reporting to c1/c0 — SWAPPED, so bit
-// order is checked too — with the other 68 qubits in |+>. Under an identity map
-// the key would read q0/q1, which are unentangled |+>: a uniform four-outcome
-// histogram, not a Bell pair.
+// The entangled pair therefore sits on q40/q41 reporting to c1/c0, with the
+// other 68 qubits in |+>. Under an identity map the key would read q0/q1, which
+// are unentangled |+>: a uniform four-outcome histogram, not a two-outcome one.
+//
+// **The two reported bits must have DIFFERENT marginals**, or bit order is not
+// tested at all. Two earlier versions of this fixture got that wrong:
+//
+//   * a Bell pair, support {00, 11} — closed under swapping the two bits;
+//   * an anti-correlated pair, support {01, 10} — also closed under it.
+//
+// Both were checked against a real bit-order defect (`Some(c)` -> `Some(c ^ 1)`
+// at every projection site) and both passed: 118 tests green in the first case,
+// 73 in the second. A *set* being preserved is the trap — the swap has to move
+// PROBABILITY, so the two outcomes need unequal weight.
+//
+// So the pair is prepared with `ry(0.7954)` instead of `h`: P(01) = 0.85 and
+// P(10) = 0.15. Swapping the bits exchanges those, which no tolerance band can
+// absorb.
 // ---------------------------------------------------------------------------
 
-/// Bell pair on q40/q41, reported to c1/c0, at 70 qubits.
-fn wide_src(n: usize) -> String {
+/// Anti-correlated pair on `(a, b)`, reported to c1/c0, at `n` qubits.
+///
+/// The pair indices are parameters rather than a `.replace` on a fixed source.
+/// With the replace, the |+> loop below — which skips only literal 40/41 — also
+/// hit the reported pair once it had been renamed, applying `h` to both AFTER
+/// the entangling gates. That is not harmless: H⊗H maps |Ψ+> to |Φ->, turning
+/// the anti-correlated pair back into a correlated one, whose support {00, 11}
+/// is exactly the palindrome this fixture exists to avoid.
+fn wide_src_pair(n: usize, a: usize, b: usize) -> String {
     let mut s = format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[2];\n");
-    s.push_str("h q[40];\ncx q[40], q[41];\n");
     for i in 0..n {
-        if i != 40 && i != 41 {
+        if i != a && i != b {
             s.push_str(&format!("h q[{i}];\n"));
         }
     }
-    // Deliberately crossed: q40 -> c1, q41 -> c0.
-    s.push_str("measure q[40] -> c[1];\nmeasure q[41] -> c[0];\n");
+    // cos|0> + sin|1> with cos^2 = 0.85, entangled, then one side flipped:
+    // outcomes are 01 (p = 0.85) and 10 (p = 0.15) — never 00 or 11, and never
+    // equally weighted.
+    s.push_str(&format!("ry(0.7954) q[{a}];\ncx q[{a}], q[{b}];\nx q[{b}];\n"));
+    // Crossed: a -> c1, b -> c0. With an anti-correlated pair this is
+    // load-bearing; with a Bell pair it would not be.
+    s.push_str(&format!("measure q[{a}] -> c[1];\nmeasure q[{b}] -> c[0];\n"));
     s
 }
 
-/// **The MPS projected key is the Bell distribution at 70 qubits.**
+fn wide_src(n: usize) -> String {
+    wide_src_pair(n, 40, 41)
+}
+
+/// **The MPS projected key is the anti-correlated distribution at 70 qubits.**
 ///
-/// The assertion is on the key CONTENTS. `|01>` and `|10>` carry probability
+/// The assertion is on the key CONTENTS. `|00>` and `|11>` carry probability
 /// zero, so their absence is the whole claim: an identity map, an off-by-one, a
-/// reversed bit order or a dropped projection all put weight there.
+/// dropped projection or a bit-order error all put weight there. The last of
+/// those is why the pair is anti-correlated rather than a Bell pair.
 #[test]
-fn mps_projected_counts_above_the_cliff_are_the_bell_distribution() {
+fn mps_projected_counts_above_the_cliff_are_anticorrelated() {
     let ir = omega_parser::lower_to_ir(&wide_src(70)).expect("lower");
-    let (mut n00, mut n11, mut other) = (0u32, 0u32, 0u32);
+    let (mut n01, mut n10, mut other) = (0u32, 0u32, 0u32);
     let mut total = 0u32;
     for seed in 1..=4u64 {
         let cfg = ExecConfig {
@@ -239,8 +269,8 @@ fn mps_projected_counts_above_the_cliff_are_the_bell_distribution() {
         for (k, v) in &c {
             total += v;
             match k {
-                0b00 => n00 += v,
-                0b11 => n11 += v,
+                0b01 => n01 += v,
+                0b10 => n10 += v,
                 _ => other += v,
             }
         }
@@ -248,13 +278,20 @@ fn mps_projected_counts_above_the_cliff_are_the_bell_distribution() {
     assert_eq!(total, 1200, "shots went missing");
     assert_eq!(
         other, 0,
-        "the reported pair is a Bell pair, so only |00> and |11> may appear; \
-         {other} of 1200 shots landed elsewhere. Under an identity qubit->cbit \
-         map the key would read q0/q1 — two independent |+> qubits — and this is \
-         the count that would be ~900."
+        "the reported pair's support is {{01, 10}}; {other} of 1200 shots landed \
+         elsewhere. Under an identity qubit->cbit map the key reads q0/q1 — two \
+         independent |+> qubits — and this count would be ~900."
     );
-    let skew = (n00 as i64 - n11 as i64).unsigned_abs();
-    assert!(skew < 130, "|00> vs |11> skew {skew} exceeds 6 sigma at 1200 shots");
+    // p = 0.85 / 0.15. 6 sigma at 1200 shots is ~74, so the bands cannot meet
+    // in the middle: a swapped bit order lands 1020 in `n10`, not 180.
+    let f01 = n01 as f64 / total as f64;
+    assert!(
+        (f01 - 0.85).abs() < 0.07,
+        "|01> took {f01:.3} of the shots, expected 0.85 (|01> {n01}, |10> {n10}). \
+         0.15 means the two classical bits are SWAPPED — which a Bell or \
+         anti-correlated pair could not have detected, both supports being \
+         closed under the swap."
+    );
 }
 
 /// **A reset circuit above the cliff.** Same claim, different branch.
@@ -268,9 +305,10 @@ fn mps_projected_counts_above_the_cliff_are_the_bell_distribution() {
 #[test]
 fn mps_reset_circuit_above_the_cliff_is_also_projected() {
     let mut s = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[70];\ncreg c[2];\n".to_string();
-    s.push_str("h q[40];\ncx q[40], q[41];\nreset q[5];\n");
+    s.push_str("ry(0.7954) q[40];\ncx q[40], q[41];\nx q[41];\nreset q[5];\n");
     s.push_str("measure q[40] -> c[1];\nmeasure q[41] -> c[0];\n");
     let ir = omega_parser::lower_to_ir(&s).expect("lower");
+    // Support is {01, 10}: anti-correlated, so a swapped bit order is visible.
 
     let cfg = ExecConfig {
         shots: Some(400),
@@ -284,13 +322,22 @@ fn mps_reset_circuit_above_the_cliff_is_also_projected() {
         ExecResult::Counts(c) => c,
         o => panic!("{o:?}"),
     };
-    let bad: Vec<u64> = c.keys().copied().filter(|k| *k != 0 && *k != 0b11).collect();
+    let bad: Vec<u64> = c.keys().copied().filter(|k| *k != 0b01 && *k != 0b10).collect();
+    let n01 = *c.get(&0b01).unwrap_or(&0);
     assert!(
         bad.is_empty(),
-        "reset path emitted keys outside the 2-bit creg's Bell support: {bad:?} \
-         — a key like 0b110 is the full register reported at the creg's width"
+        "reset path emitted keys outside the 2-bit creg's anti-correlated \
+         support {{01, 10}}: {bad:?} — a key like 0b110 is the full register \
+         reported at the creg's width"
     );
     assert_eq!(c.values().sum::<u32>(), 400);
+    // Same asymmetry as above, so this arm also detects a swapped bit order.
+    let f01 = n01 as f64 / 400.0;
+    assert!(
+        (f01 - 0.85).abs() < 0.09,
+        "|01> took {f01:.3} of 400 shots, expected 0.85 — 0.15 means the two \
+         classical bits are swapped"
+    );
 }
 
 /// **Guard the guard: the fixture must be able to fail.**
@@ -301,8 +348,7 @@ fn mps_reset_circuit_above_the_cliff_is_also_projected() {
 /// are perfectly correlated and q0 is not correlated with them.
 #[test]
 fn the_wide_fixture_would_expose_an_identity_map() {
-    let ir = omega_parser::lower_to_ir(&wide_src(20).replace("q[40]", "q[10]").replace("q[41]", "q[11]"))
-        .expect("lower");
+    let ir = omega_parser::lower_to_ir(&wide_src_pair(20, 10, 11)).expect("lower");
     let cfg = ExecConfig {
         shots: Some(600),
         seed: Some(5),
@@ -317,10 +363,10 @@ fn the_wide_fixture_would_expose_an_identity_map() {
     };
     // Full-register keys here. q10 and q11 must agree in every single shot...
     for k in c.keys() {
-        assert_eq!(
+        assert_ne!(
             (k >> 10) & 1,
             (k >> 11) & 1,
-            "fixture no longer entangles the reported pair"
+            "fixture no longer anti-correlates the reported pair"
         );
     }
     // ...and q0, which an identity map would report instead, must take BOTH
@@ -331,5 +377,101 @@ fn the_wide_fixture_would_expose_an_identity_map() {
         2,
         "q0 is constant, so an identity map would still yield a 2-outcome \
          histogram and the tests above could not tell the two apart"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The NOISY backend, which had the guard but not the projection.
+//
+// `NoisyMpsBackend::execute` was given the width guard and nothing else, so it
+// admitted a wide run at CREG width — the guard's predicate promises the key
+// will be the creg — and then sampled the FULL register in both non-collapse
+// arms. Measured through `omega-run` before the fix:
+//
+//   70q, pair on q40/q41 -> creg c[2], --noise:
+//       |110000000000000000000000000000000000000000>: 110, |00>: 90
+//   70q, x q[65]; measure q[65] -> c[0], --noise:
+//       |10>: 50 of 50   (bit 65 masked to bit 1 by `1u64 << 65`; truth |1>)
+//
+// The noiseless run of the same circuit was correct, so adding `--noise`
+// silently changed what the key meant. Nothing in the suite constructed this
+// backend above the cliff, which is why a guard-only fix looked complete.
+// ---------------------------------------------------------------------------
+
+fn noisy_counts(src: &str, shots: u32, seed: u64) -> HashMap<u64, u32> {
+    use omega_backend_mps::NoisyMpsBackend;
+    use omega_core::noise::{NoiseModel, ReadoutError};
+
+    let ir = omega_parser::lower_to_ir(src).expect("lower");
+    let mut model = NoiseModel::default();
+    // Readout error is the arm that flips bits: it must act on the QUBIT index,
+    // while the key is built on the classical index. Flipping a packed creg key
+    // would apply qubit q's detector error to classical bit q.
+    model.readout = ReadoutError::symmetric(0.02);
+    let cfg = ExecConfig {
+        shots: Some(shots),
+        seed: Some(seed),
+        mid_circuit_mode: MidCircuitMode::Skip,
+    };
+    match NoisyMpsBackend::with_model(8, model)
+        .execute(&ir, &ParameterBinding::default(), &cfg)
+        .expect("70-qubit noisy MPS sampling must work, not be refused")
+    {
+        ExecResult::Counts(c) => c,
+        o => panic!("{o:?}"),
+    }
+}
+
+/// **The noisy backend keys on the creg above the cliff, like the noiseless
+/// one.**
+///
+/// With 2% readout error the support is no longer exactly {01, 10} — that is
+/// the point of the model — so the assertion is that the DOMINANT outcome is
+/// still `01` and that no key exceeds two bits. A full-register key is not a
+/// small perturbation of a 2-bit one; it is a 42-character string.
+#[test]
+fn the_noisy_backend_projects_above_the_cliff() {
+    let c = noisy_counts(&wide_src(70), 400, 5);
+
+    let too_wide: Vec<u64> = c.keys().copied().filter(|k| *k > 0b11).collect();
+    assert!(
+        too_wide.is_empty(),
+        "keys outside the 2-bit creg: {too_wide:?} — the guard admitted this run \
+         at creg width and the sampler then built a full-register key"
+    );
+    let total: u32 = c.values().sum();
+    assert_eq!(total, 400);
+    let n01 = *c.get(&0b01).unwrap_or(&0) as f64 / total as f64;
+    // 0.85 ideal, softened by 2% readout on each of the two reported bits.
+    assert!(
+        n01 > 0.70,
+        "|01> took {n01:.3} of the shots; ~0.82 expected at 2% readout error. \
+         Near 0.15 means the two classical bits are swapped; near 0.25 means the \
+         key is reading unmeasured qubits. Counts: {c:?}"
+    );
+}
+
+/// **A qubit above index 63 must not alias into a low bit.**
+///
+/// `1u64 << 65` is masked to `1u64 << 1` in release builds and panics in debug,
+/// so measuring q65 reported bit 1. The creg is 1 bit wide, so the only
+/// admissible key is 0 or 1 — and with `x q[65]` it is 1 in all but the readout
+/// flips.
+#[test]
+fn a_qubit_above_the_cliff_does_not_alias_into_a_low_bit() {
+    let src = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[70];\ncreg c[1];\n\
+               x q[65];\nmeasure q[65] -> c[0];\n";
+    let c = noisy_counts(src, 200, 9);
+    let bad: Vec<u64> = c.keys().copied().filter(|k| *k > 1).collect();
+    assert!(
+        bad.is_empty(),
+        "a 1-bit creg produced {bad:?}. A key of 2 is bit 65 aliased to bit 1 by \
+         a masked shift"
+    );
+    let ones = *c.get(&1).unwrap_or(&0);
+    assert!(
+        ones > 180,
+        "q65 is |1>, so ~98% of 200 shots should read 1 at 2% readout error; got \
+         {ones}. Counts: {c:?}"
     );
 }
