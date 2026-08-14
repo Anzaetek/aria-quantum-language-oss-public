@@ -156,8 +156,11 @@ fn mps_backend_from(name: &str) -> Option<MpsBackend> {
         Ok(Some(omega_backend_mps::select::MpsSelect::Auto { max_chi })) => {
             Some(MpsBackend::new(max_chi).with_adaptive(omega_backend_mps::select::AUTO_EPS))
         }
-        // A malformed selector (`mps:0`, `mps:banana`) is refused by the caller's
-        // unknown-backend path with the parser's own message.
+        // A malformed selector never reaches here: it is refused earlier, in
+        // `cmd_exec`, with the parser's own message. (An earlier version of this
+        // comment claimed the caller's unknown-backend path showed that message.
+        // It did not — the message was discarded and each mode invented its own,
+        // including two that were simply false.)
         _ => None,
     }
 }
@@ -492,6 +495,27 @@ fn main() {
             CircuitType::GateBased => "statevector",
             CircuitType::Photonic => "photonics",
         });
+
+    // A MALFORMED mps selector is reported with the parser's own message, once,
+    // before any mode dispatches.
+    //
+    // Previously `mps_backend_from` mapped `Err` to `None`, so the guard arms
+    // did not match and the name fell through to whatever each mode says about
+    // an unknown backend. Measured, all for `--backend mps:0`:
+    //
+    //   --shots         -> "Unknown backend: mps:0"                    (vague)
+    //   --gradient      -> "Gradient not supported for backend: mps:0" (FALSE)
+    //   --expectation   -> "Expectation not supported for backend"     (FALSE)
+    //   --noise         -> "supported on statevector or mps (got 'mps:0')"
+    //                      — which tells the user to use the thing they typed.
+    //
+    // "MPS bond dimension must be ≥ 1" was never shown anywhere.
+    if chosen.starts_with("mps") {
+        if let Err(e) = omega_backend_mps::select::parse_mps(chosen) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
 
     // --- Mode: --bridge dispatch through an external simulator ---
     if let Some(ref bridge_str) = bridge_name {

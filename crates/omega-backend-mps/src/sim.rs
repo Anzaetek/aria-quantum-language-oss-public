@@ -445,6 +445,12 @@ pub struct NoisyMpsBackend {
     svd_fn: SvdFlatFn,
     contract_fn: Option<Contract2qFn>,
     model: NoiseModel,
+    /// Same ceiling as [`MpsBackend`]. It was absent, so adding `--noise`
+    /// REMOVED the correctness gate: measured on a 12-qubit entangler at χ=2,
+    /// `--backend mps:2` was refused (certificate 3.673) while
+    /// `--backend mps:2 --noise …` returned counts without a word.
+    max_discarded_weight: f64,
+    stats: Mutex<MpsRunStats>,
 }
 
 impl NoisyMpsBackend {
@@ -457,7 +463,46 @@ impl NoisyMpsBackend {
             svd_fn: truncated_svd_flat,
             contract_fn: None,
             model,
+            max_discarded_weight: DEFAULT_MAX_DISCARDED_WEIGHT,
+            stats: Mutex::new(MpsRunStats::default()),
         }
+    }
+
+    /// Raise (or lower) the discarded-weight ceiling — see
+    /// [`MpsBackend::with_max_discarded_weight`], which this mirrors.
+    ///
+    /// Noise does not excuse truncation error. A trajectory whose bond was too
+    /// small is wrong for the same reason a noiseless one is, and the noise
+    /// model does not cover it.
+    pub fn with_max_discarded_weight(mut self, w: f64) -> Self {
+        self.max_discarded_weight = w;
+        self
+    }
+
+    /// The truncation certificate of the most recent run.
+    pub fn last_run_stats(&self) -> MpsRunStats {
+        *self.stats.lock().unwrap()
+    }
+
+    fn record_stats(&self, mps: &Mps) {
+        *self.stats.lock().unwrap() = MpsRunStats {
+            discarded_weight: mps.discarded_weight,
+            max_bond_reached: mps.max_bond_reached,
+        };
+    }
+
+    fn check_truncation(&self) -> Result<()> {
+        let st = self.last_run_stats();
+        if st.discarded_weight > self.max_discarded_weight {
+            return Err(OmegaError::Unsupported(format!(
+                "MPS truncation certificate {:.3e} exceeds the ceiling {:.3e} (bond \
+                 reached {}). Noise does not excuse it — this is bond truncation, not \
+                 a modelled channel. Raise the bond dimension, or call \
+                 `with_max_discarded_weight` to accept an approximation deliberately.",
+                st.discarded_weight, self.max_discarded_weight, st.max_bond_reached
+            )));
+        }
+        Ok(())
     }
 
     /// Route bond-compression SVDs through `f` (e.g. the CUDA `gesvdj`
@@ -562,6 +607,8 @@ impl Backend for NoisyMpsBackend {
             None => {
                 let (mps, _cbits) =
                     self.evolve(circuit, params, &config_skip_shots(config), &mut rng)?;
+                self.record_stats(&mps);
+                self.check_truncation()?;
                 Ok(ExecResult::Statevector(mps.to_statevector()))
             }
             // Per-trajectory when a channel acts during evolution OR when
@@ -583,8 +630,10 @@ impl Backend for NoisyMpsBackend {
                         }
                         o
                     };
+                    self.record_stats(&mps);
                     *counts.entry(outcome).or_insert(0) += 1;
                 }
+                self.check_truncation()?;
                 Ok(ExecResult::Counts(counts))
             }
             Some(shots) => {
@@ -598,8 +647,10 @@ impl Backend for NoisyMpsBackend {
                     if !self.model.readout.is_zero() {
                         outcome = flip_all_readout(outcome, n, &self.model.readout, &mut rng);
                     }
+                    self.record_stats(&mps);
                     *counts.entry(outcome).or_insert(0) += 1;
                 }
+                self.check_truncation()?;
                 Ok(ExecResult::Counts(counts))
             }
         }
