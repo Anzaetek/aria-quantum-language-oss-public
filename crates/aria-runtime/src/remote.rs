@@ -352,7 +352,14 @@ pub fn run_counts_remote(
     // full-register keying. Circuits lower() can't handle (e.g. photonic
     // gates) keep the server's raw keying.
     match lower(&bound) {
-        Ok(low) if !low.needs_collapse => project_counts_onto_creg(res, &measure_pairs(&low)),
+        // Same rule as the local path: a backend that already keyed on the
+        // creg must not be re-projected.
+        Ok(low)
+            if !low.needs_collapse
+                && !omega_core::executor::counts_keyed_on_creg(&low.ir, false) =>
+        {
+            project_counts_onto_creg(res, &measure_pairs(&low))
+        }
         _ => Ok(res),
     }
 }

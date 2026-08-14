@@ -412,6 +412,19 @@ impl Registry {
             }
         };
 
+        // Width to RENDER a counts key at. NOT `ir.num_qubits`: in collapse mode
+        // the key is packed from the CLASSICAL register, so a 1024-qubit
+        // circuit measuring two qubits produces a 2-bit outcome. This site kept
+        // padding to `num_qubits` after the CLI renderers were fixed, so the
+        // same run reported `"11"` from the CLI and 1024 characters over HTTP.
+        let counts_width = omega_core::executor::counts_outcome_width(
+            &ir,
+            omega_core::executor::counts_keyed_on_creg(
+                &ir,
+                config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse,
+            ),
+        );
+
         // Serialize result to JSON
         match result {
             omega_core::executor::ExecResult::Counts(counts) => {
@@ -419,7 +432,7 @@ impl Registry {
                     .into_iter()
                     .map(|(bs, ct)| {
                         (
-                            format!("{:0>width$b}", bs, width = ir.num_qubits as usize),
+                            format!("{:0>width$b}", bs, width = counts_width),
                             ct,
                         )
                     })
