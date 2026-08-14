@@ -22,6 +22,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = &args.get(1..).unwrap_or(&[]);
+    // `aria run --help` used to print "--help requires a value", because the
+    // parser took every `--name` outside `bool_flags` as value-taking. Asking a
+    // CLI for help is the one thing that must never be an error.
+    if rest.iter().any(|a| a == "-h" || a == "--help") {
+        usage();
+        return ExitCode::SUCCESS;
+    }
     let result = match cmd {
         "list" => cmd_list(rest),
         "parse" => cmd_parse(rest),
@@ -84,7 +91,96 @@ struct Args {
     flags: Vec<String>,
 }
 
-fn parse_args(raw: &[String], bool_flags: &[&str]) -> Result<Args, String> {
+/// The `--name value` options each subcommand understands, alongside its
+/// boolean flags.
+///
+/// Declared rather than inferred so an unrecognised option is refused at PARSE
+/// time, before the subcommand has read a file or reserved anything. The risk
+/// of a declared list is that it drifts from what the code actually reads —
+/// `unknown_flags_are_refused.rs` fails if it does, by comparing this against
+/// the names the accessors were seen to ask for.
+/// A refusal naming the option, and the nearest thing it might have been.
+fn unknown_option(bad: &str, bool_flags: &[&str], opts: &[&str]) -> String {
+    // A single substitution, or one insertion/deletion, away from a real name.
+    let edit1 = |k: &&str| -> bool {
+        let (a, b) = (k.as_bytes(), bad.as_bytes());
+        match a.len().abs_diff(b.len()) {
+            0 => a.iter().zip(b).filter(|(x, y)| x != y).count() == 1,
+            1 => {
+                let (long, short) = if a.len() > b.len() { (a, b) } else { (b, a) };
+                let (mut li, mut si, mut skipped) = (0, 0, false);
+                while li < long.len() && si < short.len() {
+                    if long[li] == short[si] {
+                        li += 1;
+                        si += 1;
+                    } else if skipped {
+                        return false;
+                    } else {
+                        skipped = true;
+                        li += 1;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    };
+    // Transposition: `--stpes` for `--steps`. Common, and not an edit-1.
+    let transposed = |k: &&str| -> bool {
+        let (a, b) = (k.as_bytes(), bad.as_bytes());
+        a.len() == b.len()
+            && (0..a.len().saturating_sub(1)).any(|i| {
+                let mut t = b.to_vec();
+                t.swap(i, i + 1);
+                t == a
+            })
+    };
+    let suggestion = opts
+        .iter()
+        .chain(bool_flags.iter())
+        .find(|k| edit1(k) || transposed(k))
+        .map(|k| format!(" (did you mean --{k}?)"))
+        .unwrap_or_default();
+    let mut known: Vec<&str> = opts.iter().chain(bool_flags.iter()).copied().collect();
+    known.sort_unstable();
+    format!(
+        "unrecognised option --{bad}{suggestion}. It used to be accepted and \
+         ignored, which for a mistyped safety flag means running without the \
+         gate you asked for.\n  this subcommand understands: {}",
+        known
+            .iter()
+            .map(|k| format!("--{k}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+struct Vocabulary;
+impl Vocabulary {
+    const LIST: &'static [&'static str] = &[];
+    const PARSE: &'static [&'static str] = &["circuit", "int"];
+    const RUN: &'static [&'static str] = &[
+        "backend", "bind", "circuit", "expectation", "int", "max-freq", "max-weight", "noise",
+        "seed", "shots", "strict-truncation", "token", "truncate", "url",
+    ];
+    /// `train` delegates to `cmd_train_supervised` with the same `Args`, so its
+    /// vocabulary is the union of both.
+    const TRAIN: &'static [&'static str] = &[
+        "backend", "circuit", "data", "feature-prefix", "freeze", "grad", "init-scale", "int",
+        "labels", "loss", "lr", "observable", "opt", "save-model", "seed", "set", "steps",
+        "strict-truncation",
+    ];
+    const PREDICT: &'static [&'static str] = &["backend", "data", "out", "strict-truncation"];
+    const EXPORT: &'static [&'static str] = &["circuit", "int"];
+    const TUNE: &'static [&'static str] = &[
+        "backend", "circuit", "csv", "data", "feature-prefix", "int", "labels", "loss",
+        "observable", "pruner", "sampler", "seed", "space", "steps", "strict-truncation",
+        "trials",
+    ];
+    const IMPORT: &'static [&'static str] = &["name"];
+}
+
+fn parse_args(raw: &[String], bool_flags: &[&str], opts: &[&str]) -> Result<Args, String> {
     let mut a = Args {
         positional: Vec::new(),
         opts: Vec::new(),
@@ -98,6 +194,18 @@ fn parse_args(raw: &[String], bool_flags: &[&str]) -> Result<Args, String> {
                 a.flags.push(name.to_string());
                 i += 1;
             } else {
+                if !opts.contains(&name) {
+                    // Previously ANY `--name` outside `bool_flags` was taken as
+                    // an option, stored, and never read again — silently.
+                    // Measured on examples/aria/bell.aria:
+                    //   `--shot 9999`             ran 1024 shots (the default)
+                    //   `--strict-trunctaion 0.5` ran with the DEFAULT gate
+                    //   `--typo xyz`              ran, no diagnostic
+                    // The second is the one that matters: a typo in a safety
+                    // flag left the user believing they had tightened a gate
+                    // they had not touched.
+                    return Err(unknown_option(name, bool_flags, opts));
+                }
                 let val = raw
                     .get(i + 1)
                     .ok_or_else(|| format!("--{name} requires a value"))?;
@@ -191,7 +299,7 @@ fn instantiate(src: &str, name: &str, ints: &[(String, i64)]) -> Result<Circuit,
 // ---------------------------------------------------------------------------
 
 fn cmd_list(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &[])?;
+    let a = parse_args(raw, &[], Vocabulary::LIST)?;
     let path = a.first_positional("<file.aria>")?;
     let prog = parse_aria(&read_source(path)?)?;
     println!("{path}:");
@@ -211,7 +319,7 @@ fn cmd_list(raw: &[String]) -> Result<(), String> {
 }
 
 fn cmd_parse(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &[])?;
+    let a = parse_args(raw, &[], Vocabulary::PARSE)?;
     let path = a.first_positional("<file.aria>")?;
     let src = read_source(path)?;
     let prog = parse_aria(&src)?;
@@ -274,7 +382,7 @@ fn apply_strict_truncation(a: &Args) -> Result<Option<f64>, String> {
 }
 
 fn cmd_run(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &["statevector"])?;
+    let a = parse_args(raw, &["statevector"], Vocabulary::RUN)?;
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("run requires --circuit NAME")?;
     let ints = parse_kv_i64(a.all("int").into_iter())?;
@@ -486,7 +594,7 @@ fn read_numeric_csv(path: &str) -> Result<Vec<Vec<f64>>, String> {
 }
 
 fn cmd_train(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &[])?;
+    let a = parse_args(raw, &[], Vocabulary::TRAIN)?;
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("train requires --circuit NAME")?;
     let ints = parse_kv_i64(a.all("int").into_iter())?;
@@ -729,7 +837,7 @@ fn cmd_train_supervised(
 /// `aria predict <model.json> --data X.csv [--out scores.csv] [--backend B]` —
 /// score a feature matrix with a saved trained model.
 fn cmd_predict(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &[])?;
+    let a = parse_args(raw, &[], Vocabulary::PREDICT)?;
     let model_path = a.first_positional("<model.json>")?;
     let data_path = a
         .opt("data")
@@ -760,7 +868,7 @@ fn cmd_predict(raw: &[String]) -> Result<(), String> {
 }
 
 fn cmd_export(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &["qasm", "qasm3", "json", "lean", "gate-model"])?;
+    let a = parse_args(raw, &["qasm", "qasm3", "json", "lean", "gate-model"], Vocabulary::EXPORT)?;
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("export requires --circuit NAME")?;
     let ints = parse_kv_i64(a.all("int").into_iter())?;
@@ -912,7 +1020,7 @@ fn cmd_tune(raw: &[String]) -> Result<(), String> {
     use aria_runtime::{train_supervised, Loss, Optimizer, SupervisedConfig};
     use aria_tune::{Direction, MedianPruner, NoPruner, RandomSampler, Sampler, Study, TpeSampler};
 
-    let a = parse_args(raw, &[])?;
+    let a = parse_args(raw, &[], Vocabulary::TUNE)?;
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("tune requires --circuit NAME")?;
     let spec = a
@@ -1127,7 +1235,7 @@ fn train_x_check(rows: Vec<Vec<f64>>, n_labels: usize) -> Result<Vec<Vec<f64>>, 
 /// `aria import <file.qasm> [--name NAME]` — parse an OpenQASM 2.0 file (the
 /// fail-loud importer) and print equivalent `.aria` source to stdout.
 fn cmd_import(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &[])?;
+    let a = parse_args(raw, &[], Vocabulary::IMPORT)?;
     let path = a.first_positional("<file.qasm>")?;
     let name = a.opt("name").unwrap_or("Imported");
     let qasm = read_source(path)?;
