@@ -292,12 +292,52 @@ fn cost_kind_for(sel: &OmegaBackendSel) -> CostKind {
 /// the right memory pool and prices at the right element width (device kernels
 /// are f32). Mirrors `exec_statevector`'s routing exactly — if the two ever
 /// disagree, the reservation is against the wrong pool.
+/// Whether a device statevector will actually be used, decided **once**.
+///
+/// Pricing and dispatch both asked `DeviceKind::resolve(None)`, which reports
+/// what was *requested*, not what opens. `exec_statevector` then fell back to
+/// the CPU when `OpenClStatevectorBackend::new()` failed — right as an
+/// availability decision, but admission had already run and priced
+/// `Device(0)` at 8 B/amplitude against the device pool. The job then ran on
+/// the CPU at 16 B in host RAM: wrong pool and wrong width, and silent to the
+/// governor, which never re-prices.
+///
+/// Unifying the two *lookups* does not fix that — the fallback happens after
+/// both, so what breaks the invariant is a runtime failure between them. What
+/// does fix it is unifying the **open attempt**: try once, remember the answer,
+/// and have pricing and dispatch consult the same memo. The failures this
+/// guards against (a stale ICD, a driver that enumerates but will not create a
+/// context) are properties of the installation, not of a single job.
+///
+/// Residual, and deliberately not chased: a device that opens at startup and
+/// dies later. That window is strictly smaller than the one this closes.
+#[cfg(feature = "opencl")]
+fn opencl_statevector_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        use omega_core::device::DeviceKind;
+        if DeviceKind::resolve(None) != DeviceKind::OpenCl {
+            return false;
+        }
+        match omega_backend_statevector_opencl::OpenClStatevectorBackend::new() {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!(
+                    "[quantum] OpenCL requested but unavailable ({e}); pricing and \
+                     executing on the CPU for the life of this process"
+                );
+                false
+            }
+        }
+    })
+}
+
 fn exec_target_for(sel: &OmegaBackendSel) -> crate::worker::ExecTarget {
     #[cfg(feature = "opencl")]
     {
-        use omega_core::device::DeviceKind;
         if matches!(sel, OmegaBackendSel::Statevector | OmegaBackendSel::Auto)
-            && DeviceKind::resolve(None) == DeviceKind::OpenCl
+            && opencl_statevector_available()
         {
             return crate::worker::ExecTarget::Device(0);
         }
@@ -306,19 +346,53 @@ fn exec_target_for(sel: &OmegaBackendSel) -> crate::worker::ExecTarget {
     crate::worker::ExecTarget::Cpu
 }
 
-fn shape_for(ir: &OmegaCircuitIR, densifies: bool, batch: usize) -> JobShape {
+/// Shape for one row.
+///
+/// `target` is passed IN rather than re-derived from `OMEGA_DEVICE`, because it
+/// is a property of the ENDPOINT: `exec_target_for` returns `Device(0)` for a
+/// Statevector selection whenever the resolved device is OpenCL, but only
+/// `/execute` can reach a device. `/expectation` builds
+/// `StatevectorBackend::new()` unconditionally, and `/gradient` does the same —
+/// so both were priced at 8 B/amplitude (device kernels are f32) while
+/// allocating `Complex64` at 16. `exec_target_for`'s doc comment claims it
+/// mirrors execution routing exactly; it did so for one of its three callers.
+fn shape_for(
+    ir: &OmegaCircuitIR,
+    densifies: bool,
+    batch: usize,
+    target: crate::worker::ExecTarget,
+) -> JobShape {
     let resolved = resolve_backend(ir);
     let mut shape = JobShape::new(ir.num_qubits, cost_kind_for(&resolved));
     shape.densifies = densifies;
     shape.batch = batch;
-    shape.target = exec_target_for(&resolved);
+    shape.target = target;
+    shape
+}
+
+/// Shape for one `/gradient` row.
+///
+/// The adjoint sweep is **always** the dense CPU statevector (`:766` builds
+/// `StatevectorBackend::new()` before the loop and never consults the row's
+/// backend), so the row's DECLARED backend must not set the cost kind either.
+/// It did: a `Stabilizer` row was priced as a tableau, and a `Plugin` row as
+/// `Opaque` — a 1 MiB reservation for a full dense adjoint, bounded only by the
+/// qubit ceiling.
+fn gradient_shape(ir: &OmegaCircuitIR, batch: usize) -> JobShape {
+    let mut shape = JobShape::new(ir.num_qubits, crate::worker::CostKind::DenseStatevector);
+    shape.densifies = true;
+    shape.batch = batch;
+    shape.target = crate::worker::ExecTarget::Cpu;
+    shape.gradient = true;
     shape
 }
 
 /// Shape for `/execute`. `shots: None` ships every amplitude back (and so pays
 /// for the JSON encoding); a shot run samples and returns counts.
 fn execute_shape(ir: &OmegaCircuitIR, shots: Option<u32>) -> JobShape {
-    let base = shape_for(ir, true, 1);
+    // `/execute` is the one endpoint that can actually reach a device, so it
+    // is the one that passes the device-capable target.
+    let base = shape_for(ir, true, 1, exec_target_for(&resolve_backend(ir)));
     match shots {
         None => base.returning_statevector(),
         Some(_) => base.with_shots(),
@@ -335,14 +409,65 @@ fn admit_batch(
     circuits: &[OmegaCircuitIR],
     densifies: bool,
 ) -> Result<Reservation, Box<axum::response::Response>> {
-    let worst = circuits
+    admit_shapes(
+        &circuits
+            .iter()
+            .map(|ir| shape_for(ir, densifies, circuits.len(), crate::worker::ExecTarget::Cpu))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Reserve for a batch of already-built shapes.
+///
+/// # The hole this closes
+///
+/// The previous selection was
+/// `max_by_key(|sh| estimate_peak_bytes(sh).unwrap_or(u64::MAX))`, so an
+/// **unpriceable** row won — and `Governor::admit` then reserves 0 bytes for an
+/// unpriceable-by-kind shape (`worker.rs`: `None if !is_priceable => reserve_in(pool, 0, 1)`),
+/// deliberately, so the plugin path is not broken. Combining the two erased the
+/// price of everything else in the batch:
+///
+/// ```json
+/// {"circuits": [ {"num_qubits": 30, "backend": "Statevector"},
+///                {"num_qubits": 1,  "backend": {"Plugin": {"name": "x"}}} ]}
+/// ```
+///
+/// The plugin row wins selection, the batch reserves ~1 MiB, and the loop then
+/// executes the 30-qubit dense row — 16 GiB — before failing on the plugin row.
+/// No plugin need be loaded: `resolve_backend` returns the declared backend
+/// verbatim and existence is only checked at execution. The `unwrap_or(u64::MAX)`
+/// comment said an unpriceable row "must not be silently out-ranked"; what it
+/// actually did was out-rank everything and then price at nothing.
+///
+/// The qubit ceiling was wrong for the same reason: `admit` applies it to the
+/// single shape handed to it, so it was enforced at the *winning* row's width.
+/// `[{"num_qubits": 34}, {"num_qubits": 1, "Plugin"}]` walked past
+/// `OMEGA_MAX_QUBITS` on a four-line body.
+///
+/// So: the ceiling is checked against **every** dense-driven row, and the
+/// reservation is the worst row we can actually price. A batch in which nothing
+/// is priceable keeps the old behaviour, which is the working plugin path.
+fn admit_shapes(shapes: &[JobShape]) -> Result<Reservation, Box<axum::response::Response>> {
+    debug_assert!(!shapes.is_empty(), "caller checked the batch is non-empty");
+    let max_qubits = governor().config().max_qubits;
+    if let Some(over) = shapes
         .iter()
-        .map(|ir| shape_for(ir, densifies, circuits.len()))
-        // An unpriceable row sorts above every priced one: it must not be
-        // silently out-ranked by a row we happen to have a number for.
-        .max_by_key(|sh| crate::worker::estimate_peak_bytes(sh).unwrap_or(u64::MAX))
-        .expect("caller checked the batch is non-empty");
-    admit_shape(&worst)
+        .find(|sh| sh.is_dense_driven() && sh.num_qubits > max_qubits)
+    {
+        // Refuse through `admit` so the body and status match every other
+        // ceiling refusal rather than being spelled a second way here.
+        return admit_shape(over);
+    }
+    let worst = shapes
+        .iter()
+        .filter(|sh| crate::worker::estimate_peak_bytes(sh).is_some())
+        .max_by_key(|sh| crate::worker::estimate_peak_bytes(sh).unwrap_or(0));
+    match worst {
+        Some(sh) => admit_shape(sh),
+        // Every row unpriceable: the plugin/photonic path, unchanged.
+        None => admit_shape(&shapes[0]),
+    }
 }
 
 fn admit_shape(shape: &JobShape) -> Result<Reservation, Box<axum::response::Response>> {
@@ -503,15 +628,26 @@ fn exec_statevector(
 ) -> omega_core::error::Result<ExecResult> {
     #[cfg(feature = "opencl")]
     {
-        use omega_core::device::DeviceKind;
-        if DeviceKind::resolve(None) == DeviceKind::OpenCl {
+        // The SAME memo admission priced against, so a fallback cannot happen
+        // between the two. If the device did not open, `exec_target_for`
+        // already returned `Cpu` and the reservation is a host one.
+        if opencl_statevector_available() {
             match omega_backend_statevector_opencl::OpenClStatevectorBackend::new() {
                 Ok(backend) => {
                     eprintln!("[quantum] statevector via OpenCL device");
                     return backend.execute(core, binding, config);
                 }
                 Err(e) => {
-                    eprintln!("[quantum] OpenCL device unavailable ({e}); CPU statevector");
+                    // The device opened during the probe and will not open now.
+                    // Refusing is the honest answer: falling back here would run
+                    // on the CPU at 16 B/amplitude against a device reservation
+                    // priced at 8, which is the defect this memo exists to close.
+                    return Err(omega_core::error::OmegaError::Backend(format!(
+                        "OpenCL device opened at startup but not now ({e}); this run \
+                         was priced as device work, so completing it on the CPU would \
+                         hold a reservation that describes neither the pool nor the \
+                         width actually used"
+                    )));
                 }
             }
         }
@@ -755,9 +891,18 @@ pub async fn gradient_quantum_route(
 
     // A gradient holds the backward state alongside the forward one, so it is
     // priced with `gradient = true` rather than as a plain expectation.
-    let mut shape = shape_for(&circuits[0], true, circuits.len());
-    shape.gradient = true;
-    let _reservation = match admit_shape(&shape) {
+    // Every row, not `circuits[0]`. The handler loops over the whole batch
+    // below, and `admit_batch` three functions above exists precisely to stop
+    // one row standing in for all of them — its own comment says "width does
+    // not imply cost". `/expectation` uses it; this did not, and the comment
+    // here explained only the `gradient` flag, so pricing one row read as
+    // deliberate. A `[4q, 30q]` batch was admitted on kilobytes and ran a
+    // 30-qubit adjoint: forward and backward state, order 32 GiB.
+    let shapes: Vec<JobShape> = circuits
+        .iter()
+        .map(|ir| gradient_shape(ir, circuits.len()))
+        .collect();
+    let _reservation = match admit_shapes(&shapes) {
         Ok(r) => r,
         Err(resp) => return *resp,
     };

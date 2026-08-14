@@ -206,7 +206,7 @@ impl JobShape {
 
     /// Whether this job's price is driven by `2^n`, and so should also obey the
     /// qubit ceiling.
-    fn is_dense_driven(&self) -> bool {
+    pub fn is_dense_driven(&self) -> bool {
         match self.kind {
             CostKind::DenseStatevector | CostKind::Opaque => true,
             CostKind::Mps { .. } | CostKind::Stabilizer => self.densifies,
