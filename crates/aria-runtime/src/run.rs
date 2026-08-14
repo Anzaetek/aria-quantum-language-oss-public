@@ -419,6 +419,18 @@ pub fn run_counts(
     if low.needs_collapse {
         return Ok(res);
     }
+    // Do NOT project a result the backend already keyed on the creg.
+    //
+    // Above 64 qubits the MPS and stabilizer backends pack the outcome from the
+    // classical register themselves, because the full-register key does not
+    // exist there. Re-projecting reads QUBIT positions out of a CREG key, and
+    // the result is not merely mislabelled — measured on a 70-qubit circuit
+    // whose true marginal is 0.79/0.21, this front end reported |00> with
+    // probability 1.000 while `omega-run` on the identical circuit reported
+    // 1577/423. Certainty, on a distribution that has none.
+    if omega_core::executor::counts_keyed_on_creg(&low.ir, low.needs_collapse) {
+        return Ok(res);
+    }
     project_counts_onto_creg(res, &measure_pairs(&low))
 }
 
@@ -475,6 +487,18 @@ pub fn run_counts_noisy(
         .execute(&low.ir, &ParameterBinding::new(), &cfg)
         .map_err(|e| e.to_string())?;
     if low.needs_collapse {
+        return Ok(res);
+    }
+    // Do NOT project a result the backend already keyed on the creg.
+    //
+    // Above 64 qubits the MPS and stabilizer backends pack the outcome from the
+    // classical register themselves, because the full-register key does not
+    // exist there. Re-projecting reads QUBIT positions out of a CREG key, and
+    // the result is not merely mislabelled — measured on a 70-qubit circuit
+    // whose true marginal is 0.79/0.21, this front end reported |00> with
+    // probability 1.000 while `omega-run` on the identical circuit reported
+    // 1577/423. Certainty, on a distribution that has none.
+    if omega_core::executor::counts_keyed_on_creg(&low.ir, low.needs_collapse) {
         return Ok(res);
     }
     project_counts_onto_creg(res, &measure_pairs(&low))

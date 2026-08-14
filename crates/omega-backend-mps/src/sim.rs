@@ -180,12 +180,28 @@ impl MpsBackend {
         *self.stats.lock().unwrap()
     }
 
-    /// Record a finished run's truncation stats (last-writer-wins).
+    /// Record a trajectory's truncation stats, keeping the WORST seen since
+    /// [`Self::reset_stats`].
+    ///
+    /// This was last-writer-wins, and on the per-shot path that made the
+    /// deferred `check_truncation` consult the LAST trajectory only. So a
+    /// 1000-shot run in which shot 3 discarded half the state was refused when
+    /// the early abort was compiled in and ACCEPTED when it was not — the two
+    /// gates disagreed about which runs are unusable, and the early abort's
+    /// comment claiming they agree was wrong.
+    ///
+    /// A histogram is polluted by any bad trajectory, so the worst one is the
+    /// quantity that gates it; reporting the last one was never right either.
     fn record_stats(&self, mps: &Mps) {
-        *self.stats.lock().unwrap() = MpsRunStats {
-            discarded_weight: mps.discarded_weight,
-            max_bond_reached: mps.max_bond_reached,
-        };
+        let mut st = self.stats.lock().unwrap();
+        st.discarded_weight = st.discarded_weight.max(mps.discarded_weight);
+        st.max_bond_reached = st.max_bond_reached.max(mps.max_bond_reached);
+    }
+
+    /// Clear the worst-case accumulator, once per `execute`, so the stats
+    /// describe THIS run and not a previous one on the same backend value.
+    fn reset_stats(&self) {
+        *self.stats.lock().unwrap() = MpsRunStats::default();
     }
 
     /// Evolve |0…0⟩ through `circuit` once, returning the final chain and the
@@ -252,6 +268,21 @@ impl MpsBackend {
                 }
             }
         }
+        // The abort above runs BEFORE each op, so the LAST op's split was never
+        // tested by it — a circuit crossing the ceiling only on its final gate
+        // escaped the early path entirely and relied on the caller remembering
+        // to call `check_truncation`. Test it here, so `evolve_once` never
+        // returns a chain that is already over the ceiling.
+        if mps.discarded_weight > self.max_discarded_weight {
+            return Err(OmegaError::Unsupported(format!(
+                "MPS truncation certificate {:.3e} exceeded the ceiling {:.3e} on the \
+                 circuit's final operation (bond reached {}). Raise the bond dimension \
+                 (`--backend mps:<chi>`), or call `with_max_discarded_weight` to accept \
+                 an approximation deliberately.",
+                mps.discarded_weight, self.max_discarded_weight, mps.max_bond_reached
+            )));
+        }
+
         Ok((mps, classical_bits))
     }
 
@@ -289,6 +320,9 @@ impl Backend for MpsBackend {
                 "MPS backend does not support photonic circuits".into(),
             ));
         }
+        // Stats are worst-over-trajectory now, so they must start empty or a
+        // previous run's certificate would gate this one.
+        self.reset_stats();
 
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -342,6 +376,15 @@ impl Backend for MpsBackend {
         }
 
         if let (true, Some(shots)) = (by_creg || circuit_has_reset(circuit), config.shots) {
+            // Same predicate as the guard above: above the cliff a measured
+            // circuit is keyed on the creg, whichever branch produces it.
+            let project_wide = !by_creg && omega_core::executor::counts_keyed_on_creg(circuit, false);
+            let mut cbit_of = vec![None; circuit.num_qubits as usize];
+            if project_wide {
+                for (q, c) in omega_core::executor::measure_pairs(circuit) {
+                    cbit_of[q as usize] = Some(c);
+                }
+            }
             let mut counts = HashMap::new();
             for _ in 0..shots {
                 let (mps, cbits) = self.evolve_once(circuit, params, config, &mut rng)?;
@@ -353,6 +396,17 @@ impl Backend for MpsBackend {
                 // noisy-MPS backends.
                 let outcome = if by_creg {
                     mps_creg_to_u64(&cbits)
+                } else if project_wide {
+                    // A RESET circuit reaches this loop with `by_creg == false`,
+                    // and the guard above admitted it at CREG width (because it
+                    // tests `by_creg || circuit_has_reset`). Falling through to
+                    // the unprojected sampler then built a FULL-register key —
+                    // measured on a 70-qubit reset circuit: keys carrying bits
+                    // at q1/q2 rendered at the creg's promised width 2, with
+                    // qubits >= 64 silently aliased by masked shifts. Guard and
+                    // sampler must use the same predicate; they did not.
+                    let envs = mps.right_environments();
+                    mps.sample_with_envs_projected(&envs, &mut rng, &cbit_of)
                 } else {
                     let envs = mps.right_environments();
                     mps.sample_with_envs(&envs, &mut rng)
@@ -539,10 +593,15 @@ impl NoisyMpsBackend {
     }
 
     fn record_stats(&self, mps: &Mps) {
-        *self.stats.lock().unwrap() = MpsRunStats {
-            discarded_weight: mps.discarded_weight,
-            max_bond_reached: mps.max_bond_reached,
-        };
+        let mut st = self.stats.lock().unwrap();
+        st.discarded_weight = st.discarded_weight.max(mps.discarded_weight);
+        st.max_bond_reached = st.max_bond_reached.max(mps.max_bond_reached);
+    }
+
+    /// Clear the worst-case accumulator, once per `execute`, so the stats
+    /// describe THIS run and not a previous one on the same backend value.
+    fn reset_stats(&self) {
+        *self.stats.lock().unwrap() = MpsRunStats::default();
     }
 
     fn check_truncation(&self) -> Result<()> {
@@ -670,7 +729,27 @@ impl Backend for NoisyMpsBackend {
                 "MPS backend does not support photonic circuits".into(),
             ));
         }
+        // Stats are worst-over-trajectory now, so they must start empty or a
+        // previous run's certificate would gate this one.
+        self.reset_stats();
         let n = circuit.num_qubits as usize;
+        // The width guard was on three backends and NOT this one, despite the
+        // comment pasted into all three saying "refused in EVERY backend that
+        // can exceed 64 qubits". Measured: a 66-qubit GHZ with `--noise`
+        // returned `|0^2 1^64>` — the exact row from the defect table in
+        // `executor.rs`, shipping again because adding a noise model routed
+        // around the guard. Debug builds panicked on the shift instead.
+        if config.shots.is_some() {
+            omega_core::executor::check_counts_width(
+                omega_core::executor::counts_outcome_width(
+                    circuit,
+                    omega_core::executor::counts_keyed_on_creg(
+                        circuit,
+                        mps_collapses(circuit, config) || circuit_has_reset(circuit),
+                    ),
+                ),
+            )?;
+        }
         let mut rng: StdRng = match config.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => rand::make_rng::<StdRng>(),

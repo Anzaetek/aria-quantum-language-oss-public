@@ -530,14 +530,22 @@ fn backend_name(sel: &OmegaBackendSel) -> String {
     }
 }
 
-fn exec_result_to_json(result: &ExecResult, num_qubits: u32) -> serde_json::Value {
+/// Render an `ExecResult` to the wire.
+///
+/// `counts_width` is the width to zero-pad a counts key to, which is NOT always
+/// the qubit count: in collapse mode the key is packed from the CLASSICAL
+/// register. Callers must pass `counts_outcome_width(..)`, not `num_qubits` —
+/// the parameter was named `num_qubits` and every caller obliged, so a 70-qubit
+/// circuit measuring 2 qubits reported its 2-bit outcome padded to 70
+/// characters.
+fn exec_result_to_json(result: &ExecResult, counts_width: u32) -> serde_json::Value {
     match result {
         ExecResult::Counts(counts) => {
             let map: std::collections::HashMap<String, u32> = counts
                 .iter()
                 .map(|(bs, ct)| {
                     (
-                        format!("{:0>width$b}", bs, width = num_qubits as usize),
+                        format!("{:0>width$b}", bs, width = counts_width as usize),
                         *ct,
                     )
                 })
@@ -641,7 +649,16 @@ pub async fn execute_quantum_route(
     if let Err(resp) = check_rights(&claims, rights::EXECUTE) {
         return resp;
     }
-    let num_qubits = req.circuit.num_qubits;
+    // The RENDER width for counts, which is the classical-register width in
+    // collapse mode rather than the qubit count. See `exec_result_to_json`.
+    let counts_width = {
+        let core = translate_to_core_ir(&req.circuit);
+        let collapse = matches!(req.circuit.mid_circuit_mode, OmegaMidCircuitMode::Collapse);
+        omega_core::executor::counts_outcome_width(
+            &core,
+            omega_core::executor::counts_keyed_on_creg(&core, collapse),
+        ) as u32
+    };
     let mut timer = PhaseTimer::new();
     // Price and reserve before allocating anything. `_reservation` must stay
     // alive for the whole execution — dropping it returns the budget.
@@ -655,7 +672,7 @@ pub async fn execute_quantum_route(
             timer.mark("exec");
             let body = serde_json::json!({
                 "backend": backend_name(&resolved),
-                "result": exec_result_to_json(&result, num_qubits),
+                "result": exec_result_to_json(&result, counts_width),
             });
             timer.mark("serialize");
             // `Server-Timing` is a standard header, so devtools and existing
@@ -977,6 +994,104 @@ mod tests {
                     condition: None,
                 },
             ],
+        }
+    }
+
+    /// A wide circuit that measures two qubits into a two-bit creg, in
+    /// collapse mode — the shape whose counts key is the CREG, not the
+    /// register.
+    fn wide_collapse_ir(n: u32) -> OmegaCircuitIR {
+        let mut ops = vec![
+            OmegaGateOp {
+                gate: OmegaGateKind::H,
+                qubits: vec![0],
+                params: vec![],
+                classical_bit: None,
+                condition: None,
+            },
+            OmegaGateOp {
+                gate: OmegaGateKind::CX,
+                qubits: vec![0, 1],
+                params: vec![],
+                classical_bit: None,
+                condition: None,
+            },
+        ];
+        for (q, c) in [(0u32, 0u32), (1, 1)] {
+            ops.push(OmegaGateOp {
+                gate: OmegaGateKind::Measure,
+                qubits: vec![q],
+                params: vec![],
+                classical_bit: Some(c),
+                condition: None,
+            });
+        }
+        OmegaCircuitIR {
+            num_qubits: n,
+            num_classical_bits: 2,
+            is_photonic: false,
+            mid_circuit_mode: OmegaMidCircuitMode::Collapse,
+            backend: OmegaBackendSel::Statevector,
+            ops,
+        }
+    }
+
+    /// **The wire must report a counts key at the width it actually has.**
+    ///
+    /// In collapse mode the key is packed from the classical register, so a
+    /// 20-qubit circuit measuring 2 qubits yields a 2-bit outcome. This site
+    /// padded to `num_qubits` after the CLI renderers were corrected, so the
+    /// same run printed `11` locally and `00000000000000000011` over HTTP —
+    /// a JSON consumer counting characters read 18 qubits that were never
+    /// measured, and were not zero either.
+    #[test]
+    fn collapse_mode_counts_are_rendered_at_the_creg_width() {
+        let ir = wide_collapse_ir(20);
+        let core = translate_to_core_ir(&ir);
+        let width = omega_core::executor::counts_outcome_width(
+            &core,
+            omega_core::executor::counts_keyed_on_creg(&core, true),
+        ) as u32;
+        assert_eq!(width, 2, "the creg is 2 bits wide");
+
+        let (result, _) = execute_quantum_ir(&ir, Some(200), Some(3)).expect("execute");
+        let json = exec_result_to_json(&result, width);
+        let counts = json["counts"].as_object().expect("counts object");
+
+        for k in counts.keys() {
+            assert_eq!(
+                k.len(),
+                2,
+                "key {k:?} is {} characters wide; the outcome is 2 bits. \
+                 Rendering at `num_qubits` produces a 20-character string for \
+                 the same run.",
+                k.len()
+            );
+        }
+        let mut keys: Vec<&String> = counts.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["00", "11"],
+            "a Bell pair measured into a 2-bit creg has exactly these outcomes"
+        );
+    }
+
+    /// **Skip mode still renders the full register**, so the fix above did not
+    /// narrow a case that was already right.
+    #[test]
+    fn skip_mode_counts_are_still_rendered_at_the_register_width() {
+        let ir = bell_ir(OmegaBackendSel::Statevector);
+        let core = translate_to_core_ir(&ir);
+        let width = omega_core::executor::counts_outcome_width(
+            &core,
+            omega_core::executor::counts_keyed_on_creg(&core, false),
+        ) as u32;
+        assert_eq!(width, 2);
+        let (result, _) = execute_quantum_ir(&ir, Some(100), Some(1)).expect("execute");
+        let json = exec_result_to_json(&result, width);
+        for k in json["counts"].as_object().unwrap().keys() {
+            assert_eq!(k.len(), 2, "unmeasured Bell pair is keyed on both qubits");
         }
     }
 

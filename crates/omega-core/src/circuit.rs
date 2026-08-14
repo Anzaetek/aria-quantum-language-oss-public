@@ -213,9 +213,24 @@ impl GateOp {
         let mut value: u64 = 0;
         for i in 0..num_bits {
             let idx = (start_bit + i) as usize;
-            if idx < classical_bits.len() {
-                value |= (classical_bits[idx] as u64 & 1) << i;
+            let bit = if idx < classical_bits.len() {
+                classical_bits[idx] & 1
+            } else {
+                0
+            };
+            if i >= 64 {
+                // `1u64 << 64` panics in debug and is masked to `<< 0` in
+                // release, so `if (c == 1)` on a `creg c[70]` either crashed or
+                // silently OR-ed bit 64 into bit 0 — a condition that fired on
+                // the wrong register contents. It is not a representation gap:
+                // `expected` is a u64, so ANY set bit at or above 64 makes the
+                // register strictly larger than it, and the test is false.
+                if bit != 0 {
+                    return false;
+                }
+                continue;
             }
+            value |= (bit as u64) << i;
         }
         value == expected
     }

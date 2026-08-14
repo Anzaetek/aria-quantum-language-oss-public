@@ -148,8 +148,20 @@ impl Backend for PauliBackend {
                         // Only the MEASURED qubits are measured. Marginalising
                         // over an unmeasured qubit is the same as never
                         // measuring it, so the reported distribution is
-                        // unchanged — and at 1024 qubits this is the difference
-                        // between ~1.4 s per shot and a negligible one.
+                        // unchanged.
+                        //
+                        // The cost of the alternative, measured by forcing every
+                        // site to be measured on a 1024-qubit GHZ reporting two
+                        // qubits, 100 shots: **111.8 s (1.12 s per shot)**, against
+                        // **0.71 s for the whole run** as written — process startup
+                        // included, so the true per-shot figure is well under a
+                        // millisecond. Roughly 1600x.
+                        //
+                        // Read that as the price of NOT projecting. Timing this
+                        // path and comparing it against the number above is
+                        // comparing two different things, and reads as though the
+                        // comment overstated the saving by three orders of
+                        // magnitude.
                         //
                         // (The MPS backend cannot do this: its sampler walks the
                         // chain left to right and each site conditions the next,

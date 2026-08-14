@@ -119,8 +119,9 @@ fn unmeasured_qubits_do_not_reach_the_key() {
 /// The stabilizer path measures ONLY the reported qubits, unlike the MPS path
 /// which must draw every site because each conditions the next. Marginalising
 /// over an unmeasured qubit equals never measuring it, so the distribution is
-/// unchanged — and at 1024 qubits it is the difference between ~1.4 s per shot
-/// and a negligible one.
+/// unchanged. Measured at 1024 qubits reporting two: forcing every site to be
+/// measured costs 111.8 s for 100 shots (1.12 s per shot); as written the whole
+/// run takes 0.71 s including process startup.
 #[test]
 fn stabilizer_projected_counts_are_the_bell_distribution() {
     use omega_backend_pauli::PauliBackend;
@@ -173,5 +174,162 @@ fn stabilizer_projected_counts_are_the_bell_distribution() {
         dev < 150,
         "|00> came out {zeros}/2400, {dev} away from the expected 1200 — beyond the \
          6-sigma band, so this is a bias rather than sampling noise"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Above the cliff, on MPS, with a NON-IDENTITY qubit -> cbit map.
+//
+// Everything above this line runs at n = 20 or on the stabilizer backend. So
+// the MPS projection — `sample_with_envs_projected`, the function the whole
+// wide-sampling story rests on — had no test that executed it at all, and a
+// review confirmed the suite stayed green with the classical keying destroyed.
+//
+// Two things were missing, and both are needed together:
+//
+//   * a width ABOVE 64, or the projected branch is never taken;
+//   * a map that is not the identity, or `cbit_of[q] = q` passes every check.
+//     Every fixture above measures q0 -> c0 and q1 -> c1, under which
+//     "project onto the creg" and "take the low bits of the register" are the
+//     same function.
+//
+// The Bell pair therefore sits on q40/q41 reporting to c1/c0 — SWAPPED, so bit
+// order is checked too — with the other 68 qubits in |+>. Under an identity map
+// the key would read q0/q1, which are unentangled |+>: a uniform four-outcome
+// histogram, not a Bell pair.
+// ---------------------------------------------------------------------------
+
+/// Bell pair on q40/q41, reported to c1/c0, at 70 qubits.
+fn wide_src(n: usize) -> String {
+    let mut s = format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[2];\n");
+    s.push_str("h q[40];\ncx q[40], q[41];\n");
+    for i in 0..n {
+        if i != 40 && i != 41 {
+            s.push_str(&format!("h q[{i}];\n"));
+        }
+    }
+    // Deliberately crossed: q40 -> c1, q41 -> c0.
+    s.push_str("measure q[40] -> c[1];\nmeasure q[41] -> c[0];\n");
+    s
+}
+
+/// **The MPS projected key is the Bell distribution at 70 qubits.**
+///
+/// The assertion is on the key CONTENTS. `|01>` and `|10>` carry probability
+/// zero, so their absence is the whole claim: an identity map, an off-by-one, a
+/// reversed bit order or a dropped projection all put weight there.
+#[test]
+fn mps_projected_counts_above_the_cliff_are_the_bell_distribution() {
+    let ir = omega_parser::lower_to_ir(&wide_src(70)).expect("lower");
+    let (mut n00, mut n11, mut other) = (0u32, 0u32, 0u32);
+    let mut total = 0u32;
+    for seed in 1..=4u64 {
+        let cfg = ExecConfig {
+            shots: Some(300),
+            seed: Some(seed),
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let c = match MpsBackend::new(8)
+            .execute(&ir, &ParameterBinding::default(), &cfg)
+            .expect("70-qubit MPS sampling must work, not be refused")
+        {
+            ExecResult::Counts(c) => c,
+            o => panic!("{o:?}"),
+        };
+        for (k, v) in &c {
+            total += v;
+            match k {
+                0b00 => n00 += v,
+                0b11 => n11 += v,
+                _ => other += v,
+            }
+        }
+    }
+    assert_eq!(total, 1200, "shots went missing");
+    assert_eq!(
+        other, 0,
+        "the reported pair is a Bell pair, so only |00> and |11> may appear; \
+         {other} of 1200 shots landed elsewhere. Under an identity qubit->cbit \
+         map the key would read q0/q1 — two independent |+> qubits — and this is \
+         the count that would be ~900."
+    );
+    let skew = (n00 as i64 - n11 as i64).unsigned_abs();
+    assert!(skew < 130, "|00> vs |11> skew {skew} exceeds 6 sigma at 1200 shots");
+}
+
+/// **A reset circuit above the cliff.** Same claim, different branch.
+///
+/// `circuit_has_reset` admits a circuit to creg keying even when it has no
+/// feed-forward, and for a while that branch chose its outcome with a
+/// *different* predicate than the guard that admitted it — so it fell through
+/// to the unprojected sampler and emitted a full-register key at the creg's
+/// promised width. Measured before the fix on this shape: `|110>` where `|11>`
+/// was promised.
+#[test]
+fn mps_reset_circuit_above_the_cliff_is_also_projected() {
+    let mut s = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[70];\ncreg c[2];\n".to_string();
+    s.push_str("h q[40];\ncx q[40], q[41];\nreset q[5];\n");
+    s.push_str("measure q[40] -> c[1];\nmeasure q[41] -> c[0];\n");
+    let ir = omega_parser::lower_to_ir(&s).expect("lower");
+
+    let cfg = ExecConfig {
+        shots: Some(400),
+        seed: Some(3),
+        mid_circuit_mode: MidCircuitMode::Skip,
+    };
+    let c = match MpsBackend::new(8)
+        .execute(&ir, &ParameterBinding::default(), &cfg)
+        .expect("reset + 70 qubits must work")
+    {
+        ExecResult::Counts(c) => c,
+        o => panic!("{o:?}"),
+    };
+    let bad: Vec<u64> = c.keys().copied().filter(|k| *k != 0 && *k != 0b11).collect();
+    assert!(
+        bad.is_empty(),
+        "reset path emitted keys outside the 2-bit creg's Bell support: {bad:?} \
+         — a key like 0b110 is the full register reported at the creg's width"
+    );
+    assert_eq!(c.values().sum::<u32>(), 400);
+}
+
+/// **Guard the guard: the fixture must be able to fail.**
+///
+/// If `wide_src` ever stops entangling, or the unmeasured qubits stop being in
+/// superposition, the two tests above pass vacuously. Below the cliff the full
+/// register is reported, so this checks the fixture's physics directly: q40/q41
+/// are perfectly correlated and q0 is not correlated with them.
+#[test]
+fn the_wide_fixture_would_expose_an_identity_map() {
+    let ir = omega_parser::lower_to_ir(&wide_src(20).replace("q[40]", "q[10]").replace("q[41]", "q[11]"))
+        .expect("lower");
+    let cfg = ExecConfig {
+        shots: Some(600),
+        seed: Some(5),
+        mid_circuit_mode: MidCircuitMode::Skip,
+    };
+    let c = match MpsBackend::new(8)
+        .execute(&ir, &ParameterBinding::default(), &cfg)
+        .expect("run")
+    {
+        ExecResult::Counts(c) => c,
+        o => panic!("{o:?}"),
+    };
+    // Full-register keys here. q10 and q11 must agree in every single shot...
+    for k in c.keys() {
+        assert_eq!(
+            (k >> 10) & 1,
+            (k >> 11) & 1,
+            "fixture no longer entangles the reported pair"
+        );
+    }
+    // ...and q0, which an identity map would report instead, must take BOTH
+    // values, so reading it in place of the pair is detectable.
+    let q0: std::collections::HashSet<u64> = c.keys().map(|k| k & 1).collect();
+    assert_eq!(
+        q0.len(),
+        2,
+        "q0 is constant, so an identity map would still yield a 2-outcome \
+         histogram and the tests above could not tell the two apart"
     );
 }

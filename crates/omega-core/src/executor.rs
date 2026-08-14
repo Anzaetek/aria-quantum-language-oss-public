@@ -171,14 +171,19 @@ pub fn needs_collapse(circuit: &CircuitIR) -> bool {
 /// Lives here because it had been copy-pasted into three backends, and a
 /// fourth copy is a fourth chance to key counts differently from the rest.
 pub fn creg_to_u64(classical_bits: &[u8]) -> u64 {
-    // Callers must have gone through `check_counts_width` first. The `break`
-    // below is what silently produced wrong results for 65+ qubits, so it is
-    // now an assertion in debug builds rather than a quiet fact.
+    // The condition is on the bits that are SET, not on the register's declared
+    // size. `creg c[70]; measure q[0] -> c[0];` is a perfectly representable
+    // 1-bit outcome that happens to live in a 70-entry slice — asserting on
+    // `classical_bits.len()` panicked on it in debug builds, while
+    // `counts_outcome_width` (which gates the same runs) correctly reported 1.
+    // The two disagreed about what "too wide" means.
+    //
+    // What actually loses information is a set bit at or above index 64.
     debug_assert!(
-        classical_bits.len() <= MAX_COUNTS_QUBITS,
-        "creg_to_u64 called with {} bits; the counts key holds {MAX_COUNTS_QUBITS}. \
-         Call `check_counts_width` before producing counts.",
-        classical_bits.len()
+        classical_bits.iter().skip(MAX_COUNTS_QUBITS).all(|b| *b & 1 == 0),
+        "creg_to_u64: a classical bit at or above index {MAX_COUNTS_QUBITS} is \
+         set, so the {MAX_COUNTS_QUBITS}-bit counts key cannot represent this \
+         outcome. Call `check_counts_width(counts_outcome_width(..))` first."
     );
     let mut bits = 0u64;
     for (i, b) in classical_bits.iter().enumerate() {
@@ -248,18 +253,24 @@ pub fn counts_keyed_on_creg(circuit: &CircuitIR, collapse: bool) -> bool {
 
 /// The number of bits a shot outcome of `circuit` actually occupies.
 ///
-/// **Not the qubit count.** Which register keys the outcome depends on the mode:
+/// **Not the qubit count.** Which register keys the outcome decides the width:
 ///
-/// * collapse — the mid-circuit `measure`s already ran, so the CREG is the
-///   result (`creg_to_u64`), and the width is the highest classical bit used;
-/// * skip — the final qubit register is sampled, so the width is `num_qubits`.
+/// * keyed on the creg — the width is the highest classical bit used;
+/// * keyed on the qubit register — the width is `num_qubits`.
 ///
-/// Gating on `num_qubits` in both cases over-refuses badly. Measured: a
+/// `by_creg` must be [`counts_keyed_on_creg`]'s answer, **not** the raw
+/// collapse flag. The two differ above the 64-qubit cliff, where a measured
+/// circuit is keyed on its creg even in skip mode — passing `collapse` there
+/// returns `num_qubits`, which then refuses a run that was going to produce a
+/// perfectly representable 2-bit key. The parameter was called `collapse` and
+/// at least one caller obliged.
+///
+/// Gating on `num_qubits` unconditionally over-refuses badly. Measured: a
 /// 1024-qubit circuit measuring two qubits into `creg c[2]` was refused, though
 /// its outcome needs two bits — and that is the natural shape of a large run.
 /// A 70-qubit circuit with a 2-bit creg was refused for the same reason.
-pub fn counts_outcome_width(circuit: &CircuitIR, collapse: bool) -> usize {
-    if collapse {
+pub fn counts_outcome_width(circuit: &CircuitIR, by_creg: bool) -> usize {
+    if by_creg {
         measure_pairs(circuit)
             .iter()
             .map(|&(_, c)| c as usize + 1)
