@@ -227,6 +227,25 @@ pub const MAX_COUNTS_QUBITS: usize = 64;
 ///
 /// Expectation values, statevectors and probability vectors are unaffected —
 /// this is a property of the counts KEY, not of any simulation.
+/// Is this run's counts key packed from the CLASSICAL register?
+///
+/// Three places need this answer and they must agree: the width guard, the
+/// sampling path that builds the key, and the front end that renders it. A
+/// disagreement shows up as a correct key printed at the wrong width, or a
+/// refusal for a key that was never going to be built.
+///
+/// Two ways it becomes true:
+/// * **collapse** — the mid-circuit measures already ran, so the creg IS the
+///   result;
+/// * **above the 64-qubit cliff with measurements** — the full-register key
+///   cannot be represented at all, so a measured circuit is keyed on its creg
+///   instead. Below the cliff the full register is kept, so nothing a caller
+///   already relies on moves.
+pub fn counts_keyed_on_creg(circuit: &CircuitIR, collapse: bool) -> bool {
+    collapse
+        || (circuit.num_qubits as usize > MAX_COUNTS_QUBITS && !measure_pairs(circuit).is_empty())
+}
+
 /// The number of bits a shot outcome of `circuit` actually occupies.
 ///
 /// **Not the qubit count.** Which register keys the outcome depends on the mode:

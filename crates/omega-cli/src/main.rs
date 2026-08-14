@@ -448,7 +448,10 @@ fn main() {
     // it.
     let counts_display_width = omega_core::executor::counts_outcome_width(
         &circuit,
-        omega_core::executor::needs_collapse(&circuit),
+        omega_core::executor::counts_keyed_on_creg(
+            &circuit,
+            omega_core::executor::needs_collapse(&circuit),
+        ),
     ) as u32;
     info(format!(
         "Circuit: {} {}, {} ops, type: {:?}",
