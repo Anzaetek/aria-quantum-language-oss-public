@@ -2619,6 +2619,7 @@ version = "0.1.0"
 dependencies = [
  "aria-core",
  "base64",
+ "omega-backend-pauliprop",
  "omega-backend-photonics",
  "omega-core",
  "omega-parser",
