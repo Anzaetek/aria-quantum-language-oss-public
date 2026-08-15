@@ -108,12 +108,42 @@ def aria_statevector_probs(twin, circuit, ints):
 # Independent reference: a tiny OpenQASM-2 parser over the demo gate set
 # {h, x, cz, cp(θ), swap} into a Qiskit circuit (qubit 0 = LSB, as in aria).
 # ---------------------------------------------------------------------------
+# Gate names this parser implements natively below. A `gate` DECLARATION for
+# one of these can be skipped, because we apply Qiskit's own definition instead
+# of the emitted body. Anything else must still be refused: silently ignoring
+# an unknown custom-gate declaration would drop real operations and leave the
+# comparison looking like agreement.
+NATIVE_GATES = {"h", "x", "cz", "swap", "cp", "cu1"}
+
+
 def qasm_to_qiskit(qasm, drop_measure=True):
     n = None
     body = []
+    in_gate_decl = False
     for raw in qasm.splitlines():
         line = raw.strip().rstrip(";").strip()
         if not line or line.startswith(("OPENQASM", "include", "creg")):
+            continue
+        # `gate NAME(params) args { body }` — the aria exporter emits these for
+        # gates outside the qelib1 core (e.g. `gate swap q0,q1 { cx …; cx …; cx …; }`)
+        # so the QASM stands alone. This parser predates that and died on the
+        # declaration with "unhandled QASM op", which took the whole MANDATORY
+        # QEC cross-check down with it.
+        if in_gate_decl:
+            if "}" in line:
+                in_gate_decl = False
+            continue
+        if line.startswith("gate "):
+            name = line.split()[1].split("(")[0]
+            if name not in NATIVE_GATES:
+                raise RuntimeError(
+                    f"QASM declares gate {name!r}, which this reference parser does "
+                    f"not implement; add it to NATIVE_GATES and to the dispatch "
+                    f"below rather than skipping it: {line!r}"
+                )
+            # Multi-line declaration: swallow until the closing brace.
+            if "{" in line and "}" not in line:
+                in_gate_decl = True
             continue
         if line.startswith("qreg"):
             n = int(line[line.index("[") + 1 : line.index("]")])
@@ -141,7 +171,12 @@ def qasm_to_qiskit(qasm, drop_measure=True):
             qc.cz(qubits[0], qubits[1])
         elif head == "swap":
             qc.swap(qubits[0], qubits[1])
-        elif head.startswith("cp("):
+        elif head.startswith(("cp(", "cu1(")):
+            # `cu1(λ)` and `cp(λ)` are the same controlled-phase gate —
+            # diag(1, 1, 1, e^{iλ}). Qiskit renamed `cu1` to `cp`; the aria
+            # exporter emits the `cu1` spelling, and this parser only knew the
+            # other one, so an exported QFT was unreadable by its own reference
+            # checker.
             angle = eval(line[line.index("(") + 1 : line.index(")")], {"pi": math.pi})
             qc.cp(angle, qubits[0], qubits[1])
         else:
