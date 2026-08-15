@@ -368,7 +368,11 @@ impl Backend for TchBackend {
                     }
                     *counts.entry(idx as u64).or_insert(0) += 1;
                 }
-                Ok(ExecResult::Counts(counts))
+                // Widen at the boundary, as the other statevector backends do:
+                // the sampler's key stays a `u64` (a dense tch statevector is
+                // bounded by device memory long before 64 qubits) and the
+                // outcome is the full qubit register.
+                Ok(ExecResult::counts_from_u64(counts, circuit.num_qubits))
             }
         }
     }
