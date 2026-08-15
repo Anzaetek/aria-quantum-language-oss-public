@@ -55,4 +55,8 @@ omega-parser = { path = "../omega-parser" }
 # ppvm test anchors ppvm against qiskit; nothing put our own backend on that
 # path, despite the doc comment saying that was the point.
 omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
+# Test-only: `wide_counts_vs_qiskit_mps.rs` compares OUR MPS sampling against
+# Aer's matrix-product-state method at widths a dense statevector cannot reach.
+# Above ~30 qubits there is no dense oracle to be the second opinion.
+omega-backend-mps = { path = "../omega-backend-mps" }
 omega-backend-photonics = { path = "../omega-backend-photonics" }

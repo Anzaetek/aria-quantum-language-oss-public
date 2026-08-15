@@ -29,6 +29,57 @@ pub fn run(qasm: &str, shots: u32, noise: Option<&NoiseConfig>) -> Result<Counts
     run_subprocess(&spec, &req)
 }
 
+/// Counts via Aer's **matrix-product-state** method.
+///
+/// The default `run` uses Aer's automatic method, which is a dense statevector
+/// for anything it can fit — so it cannot reach the widths our MPS backend
+/// exists for, and a comparison against it stops at ~30 qubits. This is the
+/// entry point that makes an MPS-vs-MPS comparison possible: two independent
+/// implementations of the same approximation, which is what can catch a shared
+/// misreading of the algorithm that a dense oracle never could.
+///
+/// `bond` caps Aer's bond dimension. Pass `None` for Aer's default (unbounded
+/// in practice), which is what an EXACT comparison wants — matching a finite
+/// bond on both sides compares two different approximations and any
+/// disagreement is then ambiguous between them.
+#[cfg(feature = "bridge-qiskit")]
+pub fn run_mps(
+    qasm: &str,
+    shots: u32,
+    seed: Option<u64>,
+    bond: Option<usize>,
+) -> Result<Counts, BridgeError> {
+    let mut payload = serde_json::json!({
+        "qasm": qasm,
+        "shots": shots,
+        "method": "matrix_product_state",
+    });
+    if let Some(s) = seed {
+        payload["seed"] = serde_json::json!(s);
+    }
+    if let Some(b) = bond {
+        payload["mps_bond_dimension"] = serde_json::json!(b);
+    }
+    let spec = RunnerSpec::new(Backend::Qiskit, "qiskit");
+    match invoke_runner(&spec, &payload.to_string(), ParseAs::Counts)? {
+        ParsedResponse::Counts(c) => Ok(c),
+        other => Err(BridgeError::Backend(
+            Backend::Qiskit,
+            format!("expected counts, got {other:?}"),
+        )),
+    }
+}
+
+#[cfg(not(feature = "bridge-qiskit"))]
+pub fn run_mps(
+    _qasm: &str,
+    _shots: u32,
+    _seed: Option<u64>,
+    _bond: Option<usize>,
+) -> Result<Counts, BridgeError> {
+    Err(BridgeError::NotCompiled(Backend::Qiskit, "qiskit"))
+}
+
 #[cfg(not(feature = "bridge-qiskit"))]
 pub fn expectation(
     _qasm: &str,
