@@ -99,6 +99,15 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  --backend NAME         statevector (default), mps, pauli, photonics,");
     eprintln!("                         pauliprop (Pauli propagation; --expectation only).");
+    eprintln!(
+        "  --truncate C           pauliprop: drop coefficients below C. With any of these three,"
+    );
+    eprintln!(
+        "  --max-weight W         the run reports `dropped_mass`, a BOUND on the error in <O>"
+    );
+    eprintln!(
+        "  --max-freq F           (not an estimate). Without them the exact engine is used."
+    );
     eprintln!("                         A name matching a loaded plugin resolves after the");
     eprintln!("                         compiled-in backends.");
     eprintln!("  --backend-dir DIR      Load backend plugins (.so/.dylib/.dll) from DIR");
@@ -325,6 +334,9 @@ fn main() {
     let mut param_values: Option<Vec<f64>> = None;
     let mut grad_method_name: Option<String> = None;
     let mut noise_json: Option<String> = None;
+    let mut pp_truncate: Option<f64> = None;
+    let mut pp_max_weight: Option<usize> = None;
+    let mut pp_max_freq: Option<u32> = None;
     let mut bridge_name: Option<String> = None;
     let mut backend_dirs: Vec<String> = Vec::new();
 
@@ -380,6 +392,34 @@ fn main() {
             }
             "--noise" => {
                 noise_json = Some(flag_value(&args, &mut i, "--noise"));
+            }
+            // Pauli-propagation truncation, the three axes PauliPropagation.jl
+            // uses. `aria` has had these; `omega-run` did not, so the only
+            // engine reachable here was the exact one — and with it no
+            // dropped-mass budget to report.
+            "--truncate" => {
+                pp_truncate = Some(flag_parse(
+                    &args,
+                    &mut i,
+                    "--truncate",
+                    "a coefficient floor, e.g. 1e-3",
+                ));
+            }
+            "--max-weight" => {
+                pp_max_weight = Some(flag_parse(
+                    &args,
+                    &mut i,
+                    "--max-weight",
+                    "a maximum Pauli weight",
+                ));
+            }
+            "--max-freq" => {
+                pp_max_freq = Some(flag_parse(
+                    &args,
+                    &mut i,
+                    "--max-freq",
+                    "a maximum split frequency",
+                ));
             }
             other => {
                 eprintln!("Unknown argument: {}", other);
@@ -962,11 +1002,42 @@ fn main() {
                 .expect("is_mps implies parse_mps")
                 .expectation(&circuit, &params, &observable),
             "pauliprop" | "pp" => {
-                let backend = match &exp_noise {
-                    Some(model) => PauliPropBackend::new().with_noise(model.clone()),
-                    None => PauliPropBackend::new(),
+                let truncating =
+                    pp_truncate.is_some() || pp_max_weight.is_some() || pp_max_freq.is_some();
+                let mut backend = if truncating {
+                    PauliPropBackend::with_truncation_freq(
+                        pp_truncate.unwrap_or(0.0),
+                        pp_max_weight,
+                        pp_max_freq,
+                    )
+                } else {
+                    PauliPropBackend::new()
                 };
-                backend.expectation(&circuit, &params, &observable)
+                if let Some(model) = &exp_noise {
+                    backend = backend.with_noise(model.clone());
+                }
+                if truncating {
+                    // The dropped-mass budget is a GENUINE BOUND, not an
+                    // estimate: it is the L1 mass of the coefficients thrown
+                    // away, and |<P>| <= 1 for every Pauli string, so the error
+                    // in <O> is at most that mass. No gauge caveat — unlike the
+                    // MPS fidelity, which is labelled `~` for exactly that
+                    // reason. Printed whenever truncation is on, because a
+                    // truncated expectation without its budget is a number with
+                    // no error bar.
+                    match backend.expectation_with_budget(&circuit, &params, &observable) {
+                        Ok((v, budget)) => {
+                            eprintln!(
+                                "pauliprop: dropped_mass={budget:.3e} \
+                                 (a bound on |Δ⟨O⟩|, not an estimate)"
+                            );
+                            Ok(v)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    backend.expectation(&circuit, &params, &observable)
+                }
             }
             "photonics" => {
                 let b = input_state
