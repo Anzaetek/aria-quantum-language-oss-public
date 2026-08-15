@@ -78,6 +78,34 @@ pub struct Mps {
     /// that the bond dimension is under-provisioned. The standard MPS fidelity
     /// proxy — read via [`MpsBackend::last_run_stats`].
     pub discarded_weight: f64,
+    /// **Fidelity estimate**: Π over splits of `(1 − εᵢ)`, starting at 1.0.
+    ///
+    /// The same quantity, and the same shape, that a commercial MPS simulator
+    /// reports per run: a number in [0, 1] where **1.0 means the run was
+    /// exact**. It is reported alongside `discarded_weight` rather than instead
+    /// of it, because the two answer different questions — "how good is this
+    /// state" versus "how much was thrown away" — and the sum is what the
+    /// refusal ceiling is expressed in.
+    ///
+    /// # Not a bound here, and why
+    ///
+    /// In **canonical gauge** each εᵢ is the true local discarded probability
+    /// weight and this product is a genuine LOWER bound on the state fidelity.
+    /// This MPS is deliberately not canonical (see the truncation comment in
+    /// `split_two_site`), so εᵢ is measured against the block norm rather than
+    /// the global one and the product is an ESTIMATE.
+    ///
+    /// Measured across 108 non-Clifford circuits with non-flat Schmidt spectra
+    /// (`tests/fidelity_estimate.rs`): it never exceeded the true fidelity, and
+    /// `F_true / F_est` spanned **[1.0067, 142.7]**. Tight under mild
+    /// truncation; up to ~140× pessimistic when the bond is badly starved. Read
+    /// it as "is this run usable", not as "how good is this bad run".
+    ///
+    /// Nothing proves it cannot understate on a circuit outside that corpus,
+    /// and that is the difference between this number and one you may rely on.
+    /// A separate measurement on one trajectory put the canonical certificate
+    /// at 0.664 against our 6.402 — ours overstates the loss ~10× there too.
+    pub fidelity_estimate: f64,
     /// The largest right-bond dimension reached after truncation across the run
     /// — how close the state came to saturating `max_bond_dim`.
     pub max_bond_reached: usize,
@@ -112,6 +140,7 @@ impl Mps {
             n,
             max_bond_dim,
             discarded_weight: 0.0,
+            fidelity_estimate: 1.0,
             max_bond_reached: 1,
             adaptive_eps: None,
             svd_fn: truncated_svd_flat,
@@ -181,6 +210,7 @@ impl Mps {
                 ) {
                     self.max_bond_reached = self.max_bond_reached.max(nl.bond_right);
                     self.discarded_weight += rel_discarded;
+                    self.fidelity_estimate *= (1.0 - rel_discarded).max(0.0);
                     self.tensors[q] = nl;
                     self.tensors[q + 1] = nr;
                     return;
@@ -336,6 +366,10 @@ impl Mps {
             0.0
         };
         self.discarded_weight += rel_discarded;
+        // Π(1 − εᵢ). Clamped at 0: a single split cannot discard more than the
+        // whole block, but floating point at ε ≈ 1 could produce a small
+        // negative and a NEGATIVE fidelity would be nonsense to report.
+        self.fidelity_estimate *= (1.0 - rel_discarded).max(0.0);
         self.max_bond_reached = self.max_bond_reached.max(new_bm);
 
         // Step 4: Build new tensors directly from flat U / Vt buffers.

@@ -555,9 +555,16 @@ fn report_mps_truncation(strict: Option<f64>) -> Result<(), String> {
     // an otherwise-exact split) leaves a ~1e-28 weight that isn't worth a line;
     // 1e-12 is comfortably above that floor and below any meaningful loss.
     if stats.discarded_weight > 1e-12 {
+        // `fidelity~` — an ESTIMATE, not a proven bound. The product form
+        // Π(1−εᵢ) is a genuine lower bound in canonical gauge; this MPS is not
+        // canonical, so what we have is 108 measured non-Clifford circuits in
+        // which it never exceeded the true fidelity, with F_true/F_est in
+        // [1.0067, 142.7] — tight under mild truncation, up to ~140x
+        // pessimistic when the bond is starved. Evidence, not proof.
         eprintln!(
-            "mps: discarded_weight={:.3e} max_bond_reached={}",
-            stats.discarded_weight, stats.max_bond_reached
+            "mps: fidelity~{:.4} (estimate, not a bound) \
+             discarded_weight={:.3e} max_bond_reached={}",
+            stats.fidelity_estimate, stats.discarded_weight, stats.max_bond_reached
         );
     }
     // `--strict-truncation` OVERRIDES the default; absent, the backend's default
