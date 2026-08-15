@@ -85,19 +85,28 @@ This also gates `PLAN-SV-PERF.md` S2: a shared rayon pool must never be handed
 a CUDA backend handle, and that constraint should be checked on hardware before
 S2 lands, not after.
 
-## 4. Two feature sets that are unswept on ANY machine
+## 4. One feature set still unswept anywhere
 
-I swept all 22 macOS-buildable feature combinations (all clean). Two could not
-be swept anywhere available here, and the `Outcome` migration is exactly the
-kind of change that hides in an uncompiled feature — six sites did:
+I swept all 22 macOS-buildable feature combinations, then `tch` (see below).
+All clean. One remains:
 
-- **`tch`** — `aria-cli` / `aria-runtime`. macOS builds fail on the Apple-clang
-  `std::is_arithmetic` issue; Linux is where this can be checked at all.
-  `cargo check -p aria-runtime --features tch --all-targets`.
 - **`cuda` in `bindings/aria-py`** — a **separate workspace with its own
   lockfile**, so no workspace-wide command reaches it. `ci.sh:402` has a stage
   for it now (request E1), but the `cuda` feature there is untested.
   `cargo check --features cuda --all-targets` inside `bindings/aria-py`.
+
+**`tch` turned out to be reachable here after all, and was the seventh
+`Outcome` site.** It is worth recording *why* it hid, because it is the worst
+case of the pattern: `crates/aria-backend-tch` is **`exclude`d from the
+workspace** (`Cargo.toml:18`) *and* only built behind a feature, so neither
+`cargo test --workspace` nor a per-crate `-p aria-backend-tch` sweep reaches
+it — the latter errors with "package ID specification did not match any
+packages", which reads like a typo rather than a gap. The only route in is
+`cargo check -p aria-runtime --features tch`, with `tch-env.sh` sourced and the
+Apple-clang `CXXFLAGS` workaround exported.
+
+The other `exclude`d members (`bindings/aria-py`, five `examples/wasm-guests/*`)
+were swept by hand for the same pattern: clean.
 
 ## 5. Not blocked on Linux, but wants a many-core x86 box
 
