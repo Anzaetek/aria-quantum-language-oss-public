@@ -10,6 +10,8 @@ Request shape:
   {
     "qasm":  "OPENQASM 2.0; ...",   # required, QASM2 source
     "shots": 1024,                   # required, positive int
+    "method": "matrix_product_state",# optional, Aer simulation method
+    "mps_bond_dimension": 256,       # optional, only with the MPS method
     "seed":  42,                     # optional, RNG seed for reproducibility
     "noise": {                       # optional, opaque dict; today only
                                      # {"depolarizing": p} is honoured.
@@ -140,6 +142,18 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001
                 _err(f"noise model build: {e}", kind="noise-model")
                 return 0
+
+        # Simulation METHOD. Default is Aer's automatic choice (statevector for
+        # small registers); `matrix_product_state` is what makes a 128-qubit
+        # comparison possible at all, and is the point of the wide cross-check:
+        # our MPS against theirs, rather than ours against a dense oracle that
+        # cannot reach the width.
+        method = req.get("method")
+        if method:
+            sim_kwargs["method"] = str(method)
+        bond = req.get("mps_bond_dimension")
+        if bond is not None:
+            sim_kwargs["matrix_product_state_max_bond_dimension"] = int(bond)
 
         sim = AerSimulator(**sim_kwargs)
         run_kwargs = {"shots": shots}

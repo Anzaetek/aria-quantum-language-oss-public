@@ -331,7 +331,13 @@ pub mod corpus;
 mod perceval;
 mod ppvm;
 mod qadence;
-mod qiskit;
+/// Qiskit-specific entry points.
+///
+/// Public because the wide counts cross-check needs `run_mps`, which has no
+/// backend-agnostic analogue: selecting a SIMULATION METHOD is a Qiskit
+/// concept, and pretending otherwise in the common API would invent a
+/// portability that does not exist.
+pub mod qiskit;
 pub mod qpy;
 mod tsim;
 // `runner` is the shared subprocess plumbing for Python-backed
