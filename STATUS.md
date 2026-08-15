@@ -139,9 +139,29 @@ shots. Full table in `PLAN-SV-PERF.md` §1.5.
       WASM path against an in-process oracle **on the same lowered IR**, so it
       is a transport check. It reported `Δmax = 0.000e0 PASS` for as long as the
       off-by-one existed. **The other 48 examples run through the same
-      structurally-blind check and none has been audited for the same class of
-      error** — `repeat … to B` being inclusive is easy to get wrong, and the
-      four loops in `hhl.aria` all had it.
+      structurally-blind check.** The *loop-bound* class specifically has now
+      been audited — see below — but that is one class of circuit defect, and
+      the harness is blind to all of them.
+
+    **Loop-bound audit, 2026-08-16 — `hhl` was the only one.** All **115
+    `repeat` loops across the 44 `examples/aria/*.aria`** were checked against
+    their register declarations. Everything else is right, and several are
+    right in a way that shows the inclusive semantics were understood:
+    `bernstein_vazirani.aria` and `deutsch_jozsa.aria` deliberately use
+    `to n` for the Hadamard sweep (the answer qubit at index `n` gets
+    `X` then `H`, making |−⟩) and `to n - 1` for the query register, in the
+    same file. `qft.aria` and `qec_qft.aria` implement the real controlled-phase
+    ladder with `from i + 1 to n - 1` and reverse it with `step -1`.
+
+    Two things that follow. First, `hhl.aria` was an outlier rather than a
+    symptom of a house-wide misunderstanding. Second, **`qft.aria` already
+    contains the correct inverse QFT that `hhl.aria` step 3 is missing** — so
+    reconciling the example needs no new physics, only reuse.
+
+    Scope of that audit, stated so nobody over-reads it: it covers loop bounds
+    against register sizes. It does **not** cover gate choice, angle formulas,
+    or eigenvalue proxies — the other three ways `hhl` is still not what
+    `HHL.lean` proves.
 15. **The photonic backend has never been compared on *speed*, only on
     agreement.** `bridge-perceval` exists and the DV/CV conventions are matched
     verbatim, so the correctness axis is covered — but Perceval's hot path is
