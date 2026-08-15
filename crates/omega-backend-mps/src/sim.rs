@@ -29,10 +29,40 @@ use crate::{Contract2qFn, SvdFlatFn};
 /// standard MPS fidelity proxy. `max_bond_reached` is the largest post-
 /// truncation bond dimension seen, i.e. how close the run came to saturating
 /// `max_bond_dim`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MpsRunStats {
     pub discarded_weight: f64,
+    /// **Fidelity ESTIMATE** — Π over splits of `(1 − εᵢ)`, in [0, 1], where
+    /// 1.0 means the run was exact. See [`Mps::fidelity_estimate`].
+    ///
+    /// Reported as an estimate, deliberately, and **not** as a proven bound: a
+    /// canonical-gauge product is a genuine lower bound on the state fidelity,
+    /// and this MPS is not canonical. Measured against the true fidelity `|⟨ψ_exact|ψ_χ⟩|²` on 108 non-Clifford
+    /// circuits with non-flat Schmidt spectra (n = 8/10/12, depth 1–3, 4 seeds,
+    /// χ = 2/4/8): **0 cases where the estimate exceeded the truth**. The ratio
+    /// `F_true / F_est` spanned **[1.0067, 142.7]** — tight where truncation is
+    /// mild, up to ~140× PESSIMISTIC where the bond is badly starved. So it is
+    /// a good "is this run usable" signal and a poor estimate of how good a bad
+    /// run actually is. Evidence, not a proof, and the label says so.
+    pub fidelity_estimate: f64,
     pub max_bond_reached: usize,
+}
+
+impl Default for MpsRunStats {
+    /// A run that has truncated nothing: zero discarded weight and fidelity
+    /// **1.0**, not 0.0.
+    ///
+    /// The derived `Default` gave 0.0, and `record_stats` takes the MINIMUM
+    /// fidelity over trajectories — so an accumulator starting at 0.0 stays at
+    /// 0.0 for ever and every run reports a fidelity of zero. The two fields
+    /// accumulate in opposite directions and cannot share a derive.
+    fn default() -> Self {
+        Self {
+            discarded_weight: 0.0,
+            fidelity_estimate: 1.0,
+            max_bond_reached: 0,
+        }
+    }
 }
 
 /// Accumulated discarded weight above which a result is refused rather than
@@ -195,6 +225,9 @@ impl MpsBackend {
     fn record_stats(&self, mps: &Mps) {
         let mut st = self.stats.lock().unwrap();
         st.discarded_weight = st.discarded_weight.max(mps.discarded_weight);
+        // WORST fidelity over the run, so it pairs with the worst-case
+        // discarded weight above rather than reporting a different trajectory.
+        st.fidelity_estimate = st.fidelity_estimate.min(mps.fidelity_estimate);
         st.max_bond_reached = st.max_bond_reached.max(mps.max_bond_reached);
     }
 
@@ -617,6 +650,9 @@ impl NoisyMpsBackend {
     fn record_stats(&self, mps: &Mps) {
         let mut st = self.stats.lock().unwrap();
         st.discarded_weight = st.discarded_weight.max(mps.discarded_weight);
+        // WORST fidelity over the run, so it pairs with the worst-case
+        // discarded weight above rather than reporting a different trajectory.
+        st.fidelity_estimate = st.fidelity_estimate.min(mps.fidelity_estimate);
         st.max_bond_reached = st.max_bond_reached.max(mps.max_bond_reached);
     }
 

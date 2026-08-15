@@ -109,7 +109,49 @@ so there is no separate hidden performance defect.
 performance item, and it is a different piece of work from anything revision 1
 proposed.
 
-### M4 — the certificate is uncalibrated and its documentation overclaims *(new)*
+### M4 — the certificate is uncalibrated *(CALIBRATED and shipped)*
+
+A commercial MPS simulator reports a **fidelity estimate per run** — a number in
+[0, 1] where 1.0 means exact — and states it is a lower bound. Ours reported
+`discarded_weight`, a SUM of per-split fractions that grows without limit and
+whose value the user cannot interpret: `3.000e0` says nothing about whether the
+answer is usable.
+
+Both are now reported, because they answer different questions:
+
+```
+  mps: fidelity~0.0156 (estimate, not a bound) discarded_weight=3.000e0 max_bond_reached=2
+```
+
+`fidelity ≈ Π over splits of (1 − εᵢ)`. In **canonical gauge** that product is a
+genuine lower bound on the state fidelity; this MPS is not canonical, so it is
+labelled an estimate everywhere it is printed — the tilde is not decoration.
+
+**Calibrated rather than argued** (`omega-backend-mps/tests/fidelity_estimate.rs`),
+against the true `|⟨ψ_exact|ψ_χ⟩|²` over 108 non-Clifford circuits:
+
+* **0 cases where the estimate exceeded the truth**;
+* `F_true / F_est` in **[1.0067, 142.7]** — tight under mild truncation, up to
+  ~140× pessimistic when the bond is badly starved.
+
+Read it as "is this run usable", not "how good is this bad run". Getting a
+proven bound needs canonical-gauge truncation, which is a kernel change and is
+NOT done.
+
+**Two traps the calibration had to avoid**, both hit on the way:
+
+* A **graph state has a flat Schmidt spectrum**, which is the one case where the
+  local-vs-global gauge distinction cannot appear — measured `F_est == F_true`
+  exactly, to the last digit, in all twelve graph-state cases. A corpus of those
+  would have proved nothing. The fixtures use random-angle rotations instead.
+* Tracking only the **minimum** ratio catches an over-optimistic estimate but not
+  a useless one: `1 − Σεᵢ` is strictly below the product, so it never overstates
+  and passed the whole file — while collapsing to 0 as soon as the sum passes 1,
+  which happens on ordinary circuits. Both directions are now bounded, with the
+  threshold taken from the measurement (the sum-complement's max ratio is ~1e320
+  against the product's 142.7).
+
+### M4b — the documentation overclaimed *(the original item)*
 
 `discarded_weight > 1` is legal — it is a sum over ~1555 per-split fractions,
 not a probability — so 6.586 is not an accumulation bug. Two real problems:

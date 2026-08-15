@@ -1236,9 +1236,22 @@ fn main() {
                     // Report REAL truncation only; a ~1e-28 rounding tail isn't
                     // worth a line (1e-12 floor sits above it, below real loss).
                     if stats.discarded_weight > 1e-12 {
+                        // `fidelity~` — the tilde is not decoration. It is an
+                        // ESTIMATE, not a proven bound: the product form is a
+                        // genuine lower bound in canonical gauge and this MPS
+                        // is not canonical. Measured on 108 non-Clifford
+                        // circuits with non-flat Schmidt spectra: it never
+                        // exceeded the true fidelity, with F_true/F_est in
+                        // [1.0067, 142.7] — tight when truncation is mild, up
+                        // to ~140x pessimistic when the bond is starved.
+                        // Evidence, not proof, and useful for "is this run
+                        // usable" rather than "how good is this bad run".
                         eprintln!(
-                            "mps: discarded_weight={:.3e} max_bond_reached={}",
-                            stats.discarded_weight, stats.max_bond_reached
+                            "mps: fidelity~{:.4} (estimate, not a bound) \
+                             discarded_weight={:.3e} max_bond_reached={}",
+                            stats.fidelity_estimate,
+                            stats.discarded_weight,
+                            stats.max_bond_reached
                         );
                     }
                     r
