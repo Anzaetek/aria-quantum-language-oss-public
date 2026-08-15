@@ -116,7 +116,33 @@ shots. Full table in `PLAN-SV-PERF.md` §1.5.
     disproven. → `PLAN-CR-20260813.md` B4
 12. **The ppvm bridge refuses any noise request** — ppvm's tableau supports the
     channels including atom loss; the mapping is unwritten.
-13. **The photonic backend has never been compared on *speed*, only on
+14. **`hhl.aria` and `proofs/lean4/QuantumProofs/HHL.lean` need cleaning up —
+    and the link between them is an annotation, not a check.** The off-by-one
+    fixed on 2026-08-15 is the symptom; the structure around it is the item.
+    Three separate things to settle:
+    - **The example does not implement what the proof proves.** `HHL.lean` is
+      sorry-free and genuine — `hhl_solves_system` is a real matrix-vector
+      identity `A · o = C · b` for `A = diagonal λ`, with an exact QPE and a
+      controlled `RY(2·arcsin(C/λᵢ))`. The Aria example instead uses a
+      *proxy* eigenvalue (`theta = 0.5 / (k + 1)`, commented "eigenvalue proxy
+      λ = k + 1") and, at `hhl.aria` step 3, an "inverse QFT" that is **H on
+      each qubit and nothing else** — a true inverse QFT needs the controlled
+      phase ladder, so for `n ≥ 2` that step is incomplete. Whether the example
+      should be brought up to the proof, or the header claim narrowed to what
+      the example is (a template, not a certified HHL), is a decision, not a
+      bug fix.
+    - **`@prove "hhl_recovers_inverse"` is not verified against anything.** The
+      annotation names a property; `ci.sh:656` separately checks the Lean
+      theorems are sorry-free. Nothing connects the two — no check would notice
+      if the circuit and the theorem drifted apart, and they have.
+    - **The harness cannot see circuit-level defects at all.** It compares the
+      WASM path against an in-process oracle **on the same lowered IR**, so it
+      is a transport check. It reported `Δmax = 0.000e0 PASS` for as long as the
+      off-by-one existed. **The other 48 examples run through the same
+      structurally-blind check and none has been audited for the same class of
+      error** — `repeat … to B` being inclusive is easy to get wrong, and the
+      four loops in `hhl.aria` all had it.
+15. **The photonic backend has never been compared on *speed*, only on
     agreement.** `bridge-perceval` exists and the DV/CV conventions are matched
     verbatim, so the correctness axis is covered — but Perceval's hot path is
     C++ (`quandelibc`) and piquasso's is NumPy/JAX, and neither has been timed
