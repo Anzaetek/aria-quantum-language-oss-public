@@ -19,17 +19,24 @@ circuit Hhl(n: int) {
     apply X on q[n]
 
     -- Step 2: QPE on the counting register.
-    repeat i from 0 to n {
+    --
+    -- `repeat … to B` is INCLUSIVE (GRAMMAR.md:93), and the system qubit is
+    -- index n — so `0 to n` ran over the counting register PLUS the system
+    -- qubit. That put an H on q[n] immediately after the X that prepares |b⟩,
+    -- destroying the state being solved for, and made the k = n iteration
+    -- below `CP on q[n], q[n]`: a phase gate controlling itself. The backend
+    -- accepted that and aliased its way to a confident wrong answer.
+    repeat i from 0 to n - 1 {
         apply H on q[i]
     }
-    repeat k from 0 to n {
+    repeat k from 0 to n - 1 {
         -- controlled-U^{2^k}: phase 2π · 2^k / 2^n on system qubit.
         let angle = 2 * pi * 2^k / 2^n
         apply CP(angle) on q[k], q[n]
     }
 
     -- Step 3: inverse QFT on counting register (manual, for clarity).
-    repeat i from 0 to n {
+    repeat i from 0 to n - 1 {
         apply H on q[i]
     }
 
@@ -40,7 +47,7 @@ circuit Hhl(n: int) {
     -- it is a no-op: the ancilla never leaves |0⟩ and the solution branch is
     -- empty for every input. Aria has no native CRY, so decompose
     -- CRY(φ) = RY(φ/2)·CX·RY(-φ/2)·CX (φ = C/λ, eigenvalue proxy λ = k + 1).
-    repeat k from 0 to n {
+    repeat k from 0 to n - 1 {
         let theta = 0.5 / (k + 1)
         apply RY(theta / 2) on q[n + 1]
         apply CX on q[k], q[n + 1]
@@ -48,12 +55,14 @@ circuit Hhl(n: int) {
         apply CX on q[k], q[n + 1]
     }
 
-    -- Step 5: uncompute QPE.
-    repeat k from 0 to n {
+    -- Step 5: uncompute QPE. Same inclusive-bound correction as Step 2 — and
+    -- an uncompute that ranged over a different set than the compute would not
+    -- have uncomputed anything.
+    repeat k from 0 to n - 1 {
         let angle = -2 * pi * 2^k / 2^n
         apply CP(angle) on q[k], q[n]
     }
-    repeat i from 0 to n {
+    repeat i from 0 to n - 1 {
         apply H on q[i]
     }
 
