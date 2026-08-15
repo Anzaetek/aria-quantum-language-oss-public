@@ -84,9 +84,10 @@ impl Backend for StatevectorBackend {
         // circuit, and refused in EVERY backend that can exceed 64 qubits
         // because this is a property of the result type, not of any simulator.
         if config.shots.is_some() {
-            omega_core::executor::check_counts_width(
-                omega_core::executor::counts_outcome_width(circuit, collapses(circuit, config)),
-            )?;
+            omega_core::executor::check_counts_width(omega_core::executor::counts_outcome_width(
+                circuit,
+                collapses(circuit, config),
+            ))?;
         }
 
         if let (true, Some(shots)) = (stochastic_evolution(circuit, config), config.shots) {
@@ -106,7 +107,10 @@ impl Backend for StatevectorBackend {
             }
             // Dense statevector is bounded by 2^n memory long before 64 qubits,
             // so a u64 key is always enough here; only the boundary widens.
-            return Ok(ExecResult::counts_from_u64(counts, omega_core::executor::counts_outcome_width(circuit, by_creg) as u32));
+            return Ok(ExecResult::counts_from_u64(
+                counts,
+                omega_core::executor::counts_outcome_width(circuit, by_creg) as u32,
+            ));
         }
 
         let (state, classical_bits) =
@@ -852,26 +856,60 @@ pub(crate) fn apply_2q(
 
     let step_a = 1usize << qa;
     let step_b = 1usize << qb;
+    // `qa == qb` means the caller passed the same qubit twice — a two-qubit
+    // gate applied to one qubit. It is malformed input, not a degenerate case
+    // worth supporting: Qiskit refuses it outright ("duplicate qubit
+    // arguments"), and so should we.
+    //
+    // The scan-and-reject loop this replaced did NOT refuse it. With
+    // `step_a == step_b` its four indices aliased (i01 == i10 == i11), so the
+    // three later rows overwrote each other and the gate silently became a
+    // 2x2 built from summed columns — a confident wrong answer, and one no
+    // test caught because the harness that would have compares two paths
+    // sharing the same lowered IR.
+    //
+    // A real `assert!`, not `debug_assert!`: the group walk indexes an empty
+    // slice in this case, so a release build would panic anyway, with a bare
+    // index-out-of-bounds instead of the reason.
+    assert!(
+        qa > qb,
+        "apply_2q: a two-qubit gate on one qubit (q0 == q1 == {q0}) — \
+         a controlled gate cannot control itself"
+    );
+    debug_assert_eq!(state.len(), dim);
 
-    for i in 0..dim {
-        // Only process basis states where both target bits are 0
-        if (i & step_a) != 0 || (i & step_b) != 0 {
-            continue;
+    // Walk the `dim/4` groups directly instead of scanning all `dim` indices
+    // and rejecting three of every four. The four amplitudes of a group are the
+    // four slices below, so the same four expressions run with no index
+    // arithmetic and no branch in the loop body:
+    //
+    //   chunk  = one block of 2·step_a   -> split at step_a  gives qa = 0 | 1
+    //   c0, c1 = one block of 2·step_b   -> split at step_b  gives qb = 0 | 1
+    //
+    // `qa > qb` makes `step_a` a multiple of `2·step_b`, so every inner chunk
+    // is whole and no group straddles a boundary. The four slices are disjoint
+    // by construction — which is also what makes `PLAN-SV-PERF.md` §3.2's
+    // parallel step safe without `unsafe`.
+    for chunk in state.chunks_mut(step_a << 1) {
+        let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+        for (c0, c1) in a_lo
+            .chunks_mut(step_b << 1)
+            .zip(a_hi.chunks_mut(step_b << 1))
+        {
+            let (x00, x01) = c0.split_at_mut(step_b);
+            let (x10, x11) = c1.split_at_mut(step_b);
+            for k in 0..step_b {
+                let a00 = x00[k];
+                let a01 = x01[k];
+                let a10 = x10[k];
+                let a11 = x11[k];
+
+                x00[k] = g[0] * a00 + g[1] * a01 + g[2] * a10 + g[3] * a11;
+                x01[k] = g[4] * a00 + g[5] * a01 + g[6] * a10 + g[7] * a11;
+                x10[k] = g[8] * a00 + g[9] * a01 + g[10] * a10 + g[11] * a11;
+                x11[k] = g[12] * a00 + g[13] * a01 + g[14] * a10 + g[15] * a11;
+            }
         }
-        let i00 = i;
-        let i01 = i | step_b;
-        let i10 = i | step_a;
-        let i11 = i | step_a | step_b;
-
-        let a00 = state[i00];
-        let a01 = state[i01];
-        let a10 = state[i10];
-        let a11 = state[i11];
-
-        state[i00] = g[0] * a00 + g[1] * a01 + g[2] * a10 + g[3] * a11;
-        state[i01] = g[4] * a00 + g[5] * a01 + g[6] * a10 + g[7] * a11;
-        state[i10] = g[8] * a00 + g[9] * a01 + g[10] * a10 + g[11] * a11;
-        state[i11] = g[12] * a00 + g[13] * a01 + g[14] * a10 + g[15] * a11;
     }
 }
 
@@ -1003,6 +1041,135 @@ fn expectation_pauli(sv: &[Complex64], num_qubits: u32, pauli_string: &[(u32, Pa
     }
 
     result.re
+}
+
+#[cfg(test)]
+mod group_walk_equivalence {
+    //! `apply_2q` used to scan all `dim` indices and reject three of every
+    //! four (`PLAN-SV-PERF.md` §1). The replacement walks the `dim/4` groups
+    //! directly. That is a pure indexing change, so it must be **bit-for-bit**
+    //! identical, not merely close — and the only way to say that with a
+    //! straight face is to keep the loop it replaced and compare against it.
+    use super::*;
+    use num_complex::Complex64;
+
+    /// The pre-2026-08-15 loop, verbatim. Do not "clean up": its value is
+    /// being the thing that shipped.
+    fn apply_2q_scan(
+        state: &mut [Complex64],
+        n: usize,
+        q0: usize,
+        q1: usize,
+        gate: &gates::Gate2Q,
+    ) {
+        let dim = 1usize << n;
+        let (qa, qb, g) = if q0 > q1 {
+            (q0, q1, *gate)
+        } else {
+            let mut swapped = *gate;
+            for col in 0..4 {
+                swapped.swap(4 + col, 2 * 4 + col);
+            }
+            for row in 0..4 {
+                swapped.swap(row * 4 + 1, row * 4 + 2);
+            }
+            (q1, q0, swapped)
+        };
+        let step_a = 1usize << qa;
+        let step_b = 1usize << qb;
+        for i in 0..dim {
+            if (i & step_a) != 0 || (i & step_b) != 0 {
+                continue;
+            }
+            let (i00, i01, i10, i11) = (i, i | step_b, i | step_a, i | step_a | step_b);
+            let (a00, a01, a10, a11) = (state[i00], state[i01], state[i10], state[i11]);
+            state[i00] = g[0] * a00 + g[1] * a01 + g[2] * a10 + g[3] * a11;
+            state[i01] = g[4] * a00 + g[5] * a01 + g[6] * a10 + g[7] * a11;
+            state[i10] = g[8] * a00 + g[9] * a01 + g[10] * a10 + g[11] * a11;
+            state[i11] = g[12] * a00 + g[13] * a01 + g[14] * a10 + g[15] * a11;
+        }
+    }
+
+    /// Full-mantissa amplitudes, deterministically. Constant or
+    /// `1/√2`-valued fixtures cannot distinguish two orderings — every
+    /// association gives the same bits — so this is not decoration.
+    fn dense_state(n: usize, salt: u64) -> Vec<Complex64> {
+        let mut x = salt.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            // Full 53-bit mantissa in (-1, 1), never a round number.
+            (x as f64 / u64::MAX as f64) * 2.0 - 1.0
+        };
+        (0..1usize << n)
+            .map(|_| Complex64::new(next(), next()))
+            .collect()
+    }
+
+    /// A gate with no zero and no repeated entry: a zero would let a
+    /// mis-slotted operand vanish, and a repeat would let two of them be
+    /// swapped unnoticed.
+    fn dense_gate(salt: u64) -> gates::Gate2Q {
+        let s = dense_state(2, salt); // 4 complex values
+        let t = dense_state(2, salt ^ 0x5eed);
+        let u = dense_state(2, salt ^ 0xbeef);
+        let v = dense_state(2, salt ^ 0xf00d);
+        [
+            s[0], s[1], s[2], s[3], t[0], t[1], t[2], t[3], u[0], u[1], u[2], u[3], v[0], v[1],
+            v[2], v[3],
+        ]
+    }
+
+    #[test]
+    fn group_walk_is_bit_identical_to_the_scan_on_every_qubit_pair() {
+        for n in 2..=7 {
+            let gate = dense_gate(n as u64);
+            for q0 in 0..n {
+                for q1 in 0..n {
+                    if q0 == q1 {
+                        continue;
+                    }
+                    let start = dense_state(n, (n * 100 + q0 * 10 + q1) as u64);
+                    let mut want = start.clone();
+                    let mut got = start;
+                    apply_2q_scan(&mut want, n, q0, q1, &gate);
+                    apply_2q(&mut got, n, q0, q1, &gate);
+                    for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+                        // to_bits, not ==: `0.0 == -0.0` is true and would
+                        // hide exactly the kind of slip this test exists for.
+                        assert_eq!(
+                            (w.re.to_bits(), w.im.to_bits()),
+                            (g.re.to_bits(), g.im.to_bits()),
+                            "n={n} q0={q0} q1={q1} amplitude {i}: {w} vs {g}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both orderings of the operands, since the scan's swap-and-transpose
+    /// branch is the one the group walk inherits and could silently drop.
+    #[test]
+    fn the_two_qubit_order_still_transposes_the_gate() {
+        let n = 4;
+        let gate = dense_gate(77);
+        let start = dense_state(n, 4242);
+
+        let mut lo_first = start.clone();
+        let mut hi_first = start;
+        apply_2q(&mut lo_first, n, 1, 3, &gate);
+        apply_2q(&mut hi_first, n, 3, 1, &gate);
+        assert!(
+            lo_first
+                .iter()
+                .zip(hi_first.iter())
+                .any(|(a, b)| a.re.to_bits() != b.re.to_bits()),
+            "apply_2q(q0=1,q1=3) and apply_2q(q0=3,q1=1) must differ for an \
+             asymmetric gate — if they agree, the operand order is being ignored"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1524,8 +1691,16 @@ mod tests {
             )
             .unwrap();
         let m = counts.counts();
-        let q0_ones: u32 = m.iter().filter(|(k, _)| k.bit(0) == 1).map(|(_, v)| v).sum();
-        let q1_ones: u32 = m.iter().filter(|(k, _)| k.bit(1) == 1).map(|(_, v)| v).sum();
+        let q0_ones: u32 = m
+            .iter()
+            .filter(|(k, _)| k.bit(0) == 1)
+            .map(|(_, v)| v)
+            .sum();
+        let q1_ones: u32 = m
+            .iter()
+            .filter(|(k, _)| k.bit(1) == 1)
+            .map(|(_, v)| v)
+            .sum();
         assert_eq!(q0_ones, 0, "q0 must be |0⟩ on every shot, got {m:?}");
         assert!(
             q1_ones.abs_diff(2000) < 250,
@@ -1569,10 +1744,7 @@ mod tests {
 
     /// Look up outcome `k` at the width the counts carry.
     #[allow(dead_code)]
-    fn okey(
-        map: &std::collections::HashMap<omega_core::outcome::Outcome, u32>,
-        k: u64,
-    ) -> u32 {
+    fn okey(map: &std::collections::HashMap<omega_core::outcome::Outcome, u32>, k: u64) -> u32 {
         let w = map.keys().next().map(|o| o.width()).unwrap_or(0);
         map.get(&omega_core::outcome::Outcome::from_u64(k, w))
             .copied()
