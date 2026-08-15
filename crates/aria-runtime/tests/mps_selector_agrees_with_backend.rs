@@ -42,8 +42,8 @@ fn both_parsers_agree_on_every_spelling() {
         let theirs = parse_mps(spelling)
             .unwrap_or_else(|e| panic!("{spelling}: backend parser: {e}"))
             .unwrap_or_else(|| panic!("{spelling}: backend parser did not recognise it"));
-        let ours = BackendSel::parse(spelling)
-            .unwrap_or_else(|e| panic!("{spelling}: aria parser: {e}"));
+        let ours =
+            BackendSel::parse(spelling).unwrap_or_else(|e| panic!("{spelling}: aria parser: {e}"));
         match (ours, theirs) {
             (BackendSel::Mps { chi: a }, MpsSelect::Fixed { chi: b }) => {
                 assert_eq!(a, b, "{spelling}: fixed bond differs")
@@ -65,6 +65,9 @@ fn both_parsers_refuse_the_same_garbage() {
     use omega_backend_mps::select::parse_mps;
     for bad in ["mps:0", "mps:auto:0", "mps:banana", "mps:auto:banana"] {
         assert!(parse_mps(bad).is_err(), "backend parser accepted {bad}");
-        assert!(BackendSel::parse(bad).is_err(), "aria parser accepted {bad}");
+        assert!(
+            BackendSel::parse(bad).is_err(),
+            "aria parser accepted {bad}"
+        );
     }
 }

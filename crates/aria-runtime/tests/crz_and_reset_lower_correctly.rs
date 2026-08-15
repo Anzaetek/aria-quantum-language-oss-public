@@ -46,12 +46,19 @@ fn counts(src: &str, name: &str, shots: u32) -> HashMap<String, u64> {
     {
         ExecResult::Counts(c) => c
             .into_iter()
-                        // Matches the old `{k:b}`: leading zeros stripped, but never to
+            // Matches the old `{k:b}`: leading zeros stripped, but never to
             // the empty string — an all-zero outcome is "0".
             .map(|(k, v)| {
                 let t = k.to_bitstring();
                 let t = t.trim_start_matches('0');
-                (if t.is_empty() { "0".to_string() } else { t.to_string() }, v as u64)
+                (
+                    if t.is_empty() {
+                        "0".to_string()
+                    } else {
+                        t.to_string()
+                    },
+                    v as u64,
+                )
             })
             .collect(),
         other => panic!("expected Counts, got {other:?}"),
@@ -161,13 +168,8 @@ fn the_crz_angle_reaches_the_backend() {
             "circuit C() {{\n  qreg q[2]\n  apply H on q[0]\n  apply H on q[1]\n  \
              apply CRZ({lambda}) on q[0], q[1]\n}}\n"
         );
-        expectation(
-            &circuit(&src, "C"),
-            "X0",
-            &HashMap::new(),
-            BackendSel::Sim,
-        )
-        .expect("expectation")
+        expectation(&circuit(&src, "C"), "X0", &HashMap::new(), BackendSel::Sim)
+            .expect("expectation")
     };
     let (a, b) = (at(0.4), at(1.9));
     assert!(

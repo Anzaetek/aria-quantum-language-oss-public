@@ -68,9 +68,7 @@ fn a_mistyped_flag_is_refused_and_the_real_name_suggested() {
         ("--stpes", None), // not a `run` option at all
         ("--typo", None),
     ] {
-        let out = aria(&[
-            "run", f, "--circuit", "Bell", "--shots", "20", bad, "9",
-        ]);
+        let out = aria(&["run", f, "--circuit", "Bell", "--shots", "20", bad, "9"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(
             out.status.code(),
@@ -132,7 +130,16 @@ fn declared_flags_are_still_accepted() {
         vec!["--expectation", "Z0"],
         vec!["--statevector"],
     ] {
-        let mut args = vec!["run", f, "--circuit", "Bell", "--shots", "20", "--seed", "1"];
+        let mut args = vec![
+            "run",
+            f,
+            "--circuit",
+            "Bell",
+            "--shots",
+            "20",
+            "--seed",
+            "1",
+        ];
         args.extend(extra.iter().copied());
         let out = aria(&args);
         assert_eq!(
@@ -180,16 +187,15 @@ fn every_subcommand_answers_help() {
 
 /// Names passed to `.opt(..)`, `.has(..)` or `.all(..)` inside `fn <name>`.
 fn keys_read_by(src: &str, func: &str) -> std::collections::BTreeSet<String> {
-    let start = src
-        .find(&format!("\nfn {func}("))
-        .unwrap_or_else(|| panic!("fn {func} not found — this test scans the source and the \
-                                   source moved; update it rather than deleting it"));
+    let start = src.find(&format!("\nfn {func}(")).unwrap_or_else(|| {
+        panic!(
+            "fn {func} not found — this test scans the source and the \
+                                   source moved; update it rather than deleting it"
+        )
+    });
     // The next top-level `fn` ends the body.
     let rest = &src[start + 1..];
-    let end = rest[1..]
-        .find("\nfn ")
-        .map(|i| i + 1)
-        .unwrap_or(rest.len());
+    let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
     let body = &rest[..end];
 
     let mut out = std::collections::BTreeSet::new();
@@ -228,27 +234,19 @@ fn declared(src: &str, konst: &str) -> std::collections::BTreeSet<String> {
 /// exactly that flag.
 #[test]
 fn the_declared_vocabulary_matches_what_the_code_reads() {
-    let src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
-    )
-    .expect("read main.rs");
+    let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
+        .expect("read main.rs");
 
     // `strict-truncation` is read by a shared helper; `cmd_train` delegates to
     // `cmd_train_supervised` with the same `Args`.
     let strict = keys_read_by(&src, "apply_strict_truncation");
     let supervised = keys_read_by(&src, "cmd_train_supervised");
     // Boolean flags are passed separately to `parse_args`, not in Vocabulary.
-    let bools: std::collections::BTreeSet<String> = [
-        "statevector",
-        "qasm",
-        "qasm3",
-        "json",
-        "lean",
-        "gate-model",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let bools: std::collections::BTreeSet<String> =
+        ["statevector", "qasm", "qasm3", "json", "lean", "gate-model"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
     let cases: Vec<(&str, &str, Vec<&std::collections::BTreeSet<String>>)> = vec![
         ("cmd_list", "LIST", vec![]),
