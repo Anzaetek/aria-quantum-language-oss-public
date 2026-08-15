@@ -474,8 +474,7 @@ impl LowerCtx {
                 // refused.
                 let gate = name_to_gate(&body_app.name)?;
                 let body_params = widen_cp_params(&body_app.name, body_params)?;
-                let body_qubits: smallvec::SmallVec<[Qubit; 3]> =
-                    body_qubits.into_iter().collect();
+                let body_qubits: smallvec::SmallVec<[Qubit; 3]> = body_qubits.into_iter().collect();
                 check_gate_arity(&body_app.name, &gate, body_params.len(), body_qubits.len())?;
                 self.ops.push(GateOp {
                     gate,
@@ -571,7 +570,7 @@ impl LowerCtx {
             } else {
                 params[0].clone()
             };
-            let (a, b) = (qubits[0].clone(), qubits[1].clone());
+            let (a, b) = (qubits[0], qubits[1]);
             let mut push = |gate: GateKind, qs: &[Qubit], ps: &[ParamExpr]| {
                 self.ops.push(GateOp {
                     gate,
@@ -583,15 +582,19 @@ impl LowerCtx {
             };
             for _ in 0..total_pow {
                 if app.name == "rxx" {
-                    push(GateKind::H, &[a.clone()], &[]);
-                    push(GateKind::H, &[b.clone()], &[]);
+                    push(GateKind::H, std::slice::from_ref(&a), &[]);
+                    push(GateKind::H, std::slice::from_ref(&b), &[]);
                 }
-                push(GateKind::CX, &[a.clone(), b.clone()], &[]);
-                push(GateKind::Rz, &[b.clone()], std::slice::from_ref(&theta));
-                push(GateKind::CX, &[a.clone(), b.clone()], &[]);
+                push(GateKind::CX, &[a, b], &[]);
+                push(
+                    GateKind::Rz,
+                    std::slice::from_ref(&b),
+                    std::slice::from_ref(&theta),
+                );
+                push(GateKind::CX, &[a, b], &[]);
                 if app.name == "rxx" {
-                    push(GateKind::H, &[a.clone()], &[]);
-                    push(GateKind::H, &[b.clone()], &[]);
+                    push(GateKind::H, std::slice::from_ref(&a), &[]);
+                    push(GateKind::H, std::slice::from_ref(&b), &[]);
                 }
             }
             return Ok(());
@@ -725,10 +728,7 @@ impl LowerCtx {
             ));
         }
         if !app.params.is_empty() {
-            return Err(format!(
-                "pbs takes no parameters; got {}",
-                app.params.len()
-            ));
+            return Err(format!("pbs takes no parameters; got {}", app.params.len()));
         }
 
         let (a_h, _a_v) = self.polarization_submodes(&app.modes[0], "pbs")?;
@@ -1037,16 +1037,13 @@ fn check_gate_arity(
         return Ok(());
     };
     if n_params != wp {
-        return Err(format!(
-            "`{name}` takes {wp} parameter(s), got {n_params}"
-        ));
+        return Err(format!("`{name}` takes {wp} parameter(s), got {n_params}"));
     }
     if n_qubits != wq {
         return Err(format!("`{name}` acts on {wq} qubit(s), got {n_qubits}"));
     }
     Ok(())
 }
-
 
 /// Map a gate name string to a GateKind.
 fn name_to_gate(name: &str) -> Result<GateKind, String> {

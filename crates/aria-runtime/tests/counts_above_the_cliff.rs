@@ -61,12 +61,7 @@ fn circuit(n: usize) -> aria_core::ast::nodes::Circuit {
     circuit_pair(n, 40, 41)
 }
 
-fn check(
-    counts: HashMap<omega_core::outcome::Outcome, u32>,
-    shots: u32,
-    lo: f64,
-    what: &str,
-) {
+fn check(counts: HashMap<omega_core::outcome::Outcome, u32>, shots: u32, lo: f64, what: &str) {
     let wide: Vec<String> = counts
         .keys()
         .filter(|o| o.width() > 2 || o.as_u64().unwrap_or(u64::MAX) > 0b11)
@@ -130,7 +125,12 @@ fn run_counts_noisy_keys_on_the_creg_at_seventy_qubits() {
         &model,
     );
     // 2% readout on each reported bit softens 0.85 to ~0.82.
-    check(counts_of(r, "run_counts_noisy"), 400, 0.70, "run_counts_noisy");
+    check(
+        counts_of(r, "run_counts_noisy"),
+        400,
+        0.70,
+        "run_counts_noisy",
+    );
 }
 
 /// **Guard the guard: below the cliff nothing moved.**
@@ -142,7 +142,13 @@ fn run_counts_noisy_keys_on_the_creg_at_seventy_qubits() {
 fn below_the_cliff_the_projection_still_runs() {
     let c = circuit_pair(20, 10, 11);
     let counts = counts_of(
-        run_counts(&c, &HashMap::new(), 400, Some(7), BackendSel::Mps { chi: 8 }),
+        run_counts(
+            &c,
+            &HashMap::new(),
+            400,
+            Some(7),
+            BackendSel::Mps { chi: 8 },
+        ),
         "narrow",
     );
     check(counts, 400, 0.75, "narrow");

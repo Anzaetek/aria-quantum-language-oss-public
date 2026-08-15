@@ -180,7 +180,10 @@ fn counts_width_agrees_with_projection_for_symbolic_params() {
     assert_eq!(aria_runtime::counts_width(&c, &binds), 1);
     let res = run_counts(&c, &binds, 4096, Some(5), SIM).unwrap();
     if let omega_core::executor::ExecResult::Counts(map) = res {
-        assert!(map.keys().all(|o| o.as_u64().unwrap_or(u64::MAX) <= 1), "creg-width keys, got {map:?}");
+        assert!(
+            map.keys().all(|o| o.as_u64().unwrap_or(u64::MAX) <= 1),
+            "creg-width keys, got {map:?}"
+        );
         // P(|1>) = sin²(sin(2)/2) ≈ 0.1935
         let p1 = probe(&map, 1) as f64 / 4096.0;
         let expect = (2.0f64.sin() / 2.0).sin().powi(2);

@@ -160,21 +160,61 @@ impl Vocabulary {
     const LIST: &'static [&'static str] = &[];
     const PARSE: &'static [&'static str] = &["circuit", "int"];
     const RUN: &'static [&'static str] = &[
-        "backend", "bind", "circuit", "expectation", "int", "max-freq", "max-weight", "noise",
-        "seed", "shots", "strict-truncation", "token", "truncate", "url",
+        "backend",
+        "bind",
+        "circuit",
+        "expectation",
+        "int",
+        "max-freq",
+        "max-weight",
+        "noise",
+        "seed",
+        "shots",
+        "strict-truncation",
+        "token",
+        "truncate",
+        "url",
     ];
     /// `train` delegates to `cmd_train_supervised` with the same `Args`, so its
     /// vocabulary is the union of both.
     const TRAIN: &'static [&'static str] = &[
-        "backend", "circuit", "data", "feature-prefix", "freeze", "grad", "init-scale", "int",
-        "labels", "loss", "lr", "observable", "opt", "save-model", "seed", "set", "steps",
+        "backend",
+        "circuit",
+        "data",
+        "feature-prefix",
+        "freeze",
+        "grad",
+        "init-scale",
+        "int",
+        "labels",
+        "loss",
+        "lr",
+        "observable",
+        "opt",
+        "save-model",
+        "seed",
+        "set",
+        "steps",
         "strict-truncation",
     ];
     const PREDICT: &'static [&'static str] = &["backend", "data", "out", "strict-truncation"];
     const EXPORT: &'static [&'static str] = &["circuit", "int"];
     const TUNE: &'static [&'static str] = &[
-        "backend", "circuit", "csv", "data", "feature-prefix", "int", "labels", "loss",
-        "observable", "pruner", "sampler", "seed", "space", "steps", "strict-truncation",
+        "backend",
+        "circuit",
+        "csv",
+        "data",
+        "feature-prefix",
+        "int",
+        "labels",
+        "loss",
+        "observable",
+        "pruner",
+        "sampler",
+        "seed",
+        "space",
+        "steps",
+        "strict-truncation",
         "trials",
     ];
     const IMPORT: &'static [&'static str] = &["name"];
@@ -355,7 +395,10 @@ fn print_counts(res: ExecResult, n_qubits: usize) {
                 counts.is_empty() || counts.keys().all(|o| o.width() as usize == n_qubits),
                 "print_counts was told {n_qubits} qubits but the outcomes are \
                  {:?} wide",
-                counts.keys().map(|o| o.width()).collect::<std::collections::BTreeSet<_>>()
+                counts
+                    .keys()
+                    .map(|o| o.width())
+                    .collect::<std::collections::BTreeSet<_>>()
             );
             let mut rows: Vec<_> = counts.into_iter().collect();
             rows.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
@@ -886,7 +929,11 @@ fn cmd_predict(raw: &[String]) -> Result<(), String> {
 }
 
 fn cmd_export(raw: &[String]) -> Result<(), String> {
-    let a = parse_args(raw, &["qasm", "qasm3", "json", "lean", "gate-model"], Vocabulary::EXPORT)?;
+    let a = parse_args(
+        raw,
+        &["qasm", "qasm3", "json", "lean", "gate-model"],
+        Vocabulary::EXPORT,
+    )?;
     let path = a.first_positional("<file.aria>")?;
     let name = a.opt("circuit").ok_or("export requires --circuit NAME")?;
     let ints = parse_kv_i64(a.all("int").into_iter())?;
