@@ -1155,7 +1155,14 @@ impl Backend for MetalStatevectorBackend {
                     rng.random::<u64>()
                 });
                 let counts = state.sample_shots_gpu(shots, seed)?;
-                Ok(ExecResult::Counts(counts))
+                // Same keying as the CPU sampler's sample-from-final-state arm
+                // (`omega-backend-statevector/src/sim.rs:143`): the outcome is
+                // the full qubit register, so the width is `num_qubits`. The
+                // GPU sampler's own key stays a `u64` — a Metal statevector is
+                // bounded by device memory long before 64 qubits — and widens
+                // only here, at the boundary, which is where the type has to be
+                // right.
+                Ok(ExecResult::counts_from_u64(counts, circuit.num_qubits))
             }
         }
     }
@@ -2843,7 +2850,16 @@ mod tests {
         // Bell state: shots split between |00⟩ (=0) and |11⟩ (=3).
         let total: u32 = counts.values().sum();
         assert_eq!(total, 2048);
-        let on_diag = counts.get(&0).copied().unwrap_or(0) + counts.get(&3).copied().unwrap_or(0);
+        // Width 2 is part of the key, not decoration: `Outcome::from_u64(0, 2)`
+        // and a 0 of any other width are different outcomes.
+        let on_diag = counts
+            .get(&omega_core::outcome::Outcome::from_u64(0, 2))
+            .copied()
+            .unwrap_or(0)
+            + counts
+                .get(&omega_core::outcome::Outcome::from_u64(3, 2))
+                .copied()
+                .unwrap_or(0);
         assert!(
             on_diag as f64 / total as f64 > 0.95,
             "expected ≥ 95% on |00⟩+|11⟩, got {on_diag}/{total}: {counts:?}"

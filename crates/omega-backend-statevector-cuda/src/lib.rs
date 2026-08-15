@@ -849,7 +849,13 @@ impl Backend for CudaStatevectorBackend {
                     *counts.entry(k).or_insert(0) += 1;
                 }
             }
-            return Ok(ExecResult::Counts(counts));
+            // Widen at the boundary. The keys come from
+            // `sample_counts_on_device`, which keys on the **qubit register**,
+            // so the width is `num_qubits` — not the creg width the CPU's
+            // collapse arm uses when it keys by creg. Any projection onto the
+            // creg happens later and reads `Outcome::bit(q)`, which needs the
+            // qubit-register keying this preserves.
+            return Ok(ExecResult::counts_from_u64(counts, circuit.num_qubits));
         }
 
         apply_ops_fused(
@@ -880,7 +886,10 @@ impl Backend for CudaStatevectorBackend {
                 // scan + CURAND uniforms + per-shot binary search.
                 // Handles any n the statevector itself fits at.
                 let counts = state.inner.sample_counts_on_device(shots, config.seed)?;
-                Ok(ExecResult::Counts(counts))
+                // Same widening as the Metal and OpenCL samplers: the device
+                // key stays a `u64`, and the outcome is the full qubit
+                // register.
+                Ok(ExecResult::counts_from_u64(counts, circuit.num_qubits))
             }
         }
     }
@@ -3140,12 +3149,14 @@ mod tests {
             ExecResult::Counts(c) => c,
             _ => panic!("expected counts"),
         };
-        // Bell only ever produces |00⟩ (idx 0) or |11⟩ (idx 3).
-        let n00 = *counts.get(&0).unwrap_or(&0);
-        let n11 = *counts.get(&3).unwrap_or(&0);
+        // Bell only ever produces |00⟩ (idx 0) or |11⟩ (idx 3). Width 2 is
+        // part of the key now, so the lookup must state it.
+        let key = |v: u64| omega_core::outcome::Outcome::from_u64(v, 2);
+        let n00 = *counts.get(&key(0)).unwrap_or(&0);
+        let n11 = *counts.get(&key(3)).unwrap_or(&0);
         let n_other: u32 = counts
             .iter()
-            .filter(|(&k, _)| k != 0 && k != 3)
+            .filter(|(k, _)| **k != key(0) && **k != key(3))
             .map(|(_, v)| *v)
             .sum();
         assert_eq!(n_other, 0, "Bell shouldn't produce |01⟩ or |10⟩");
@@ -3201,9 +3212,10 @@ mod tests {
         assert_eq!(counts.len() as u64, DIM, "uniform covers all bins");
         let expected = SHOTS as f64 / DIM as f64;
         for (k, &c) in &counts {
+            // `{k:?}` — an `Outcome` renders as `|0110>`, and has no `Display`.
             assert!(
                 (c as f64 - expected).abs() < 160.0,
-                "bin {k} count {c} too far from {expected}"
+                "bin {k:?} count {c} too far from {expected}"
             );
         }
     }
@@ -3253,8 +3265,12 @@ mod tests {
         };
         let total: u32 = counts.values().sum();
         assert_eq!(total, SHOTS);
-        for &k in counts.keys() {
-            assert!(k < DIM, "basis index {k} out of range");
+        for k in counts.keys() {
+            // `Outcome` is not `Copy` and carries its width; `as_u64` is
+            // `Some` here because this circuit is far below the 64-qubit
+            // boundary, and a `None` would itself be the bug worth failing on.
+            let idx = k.as_u64().expect("basis index must fit a u64 at this n");
+            assert!(idx < DIM, "basis index {idx} out of range");
         }
         // SHOTS/DIM ≈ 0.5 per bin; ~ DIM·(1 − e⁻⁰·⁵) bins observed
         // ≈ 1.65M ± 5%.

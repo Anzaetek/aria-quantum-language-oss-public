@@ -89,7 +89,11 @@ pub(crate) fn run(
             let counts = state
                 .sample_shots_gpu(shots, resolved_seed)
                 .map_err(OmegaError::from)?;
-            Ok(ExecResult::Counts(counts))
+            // Widen at the boundary, exactly as the Metal path does: the
+            // device sampler's key stays a `u64` (an OpenCL statevector is
+            // bounded by device memory long before 64 qubits), and the outcome
+            // is the full qubit register, so the width is `n`.
+            Ok(ExecResult::counts_from_u64(counts, n))
         }
     }
 }

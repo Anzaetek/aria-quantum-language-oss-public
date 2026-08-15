@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use num_complex::Complex64;
 
-use crate::outcome::Outcome;
 use crate::circuit::{CircuitIR, SymbolId};
 use crate::device::DeviceKind;
 use crate::error::Result;
+use crate::outcome::Outcome;
 use crate::params::ParameterBinding;
 
 /// How mid-circuit measurements are handled during simulation.
@@ -114,7 +114,10 @@ impl ExecResult {
                     counts.keys().all(|o| o.width() == num_qubits) || counts.is_empty(),
                     "format_counts was told width {num_qubits} but the outcomes are \
                      {:?} wide; the caller and the data disagree",
-                    counts.keys().map(|o| o.width()).collect::<std::collections::BTreeSet<_>>()
+                    counts
+                        .keys()
+                        .map(|o| o.width())
+                        .collect::<std::collections::BTreeSet<_>>()
                 );
                 let mut sorted: Vec<_> = counts.iter().collect();
                 sorted.sort_by(|a, b| b.1.cmp(a.1));
@@ -219,7 +222,10 @@ pub fn creg_to_u64(classical_bits: &[u8]) -> u64 {
     //
     // What actually loses information is a set bit at or above index 64.
     debug_assert!(
-        classical_bits.iter().skip(MAX_COUNTS_QUBITS).all(|b| *b & 1 == 0),
+        classical_bits
+            .iter()
+            .skip(MAX_COUNTS_QUBITS)
+            .all(|b| *b & 1 == 0),
         "creg_to_u64: a classical bit at or above index {MAX_COUNTS_QUBITS} is \
          set, so the {MAX_COUNTS_QUBITS}-bit counts key cannot represent this \
          outcome. Call `check_counts_width(counts_outcome_width(..))` first."
@@ -343,8 +349,9 @@ pub fn measure_pairs(circuit: &CircuitIR) -> Vec<(u32, u32)> {
 /// leaks into the key. A differential test comparing raw keys against a bridge
 /// would report an L2 near 1.0 and blame the backend.
 ///
-/// Counts keys are `u64`, so a measure targeting bit ≥ 64 of either register
-/// cannot be represented — that's a loud error, not a masked shift.
+/// Counts keys are [`Outcome`], so a measure targeting bit ≥ 64 of either
+/// register is representable and needs no refusal. (This paragraph used to say
+/// the opposite, and outlived the `u64` key it described by one commit.)
 pub fn project_counts_onto_creg(
     res: ExecResult,
     pairs: &[(u32, u32)],
@@ -1017,7 +1024,11 @@ mod tests {
         let mut raw: HashMap<Outcome, u32> = HashMap::new();
         raw.insert(Outcome::from_u64(0b01, 2), 3); // q0=1, q1=0 → c0 written 1 then 0
         let out = project_counts_onto_creg(ExecResult::Counts(raw), &measure_pairs(&c)).unwrap();
-        assert_eq!(out.counts().get(&Outcome::from_u64(0, 1)), Some(&3), "q1's later write must win");
+        assert_eq!(
+            out.counts().get(&Outcome::from_u64(0, 1)),
+            Some(&3),
+            "q1's later write must win"
+        );
     }
 
     /// No pairs → pass through untouched. A no-measure circuit's counts are

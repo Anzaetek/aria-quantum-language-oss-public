@@ -18,6 +18,7 @@ use std::time::Instant;
 use aria_core::ast::Circuit;
 use aria_core::backends::omega::try_to_omega_ir;
 use omega_core::executor::ExecResult;
+use omega_core::outcome::Outcome;
 
 use crate::lower::lower;
 use crate::run::{measure_pairs, project_counts_onto_creg};
@@ -314,6 +315,30 @@ pub fn expectation_remote_batch(
     Ok(values)
 }
 
+/// Decode the server's `{"<bitstring>": n}` counts object.
+///
+/// The wire was never `u64`-shaped — only this conversion was. Reading the key
+/// with `u64::from_str_radix` capped a remote run at 64 qubits: at 65 it
+/// returned "bad bitstring key" without saying that width was the reason, and
+/// it discarded the width even below the cliff, so `"0010"` and `"10"` decoded
+/// to the same key. `PLAN-WIDE-COUNTS.md` names this class of conversion site
+/// as where a width defect would survive if it survived anywhere — it did, here,
+/// behind a feature the workspace test stage never builds.
+///
+/// `Outcome::from_bitstring` reads the same MSB-first spelling and keeps the
+/// width the server sent.
+fn parse_counts_map(
+    counts: &serde_json::Map<String, serde_json::Value>,
+) -> Result<HashMap<Outcome, u32>, String> {
+    let mut map: HashMap<Outcome, u32> = HashMap::new();
+    for (k, val) in counts {
+        let state =
+            Outcome::from_bitstring(k).map_err(|e| format!("bad bitstring key '{k}': {e}"))?;
+        map.insert(state, val.as_u64().unwrap_or(0) as u32);
+    }
+    Ok(map)
+}
+
 /// Execute `circuit` on a remote omega-server and return measurement counts.
 pub fn run_counts_remote(
     circuit: &Circuit,
@@ -339,12 +364,7 @@ pub fn run_counts_remote(
         .and_then(|c| c.as_object())
         .ok_or_else(|| format!("unexpected omega-server response: {v}"))?;
 
-    let mut map: HashMap<u64, u32> = HashMap::new();
-    for (k, val) in counts {
-        let state = u64::from_str_radix(k, 2).map_err(|_| format!("bad bitstring key '{k}'"))?;
-        map.insert(state, val.as_u64().unwrap_or(0) as u32);
-    }
-    let res = ExecResult::Counts(map);
+    let res = ExecResult::Counts(parse_counts_map(counts)?);
     // Same creg semantics as the local backends, decided by the SAME
     // lowering as run_counts (not by the wire IR, whose mid-circuit
     // detection uses a different meta-gate set): project final-measurement
@@ -383,19 +403,70 @@ mod tests {
         assert!(!low.needs_collapse);
         assert_eq!(measure_pairs(&low), vec![(0, 0)]);
 
-        let mut map: HashMap<u64, u32> = HashMap::new();
-        map.insert(0b00, 40); // q0=0
-        map.insert(0b10, 41); // q0=0
-        map.insert(0b01, 10); // q0=1
-        map.insert(0b11, 9); //  q0=1
+        let mut map: HashMap<Outcome, u32> = HashMap::new();
+        map.insert(Outcome::from_u64(0b00, 2), 40); // q0=0
+        map.insert(Outcome::from_u64(0b10, 2), 41); // q0=0
+        map.insert(Outcome::from_u64(0b01, 2), 10); // q0=1
+        map.insert(Outcome::from_u64(0b11, 2), 9); //  q0=1
         let res = project_counts_onto_creg(ExecResult::Counts(map), &measure_pairs(&low)).unwrap();
         if let ExecResult::Counts(m) = res {
-            assert_eq!(m.get(&0), Some(&81));
-            assert_eq!(m.get(&1), Some(&19));
+            assert_eq!(m.get(&Outcome::from_u64(0, 1)), Some(&81));
+            assert_eq!(m.get(&Outcome::from_u64(1, 1)), Some(&19));
             assert_eq!(m.len(), 2);
         } else {
             panic!("expected counts");
         }
+    }
+
+    /// The remote decoder must survive past bit 64 — the cliff the local path
+    /// lost in `PLAN-WIDE-COUNTS` and this one kept until today.
+    ///
+    /// Chosen so it CANNOT pass under the old `u64::from_str_radix` decoder:
+    /// 70 characters is `Err(PosOverflow)` there, so the function returned an
+    /// error rather than a wrong key. The set bit is at index 69 — above the
+    /// 64-bit word boundary — and bit 3 is set as well, so a decoder that
+    /// silently truncated to the low word would return a key that compares
+    /// unequal here rather than one that happens to match.
+    #[test]
+    fn remote_counts_decode_above_the_64_bit_cliff() {
+        // MSB-first: string position j carries bit 69-j.
+        let mut chars = vec!['0'; 70];
+        chars[0] = '1'; // bit 69
+        chars[69 - 3] = '1'; // bit 3
+        let key: String = chars.into_iter().collect();
+
+        let mut obj = serde_json::Map::new();
+        obj.insert(key.clone(), serde_json::json!(7));
+        let m = parse_counts_map(&obj).expect("70-bit key must decode");
+
+        let decoded = m.keys().next().unwrap();
+        assert_eq!(decoded.width(), 70, "width came from the wire, not a cast");
+        assert_eq!(decoded.bit(69), 1, "the bit above word 0 survived");
+        assert_eq!(decoded.bit(3), 1);
+        assert_eq!(decoded.as_u64(), None, "70 bits do not fit a u64 by design");
+        assert_eq!(decoded.to_bitstring(), key, "round-trips to what was sent");
+        assert_eq!(m.get(decoded), Some(&7));
+    }
+
+    /// Width is part of the key: `"0010"` and `"10"` are different outcomes of
+    /// different registers, and the old `u64` decoder collapsed them to `2`.
+    #[test]
+    fn remote_counts_keep_the_width_the_server_sent() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("0010".to_string(), serde_json::json!(3));
+        obj.insert("10".to_string(), serde_json::json!(5));
+        let m = parse_counts_map(&obj).unwrap();
+        assert_eq!(m.len(), 2, "two widths are two keys, not one summed key");
+        assert_eq!(m.get(&Outcome::from_u64(0b0010, 4)), Some(&3));
+        assert_eq!(m.get(&Outcome::from_u64(0b10, 2)), Some(&5));
+    }
+
+    #[test]
+    fn remote_counts_refuse_a_non_binary_key() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("01x1".to_string(), serde_json::json!(1));
+        let e = parse_counts_map(&obj).unwrap_err();
+        assert!(e.contains("01x1"), "error names the offending key: {e}");
     }
 
     #[test]
