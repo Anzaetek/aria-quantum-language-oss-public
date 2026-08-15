@@ -15,33 +15,47 @@ use std::collections::HashMap;
 use aria_core::ast::parse_aria;
 use aria_runtime::remote::{expectation_remote, run_counts_remote, Remote};
 use omega_core::executor::ExecResult;
+use omega_core::outcome::Outcome;
 
 use crate::banner::{self, Verdict};
 use crate::harness;
 
 const TRANSPORT: &str = "omega-server over HTTP (socket)";
 
-fn counts_map(res: ExecResult) -> HashMap<u64, u32> {
+fn counts_map(res: ExecResult) -> HashMap<Outcome, u32> {
     match res {
         ExecResult::Counts(m) => m,
         _ => HashMap::new(),
     }
 }
 
-fn prob_of(counts: &HashMap<u64, u32>, key: u64) -> f64 {
+/// The examples driven here are a few qubits wide, so their outcomes fit a
+/// `u64` and the callers' bit arithmetic (`argmax(&counts) & mask`) stays
+/// meaningful. Matching on `as_u64()` rather than constructing a keyed
+/// `Outcome` keeps that true without threading a width through every caller —
+/// the outcomes in one map all share a width, so there is nothing to confuse.
+fn prob_of(counts: &HashMap<Outcome, u32>, key: u64) -> f64 {
     let total: u64 = counts.values().map(|&v| v as u64).sum();
     if total == 0 {
         return 0.0;
     }
-    *counts.get(&key).unwrap_or(&0) as f64 / total as f64
+    let hit: u32 = counts
+        .iter()
+        .filter(|(o, _)| o.as_u64() == Some(key))
+        .map(|(_, &v)| v)
+        .sum();
+    hit as f64 / total as f64
 }
 
-fn argmax(counts: &HashMap<u64, u32>) -> u64 {
-    counts
-        .iter()
-        .max_by_key(|(_, &v)| v)
-        .map(|(&k, _)| k)
-        .unwrap_or(0)
+fn argmax(counts: &HashMap<Outcome, u32>) -> u64 {
+    match counts.iter().max_by_key(|(_, &v)| v) {
+        None => 0,
+        // A `None` here would mean a >64-qubit outcome reached an example that
+        // declares a handful of qubits — a defect worth failing on, not a 0.
+        Some((o, _)) => o
+            .as_u64()
+            .expect("socket example outcome wider than 64 bits"),
+    }
 }
 
 /// Run the socket demo against `url` (optional bearer `token`). Returns true

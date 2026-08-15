@@ -130,7 +130,16 @@ fn photonics_counts(source: &str, input_fock: &[u32]) -> Counts {
                 // 3575). Normalised to the bare comma form, and
                 // `compare` now asserts the two share bins at all so this
                 // failure names its own cause next time.
-                let key = omega_backend_photonics::sim::decode_fock_string(k, input_fock.len());
+                // The photonic key packs mode occupancies into a `u64` and
+                // `decode_fock_string` unpacks that, so the `Outcome` has to be
+                // narrowed back. `expect` rather than a fallback: a photonic
+                // outcome too wide for a `u64` would mean the packing changed
+                // under this test, which is worth failing on loudly.
+                let packed = k
+                    .as_u64()
+                    .expect("photonic Fock key must fit a u64 to be decoded");
+                let key =
+                    omega_backend_photonics::sim::decode_fock_string(packed, input_fock.len());
                 (key.trim_matches(['|', '>']).to_string(), v as u32)
             })
             .collect(),

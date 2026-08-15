@@ -114,10 +114,18 @@ fn execute_bell_circuit_counts_only_have_correlated_outcomes() {
     let total: u32 = counts.values().sum();
     assert_eq!(total, SHOTS, "shots conserved");
     // Bell state: only 0b00 (idx 0) and 0b11 (idx 3) should appear.
-    let n00 = counts.get(&0).copied().unwrap_or(0);
-    let n11 = counts.get(&3).copied().unwrap_or(0);
-    let n01 = counts.get(&1).copied().unwrap_or(0);
-    let n10 = counts.get(&2).copied().unwrap_or(0);
+    // Width 2 is part of the key: a bare `0` is not an `Outcome`, and an
+    // outcome of the same value at another width is a different key.
+    let at = |v: u64| {
+        counts
+            .get(&omega_core::outcome::Outcome::from_u64(v, 2))
+            .copied()
+            .unwrap_or(0)
+    };
+    let n00 = at(0);
+    let n11 = at(3);
+    let n01 = at(1);
+    let n10 = at(2);
     assert_eq!(n01, 0, "Bell state must not produce |01⟩");
     assert_eq!(n10, 0, "Bell state must not produce |10⟩");
     let half = SHOTS / 2;
