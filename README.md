@@ -69,6 +69,8 @@ aria-quantum-language-oss/
 ├── proofs/lean4/         Lean 4 correctness theorems (sorry-free)
 ├── editors/              Aria syntax: tree-sitter · Neovim · VS Code
 ├── TUTORIAL.md · GRAMMAR.md · VERIFICATION.md · LIMITATIONS.md · TESTING.md
+├── BACKEND-CROSSOVER.md  measured CPU→GPU switch sizes, per algorithm
+├── GATE-EXACTNESS.md     every gate applied approximately, with its bound
 └── ci.sh                 the whole pipeline (local by design — no hosted runner)
 ```
 

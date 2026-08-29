@@ -53,6 +53,7 @@ The runner exits 0 in both success and structured-failure cases.
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import traceback
@@ -64,6 +65,41 @@ import warnings
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runner_io import emit as _emit, err as _err  # noqa: E402
 
+
+
+_SX_RE = re.compile(r"\bsx\s+([^;]+);")
+_SXDG_RE = re.compile(r"\bsxdg\s+([^;]+);")
+
+
+def _workaround_bloqade_sx(qasm: str) -> str:
+    """Rewrite `sx`/`sxdg` to their `u3` forms — UPSTREAM BUG WORKAROUND.
+
+    bloqade-circuit 0.14.4's pyqrack interpreter implements these two wrongly
+    (`bloqade/pyqrack/qasm2/uop.py`):
+
+        SX     -> u(pi/2,   pi/2, -pi/2)     # the CONJUGATE branch, = SX-dagger
+        SXdag  -> u(pi*3/2, pi/2,  pi/2)     # not a sqrt(X) at all; squares to I
+
+    Measured against Qiskit: `sx; sxdg` must be the identity and must leave
+    |0>, but bloqade returns |1> on 4000/4000 shots. `sx; sx` happens to agree
+    (both branches square to X), which is why a naive round-trip test misses
+    it — the error only shows when a phase-sensitive operation sits between
+    two of them, or when the daggered form is used at all.
+
+    The rewrite is EXACT for this bridge's purposes: `sx = e^{i pi/4} *
+    u3(pi/2, -pi/2, pi/2)`, a global phase, and this runner returns sampled
+    counts, in which a global phase is unobservable. bloqade's own `u3` is
+    correct — verified by running both forms of the same circuit here.
+
+    Note bloqade's NON-pyqrack path
+    (`bloqade/qasm2/rewrite/native_gates.py`, `cirq.XPowGate(exponent=-0.5)`)
+    is right; only the direct interpreter is affected. Remove this function
+    once upstream fixes `uop.py`, and the `sqrt_x_conventions` cross-check
+    will confirm it is safe to do so.
+    """
+    qasm = _SXDG_RE.sub(r"u3(pi/2,pi/2,-pi/2) \1;", qasm)
+    qasm = _SX_RE.sub(r"u3(pi/2,-pi/2,pi/2) \1;", qasm)
+    return qasm
 
 def main() -> int:
     raw = sys.stdin.read()
@@ -77,6 +113,22 @@ def main() -> int:
         return 0
 
     mode = req.get("mode") or "execute"
+    if mode == "capabilities":
+        # Capability handshake — see the note in tsim_runner.py. Answering
+        # before a run is what lets a caller avoid discovering a mismatch as a
+        # mid-run error, or, for noise, not discovering it at all.
+        _emit(
+            {
+                "ok": True,
+                "capabilities": {
+                    "backend": "bloqade",
+                    "modes": ["execute", "ahs"],
+                    "noise_keys": [],
+                    "notes": "neutral-atom; no noise model",
+                },
+            }
+        )
+        return 0
     if mode == "ahs":
         _err(
             "AHS analog mode not yet implemented in the omega-bloqade runner",
@@ -95,6 +147,20 @@ def main() -> int:
     if not isinstance(shots, int) or shots <= 0:
         _err("`shots` must be a positive integer", kind="bad-request")
         return 0
+
+    # This bridge consumes no noise model. It used to IGNORE `noise` entirely
+    # and return a noiseless distribution, which the caller reads as noisy —
+    # the same silent-drop defect `--noise` was fixed for in-tree. Refuse
+    # loudly instead, matching the tsim/ppvm runners.
+    noise = req.get("noise")
+    if noise:
+        _err(
+            f"the bloqade bridge does not implement a noise model "
+            f"(request carried noise={noise!r}); rerun without `noise`, or use "
+            "the qiskit bridge, or an in-process backend",
+            kind="bloqade-noise-not-supported",
+        )
+        return 0
     # Cross-backend fidelity fixtures (verify-qiskit/fixtures/) are
     # mostly unitary-only — no `creg` declaration, no `measure`. The
     # Qiskit and Perceval runners both transparently add measurements
@@ -104,6 +170,7 @@ def main() -> int:
     # but no measure, append `measure q -> c;`. Bloqade's gate-mode
     # entry point requires both, so without this synthesis the runner
     # would reject every unmeasured fixture with `bloqade-lower`.
+    qasm = _workaround_bloqade_sx(qasm)
     qasm, synthesised_creg = _ensure_measurement(qasm)
     creg_name = req.get("creg") or synthesised_creg or _infer_creg_name(qasm) or "c"
 
@@ -153,8 +220,34 @@ def main() -> int:
         task = sim.task(program)
         prob_dist = task.batch_run(shots=shots)
     except Exception as e:  # noqa: BLE001
+        # Classify before reporting. A raw upstream traceback is the worst
+        # possible answer to "why did my circuit not run": measured, a
+        # feedforward circuit came back as
+        # `object of type 'float' has no len()`, which names neither the
+        # feature that is missing nor a backend that has it, and which the
+        # cross-backend harness then treats as a hard error and PANICS on
+        # rather than skipping with a reason.
+        msg = str(e)
+        if "has no len()" in msg or "if_else" in msg or "IfElse" in msg:
+            _err(
+                "bloqade cannot execute a classically-conditioned circuit "
+                "through this bridge.\n"
+                "  Why: the QASM2 `if (creg == N)` construct lowers to an "
+                "`if_else` node that bloqade's pyqrack interpreter does not "
+                "handle; it fails deep inside the interpreter with a type "
+                f"error ({msg!r}) rather than a capability message.\n"
+                "  What runs it today: the in-process `statevector`, `mps` and "
+                "`pauli` backends all implement mid-circuit measurement with "
+                "feedforward.",
+                kind="bloqade-not-supported",
+            )
+            return 0
         _err(
-            f"bloqade simulator: {e}\n{traceback.format_exc()}",
+            f"bloqade simulator failed while executing the circuit: {msg}\n"
+            "  This is an execution failure, not a capability limit — the "
+            "circuit converted successfully and then the simulator raised. "
+            "Full traceback follows for upstream reporting.\n"
+            f"{traceback.format_exc()}",
             kind="bloqade-execute",
         )
         return 0

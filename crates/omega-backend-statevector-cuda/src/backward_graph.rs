@@ -1925,6 +1925,27 @@ fn forward_2q_matrix(op: &GateOp, params: &ParameterBinding) -> OmegaResult<[Com
         .collect::<OmegaResult<Vec<_>>>()?;
     let z = Complex64::new(0.0, 0.0);
     let o = Complex64::new(1.0, 0.0);
+    // NOT ROUTED THROUGH THE SPECIALISED QUAD KERNELS, deliberately, and this
+    // is the one place a reader is likely to assume otherwise.
+    //
+    // `apply_cx`/`apply_cz`/`apply_swap`/`apply_crz` in lib.rs dispatch
+    // permutation and diagonal kernels instead of a dense 4x4 (1.69x/1.70x/
+    // 2.90x/1.65x at 26 qubits). The CUDA-GRAPH path does not: it builds a
+    // dense matrix here and feeds `apply_2q_pooled`, because the graph is
+    // captured once and replayed with parameters swapped through a device-side
+    // pool, and the specialised kernels take different parameter STRUCTS rather
+    // than a different matrix in the same struct. Wiring them in means a pooled
+    // variant per kernel, which is a real change, not a redirect.
+    //
+    // Consequence to be aware of, since TrainStepGraph is live production code
+    // reached from `expectation_multi_then_gradient`: the QML training hot path
+    // gets NONE of those speedups. The perf numbers in the commit messages are
+    // the non-graph forward/adjoint path only.
+    //
+    // Numerically the two paths agree to f32 rounding, and the graph gates run
+    // at 1e-5, so this divergence is invisible to them. It is a duplication
+    // hazard rather than a correctness one: a fix to the slot mapping in lib.rs
+    // would NOT reach these matrices.
     Ok(match &op.gate {
         GateKind::CX => {
             #[rustfmt::skip]

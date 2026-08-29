@@ -96,10 +96,7 @@ fn ours(qasm: &str, shots: u32, seed: u64, chi: usize) -> HashMap<String, u32> {
         .execute(&ir, &ParameterBinding::default(), &cfg)
         .expect("our MPS must run")
     {
-        ExecResult::Counts(c) => c
-            .into_iter()
-            .map(|(o, n)| (o.to_bitstring(), n))
-            .collect(),
+        ExecResult::Counts(c) => c.into_iter().map(|(o, n)| (o.to_bitstring(), n)).collect(),
         o => panic!("{o:?}"),
     }
 }
@@ -122,9 +119,8 @@ fn tvd(a: &HashMap<String, u32>, b: &HashMap<String, u32>) -> f64 {
 
 /// GHZ over `n` qubits, every qubit measured.
 fn ghz(n: usize) -> String {
-    let mut s = format!(
-        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\nh q[0];\n"
-    );
+    let mut s =
+        format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\nh q[0];\n");
     for i in 0..n - 1 {
         s.push_str(&format!("cx q[{i}], q[{}];\n", i + 1));
     }
@@ -138,9 +134,7 @@ fn ghz(n: usize) -> String {
 /// a light CX chain. Unlike GHZ this has a broad distribution, so agreeing on
 /// it is evidence about the distribution rather than about two special keys.
 fn spread(n: usize) -> String {
-    let mut s = format!(
-        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\n"
-    );
+    let mut s = format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\n");
     for i in 0..n {
         s.push_str(&format!("ry({}) q[{i}];\n", 0.35 + 0.03 * (i % 7) as f64));
     }
@@ -228,7 +222,10 @@ fn our_mps_agrees_with_qiskit_mps_on_narrow_support_circuits() {
         );
     }
     eprintln!("narrow-support: {compared} circuits, worst TVD {worst:.4}; skipped {skipped:?}");
-    assert!(compared >= 2, "only {compared} compared (skipped {skipped:?})");
+    assert!(
+        compared >= 2,
+        "only {compared} compared (skipped {skipped:?})"
+    );
 }
 
 /// **Broad support: compare marginals and adjacent correlations.**
@@ -292,12 +289,15 @@ fn our_mps_agrees_with_qiskit_mps_on_broad_distributions() {
         "broad: {compared} circuits, worst |ΔP(1)| {worst_m:.4}, worst |Δ<ZZ>| \
          {worst_z:.4}; skipped {skipped:?}"
     );
-    assert!(compared >= 2, "only {compared} compared (skipped {skipped:?})");
+    assert!(
+        compared >= 2,
+        "only {compared} compared (skipped {skipped:?})"
+    );
 }
 
 fn top3(m: &HashMap<String, u32>) -> Vec<(String, u32)> {
     let mut v: Vec<_> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|e| std::cmp::Reverse(e.1));
     v.truncate(3);
     v
 }
@@ -354,7 +354,10 @@ fn the_tvd_separates_different_distributions() {
     let b: HashMap<String, u32> = [("01".to_string(), 100), ("10".to_string(), 100)]
         .into_iter()
         .collect();
-    assert!((tvd(&a, &a) - 0.0).abs() < 1e-12, "a distribution matches itself");
+    assert!(
+        (tvd(&a, &a) - 0.0).abs() < 1e-12,
+        "a distribution matches itself"
+    );
     assert!(
         tvd(&a, &b) > 0.99,
         "disjoint supports must give TVD ~1, got {}",

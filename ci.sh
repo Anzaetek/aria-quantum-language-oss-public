@@ -53,8 +53,41 @@ skipped() { SKIPPED_STAGES+=("$1"); echo "  (skipping $1)"; }
 step "1/9  Format check (Aria crates)"
 cargo fmt "${FMT_CRATES[@]}" -- --check
 
-step "2/9  Clippy -D warnings (Aria crates)"
-cargo clippy "${ARIA_CRATES[@]}" -- -D warnings
+step "2/9  Clippy -D warnings (WHOLE WORKSPACE, all targets)"
+# `--workspace --all-targets`, NOT a typed crate list, and NOT lib targets only.
+#
+# What the old `cargo clippy "${ARIA_CRATES[@]}" -- -D warnings` did and did not
+# cover, MEASURED rather than assumed (a first draft of this change asserted the
+# opposite and was disproved by canary):
+#
+#   * It DID lint the omega backends. `cargo clippy -p X` sets
+#     RUSTC_WORKSPACE_WRAPPER, which runs clippy-driver over every workspace
+#     member in X's dependency graph with `-D warnings` applied to each.
+#     `aria-runtime` pulls in `omega-backend-pauliprop`, so that crate — and
+#     omega-core, omega-parser, statevector, mps, pauli, photonics — were
+#     already gated. A dropped `Result` in pauliprop's lib DOES fail the old
+#     stage 2; verified by appending one and watching it exit 101.
+#
+#   * It did NOT lint any TEST target, anywhere. 9 of the 13 diagnostics this
+#     change fixed were in test files.
+#
+#   * It did NOT reach the 18 workspace members outside that dependency
+#     closure: omega-cli, omega-server, omega-ffi, omega-client, omega-bridges,
+#     omega-tensor, omega-backend-cv, omega-backend-refplugin,
+#     omega-plugin-conformance, omega-wasm-cli, omega-xcheck, and the seven
+#     GPU/OpenCL backends. The remaining 4 diagnostics lived there, including a
+#     CLI flag that had been accepted and silently discarded for its whole life.
+#
+# Cost: 24.5 s from a cold target dir, measured. `--all-targets` includes
+# `--benches`, and the eight benches/ declare `harness = false`, so stage 5's
+# `cargo test --workspace` does not build them — this is genuinely new compile
+# surface, not a re-run.
+#
+# STILL NOT COVERED, so nobody reads "workspace" as "everything": the aria-py
+# bindings (separate cargo project, see its stage below), crates/aria-backend-tch
+# and examples/wasm-guests/* (workspace `exclude`). Those are hand-gated, which
+# is the same shape of hole this change closes here.
+cargo clippy --workspace --all-targets -- -D warnings
 
 step "3/9  Build pure-Rust omega backends"
 cargo build "${OMEGA_CORE[@]}"
@@ -80,7 +113,24 @@ step "5/9  Test the WHOLE WORKSPACE (numeric gates)"
 #
 # The crate arrays above are still used for `cargo build`, fmt and clippy,
 # where a curated set is the point rather than a gap.
-cargo test --workspace
+#
+# ARIA_TEST_RELEASE=1 runs this in release for iteration speed, and it is NOT
+# equivalent. Release drops every `debug_assert` in the tree — 34 of them — and
+# several are load-bearing: `creg_to_u64`'s set-bit-above-64 check,
+# `counts_from_u64`'s width check, and the `<< 64` guard in
+# `condition_satisfied`. `wide_creg_is_not_an_overflow.rs` says so in its own
+# header: "These tests must run in a debug build to mean anything ...
+# `cargo test --release` passes on the broken code."
+#
+# So it registers as a skip. A faster run that checks less must SAY it checked
+# less, or the speed is bought by quietly lowering the bar.
+if [ "${ARIA_TEST_RELEASE:-0}" = "1" ]; then
+  cargo test --workspace --release
+  skipped "34 debug_assert checks — ARIA_TEST_RELEASE=1 built without them \
+(see wide_creg_is_not_an_overflow.rs; a debug run is required to gate)"
+else
+  cargo test --workspace
+fi
 
 # --- Reset-channel regression gates (every CPU backend) ---------------------
 # `reset q` is the non-unitary CHANNEL rho -> |0><0|_q (x) Tr_q(rho): the qubit
@@ -192,6 +242,36 @@ else
 fi
 rm -rf "$PLUGIN_DIR"
 
+step "6c/9  C embedder: link the .dylib from OUTSIDE the workspace"
+# The acceptance test for embedding as a native shared object. Deliberately a C
+# program, not a Rust test: a Rust test in this workspace proves the linker
+# works, and proves nothing about the CONTRACT an embedder depends on — that
+# `include/omega.h` compiles under a C compiler, that ownership rules hold, and
+# that every error path behaves. There was no `.c` file in the tree at all
+# before this, so none of that had ever been exercised from outside.
+#
+# `cc` is present on every platform this repo builds on, so this is not
+# optional and does not skip.
+cargo build -p omega-ffi --release >/dev/null 2>&1
+FFI_LIB_DIR="target/release"
+# A per-run directory, not a fixed path: a fixed-path fixture is what made
+# `flags_refuse_rather_than_panic` race ~1 run in 6 until it was fixed.
+EMBED_DIR=$(mktemp -d)
+if cc -I include examples/c-embed/embed.c -o "$EMBED_DIR/embed" \
+     -L "$FFI_LIB_DIR" -lomega_ffi -lm; then
+  echo "  header compiles under a C compiler"
+else
+  echo "  FAIL: include/omega.h does not compile as C, or the dylib will not link"
+  rm -rf "$EMBED_DIR"; exit 1
+fi
+if DYLD_LIBRARY_PATH="$FFI_LIB_DIR" LD_LIBRARY_PATH="$FFI_LIB_DIR" \
+     "$EMBED_DIR/embed"; then
+  echo "  OK: C embedder passed every check"
+else
+  echo "  FAIL: C embedder reported failures"; rm -rf "$EMBED_DIR"; exit 1
+fi
+rm -rf "$EMBED_DIR"
+
 step "7/9  Build WASM guests (wasm32-wasip1) for the application harnesses"
 if rustup target list --installed 2>/dev/null | grep -q wasm32-wasip1; then
   for g in "${WASM_GUESTS[@]}"; do
@@ -204,6 +284,22 @@ else
   echo "        aria-verify will fall back to the native transport below."
 fi
 
+if [ "${ARIA_DEV:-0}" = "1" ]; then
+  # ITERATION ONLY. This stage runs every shipped example through the WASM
+  # runtime against its classical oracle, and it is ~33 of the ~40 minutes a
+  # full run takes — while having no bearing at all on a parser, an emitter or a
+  # C ABI. Skipping it turns the edit/verify loop from 40 minutes into about 8.
+  #
+  # It registers through `skipped()` so the final summary NAMES it, exactly as
+  # CUDA and Lean are named. That is the whole point: a fast run must not be
+  # able to look like a gate run. The tch stage is the cautionary tale — it once
+  # printed SKIP inline and then vanished from the summary, so a run with no
+  # libtorch ended "All CI stages that ran passed" listing only Metal/OpenCL/Lean.
+  #
+  # Never set this in automation, and never report a run with it set as green.
+  echo
+  skipped "Application harnesses (aria-verify all) — ARIA_DEV=1, ITERATION ONLY"
+else
 step "8/9  Application harnesses: quantum vs classical (aria-verify all)"
 # Runs every shipped example through the omega WASM runtime (in-process) and
 # asserts each matches its pure-Rust classical oracle within tolerance.
@@ -216,6 +312,7 @@ cargo run -q -p aria-verify -- all
 if [ "${ARIA_DEEP:-0}" = "1" ]; then
   step "8b/9  Deep harnesses (ARIA_DEEP=1)"
   ARIA_DEEP=1 cargo run -q -p aria-verify -- all
+fi
 fi
 
 step "9/9  Socket transport (omega-server over HTTP) — best effort"
@@ -237,6 +334,17 @@ else
     cargo run -q -p aria-verify --features remote -- \
       socket --url http://127.0.0.1:8899 --token "$(cat "$TOK")"
     echo "  OK: socket transport verified against omega-server"
+    # The P5 template routes, end to end through the Python client. Reuses the
+    # server already running above rather than starting a second one.
+    #
+    # Stdlib only (`urllib.request`), so this needs no venv and no install —
+    # which is why it can be a plain `python3` here. It caught a real defect a
+    # mock could not have: the client encoded `OmegaParam` in the
+    # externally-tagged form and the server, which uses `#[serde(untagged)]`,
+    # answered 422.
+    python3 tools/omega_client/live_test.py \
+      --url http://127.0.0.1:8899 --token "$(cat "$TOK")"
+    echo "  OK: template routes verified through the client"
   else
     echo "  SKIP: omega-server did not come up in time (see /tmp/omega-server-ci.log)"
   fi
@@ -358,6 +466,54 @@ esac
 # assert the GPU statevector / MPS-SVD / pauliprop paths numerically match CPU.
 if [ "${ARIA_CUDA:-0}" = "1" ]; then
   step "+   Optional: CUDA GPU backends"
+  # Serialise the CUDA tests. STAGE-SCOPED deliberately: exporting this would
+  # serialise every CPU stage above too, which is both slow and would mask an
+  # unrelated CPU-side race.
+  #
+  # WHAT THIS IS AND IS NOT. It is a workaround, not a diagnosis. The received
+  # explanation — "CudaStatevectorBackend is neither Send nor Sync by
+  # construction" — does not survive contact with the code: !Send/!Sync is a
+  # compile-time property that PREVENTS cross-thread sharing, so it cannot
+  # itself segfault a harness where each #[test] builds its own backend, and
+  # forward_graph.rs already captures with CU_STREAM_CAPTURE_MODE_THREAD_LOCAL
+  # precisely so other threads' default-stream work is not swept up.
+  #
+  # What IS true: ForwardGraph::capture is reachable only from #[cfg(test)]
+  # code, so the capture/execute interaction is test-only and serialising the
+  # tests is a legitimate fix for the symptom.
+  #
+  # MEASURED 2026-08-19 on a GB10, unserialised. The cause is still not
+  # identified, but it is no longer unobserved — `cargo test --lib` fails
+  # 4/10 runs with, on the same run:
+  #   forward_graph_replay_matches_naive_forward
+  #     end_capture: CUDA_ERROR_STREAM_CAPTURE_INVALIDATED
+  #     ("operation failed due to a previous error during capture")
+  #   reset_channel_matches_aer_ground_truth
+  #     curand fill_with_uniform: CURAND_STATUS_LAUNCH_FAILURE
+  # Thread sweep: 1, 2, 4 threads clean (0/6 each); 8 threads fails (1/6). A
+  # THRESHOLD, not a two-test collision.
+  #
+  # The two guesses previously recorded here are both now unlikely, and are
+  # kept only so nobody re-derives them: "multiple primary contexts under
+  # parallel NVRTC compiles" — NVRTC runs at backend construction, while these
+  # failures land at end_capture and at a curand launch, well after; and
+  # "concurrent large allocations colliding with the oom_fallback test" —
+  # oom_fallback.rs holds BOUNDED max-qubit allocations that test refusal
+  # CLASSIFICATION, not pool exhaustion.
+  #
+  # STRONGEST REMAINING HYPOTHESIS, UNTESTED: the THREAD_LOCAL defence above is
+  # insufficient. CU_STREAM_CAPTURE_MODE_THREAD_LOCAL stops another thread's
+  # LEGACY DEFAULT-STREAM work being swept into a capture; it does NOT protect
+  # a stream under capture from concurrent submission to THAT SAME stream. And
+  # 132f8fa established the enabling fact: "every call goes through a single
+  # Arc<CudaStream>". Confirming this needs instrumenting whether each backend
+  # instance owns a distinct stream — not done, so do not cite it as known.
+  #
+  # A test-hygiene race on the process-global READ_STATE_CALL_COUNT was found
+  # and fixed separately (see qml_no_host_syncs.rs). It was NOT this, it was in
+  # a different binary, and fixing it does not make this line removable.
+  # Do not close that question on the strength of this line.
+  export RUST_TEST_THREADS=1
   # Full statevector-CUDA unit suite: apply_2q / adjoint / execute, the
   # deterministic mid-circuit Reset ≡ CPU gate, and the odd-Y Pauli-expectation
   # regression (pauli_expectation now uses the correct (-i)^|Y| prefactor).
@@ -380,8 +536,40 @@ if [ "${ARIA_CUDA:-0}" = "1" ]; then
   # ill-defined analytic case) and `reset_channel_matches_aer_ground_truth`
   # (the three discriminating circuits pinned to Aer). CUDA samples the Born
   # outcome ON DEVICE via the fused Pauli-expectation reduction.
+  # The SERVER's cuda feature. Added because it is a new CUDA surface and
+  # nothing above reaches it: every stage so far builds backend crates or the
+  # CLI, and `cargo test --workspace` builds omega-server WITHOUT features. A
+  # feature-gated path that no CI command compiles is this repository's most
+  # repeated defect — it is how the Outcome migration survived in four backends
+  # at once, and how the CUDA statevector shipped with two casts that had never
+  # seen a compiler.
+  #
+  # Both halves matter: `--features cuda` proves the CUDA dispatch, the
+  # availability memo and the MPS/PauliProp hooks compile and pass; the default
+  # build proves the feature is genuinely optional.
+  cargo test -p omega-server --features cuda
+  cargo clippy -p omega-server --features cuda --all-targets -- -D warnings
+  echo "  OK: omega-server --features cuda (statevector dispatch, MPS gesvdj + pauliprop hooks)"
+
+  # Clippy the FEATURED CUDA surface. Stage 2's `--workspace --all-targets`
+  # cannot reach any of this: cfg'd-out code is not linted, so every line behind
+  # `#[cfg(feature = "cuda")]` is invisible there no matter how wide the crate
+  # list gets. Until this line existed, `omega-cli`, `aria-runtime` and the three
+  # CUDA backends under `--features cuda` were linted by NOTHING.
+  #
+  # That is not hypothetical: `QUAD_KERNEL_MIN_QUBIT_2SLOT` needed its cfg
+  # corrected to match its four use sites, and a cfg fix is checkable only by an
+  # invocation that actually enables the feature. Without this it would have
+  # shipped unverified.
+  cargo clippy -p omega-backend-statevector-cuda -p omega-backend-mps-cuda \
+    -p omega-backend-pauliprop-cuda -p omega-cli -p aria-runtime \
+    --features omega-backend-statevector-cuda/cuda,omega-backend-mps-cuda/cuda,omega-backend-pauliprop-cuda/cuda,omega-cli/cuda,aria-runtime/cuda \
+    --all-targets -- -D warnings
+  echo "  OK: clippy --features cuda (cli, runtime, statevector/mps/pauliprop CUDA backends)"
   echo "  OK: CUDA GPU statevector + MPS(gesvdj) + pauliprop(branch) + RBS match CPU"
   echo "  OK: CUDA Reset channel (on-device sampling) == Aer"
+  # Unset so nothing below this stage inherits the serialisation.
+  unset RUST_TEST_THREADS
 else
   echo
   skipped "CUDA backends — set ARIA_CUDA=1 on a CUDA box"
@@ -403,15 +591,134 @@ fi
 # `cargo test --workspace` does not reach it -- the same coverage hole as the
 # typed crate list, one directory over. Builds always; the python tests need a
 # venv with the extension built, so they skip cleanly when it is absent.
-step "+   aria-py bindings"
-( cd bindings/aria-py && cargo build )
-ARIA_PY_VENV="bindings/aria-py/.venv/bin/python"
-if [ -x "$ARIA_PY_VENV" ] && "$ARIA_PY_VENV" -c "import aria_py, pytest" 2>/dev/null; then
-  "$ARIA_PY_VENV" -m pytest bindings/aria-py/tests -q
-  echo "  OK: aria-py builds and its python tests pass"
+# ---------------------------------------------------------------------------
+# WHICH PYTHON THIS STAGE BUILDS AGAINST — read this before "fixing" a failure
+# ---------------------------------------------------------------------------
+# pyo3 links against a REAL interpreter and REFUSES to build against one newer
+# than it supports. pyo3 0.23.5 (see bindings/aria-py/Cargo.lock) caps at
+# CPython 3.13, so on a host whose `python3` is newer — Homebrew moved to 3.14
+# — a bare `cargo build` here dies with:
+#
+#     error: the configured Python interpreter version (3.14) is newer than
+#            PyO3's maximum supported version (3.13)
+#
+# That is an ENVIRONMENT mismatch, not a defect in this repo, and it is worth
+# saying so loudly: on 2026-08-23 it aborted a full run AFTER every numbered
+# stage had already passed, which reads like a real failure and is not one.
+#
+# Resolution order, first hit wins. Set nothing and this auto-detects:
+#
+#   1. $PYO3_PYTHON     — already exported: used verbatim and NOT version
+#                         checked. You asked for it, you own it.
+#   2. $ARIA_PY_PYTHON  — this repo's knob. Path to, or name of, an interpreter.
+#   3. bindings/aria-py/.venv/bin/python, then ./.venv/bin/python
+#   4. python3.13 … python3.10 from PATH, newest first
+#   5. plain `python3`, but ONLY if it is <= 3.13
+#
+# If none yields a compatible interpreter the stage SKIPS with a named remedy
+# instead of failing: it is an optional `+` stage, and an absent toolchain must
+# not read as a defect. It still lands in SKIPPED_STAGES, so the final summary
+# says out loud that it did not run — silence here is the thing to avoid.
+#
+# DELIBERATELY NOT USED: PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1. It suppresses
+# the check and builds against the stable ABI anyway, trading a loud
+# environment error for an untested build. Wrong direction for a CI script.
+#
+# TO RAISE THE CAP: bump pyo3 in bindings/aria-py/Cargo.toml, then update
+# PYO3_MAX_MINOR here. The two must agree or this stage lies about what it
+# accepts.
+PYO3_MAX_MINOR=13
+
+# Minor version of interpreter $1, or empty if it will not run.
+py_minor() { "$1" -c 'import sys; print(sys.version_info[1])' 2>/dev/null; }
+# Can pyo3 build against $1?
+py_ok() {
+  [ -n "${1:-}" ] || return 1
+  local m
+  m="$(py_minor "$1")" || return 1
+  [ -n "$m" ] && [ "$m" -le "$PYO3_MAX_MINOR" ]
+}
+
+# An interpreter named EXPLICITLY (either knob) is a promise, not a hint. If it
+# cannot be used this stage STOPS — it does not quietly auto-detect a different
+# one. Falling back would build against a python the caller did not choose and
+# then report success, which is the "refuse rather than substitute" rule this
+# repo already applies to its emitters, one layer out.
+ARIA_PY_INTERP=""; ARIA_PY_WHY=""; ARIA_PY_EXPLICIT=0
+if [ -n "${PYO3_PYTHON:-}" ]; then
+  # Verbatim and NOT version-checked: PYO3_PYTHON is pyo3's own knob, so an
+  # operator setting it outranks our cap and owns the outcome.
+  ARIA_PY_INTERP="$PYO3_PYTHON"; ARIA_PY_WHY="\$PYO3_PYTHON (exported; not version-checked)"
+  ARIA_PY_EXPLICIT=1
+elif [ -n "${ARIA_PY_PYTHON:-}" ]; then
+  if ! py_ok "$ARIA_PY_PYTHON"; then
+    echo "  FAIL: ARIA_PY_PYTHON='$ARIA_PY_PYTHON' is not a usable CPython <= 3.$PYO3_MAX_MINOR"
+    echo "        (got: 3.$(py_minor "$ARIA_PY_PYTHON" || echo '<would not run>'))."
+    echo "        Refusing to auto-detect past an interpreter you named."
+    exit 1
+  fi
+  ARIA_PY_INTERP="$ARIA_PY_PYTHON"; ARIA_PY_WHY="\$ARIA_PY_PYTHON"; ARIA_PY_EXPLICIT=1
 else
-  echo "  OK: aria-py builds (python tests skipped — no venv with aria_py + pytest)"
-  skipped "aria-py python tests — build bindings/aria-py/.venv and \`maturin develop\`"
+  for cand in bindings/aria-py/.venv/bin/python ./.venv/bin/python \
+              python3.13 python3.12 python3.11 python3.10 python3; do
+    if py_ok "$cand"; then
+      ARIA_PY_INTERP="$cand"; ARIA_PY_WHY="auto-detected"; break
+    fi
+  done
+fi
+# pyo3 runs from inside bindings/aria-py, so a relative path would not resolve
+# there. Make it absolute, or resolve a bare command name through PATH.
+if [ -n "$ARIA_PY_INTERP" ]; then
+  if [ -x "$ARIA_PY_INTERP" ]; then
+    case "$ARIA_PY_INTERP" in /*) ;; *) ARIA_PY_INTERP="$PWD/${ARIA_PY_INTERP#./}" ;; esac
+  else
+    ARIA_PY_RESOLVED="$(command -v "$ARIA_PY_INTERP" || true)"
+    if [ -z "$ARIA_PY_RESOLVED" ] && [ "$ARIA_PY_EXPLICIT" = 1 ]; then
+      echo "  FAIL: the interpreter you named ('$ARIA_PY_INTERP') is not executable and"
+      echo "        is not on PATH. Stopping rather than skipping: a knob that is set"
+      echo "        and then silently ignored is worse than a stopped run."
+      exit 1
+    fi
+    ARIA_PY_INTERP="$ARIA_PY_RESOLVED"
+  fi
+fi
+
+step "+   aria-py bindings"
+if [ -z "$ARIA_PY_INTERP" ]; then
+  echo "  SKIP: no CPython <= 3.$PYO3_MAX_MINOR on this host (pyo3 cannot build against"
+  echo "        anything newer). Found python3 = 3.$(py_minor python3 || echo '?')."
+  echo "        Remedy — either is fine:"
+  echo "          python3.13 -m venv bindings/aria-py/.venv     # auto-detected next run"
+  echo "          ARIA_PY_PYTHON=/path/to/python3.13 ./ci.sh    # or point at one"
+  skipped "aria-py bindings — no CPython <= 3.$PYO3_MAX_MINOR (see the note above this stage in ci.sh)"
+else
+  echo "  python: $ARIA_PY_INTERP (3.$(py_minor "$ARIA_PY_INTERP" || echo '?')) — $ARIA_PY_WHY"
+  ( cd bindings/aria-py && PYO3_PYTHON="$ARIA_PY_INTERP" cargo build )
+  ARIA_PY_VENV="bindings/aria-py/.venv/bin/python"
+  ARIA_PY_MATURIN="bindings/aria-py/.venv/bin/maturin"
+  if [ -x "$ARIA_PY_VENV" ] && "$ARIA_PY_VENV" -c "import aria_py, pytest" 2>/dev/null; then
+    # REBUILD BEFORE TESTING. `cargo build` above proves the crate compiles; it
+    # does NOT update the extension module the venv imports, which is whatever
+    # `maturin develop` last installed. So without this the stage happily tests a
+    # STALE .so and reports green for source it never ran -- the same
+    # green-when-absent shape this file guards against elsewhere.
+    #
+    # It went unnoticed while every test here asserted numerics that rarely
+    # change. `tests/test_gil_release.py` asserts a property of the BINARY (does
+    # the extension release the GIL), so a stale module now shows up as a
+    # baffling failure rather than a silent pass.
+    if [ -x "$ARIA_PY_MATURIN" ]; then
+      ( cd bindings/aria-py && .venv/bin/maturin develop --release -q )
+    else
+      echo "  NOTE: no maturin in the venv — the python tests below run against"
+      echo "        the LAST INSTALLED extension, which may predate src/lib.rs."
+    fi
+    "$ARIA_PY_VENV" -m pytest bindings/aria-py/tests -q
+    echo "  OK: aria-py builds and its python tests pass"
+  else
+    echo "  OK: aria-py builds (python tests skipped — no venv with aria_py + pytest)"
+    skipped "aria-py python tests — build bindings/aria-py/.venv and \`maturin develop\`"
+  fi
 fi
 
 # Python-side unit tests for the runners. These need no simulator install
@@ -422,15 +729,34 @@ fi
 # `tests/test_perceval_conventions.py` — written to pin the hwp/pbs/bs_rx
 # conventions — had never executed in CI either. Same hand-maintained-gate
 # hole as FIXES_PLAN.md K9.
-PYTEST_PY=""
+# Run under EVERY venv that has pytest, not the first one found.
+#
+# This used to `break` at the first candidate, which is always `.venv-qiskit`
+# — and that venv has no perceval, so `test_perceval_conventions.py` called
+# `pytest.importorskip("perceval")` and skipped on every run this stage has
+# ever had. Those are the six tests pinning the `bs_rx` / `hwp` / `pbs` matrix
+# conventions, and that file's own header records the `bs_rx` mapping being
+# wrong for two years with an error of 0.798-1.0 while a phase-insensitive HOM
+# check called it fine. The stage said "Perceval conventions are pinned" and
+# they were not: 6 passed, 1 skipped, and the skip was the whole point.
+#
+# `test_runner_io.py` is stdlib-only so it runs under any venv; the perceval
+# venv therefore covers strictly more than the qiskit one. Running all of them
+# costs a second and removes the question.
+PYTEST_RAN=0
 for cand in crates/omega-bridges/python/.venv-qiskit/bin/python \
             crates/omega-bridges/python/.venv-perceval/bin/python; do
-  [ -x "$cand" ] && "$cand" -c "import pytest" 2>/dev/null && PYTEST_PY="$cand" && break
+  if [ -x "$cand" ] && "$cand" -c "import pytest" 2>/dev/null; then
+    if [ "$PYTEST_RAN" -eq 0 ]; then
+      step "+   Bridge runner python tests (protocol guard + conventions)"
+    fi
+    echo "  -- under $cand"
+    "$cand" -m pytest crates/omega-bridges/python/tests -q
+    PYTEST_RAN=$((PYTEST_RAN + 1))
+  fi
 done
-if [ -n "$PYTEST_PY" ]; then
-  step "+   Bridge runner python tests (protocol guard + conventions)"
-  "$PYTEST_PY" -m pytest crates/omega-bridges/python/tests -q
-  echo "  OK: stdout protocol guard holds and Perceval conventions are pinned"
+if [ "$PYTEST_RAN" -gt 0 ]; then
+  echo "  OK: stdout protocol guard holds and Perceval conventions are pinned ($PYTEST_RAN venv(s))"
 else
   skipped "bridge runner python tests — no venv with pytest installed"
 fi
@@ -441,8 +767,23 @@ if [ "${ARIA_BRIDGE_XCHECK:-0}" = "1" ]; then
   # `curated_fixtures()` were cfg'd out of every CI run — which is how that
   # helper kept a hard-wired path to a private corpus and a dead
   # `perceval.converters` import. A test CI cannot compile is not a gate.
-  cargo test -p omega-bridges --features bridge-qiskit,bridge-tsim,bridge-ppvm,bridge-perceval \
-    --test cross_backend -- --nocapture
+  # NOTE two things this line gets wrong when it is written the obvious way.
+  #
+  # 1. `bridge-bloqade` was missing, so `cross_backend.rs`'s bloqade arm —
+  #    `#[cfg(all(feature = "bridge-qiskit", feature = "bridge-bloqade"))]` —
+  #    had NEVER been compiled by CI. That is verbatim the bug the comment
+  #    above records fixing for perceval, still live one backend over. It hid a
+  #    real wrong answer: bloqade's pyqrack interpreter implements `sx`/`sxdg`
+  #    incorrectly, and `03_sqrt_x.qasm` came back at L2 = 1.0 against a gate
+  #    of 1.3e-2.
+  # 2. `--test cross_backend` builds ONLY that target, so every other
+  #    feature-gated test binary in the crate is skipped — including
+  #    `qiskit_expectation.rs`, whose own header calls it "the anchor for the
+  #    N-way expectation lane" whose "conventions have to be pinned harder than
+  #    usual". Six targets were in that position. Dropping the flag runs them.
+  cargo test -p omega-bridges \
+    --features bridge-qiskit,bridge-perceval,bridge-bloqade,bridge-tsim,bridge-ppvm \
+    -- --nocapture
   echo "  OK: bridge arms agree with Qiskit within L2 0.0025 (or skipped with a reason)"
 else
   skipped "bridge cross-checks — set ARIA_BRIDGE_XCHECK=1 with the backend venvs"
@@ -502,11 +843,16 @@ fi
 # defect that every internal cross-backend agreement gate missed (each pair of
 # backends coincided in the basis being checked).
 #
-# It still SKIPS rather than fails when the venv is absent — a machine without
-# it must be able to run CI — but the skip is LOUD. A silent skip is how a
-# mandatory check quietly stops running: the run stays green and nobody notices
-# the strongest evidence was never gathered. So an absent venv prints a banner
-# and sets ARIA_XCHECK_MISSING, and the final summary repeats it.
+# It SKIPS rather than fails when the venv is absent — a machine without it must
+# be able to run CI (K13) — but the skip is LOUD. A silent skip is how a check
+# quietly stops running: the run stays green and nobody notices the strongest
+# evidence was never gathered. So an absent venv prints a banner and the final
+# summary repeats it.
+#
+# RECOMMENDED, not mandatory, by decision 2026-08-18 — see the POLICY block at
+# the top of OPTIONAL_TESTS.md for the cadence and the trade being accepted.
+# The loud skip is what makes 'recommended' mean something rather than
+# decaying into 'never'.
 QISKIT_XCHECK_SKIPPED=""
 if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
     echo "== Qiskit differential cross-check =="
@@ -516,10 +862,48 @@ if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
     if [ ! -x "$QK_PY" ]; then
         QISKIT_XCHECK_SKIPPED="no venv at $QK_PY"
     else
-        cargo run -q --release -p omega-xcheck $XCHECK_FEATS -- 60 > /tmp/aria_xcheck.txt \
+        cargo run -q --release -p omega-xcheck --bin omega-xcheck $XCHECK_FEATS -- 60 > /tmp/aria_xcheck.txt \
             && "$QK_PY" tools/qiskit_xcheck/compare.py /tmp/aria_xcheck.txt \
             && echo "  qiskit cross-check OK" \
             || { echo "  QISKIT CROSS-CHECK FAILED"; exit 1; }
+
+        # QASM ROUND-TRIP: aria's NATIVE execution vs Qiskit running aria's
+        # EXPORTED text. OPTIONAL_TESTS.md gap #5.
+        #
+        # A separate stage from the comparison above, because the reference is
+        # different in a way that matters. `compare.py` builds the circuit in
+        # Qiskit from a gate list, so both sides construct independently. This
+        # one puts our EXPORTER in the path and keeps aria's in-memory execution
+        # as the reference — so a lossy export shows up, where feeding the same
+        # text to both engines would let them agree on what the export dropped.
+        #
+        # It is also the only export check that can see measurement and classical
+        # conditions at all: `qasm2_dialect.py` compares `Operator(loaded)`, and
+        # `Operator()` raises on both, so every circuit of this shape is excluded
+        # from it. That is precisely the shape of the 2026-08-08 defect.
+        cargo run -q --release -p aria-runtime --bin qasm_roundtrip_xcheck -- 12 \
+            > /tmp/aria_qasm_roundtrip.txt \
+            && "$QK_PY" tools/qiskit_xcheck/compare_qasm_roundtrip.py /tmp/aria_qasm_roundtrip.txt \
+            && echo "  qasm round-trip OK" \
+            || { echo "  QASM ROUND-TRIP FAILED"; exit 1; }
+
+        # PauliProp against Qiskit. The harness above drives STATEVECTOR-shaped
+        # backends and compares probabilities; PauliProp returns expectations and
+        # never entered it, so until now its only checks were our own CPU
+        # statevector, the same-algorithm ppvm anchor, and GPU-vs-CPU — all
+        # sharing this project's conventions. Two implementations that share a
+        # convention agree on a shared mistake, which is exactly how the Reset
+        # channel shipped wrong in three backends at once.
+        #
+        # The corpus is deliberately NON-Clifford (rz/rx/ry/t at angles off the
+        # π/2 lattice): the Clifford-only corpus above never reaches `branch`,
+        # the tree-expansion step that IS the engine, so a Clifford cross-check
+        # of PauliProp would be green and vacuous.
+        cargo run -q --release -p omega-xcheck --bin pauliprop_xcheck -- 40 \
+                > /tmp/aria_pp_xcheck.txt \
+            && "$QK_PY" tools/qiskit_xcheck/compare_pauliprop.py /tmp/aria_pp_xcheck.txt \
+            && echo "  pauliprop vs qiskit OK" \
+            || { echo "  PAULIPROP QISKIT CROSS-CHECK FAILED"; exit 1; }
 
         # Is our QASM2 the same DIALECT qiskit speaks? The check above compares
         # simulation results; this one compares the interchange format, which is
@@ -535,6 +919,16 @@ if [ "${ARIA_QISKIT_XCHECK:-0}" = "1" ]; then
         cargo test -q -p aria-core --test qasm2_qiskit_dialect \
             && "$QK_PY" tools/qiskit_xcheck/qasm2_dialect.py target/qasm2_dialect_corpus.txt \
             || { echo "  QASM2 DIALECT CHECK FAILED"; exit 1; }
+
+        # And the same question for OpenQASM 3, which the 2.0 check cannot
+        # answer. The QASM2 lane validates against a reader that accepts names
+        # absent from `stdgates.inc` (`cu1` among them), so it would happily
+        # certify a QASM3 file a strict consumer rejects. This one parses with
+        # `qiskit.qasm3.loads` and compares operators. Self-skips with a note
+        # when `qiskit-qasm3-import` is not installed, rather than failing.
+        cargo test -q -p aria-core --test emitters_refuse_rather_than_substitute \
+            && "$QK_PY" tools/qiskit_xcheck/qasm3_dialect.py target/qasm3_dialect_corpus.txt \
+            || { echo "  QASM3 DIALECT CHECK FAILED"; exit 1; }
     fi
 else
     QISKIT_XCHECK_SKIPPED="ARIA_QISKIT_XCHECK not set"
@@ -542,17 +936,24 @@ fi
 
 if [ -n "$QISKIT_XCHECK_SKIPPED" ]; then
     printf '\n\033[1;33m'
-    echo "!! WARNING — the MANDATORY Qiskit differential cross-check did NOT run"
+    echo "!! NOTE — the RECOMMENDED Qiskit differential cross-check did not run"
     echo "!!   reason: $QISKIT_XCHECK_SKIPPED"
     echo "!!"
-    echo "!! This is the only INDEPENDENT implementation checked against. Two Aria"
-    echo "!! backends agreeing may only mean they share a convention — and this"
-    echo "!! project has already shipped a defect that every internal agreement"
-    echo "!! gate missed. A green run without it is WEAKER EVIDENCE than it looks."
+    echo "!! Not required on every run, BY DECISION (2026-08-18, OPTIONAL_TESTS.md):"
+    echo "!! it costs a venv and minutes, and the edit/verify loop pays that for no"
+    echo "!! signal on most changes. Run it PERIODICALLY instead — before anything"
+    echo "!! touching gate semantics, a parser/emitter lane or a backend's numerics,"
+    echo "!! and at least once before a release or hand-off."
+    echo "!!"
+    echo "!! Worth the cadence because it is the only INDEPENDENT implementation"
+    echo "!! checked against. Two Aria backends agreeing may only mean they share a"
+    echo "!! convention, and this project has already shipped a defect that every"
+    echo "!! internal agreement gate missed. A green run without it is WEAKER"
+    echo "!! EVIDENCE than it looks — accepted knowingly, not enforced."
     echo "!!"
     echo "!!   python3 -m venv .venv-qiskit"
     echo "!!   ./.venv-qiskit/bin/pip install qiskit qiskit-aer"
-    echo "!!   ARIA_QISKIT_XCHECK=1 ARIA_QEC_XCHECK=1 ./ci.sh"
+    echo "!!   ARIA_QISKIT_XCHECK=1 ARIA_NWAY=1 ./ci.sh"
     printf '\033[0m\n'
 fi
 
@@ -579,6 +980,18 @@ if [ "${ARIA_METAL:-0}" = "1" ]; then
   # RBS (Givens) statevector forward ≡ CPU (f32, tol 1e-6) AND the RBS adjoint
   # gradient ≡ CPU adjoint (tol 1e-5). The `rbs` filter runs both gates.
   cargo test --release -p aria-runtime --features metal --test run_examples rbs
+  # Featured clippy for the Metal half — the mirror of the CUDA arm above, and
+  # necessary for the same reason: `--workspace --all-targets` in stage 2 CANNOT
+  # lint cfg'd-out code, so everything behind `feature = "metal"` was linted by
+  # nothing. Measured when the widened gate landed: stage 2 was clean, and
+  # `--features metal` immediately found two `int_plus_one` errors in
+  # `statevector-metal` that no run had ever seen.
+  #
+  # This is the half a CUDA host can never check, exactly as the CUDA arm is the
+  # half this host can never check. Both must exist or the widened gate is only
+  # widened on whichever machine happens to run it.
+  cargo clippy --workspace --all-targets --features metal -- -D warnings
+  echo "  OK: clippy --features metal (whole workspace, all targets)"
   echo "  OK: Metal GPU statevector + MPS(θ-contraction) + pauliprop(branch) + RBS match CPU"
 else
   echo
@@ -623,6 +1036,56 @@ fi
 # correspondence + noise-deviation theorems.
 if [ "${ARIA_LEAN:-0}" = "1" ]; then
   step "+   Optional: Lean 4 proof tree (mathlib)"
+  # Assert a `#print axioms` batch is BOTH sorry-free AND actually ran.
+  #
+  # `grep -q sorryAx` alone cannot tell "sorry-free" from "never checked": if a
+  # theorem is renamed, an import breaks, or the module is dropped, `lean
+  # --stdin` prints an error, emits no `sorryAx`, and the check reports OK. All
+  # nine batches below were that shape, so a rename would have silently retired
+  # the proof obligation while CI stayed green. Verified by hand: feeding a
+  # deliberately misspelled theorem name produced `error(lean.unknownIdentifier)`
+  # and the old guard still concluded "OK: sorry-free".
+  #
+  # This is the same vacuous-pass the bridges stage already guards against
+  # ("every case Unavailable => fail, not pass"). The knowledge existed in this
+  # file and had not reached these checks.
+  #
+  # So also require the EXACT number of `depends on axioms` reports.
+  # $1 = label, $2 = expected theorem count, $3 = the Lean source.
+  #
+  # TWO BASH TRAPS, both hit while writing this, both invisible to a
+  # passing run and caught only by a deliberate negative test:
+  #
+  # 1. The source is passed as $3, NOT piped in. A function on the right of a
+  #    `|` runs in a SUBSHELL, where its `exit 1` kills only that subshell —
+  #    the stage printed FAIL and still exited 0.
+  # 2. `out=$(...)` needs `|| true`. lean exits 1 on exactly the errors this
+  #    guard exists to catch (measured: unknown constant, broken import and a
+  #    failed proof all exit 1), so under `set -euo pipefail` the assignment
+  #    aborted the whole script AT THAT LINE — before the count check, and with
+  #    every byte of lean's output swallowed by the substitution. CI still went
+  #    red, so the gate was safe, but it died silently and the diagnostic below
+  #    was unreachable dead code for its primary trigger.
+  lean_axioms() {
+    local label="$1" want="$2" src="$3" out got
+    # `|| true`: see trap 2 above. The count check is what turns a lean failure
+    # into a REPORTED failure rather than a bare abort.
+    out=$(cd proofs/lean4 && printf '%b' "$src" | lake env lean --stdin 2>&1) || true
+    if printf '%s\n' "$out" | grep -q sorryAx; then
+      echo "  FAIL: $label depends on sorryAx"; exit 1
+    fi
+    # `grep -c` exits 1 on zero matches; `|| true` keeps `set -e`/pipefail from
+    # turning "checked nothing" into a silent stage abort instead of a FAIL.
+    got=$(printf '%s\n' "$out" | grep -c 'depends on axioms' || true)
+    if [ "$got" -ne "$want" ]; then
+      echo "  FAIL: $label — expected $want axiom report(s), got $got."
+      echo "        A theorem was renamed/removed, an import broke, lean errored,"
+      echo "        or a theorem became fully axiom-free (that prints 'does not"
+      echo "        depend on any axioms', which deliberately does not match)."
+      printf '%s\n' "$out" | head -20
+      exit 1
+    fi
+  }
   if ! command -v lake >/dev/null 2>&1; then
     echo "  SKIP: 'lake' not found (install via elan)"
   else
@@ -634,53 +1097,33 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
     fi
     # Enforce sorry-free on the shipped correspondence theorems (`lake build`
     # does not error on `sorry`).
-    ax=$(cd proofs/lean4 && printf 'import QuantumProofs.CirculantSolveGeneral\nopen QuantumProofs.CirculantSolveGeneral\n#print axioms dft_diagonalizes_circulant\n#print axioms qft_diagonalizes_circulant\n#print axioms circulant_solve_operator\n#print axioms circulant_solve_noise_deviation\n#print axioms qft_diagonalizes_solve_error\n' \
-      | lake env lean --stdin 2>&1)
-    if printf '%s' "$ax" | grep -q sorryAx; then
-      echo "  FAIL: circulant theorems depend on sorryAx"; exit 1
-    else
-      echo "  OK: general-n circulant diagonalize + solve op = C⁻¹ + noisy-solve deviation axiom-clean (sorry-free)"
-    fi
+    lean_axioms "circulant theorems" 5 \
+      'import QuantumProofs.CirculantSolveGeneral\nopen QuantumProofs.CirculantSolveGeneral\n#print axioms dft_diagonalizes_circulant\n#print axioms qft_diagonalizes_circulant\n#print axioms circulant_solve_operator\n#print axioms circulant_solve_noise_deviation\n#print axioms qft_diagonalizes_solve_error\n'
+    echo "  OK: general-n circulant diagonalize + solve op = C⁻¹ + noisy-solve deviation axiom-clean (sorry-free)"
     # Noise-channel library: the formal backing for the `noise` app's laws (A)/(B).
     # The CPTP Kraus maps + closed-form fidelity/relaxation/coherence laws must be sorry-free.
-    nx=$(cd proofs/lean4 && printf 'import QuantumProofs.Noise\nopen QuantumProofs.Noise\n#print axioms KrausMap.apply_isDensity\n#print axioms depolarizing_apply\n#print axioms amplitudeDamping_expZ\n#print axioms phaseDamping_coherence\n#print axioms depolarizing_iterate_fidelity\n#print axioms circulant_cyclicshift_fidelity\n#print axioms kraus_tensor_complete\n#print axioms threeQubitDepolarizing_fidelity\n#print axioms globalDepol_fidelity\n#print axioms globalDepol_circulant_fidelity\n' \
-      | lake env lean --stdin 2>&1)
-    if printf '%s' "$nx" | grep -q sorryAx; then
-      echo "  FAIL: noise-channel theorems depend on sorryAx"; exit 1
-    else
-      echo "  OK: noise channels (depolarizing + amp/phase damping + depth-G + tensor width + global entangled) CPTP + laws sorry-free"
-    fi
+    lean_axioms "noise-channel theorems" 10 \
+      'import QuantumProofs.Noise\nopen QuantumProofs.Noise\n#print axioms KrausMap.apply_isDensity\n#print axioms depolarizing_apply\n#print axioms amplitudeDamping_expZ\n#print axioms phaseDamping_coherence\n#print axioms depolarizing_iterate_fidelity\n#print axioms circulant_cyclicshift_fidelity\n#print axioms kraus_tensor_complete\n#print axioms threeQubitDepolarizing_fidelity\n#print axioms globalDepol_fidelity\n#print axioms globalDepol_circulant_fidelity\n'
+    echo "  OK: noise channels (depolarizing + amp/phase damping + depth-G + tensor width + global entangled) CPTP + laws sorry-free"
     # Quantum-linear-algebra capstones (HHL + QSVT inversion): the formal
     # backing for the `hhl`/`qsvt_invert` Aria examples and the certified
     # Neumann 1/x inverter. Must be sorry-free.
-    la=$(cd proofs/lean4 && printf 'import QuantumProofs.HHL\nimport QuantumProofs.QSVT\nopen QuantumProofs.HHL QuantumProofs.QSVT\n#print axioms hhl_solves_system\n#print axioms controlled_inv_rotation\n#print axioms hhl_success_prob_lower\n#print axioms inv_poly_approx\n#print axioms qsvt_invert_correct\n#print axioms qsvt_residual_exact\n#print axioms qsvt_solves_system_approx\n' \
-      | lake env lean --stdin 2>&1)
-    if printf '%s' "$la" | grep -q sorryAx; then
-      echo "  FAIL: HHL/QSVT theorems depend on sorryAx"; exit 1
-    else
-      echo "  OK: HHL (solves A·x=C·b + RY rotation + success bound) + QSVT (1/x poly + A⁻¹ approx + exact residual) sorry-free"
-    fi
+    lean_axioms "HHL/QSVT theorems" 7 \
+      'import QuantumProofs.HHL\nimport QuantumProofs.QSVT\nopen QuantumProofs.HHL QuantumProofs.QSVT\n#print axioms hhl_solves_system\n#print axioms controlled_inv_rotation\n#print axioms hhl_success_prob_lower\n#print axioms inv_poly_approx\n#print axioms qsvt_invert_correct\n#print axioms qsvt_residual_exact\n#print axioms qsvt_solves_system_approx\n'
+    echo "  OK: HHL (solves A·x=C·b + RY rotation + success bound) + QSVT (1/x poly + A⁻¹ approx + exact residual) sorry-free"
     # QSP fundamental theorem: the formal backing for QSVT angle-finding. Forward
     # (any phase list implements a degree/parity polynomial transform) AND converse
     # (every admissible polynomial pair is realized by some phase list, up to a
     # global phase — the SL₂ obstruction forces the qualifier). Must be sorry-free.
-    qs=$(cd proofs/lean4 && printf 'import QuantumProofs.QSP\nopen QuantumProofs.QSP\n#print axioms qsp_implements_poly\n#print axioms qsp_implements_poly_degree\n#print axioms qsp_gram_diag\n#print axioms qsp_converse\n' \
-      | lake env lean --stdin 2>&1)
-    if printf '%s' "$qs" | grep -q sorryAx; then
-      echo "  FAIL: QSP theorems depend on sorryAx"; exit 1
-    else
-      echo "  OK: QSP fundamental theorem (forward implements-poly + degree + Gram + converse up-to-global-phase) sorry-free"
-    fi
+    lean_axioms "QSP theorems" 4 \
+      'import QuantumProofs.QSP\nopen QuantumProofs.QSP\n#print axioms qsp_implements_poly\n#print axioms qsp_implements_poly_degree\n#print axioms qsp_gram_diag\n#print axioms qsp_converse\n'
+    echo "  OK: QSP fundamental theorem (forward implements-poly + degree + Gram + converse up-to-global-phase) sorry-free"
     # Gate-model export obligation: the `aria export --gate-model` artefact for
     # Bell must build sorry-free (closed by QuantumProofs.BellPrep theorems).
     if ( cd proofs/lean4 && lake build QuantumProofs.Generated.GateModel.Bell_Spec >/dev/null 2>&1 ); then
-      gm=$(cd proofs/lean4 && printf 'import QuantumProofs.Generated.GateModel.Bell_Spec\nopen Exported.GateModel.Bell\n#print axioms bell_correct\n#print axioms circuit_unitary\n' \
-        | lake env lean --stdin 2>&1)
-      if printf '%s' "$gm" | grep -q sorryAx; then
-        echo "  FAIL: gate-model Bell_Spec depends on sorryAx"; exit 1
-      else
-        echo "  OK: gate-model export (aria export --gate-model) builds sorry-free"
-      fi
+      lean_axioms "gate-model Bell_Spec" 2 \
+        'import QuantumProofs.Generated.GateModel.Bell_Spec\nopen Exported.GateModel.Bell\n#print axioms bell_correct\n#print axioms circuit_unitary\n'
+      echo "  OK: gate-model export (aria export --gate-model) builds sorry-free"
     else
       echo "  FAIL: gate-model Bell_Spec.lean failed to build"; exit 1
     fi
@@ -688,26 +1131,18 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
     # (state-prep) and GHZPrep.ghz_unitary (the `@assert unitary`, now closed
     # sorry-free via compositional unitarity — formerly dropped).
     if ( cd proofs/lean4 && lake build QuantumProofs.Generated.GateModel.GHZ_Spec >/dev/null 2>&1 ); then
-      gz=$(cd proofs/lean4 && printf 'import QuantumProofs.Generated.GateModel.GHZ_Spec\nopen Exported.GateModel.GHZ\n#print axioms ghz_correct\n#print axioms circuit_unitary\n' \
-        | lake env lean --stdin 2>&1)
-      if printf '%s' "$gz" | grep -q sorryAx; then
-        echo "  FAIL: gate-model GHZ_Spec depends on sorryAx"; exit 1
-      else
-        echo "  OK: gate-model GHZ export builds sorry-free (state-prep + unitary)"
-      fi
+      lean_axioms "gate-model GHZ_Spec" 2 \
+        'import QuantumProofs.Generated.GateModel.GHZ_Spec\nopen Exported.GateModel.GHZ\n#print axioms ghz_correct\n#print axioms circuit_unitary\n'
+      echo "  OK: gate-model GHZ export builds sorry-free (state-prep + unitary)"
     else
       echo "  FAIL: gate-model GHZ_Spec.lean failed to build"; exit 1
     fi
     # QFT: the EQUIV obligation (denote = dft_matrix n) — recognized circuit is
     # the exporter-lowered QFT(n), closed sorry-free by QFTExport.qftLowered_correct.
     if ( cd proofs/lean4 && lake build QuantumProofs.Generated.GateModel.QFT_Spec >/dev/null 2>&1 ); then
-      qf=$(cd proofs/lean4 && printf 'import QuantumProofs.Generated.GateModel.QFT_Spec\nopen Exported.GateModel.QFT\n#print axioms qft_equals_dft\n' \
-        | lake env lean --stdin 2>&1)
-      if printf '%s' "$qf" | grep -q sorryAx; then
-        echo "  FAIL: gate-model QFT_Spec depends on sorryAx"; exit 1
-      else
-        echo "  OK: gate-model QFT export builds sorry-free (equiv denote=DFT)"
-      fi
+      lean_axioms "gate-model QFT_Spec" 1 \
+        'import QuantumProofs.Generated.GateModel.QFT_Spec\nopen Exported.GateModel.QFT\n#print axioms qft_equals_dft\n'
+      echo "  OK: gate-model QFT export builds sorry-free (equiv denote=DFT)"
     else
       echo "  FAIL: gate-model QFT_Spec.lean failed to build"; exit 1
     fi
@@ -715,13 +1150,9 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
     # actual (n+1)-qubit QPE circuit yields the phase m with probability 1,
     # closed sorry-free by QPEFaithful.qpe_faithful (no matrix-adjoint caveat).
     if ( cd proofs/lean4 && lake build QuantumProofs.Generated.GateModel.QPE_Spec >/dev/null 2>&1 ); then
-      qp=$(cd proofs/lean4 && printf 'import QuantumProofs.Generated.GateModel.QPE_Spec\nopen Exported.GateModel.QPE\n#print axioms qpe_recovers_phase\n' \
-        | lake env lean --stdin 2>&1)
-      if printf '%s' "$qp" | grep -q sorryAx; then
-        echo "  FAIL: gate-model QPE_Spec depends on sorryAx"; exit 1
-      else
-        echo "  OK: gate-model QPE export builds sorry-free (faithful counting-reg measure)"
-      fi
+      lean_axioms "gate-model QPE_Spec" 1 \
+        'import QuantumProofs.Generated.GateModel.QPE_Spec\nopen Exported.GateModel.QPE\n#print axioms qpe_recovers_phase\n'
+      echo "  OK: gate-model QPE export builds sorry-free (faithful counting-reg measure)"
     else
       echo "  FAIL: gate-model QPE_Spec.lean failed to build"; exit 1
     fi
@@ -731,13 +1162,9 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
     # probability ≥ 1 − 1/8, closed sorry-free by
     # GroverCircuit.grover_gate_optimal_success.
     if ( cd proofs/lean4 && lake build QuantumProofs.Generated.GateModel.Grover_Spec >/dev/null 2>&1 ); then
-      gv=$(cd proofs/lean4 && printf 'import QuantumProofs.Generated.GateModel.Grover_Spec\nopen Exported.GateModel.Grover\n#print axioms grover_finds_marked\n' \
-        | lake env lean --stdin 2>&1)
-      if printf '%s' "$gv" | grep -q sorryAx; then
-        echo "  FAIL: gate-model Grover_Spec depends on sorryAx"; exit 1
-      else
-        echo "  OK: gate-model Grover export builds sorry-free (measurement ≥ 1−1/N)"
-      fi
+      lean_axioms "gate-model Grover_Spec" 1 \
+        'import QuantumProofs.Generated.GateModel.Grover_Spec\nopen Exported.GateModel.Grover\n#print axioms grover_finds_marked\n'
+      echo "  OK: gate-model Grover export builds sorry-free (measurement ≥ 1−1/N)"
     else
       echo "  FAIL: gate-model Grover_Spec.lean failed to build"; exit 1
     fi
@@ -747,22 +1174,69 @@ else
   skipped "Lean proof tree — set ARIA_LEAN=1 (needs lake + mathlib cache)"
 fi
 
-# Optional: QEC encoded-demo cross-check against Qiskit (opt-in; needs a Python
-# venv with qiskit). Mirrors the GPU/Lean stages: default CI stays green without
-# qiskit. Set ARIA_QEC_XCHECK=1 to export the aria QEC demo circuits (grover/
-# qft/qpe) and assert an independent SDK (Qiskit Statevector, + stim stabilizer)
-# reproduces aria's distributions exactly (aria == qiskit == analytic, ≤ 1e-9).
+# QEC encoded-demo cross-check against Qiskit + stim + PyMatching.
+#
+# POLICY (decided 2026-08-18): **MANDATORY on any platform that can run it.**
+# Deliberately a stronger rule than the Qiskit cross-check above, which is
+# RECOMMENDED — see the POLICY block in OPTIONAL_TESTS.md for that one. The two
+# differ because this stage checks a DECODER against an independent
+# implementation of the same algorithm, and a decoder that is subtly wrong still
+# decodes: it returns corrections, the run stays green, and only a differential
+# comparison shows the logical error rate is off.
+#
+# "Can run it" is not a matter of opinion, so it is measured rather than
+# assumed. Three outcomes, kept distinct because collapsing them is how a
+# mandatory check quietly becomes optional:
+#
+#   RAN        — the venv imports qiskit AND pymatching. Failure is fatal.
+#   INCAPABLE  — the venv exists but pymatching does not import. That is the
+#                real state of at least one host in this project: pymatching's
+#                C++ extension does not build wheels on aarch64 Linux there. A
+#                clean skip, because the platform genuinely cannot, and K13 says
+#                such a machine must still be able to run CI.
+#   NOT RUN    — no venv, so capability is UNKNOWN. Reported LOUDLY as a
+#                mandatory check that did not run, because "I did not build the
+#                venv" must never read the same as "this box cannot".
+#
+# The distinction is the whole point of the policy. Without it, the machine that
+# CAN run the check and the machine that CANNOT produce identical output, and
+# the mandatory one silently degrades to the optional one.
+QEC_PY="tools/qec_cross_check/.venv/bin/python"
 if [ "${ARIA_QEC_XCHECK:-0}" = "1" ]; then
-  step "+   Optional: QEC demo cross-check vs Qiskit"
+  step "+   QEC demo cross-check vs Qiskit (MANDATORY where capable)"
   if command -v python3 >/dev/null 2>&1; then
     bash tools/qec_cross_check/run.sh
     echo "  OK: encoded grover/qft/qpe match Qiskit (+ stim); surface decoder matches PyMatching"
   else
     echo "  SKIP: python3 not found (needed to build the qiskit venv)"
+    skipped "QEC cross-check — no python3 on this host (INCAPABLE)"
   fi
-else
+elif [ -x "$QEC_PY" ] && ! "$QEC_PY" -c "import pymatching" >/dev/null 2>&1; then
+  # Venv built, pymatching absent from it: the platform tried and could not.
   echo
-  skipped "QEC cross-check (MANDATORY) — set ARIA_QEC_XCHECK=1 with a qiskit venv"
+  skipped "QEC cross-check — pymatching does not import in $QEC_PY (INCAPABLE platform, clean skip)"
+else
+  # Either the venv imports pymatching (capable, and the operator chose not to
+  # run it) or there is no venv at all (unknown). Both are a mandatory check
+  # that did not run, and both get the banner.
+  echo
+  if [ -x "$QEC_PY" ]; then
+    QEC_WHY="this host CAN run it — the venv imports pymatching"
+  else
+    QEC_WHY="no venv at $QEC_PY, so capability is unverified"
+  fi
+  printf '\n\033[1;33m'
+  echo "!! WARNING — the MANDATORY QEC cross-check did NOT run"
+  echo "!!   $QEC_WHY"
+  echo "!!"
+  echo "!! MANDATORY on any platform that can run it (decision 2026-08-18)."
+  echo "!! It is the only differential check on the DECODER: a decoder that is"
+  echo "!! subtly wrong still returns corrections and still looks green. Only"
+  echo "!! comparison against PyMatching shows the logical error rate is off."
+  echo "!!"
+  echo "!!   ARIA_QEC_XCHECK=1 ./ci.sh"
+  printf '\033[0m\n'
+  skipped "QEC cross-check (MANDATORY where capable) — $QEC_WHY"
 fi
 
 # Optional: CV backend vs piquasso, LIVE.
@@ -780,6 +1254,14 @@ if [ "${ARIA_CV_XCHECK:-0}" = "1" ]; then
   done
   if [ -n "$CV_PY" ]; then
     "$CV_PY" tools/cv_cross_check/verify_fixture.py
+    # The multi-mode fixture is a SEPARATE artifact with its own generator, and
+    # it must drift-check too. Without this line the beamsplitter corpus would
+    # be protected only by the committed file, which cannot catch a fixture
+    # regenerated to match a change in our own code.
+    "$CV_PY" tools/cv_cross_check/verify_multimode_fixture.py
+    # And the loss fixture, third sibling — density-matrix simulator, own
+    # generator, same reasoning.
+    "$CV_PY" tools/cv_cross_check/verify_loss_fixture.py
   else
     echo "  SKIP: no piquasso venv (see PREREQUISITES.md)"
   fi

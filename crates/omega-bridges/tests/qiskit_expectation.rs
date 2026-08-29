@@ -107,9 +107,8 @@ fn reset_is_refused_because_the_anchor_would_be_nondeterministic() {
 #[test]
 fn a_conditioned_gate_is_refused() {
     skip_without_venv!();
-    let qasm = format!(
-        "{HDR}qreg q[2];\ncreg c[1];\nh q[0];\nmeasure q[0] -> c[0];\nif (c==1) x q[1];"
-    );
+    let qasm =
+        format!("{HDR}qreg q[2];\ncreg c[1];\nh q[0];\nmeasure q[0] -> c[0];\nif (c==1) x q[1];");
     match expectation_qasm2(Backend::Qiskit, &qasm, &[obs("IZ")]) {
         Err(BridgeError::CannotExpress(_, msg)) => assert!(
             msg.contains("conditioned") || msg.contains("mixture"),

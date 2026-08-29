@@ -87,6 +87,13 @@ missed: the noise-model gate `matches!(chosen, "statevector" | "sv" | "mps")`
 (a `mps:512 --noise` run would be spuriously rejected), the `--list-backends`
 names, and the `NoisyMpsBackend::with_model(64, …)` construction.
 
+**DONE (verified 2026-08-16).** `omega-run --backend mps:2` and
+`--backend mps:auto` both run today. The only surviving piece was the inverse
+of revision 1's complaint: `--help` did *not* advertise a grammar the binary
+**does** accept, so the knob was undiscoverable rather than unreachable. That
+is now fixed, together with a note on what `mps:auto`'s default ceiling costs
+in memory.
+
 ### M3 — **withdrawn: the mechanism does not exist**
 
 Revision 1 claimed "with a fixed χ every split is contracted at full bond even

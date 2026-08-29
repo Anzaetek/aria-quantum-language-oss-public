@@ -277,6 +277,21 @@ struct SampleParams {
     dim: u32,
 }
 
+/// Params for `apply_octet_swap`.
+///
+/// Field order and types must match the `OctetSwapParams` struct in
+/// `shaders/apply_octet_swap.metal` EXACTLY: `set_bytes` copies raw memory, so a
+/// reordering here is a silent wrong answer rather than a compile error.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OctetSwapParams {
+    qa: u32,
+    qb: u32,
+    qc: u32,
+    slot_lo: u32,
+    slot_hi: u32,
+}
+
 impl StateBuffer {
     /// Open a kernel-dispatch batch. Subsequent kernel calls (the
     /// in-place applies — `apply_diagonal`, `apply_diagonal_2q`,
@@ -915,6 +930,78 @@ impl StateBuffer {
                 1,
                 std::mem::size_of::<Apply2qParams>() as u64,
                 (&params as *const Apply2qParams) as *const c_void,
+            );
+            encoder.dispatch_threads(grid_size, tg_size);
+        });
+        Ok(())
+    }
+
+    /// Exchange two slots of every 3-qubit octet — the exact form of CCX and
+    /// CSwap, which are permutations of the computational basis.
+    ///
+    /// `(qa, qb, qc)` are the LOGICAL roles the gate defines, and
+    /// `slot = bit_qa + 2*bit_qb + 4*bit_qc`. CCX is slots 3 <-> 7, CSwap 3 <-> 5.
+    ///
+    /// One thread per octet, `dim / 8` — the same shape as `apply_2q`'s `dim / 4`
+    /// quads, one exponent down. The kernel performs no arithmetic, so unlike the
+    /// 2q path there is nothing here whose operand order must be preserved: a
+    /// permutation cannot round.
+    pub fn apply_octet_swap(
+        &self,
+        qa: u32,
+        qb: u32,
+        qc: u32,
+        slot_lo: u32,
+        slot_hi: u32,
+    ) -> Result<(), MetalError> {
+        for q in [qa, qb, qc] {
+            if q >= self.num_qubits {
+                return Err(MetalError::QubitOutOfRange {
+                    qubit: q,
+                    num_qubits: self.num_qubits,
+                });
+            }
+        }
+        if qa == qb || qa == qc {
+            return Err(MetalError::DuplicateQubits { qubit: qa });
+        }
+        if qb == qc {
+            return Err(MetalError::DuplicateQubits { qubit: qb });
+        }
+        if self.num_qubits < 3 {
+            return Err(MetalError::QubitOutOfRange {
+                qubit: qc,
+                num_qubits: self.num_qubits,
+            });
+        }
+        let params = OctetSwapParams {
+            qa,
+            qb,
+            qc,
+            slot_lo,
+            slot_hi,
+        };
+        let octets: u64 = 1u64 << (self.num_qubits - 3);
+
+        let pipeline = self.handle.kernels.apply_octet_swap.clone();
+        let max_tg = pipeline.max_total_threads_per_threadgroup();
+        let tg_size = MTLSize {
+            width: max_tg.min(octets),
+            height: 1,
+            depth: 1,
+        };
+        let grid_size = MTLSize {
+            width: octets,
+            height: 1,
+            depth: 1,
+        };
+        self.with_compute_encoder(|encoder| {
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_buffer(0, Some(&self.state), 0);
+            encoder.set_bytes(
+                1,
+                std::mem::size_of::<OctetSwapParams>() as u64,
+                (&params as *const OctetSwapParams) as *const c_void,
             );
             encoder.dispatch_threads(grid_size, tg_size);
         });

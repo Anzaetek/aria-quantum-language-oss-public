@@ -9,7 +9,8 @@ struct Qasm2Parser;
 
 /// Parse a QASM 2.0 source string into an AST.
 pub fn parse_qasm2(input: &str) -> Result<Qasm2Program, String> {
-    let pairs = Qasm2Parser::parse(Rule::program, input).map_err(|e| format!("{}", e))?;
+    let pairs =
+        Qasm2Parser::parse(Rule::program, input).map_err(|e| enrich_parse_error(input, &e))?;
 
     let mut version = String::new();
     let mut statements = Vec::new();
@@ -43,6 +44,120 @@ pub fn parse_qasm2(input: &str) -> Result<Qasm2Program, String> {
     })
 }
 
+/// Name the OpenQASM 3 construct a parse failure actually tripped over.
+///
+/// A pest error is a position and a list of rules it wanted — `--> 9:7 …
+/// expected param_list_app`. That is accurate and useless: it describes our
+/// grammar, not the user's file. Measured across the specification's own
+/// examples, every out-of-profile program failed with some variant of it, and
+/// none said *which language feature* was the problem.
+///
+/// This is **purely diagnostic**. It never changes what is accepted — it runs
+/// only on an error that has already happened, and it appends to the pest
+/// output rather than replacing it, so the position is still there for anyone
+/// who wants it.
+///
+/// The keyword is read from the line pest stopped on. It is not a
+/// "does-this-look-like-QASM" sniff (see `lower_to_ir_with_dialect`, which
+/// deliberately avoids one): nothing branches on the result, so a wrong guess
+/// costs a less helpful message and nothing else.
+fn enrich_parse_error(input: &str, e: &pest::error::Error<Rule>) -> String {
+    use pest::error::LineColLocation;
+    let line_no = match e.line_col {
+        LineColLocation::Pos((l, _)) => l,
+        LineColLocation::Span((l, _), _) => l,
+    };
+    let line = input.lines().nth(line_no.saturating_sub(1)).unwrap_or("");
+    let first_word = line
+        .trim_start()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+
+    if let Some(why) = unsupported_construct(first_word) {
+        return format!("{why}\n\n{e}");
+    }
+    // Not a keyword we know. One more cause worth naming, because no keyword
+    // lookup can find it: OpenQASM 3 permits Unicode identifiers and our
+    // `ident` rule is ASCII-only. `cphase.qasm` declares `gate cphase(θ) a, b`
+    // and failed with a caret under a character the reader simply cannot spell.
+    if !line.is_ascii() {
+        let offenders: String = line
+            .chars()
+            .filter(|c| !c.is_ascii())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        return format!(
+            "this line contains non-ASCII character(s) `{offenders}`. OpenQASM 3 allows \
+             Unicode identifiers; this reader's `ident` rule is ASCII-only, so a name \
+             like `θ` cannot be read. Rename it (for example `theta`) before importing.\
+             \n\n{e}"
+        );
+    }
+    format!("{e}")
+}
+
+/// OpenQASM 3 constructs outside this reader's gate-model profile, each with a
+/// message saying what it is and what to do instead.
+///
+/// Deliberately explicit rather than a catch-all: an unlisted keyword falls
+/// back to the raw pest error, which is honest, whereas a generic "unsupported
+/// feature" would claim knowledge we do not have.
+fn unsupported_construct(keyword: &str) -> Option<String> {
+    /// Stated once, so every message describes the same profile.
+    const PROFILE: &str = "This reader implements the gate-model profile: register \
+                           declarations, gate applications and `gate` definitions, \
+                           `barrier`, `reset`, `measure`, and guards of the form \
+                           `if (c == N)` or `if (c[i] == true/false)`.";
+
+    let (what, advice) = match keyword {
+        "def" => (
+            "`def` (subroutine definition)",
+            " Inline the subroutine before importing.",
+        ),
+        // `defcalgrammar` is a separate keyword and is how `defcal.qasm`
+        // actually opens — matching only `defcal` missed the very file the
+        // construct is named after.
+        "defcal" | "cal" | "defcalgrammar" => (
+            "pulse-level calibration (`defcal` / `cal` / `defcalgrammar`)",
+            " There is no pulse model here, and no approximation that would not \
+             silently change the circuit.",
+        ),
+        "extern" => ("`extern` (external function declaration)", ""),
+        // Reached only when the `if_stmt` rule itself failed, so the condition
+        // is neither supported form — typically a cast, as in
+        // `if(int[4](c) == 1)` (`inverseqft1.qasm`), or an arithmetic
+        // expression. A *mixed* comparison (`c[0] == 1`) does parse and is
+        // refused later with a message naming which side is wrong, so it never
+        // reaches here.
+        "if" => (
+            "an `if` guard that is neither `c == N` nor `c[i] == true/false` — a cast \
+             or expression in the condition",
+            " Compare a whole register to an integer, or a single bit to a boolean.",
+        ),
+        "for" | "while" => ("a loop (`for` / `while`)", " Unroll it before importing."),
+        "const" => ("`const` (compile-time constant)", ""),
+        "int" | "uint" | "float" | "angle" | "bool" | "complex" => {
+            ("a classical variable declaration", "")
+        }
+        "duration" | "stretch" | "delay" | "durationof" => (
+            "timing control (`duration` / `stretch` / `delay`)",
+            " Gates here are ordered but not scheduled, so a duration cannot be \
+             honoured and ignoring it would answer a different question.",
+        ),
+        "array" => ("`array` (classical array declaration)", ""),
+        "let" => ("`let` (register alias)", ""),
+        "input" | "output" => ("`input` / `output` (circuit parameters)", ""),
+        "gphase" => ("`gphase` (global phase)", ""),
+        "pragma" | "annotation" => ("a pragma or annotation", ""),
+        _ => return None,
+    };
+    Some(format!(
+        "OpenQASM 3 {what} is not in the supported subset. {PROFILE}{advice}"
+    ))
+}
+
 fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt>, String> {
     let inner = pair.into_inner().next().ok_or("empty statement")?;
 
@@ -66,19 +181,15 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt
             Ok(Some(Qasm2Stmt::CregDecl { name, size }))
         }
         Rule::qubit_decl_v3 => {
-            // QASM 3: `qubit[N] name;`. Lower to QregDecl — same
-            // semantics as QASM 2's `qreg name[N];`, arg order reversed.
-            let mut it = inner.into_inner();
-            let size: u32 = it.next().unwrap().as_str().parse().unwrap();
-            let name = it.next().unwrap().as_str().to_string();
+            // QASM 3: `qubit[N] name;` or, for a single qubit, `qubit name;`.
+            // Lowers to QregDecl — same semantics as QASM 2's `qreg name[N];`,
+            // arg order reversed.
+            let (name, size) = decl_v3_parts(inner)?;
             Ok(Some(Qasm2Stmt::QregDecl { name, size }))
         }
         Rule::bit_decl_v3 => {
-            // QASM 3: `bit[N] name;`. Lower to CregDecl — same
-            // semantics as QASM 2's `creg name[N];`, arg order reversed.
-            let mut it = inner.into_inner();
-            let size: u32 = it.next().unwrap().as_str().parse().unwrap();
-            let name = it.next().unwrap().as_str().to_string();
+            // QASM 3: `bit[N] name;` or `bit name;`.
+            let (name, size) = decl_v3_parts(inner)?;
             Ok(Some(Qasm2Stmt::CregDecl { name, size }))
         }
         Rule::gate_def => {
@@ -156,32 +267,73 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt
         }
         Rule::if_stmt => {
             let mut it = inner.into_inner();
-            let creg = it.next().unwrap().as_str().to_string();
-            let value: u64 = it.next().unwrap().as_str().parse().unwrap();
+            // `cond_target` is either `c` (whole register) or `c[i]` (one bit).
+            let target = it.next().ok_or("`if` without a condition target")?;
+            let mut tparts = target.into_inner();
+            let creg = tparts
+                .next()
+                .ok_or("`if` condition names no register")?
+                .as_str()
+                .to_string();
+            let bit: Option<u32> = match tparts.next() {
+                Some(idx) => Some(idx.as_str().parse().map_err(|_| {
+                    format!(
+                        "bit index `{}` in `if ({creg}[…])` is not a u32",
+                        idx.as_str()
+                    )
+                })?),
+                None => None,
+            };
+            // `cond_value` is an integer (`c == 1`) or a boolean (`c[0] == true`).
+            let vpair = it.next().ok_or("`if` without a comparison value")?;
+            let vtext = vpair.as_str();
+            let value: u64 = match vtext {
+                "true" => 1,
+                "false" => 0,
+                other => other.parse().map_err(|_| {
+                    format!("`if ({creg} == {other})`: not an integer or boolean literal")
+                })?,
+            };
+            // OpenQASM 3 pairs a bit with a bool and a bitarray with an int.
+            // Mixing them is what made our own emitter's output unloadable, so
+            // refuse rather than quietly accept a spelling qiskit rejects.
+            let is_bool = matches!(vtext, "true" | "false");
+            if let (Some(i), false) = (bit, is_bool) {
+                return Err(format!(
+                    "`if ({creg}[{i}] == {vtext})` compares a single BIT to an integer. \
+                     OpenQASM 3 requires `bit == const bool` — write `{}` — or compare \
+                     the whole register (`{creg} == {vtext}`). Strict consumers reject \
+                     the mixed form.",
+                    if value == 0 { "false" } else { "true" }
+                ));
+            }
+            if bit.is_none() && is_bool {
+                return Err(format!(
+                    "`if ({creg} == {vtext})` compares a whole REGISTER to a boolean. \
+                     OpenQASM 3 requires `bitarray == const int` — write \
+                     `{creg} == {value}` — or address a single bit (`{creg}[0] == {vtext}`)."
+                ));
+            }
             // The guarded statement may be a gate application, a `measure` or
             // a `reset` — the grammar used to admit only the first, so
             // `if (c==1) measure q[0] -> c[0];` never parsed.
             let then_stmt = it.next().unwrap();
+            // A braced block holds zero or more statements; the bare form is
+            // the same thing with exactly one. Flattening both into a `Vec`
+            // here means the lowering has a single path and the two spellings
+            // cannot drift apart.
             let then = match then_stmt.as_rule() {
-                Rule::gate_app_stmt => Qasm2Stmt::GateApp(parse_gate_app(then_stmt)?),
-                Rule::measure_stmt => {
-                    let mut m = then_stmt.into_inner();
-                    let qubit = parse_qubit_ref(m.next().unwrap())?;
-                    let cbit = parse_cbit_ref(m.next().unwrap())?;
-                    Qasm2Stmt::Measure { qubit, cbit }
-                }
-                Rule::reset_stmt => {
-                    let qr = then_stmt.into_inner().next().unwrap();
-                    Qasm2Stmt::Reset(parse_qubit_ref(qr)?)
-                }
-                other => {
-                    return Err(format!("unexpected statement after `if (...)`: {other:?}"))
-                }
+                Rule::if_block => then_stmt
+                    .into_inner()
+                    .map(parse_guarded_stmt)
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => vec![parse_guarded_stmt(then_stmt)?],
             };
             Ok(Some(Qasm2Stmt::If {
                 creg,
+                bit,
                 value,
-                then: Box::new(then),
+                then,
             }))
         }
         Rule::reset_stmt => {
@@ -190,6 +342,62 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt
             Ok(Some(Qasm2Stmt::Reset(qubit)))
         }
         _ => Ok(None),
+    }
+}
+
+/// One statement inside an `if` — bare or inside a braced block.
+///
+/// Shared by both spellings deliberately: when the grammar was widened to admit
+/// guarded `measure`/`reset`, the lowering's `if let` matched nothing and
+/// emitted NOTHING, turning a parse error into a silent drop. Keeping one
+/// function means adding a guardable form cannot repeat that.
+fn parse_guarded_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Qasm2Stmt, String> {
+    match pair.as_rule() {
+        Rule::gate_app_stmt => Ok(Qasm2Stmt::GateApp(parse_gate_app(pair)?)),
+        Rule::measure_stmt => {
+            let mut m = pair.into_inner();
+            let qubit = parse_qubit_ref(m.next().ok_or("`measure` without a qubit")?)?;
+            let cbit = parse_cbit_ref(m.next().ok_or("`measure` without a target bit")?)?;
+            Ok(Qasm2Stmt::Measure { qubit, cbit })
+        }
+        Rule::reset_stmt => {
+            let qr = pair.into_inner().next().ok_or("`reset` without a qubit")?;
+            Ok(Qasm2Stmt::Reset(parse_qubit_ref(qr)?))
+        }
+        other => Err(format!("unexpected statement after `if (...)`: {other:?}")),
+    }
+}
+
+/// Split a QASM 3 register declaration into `(name, size)`.
+///
+/// The size is optional — `qubit q;` is a single qubit — so the inner pairs are
+/// either `[integer, ident]` or just `[ident]`. Reading them positionally with
+/// `it.next()` would take the NAME as the size the moment the brackets are
+/// absent, so the shape is inspected rather than assumed.
+///
+/// The width is parsed fallibly. It was `.parse().unwrap()`, which panics on an
+/// integer too large for `u32` — and a parser that crashes on malformed input
+/// cannot be pointed at anything untrusted. Same contract as
+/// `check_gate_arity`: refuse with a message, never abort.
+fn decl_v3_parts(pair: pest::iterators::Pair<Rule>) -> Result<(String, u32), String> {
+    let parts: Vec<_> = pair.into_inner().collect();
+    match parts.as_slice() {
+        [name] => Ok((name.as_str().to_string(), 1)),
+        [size, name] => {
+            let s = size.as_str();
+            let size: u32 = s.parse().map_err(|_| {
+                format!(
+                    "register size `{s}` is not a valid u32 (declaring `{}`)",
+                    name.as_str()
+                )
+            })?;
+            Ok((name.as_str().to_string(), size))
+        }
+        other => Err(format!(
+            "malformed register declaration: expected `name` or `[size] name`, \
+             got {} component(s)",
+            other.len()
+        )),
     }
 }
 

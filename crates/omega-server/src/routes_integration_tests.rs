@@ -1045,7 +1045,8 @@ async fn an_unpriceable_row_does_not_erase_the_price_of_the_batch() {
         "mid_circuit_mode": "Skip", "backend": {"Plugin": {"name": "nonexistent"}},
         "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
     });
-    let body = serde_json::json!({ "circuits": [photonic, plugin], "observable": "Z0" }).to_string();
+    let body =
+        serde_json::json!({ "circuits": [photonic, plugin], "observable": "Z0" }).to_string();
     let resp = app
         .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
         .await
@@ -1076,7 +1077,8 @@ async fn the_qubit_ceiling_applies_to_every_row_of_a_batch() {
         "ops": [{"gate": "H", "qubits": [0], "params": [], "classical_bit": null, "condition": null}]
     });
     // Unpriceable row FIRST, so it is the one `admit` would have seen.
-    let body = serde_json::json!({ "circuits": [plugin, very_wide], "observable": "Z0" }).to_string();
+    let body =
+        serde_json::json!({ "circuits": [plugin, very_wide], "observable": "Z0" }).to_string();
     let resp = app
         .oneshot(req_post_auth("/v1/quantum/expectation", &token, &body))
         .await

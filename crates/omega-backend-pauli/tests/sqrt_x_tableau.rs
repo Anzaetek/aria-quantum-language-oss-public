@@ -98,7 +98,10 @@ fn sx_on_zero_lands_on_the_minus_y_eigenstate() {
         "sx|0> must be the -Y eigenstate: <Y> = {}, expected -1",
         expect(ops.clone(), PauliOp::Y)
     );
-    assert!(expect(ops.clone(), PauliOp::Z).abs() < 1e-12, "<Z> must be 0");
+    assert!(
+        expect(ops.clone(), PauliOp::Z).abs() < 1e-12,
+        "<Z> must be 0"
+    );
     assert!(expect(ops, PauliOp::X).abs() < 1e-12, "<X> must be 0");
 }
 
@@ -122,16 +125,25 @@ fn sxdg_on_zero_lands_on_the_plus_y_eigenstate() {
 #[test]
 fn sx_twice_is_x() {
     let v = expect(vec![op(GateKind::Sx), op(GateKind::Sx)], PauliOp::Z);
-    assert!((v + 1.0).abs() < 1e-12, "sx;sx|0> = |1>, <Z> = {v}, expected -1");
+    assert!(
+        (v + 1.0).abs() < 1e-12,
+        "sx;sx|0> = |1>, <Z> = {v}, expected -1"
+    );
 }
 
 /// `sx; sxdg` is the identity, so `⟨Z⟩` returns to +1.
 #[test]
 fn sx_then_sxdg_is_identity() {
     let v = expect(vec![op(GateKind::Sx), op(GateKind::Sxdg)], PauliOp::Z);
-    assert!((v - 1.0).abs() < 1e-12, "sx;sxdg = I, <Z> = {v}, expected +1");
+    assert!(
+        (v - 1.0).abs() < 1e-12,
+        "sx;sxdg = I, <Z> = {v}, expected +1"
+    );
     let w = expect(vec![op(GateKind::Sxdg), op(GateKind::Sx)], PauliOp::Z);
-    assert!((w - 1.0).abs() < 1e-12, "sxdg;sx = I, <Z> = {w}, expected +1");
+    assert!(
+        (w - 1.0).abs() < 1e-12,
+        "sxdg;sx = I, <Z> = {w}, expected +1"
+    );
 }
 
 /// `X` is the fixed axis: `sx` on the `+X` eigenstate leaves `⟨X⟩ = +1`.

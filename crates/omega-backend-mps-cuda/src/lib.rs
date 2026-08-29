@@ -35,6 +35,9 @@
 //! - `--features cuda` on Linux without a CUDA driver → compiles, but
 //!   the context init returns `None` at runtime and we fall back.
 
+pub mod availability;
+pub use availability::{classify_panic, CudaSvdUnavailable};
+
 use num_complex::Complex64;
 
 pub use omega_backend_mps::mps::Mps;

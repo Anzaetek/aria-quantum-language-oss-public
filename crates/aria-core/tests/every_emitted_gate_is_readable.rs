@@ -13,7 +13,13 @@
 //! | `cp` | hand diff | fixed — widened to `CU3` |
 //! | `rxx` | hand diff | fixed — decomposed in the parser |
 //! | `rzz` | hand diff | fixed — decomposed in the parser |
-//! | `ryy` | hand diff | **still unreadable, deliberately — see below** |
+//! | `ryy` | hand diff | fixed — emitted with its Qiskit-style definition |
+//!
+//! The `ryy` row said "still unreadable, deliberately" long after `spec()` had
+//! been changed to classify it as round-tripping. A stale row in the header of
+//! the file whose entire subject is two tables drifting apart: it reads as
+//! evidence for a mis-filing that is not there, and the next person to check
+//! has to re-derive the answer to disprove the documentation.
 //!
 //! # Why an exhaustive `match` and not a source scrape
 //!
@@ -36,6 +42,22 @@ enum Spec {
     RoundTrips(usize, usize),
     /// Emitted, but no consumer can read it back. The string is the reason, and
     /// it must be a reason about the *ecosystem*, not about our convenience.
+    ///
+    /// No gate maps here today — `ryy`, the last one that did, now round-trips
+    /// via its Qiskit-style preamble definition. The variant stays because
+    /// deleting it would leave the next genuinely-unreadable gate with nowhere
+    /// to state its reason, and the path of least resistance would then be to
+    /// file it under `RoundTrips` and watch the suite fail, or under `NotQasm2`
+    /// and claim it was never in the lane. Both are lies; this is the third
+    /// option that keeps the table honest.
+    ///
+    /// `expect`, not `allow`: when a gate does map here, the unfulfilled
+    /// expectation fires and forces this attribute out. An `allow` would sit
+    /// here silently forever — the drift this file exists to catch.
+    #[expect(
+        dead_code,
+        reason = "deliberate headroom: the classification a future unreadable gate needs"
+    )]
     EmittedButUnreadable(usize, usize, &'static str),
     /// Not part of the QASM2 lane at all.
     NotQasm2,
@@ -72,24 +94,83 @@ fn spec(kind: &GateKind) -> Spec {
         Barrier | Reset | Measure => Spec::NotQasm2,
         // Photonic: the OPTICQASM lane, guarded by
         // `opticqasm_readable_by_parser.rs` and `opticqasm_reader_agreement.rs`.
-        BeamSplitter | PhaseShifter | Squeezing | Displacement | Kerr
-        | HalfWavePlate | PolarizingBeamSplitter => Spec::NotQasm2,
+        BeamSplitter
+        | PhaseShifter
+        | Squeezing
+        | Displacement
+        | Kerr
+        | HalfWavePlate
+        | PolarizingBeamSplitter => Spec::NotQasm2,
     }
 }
 
 /// Every variant, listed once. Kept beside `spec()` so the compiler's
 /// exhaustiveness check and this list are read together.
 const ALL: &[GateKind] = &[
-    GateKind::I, GateKind::X, GateKind::Y, GateKind::Z, GateKind::H,
-    GateKind::S, GateKind::Sdg, GateKind::T, GateKind::Tdg, GateKind::SX,
-    GateKind::RX, GateKind::RY, GateKind::RZ, GateKind::P, GateKind::U,
-    GateKind::CX, GateKind::CY, GateKind::CZ, GateKind::SWAP,
-    GateKind::RXX, GateKind::RYY, GateKind::RZZ, GateKind::CP, GateKind::CRz,
-    GateKind::RBS, GateKind::CCX, GateKind::CSWAP,
-    GateKind::Barrier, GateKind::Reset, GateKind::Measure,
-    GateKind::BeamSplitter, GateKind::PhaseShifter,
-    GateKind::Squeezing, GateKind::Displacement, GateKind::Kerr,
+    GateKind::I,
+    GateKind::X,
+    GateKind::Y,
+    GateKind::Z,
+    GateKind::H,
+    GateKind::S,
+    GateKind::Sdg,
+    GateKind::T,
+    GateKind::Tdg,
+    GateKind::SX,
+    GateKind::RX,
+    GateKind::RY,
+    GateKind::RZ,
+    GateKind::P,
+    GateKind::U,
+    GateKind::CX,
+    GateKind::CY,
+    GateKind::CZ,
+    GateKind::SWAP,
+    GateKind::RXX,
+    GateKind::RYY,
+    GateKind::RZZ,
+    GateKind::CP,
+    GateKind::CRz,
+    GateKind::RBS,
+    GateKind::CCX,
+    GateKind::CSWAP,
+    GateKind::Barrier,
+    GateKind::Reset,
+    GateKind::Measure,
+    GateKind::BeamSplitter,
+    GateKind::PhaseShifter,
+    GateKind::Squeezing,
+    GateKind::Displacement,
+    GateKind::Kerr,
+    GateKind::HalfWavePlate,
+    GateKind::PolarizingBeamSplitter,
 ];
+
+/// `ALL` is NOT compiler-enforced the way `spec()` is, and it had already
+/// drifted: `HalfWavePlate` and `PolarizingBeamSplitter` were added to the enum
+/// and to `spec()`'s photonic arm — which the exhaustiveness check forced — but
+/// not here, leaving `ALL` at 35 of 37 variants. Both are `NotQasm2`, so the
+/// suite's behaviour was unchanged and nothing failed. That is the point: the
+/// file's design argument is that the compiler and this list keep each other
+/// honest, and only one direction of that was ever true.
+///
+/// `GateKind` is fieldless (this `as usize` would not compile otherwise) and
+/// declares no explicit discriminants, so the last variant's discriminant plus
+/// one IS the variant count.
+///
+/// **What this catches:** a variant inserted anywhere at or before the marker
+/// without being added here — the count moves and this fails to build.
+///
+/// **What it does NOT catch:** a variant appended AFTER the marker, which is
+/// exactly how the two above went missing. So when you add a variant at the end
+/// of `GateKind`, move the marker to it. Stated rather than glossed, because a
+/// guard whose limit is undocumented is worse than none — it invites trust it
+/// has not earned.
+const _: () = assert!(
+    ALL.len() == GateKind::PolarizingBeamSplitter as usize + 1,
+    "ALL is missing a GateKind variant (or the marker below it is stale) — \
+     see the note above this assert"
+);
 
 /// Distinct, generic parameter values: no coincidence (0, π/2, equal values)
 /// can make a swapped or dropped parameter invisible.
@@ -99,7 +180,7 @@ fn emit(kind: &GateKind, n_params: usize, n_qubits: usize) -> Result<String, Str
     let mut c = Circuit::new("c");
     let q = c.qreg("q", n_qubits);
     c.apply(
-        GateDef::with_params(kind.clone(), PARAMS[..n_params].to_vec()),
+        GateDef::with_params(*kind, PARAMS[..n_params].to_vec()),
         q.to_vec(),
     );
     to_qasm(&c)
@@ -118,7 +199,9 @@ fn every_qasm2_gate_aria_core_emits_is_read_back_by_omega_parser() {
         let text = match emit(kind, np, nq) {
             Ok(t) => t,
             Err(e) => {
-                broken.push(format!("{kind:?}: declared as round-tripping but NOT EMITTED: {e}"));
+                broken.push(format!(
+                    "{kind:?}: declared as round-tripping but NOT EMITTED: {e}"
+                ));
                 continue;
             }
         };

@@ -5,6 +5,7 @@ pub(crate) mod adjoint;
 // forward + derivative matrix builders without duplicating the math.
 // Module re-exports `Gate1Q`, `Gate2Q` plus h/x/y/z/.../drx/dry/drz/...
 // — the small set of pure-math functions we need cross-backend.
+pub mod capacity;
 pub mod gates;
 pub mod noise;
 pub mod sim;

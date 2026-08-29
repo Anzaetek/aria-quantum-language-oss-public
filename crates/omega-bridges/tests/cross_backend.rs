@@ -29,9 +29,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use omega_bridges::corpus::{crosscheck_corpus, gates_used};
 #[cfg(feature = "bridge-perceval")]
 use omega_bridges::run_opticqasm;
-use omega_bridges::corpus::{crosscheck_corpus, gates_used};
 use omega_bridges::{run_qasm2, Backend, BridgeError, Counts};
 
 /// Small subset of the cross-check corpus, so the Perceval and Bloqade arms
@@ -55,14 +55,23 @@ use omega_bridges::{run_qasm2, Backend, BridgeError, Counts};
 /// filtered by gate set: Perceval and Bloqade have no `{"mode":"gates"}`
 /// introspection, so an out-of-subset fixture comes back `Unavailable` and is
 /// skipped with a reason by `run_or_skip`, which is the existing behaviour.
+/// The WHOLE corpus, not a prefix of it.
+///
+/// This used to `.take(5)`. Because the corpus is ordered lexically that meant
+/// "only the single-qubit and Bell/GHZ fixtures" — the easy end — and it was
+/// silent: the arms reported success having never seen `sqrt_x`, `qft_3`,
+/// `clifford_t` or anything with a Toffoli in it. Bloqade in particular can
+/// run 12 of the 14 and was being asked for 5.
+///
+/// Out-of-subset fixtures are still skipped with a reason by `run_or_skip`;
+/// the cap was hiding fixtures these backends can actually do, which is a
+/// different thing from filtering ones they cannot.
 #[allow(dead_code)]
 fn curated_fixtures() -> Vec<(&'static str, PathBuf)> {
-    const MAX: usize = 5;
     let corpus = crosscheck_corpus();
     corpus
         .files
         .into_iter()
-        .take(MAX)
         .map(|p| (corpus.label, p))
         .collect()
 }
@@ -682,7 +691,10 @@ fn corpus_identity_is_reported_and_covers_the_defect_classes() {
     eprintln!("cross-backend corpus: {label} ({} files)", files.len());
     eprintln!("  measure: {with_measure}   conditionals: {with_if}   reset: {with_reset}");
 
-    assert!(!files.is_empty(), "corpus is empty — nothing would be compared");
+    assert!(
+        !files.is_empty(),
+        "corpus is empty — nothing would be compared"
+    );
 
     if label != "tests/fixtures/crosscheck" {
         // Not a failure: the private corpus is larger and legitimate. But it is

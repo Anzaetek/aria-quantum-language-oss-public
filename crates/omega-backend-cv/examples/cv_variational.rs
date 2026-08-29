@@ -149,7 +149,10 @@ fn main() {
         "  single displacement (baseline): P(|{TARGET}>) = {:.6} at alpha = {:.2}",
         best_coherent.1, best_coherent.0
     );
-    println!("  analytic Poissonian optimum:    P(|2>) = {:.6}\n", 2.0 * (-2.0f64).exp());
+    println!(
+        "  analytic Poissonian optimum:    P(|2>) = {:.6}\n",
+        2.0 * (-2.0f64).exp()
+    );
 
     // The layered ansatz, from several starts — a plain gradient ascent on a
     // non-convex landscape finds different local optima, and reporting only the

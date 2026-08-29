@@ -42,7 +42,28 @@ if "$PY" -c "import pymatching" >/dev/null 2>&1; then
   echo
   "$PY" "$here/check_decoder.py" || rc=$?
 else
+  # LOUD, and it says which half was lost.
+  #
+  # This used to read "(skipping decoder cross-check — pymatching not
+  # installed)" in parentheses, and then exit 0. So on a host where the install
+  # had silently failed, HALF this stage stopped running and the line reporting
+  # it was quieter than the lines reporting success. The decoder half is the one
+  # that cannot be replaced by anything internal: a wrong decoder still returns
+  # corrections and still looks green, and only PyMatching shows the logical
+  # error rate is off.
+  #
+  # Still exit 0 rather than fail: a platform whose pymatching wheel does not
+  # build must be able to run CI (K13), and ci.sh classifies that case as
+  # INCAPABLE by making the same import check itself. What is fixed here is that
+  # the narrowing is now impossible to read past.
   echo
-  echo "  (skipping decoder cross-check — pymatching not installed)"
+  echo "  ############################################################"
+  echo "  # HALF OF THIS STAGE DID NOT RUN"
+  echo "  #   the encoded-algorithm cross-check ABOVE ran;"
+  echo "  #   the surface-code DECODER cross-check did NOT."
+  echo "  # reason: pymatching does not import for $PY"
+  echo "  # This is the only differential check on the decoder. Without it a"
+  echo "  # decoder that is subtly wrong still decodes and still looks green."
+  echo "  ############################################################"
 fi
 exit "$rc"

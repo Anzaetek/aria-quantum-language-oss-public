@@ -22,7 +22,9 @@
 //! the cheap uniform start, not the only possible shape.
 
 #[cfg(feature = "bridge-ppvm")]
-use crate::runner::{invoke_runner, run_subprocess, ParseAs, ParsedResponse, RunnerRequest, RunnerSpec};
+use crate::runner::{
+    invoke_runner, run_subprocess, ParseAs, ParsedResponse, RunnerRequest, RunnerSpec,
+};
 use crate::{Backend, BridgeError, Counts, NoiseConfig};
 
 #[cfg(not(feature = "bridge-ppvm"))]
@@ -81,7 +83,11 @@ pub fn expectation(
             if v.len() != observables.len() {
                 return Err(BridgeError::Backend(
                     Backend::Ppvm,
-                    format!("returned {} values for {} observables", v.len(), observables.len()),
+                    format!(
+                        "returned {} values for {} observables",
+                        v.len(),
+                        observables.len()
+                    ),
                 ));
             }
             Ok(v)

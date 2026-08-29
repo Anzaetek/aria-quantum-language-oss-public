@@ -74,6 +74,28 @@ pub(crate) struct DeviceHandle {
 }
 
 impl DeviceHandle {
+    /// `(name, registers, local bytes, shared bytes)` per kernel, from
+    /// `cuFuncGetAttribute`. See `CudaStatevectorBackend::kernel_resource_report`.
+    pub fn kernel_resource_report(&self) -> Result<Vec<(String, i32, i32, i32)>, CudaError> {
+        use cudarc::driver::sys::CUfunction_attribute_enum as A;
+        let attr = |f: &cudarc::driver::CudaFunction, a| {
+            f.get_attribute(a)
+                .map_err(|e| CudaError::Driver(format!("cuFuncGetAttribute: {e}")))
+        };
+        self.kernels
+            .named_functions()
+            .into_iter()
+            .map(|(name, f)| {
+                Ok((
+                    name.to_string(),
+                    attr(f, A::CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+                    attr(f, A::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
+                    attr(f, A::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?,
+                ))
+            })
+            .collect()
+    }
+
     pub fn new() -> Result<Self, CudaError> {
         let ctx = CudaContext::new(0)
             .map_err(|e| CudaError::Driver(format!("CudaContext::new(0) failed: {e}")))?;
@@ -222,6 +244,91 @@ impl Default for Apply2qParams {
 }
 unsafe impl DeviceRepr for Apply2qParams {}
 unsafe impl ValidAsZeroBits for Apply2qParams {}
+
+/// Slot pair to exchange in every quad — see `kernels/apply_quad_perm.cu`.
+/// Slot bit 0 is `qa`, bit 1 is `qb`, matching `apply_2q`'s row convention.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QuadSwapParams {
+    pub qa: u32,
+    pub qb: u32,
+    pub slot_a: u32,
+    pub slot_b: u32,
+}
+unsafe impl DeviceRepr for QuadSwapParams {}
+unsafe impl ValidAsZeroBits for QuadSwapParams {}
+
+/// Two slots exchanged, each incoming value phased — CY.
+///
+/// **NO F64 TWIN in this file — see `f64_path::QuadSwapPhaseParamsF64`.** Same
+/// hazard as the other two phase structs: the `.cu` declares the phases as
+/// `real`, so at f64 the device struct is 48 B against 32 B here.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QuadSwapPhaseParams {
+    pub qa: u32,
+    pub qb: u32,
+    pub slot_a: u32,
+    pub slot_b: u32,
+    pub phase_a_re: f32,
+    pub phase_a_im: f32,
+    pub phase_b_re: f32,
+    pub phase_b_im: f32,
+}
+unsafe impl DeviceRepr for QuadSwapPhaseParams {}
+unsafe impl ValidAsZeroBits for QuadSwapPhaseParams {}
+
+/// Two slots of every octet, exchanged — exact CCX / CSwap. All-u32, so one
+/// struct serves both precisions.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OctetSwapParams {
+    pub q0: u32,
+    pub q1: u32,
+    pub q2: u32,
+    pub slot_a: u32,
+    pub slot_b: u32,
+}
+unsafe impl DeviceRepr for OctetSwapParams {}
+unsafe impl ValidAsZeroBits for OctetSwapParams {}
+
+/// One slot of every quad, multiplied by a phase — CZ, CP/CU1.
+///
+/// **NO F64 TWIN — adding these kernels to `KernelsF64` without one WILL read
+/// garbage.** The `.cu` declares `phase_re`/`phase_im` as `real`, so under
+/// `-DOMEGA_REAL=double` the device struct is 32 B (4 B pad + 2×8 B) against
+/// this 20 B host struct; `QuadPhaseParams` goes 60 B → 96 B. Nothing launches
+/// them at f64 today (`f64_path.rs`'s `KernelsF64` loads only `apply_1q` and
+/// `apply_2q`), and `precision_compile` green means only that they COMPILE at
+/// f64 — it says nothing about the host layout. `Apply1qParamsF64` in
+/// `f64_path.rs` is the pattern to copy, explicit `_pad` and all.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QuadPhase1Params {
+    pub qa: u32,
+    pub qb: u32,
+    pub slot: u32,
+    pub phase_re: f32,
+    pub phase_im: f32,
+}
+unsafe impl DeviceRepr for QuadPhase1Params {}
+unsafe impl ValidAsZeroBits for QuadPhase1Params {}
+
+/// The non-identity slots of every quad, each multiplied by its phase. f32 to
+/// match the f32 kernel module this host side launches — the same precedent as
+/// `Apply2qParams::u`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QuadPhaseParams {
+    pub qa: u32,
+    pub qb: u32,
+    pub count: u32,
+    pub slots: [u32; 4],
+    pub phase_re: [f32; 4],
+    pub phase_im: [f32; 4],
+}
+unsafe impl DeviceRepr for QuadPhaseParams {}
+unsafe impl ValidAsZeroBits for QuadPhaseParams {}
 
 // The following constructors + apply_*_via_pool methods are
 // consumed by the upcoming ForwardGraph slice. Until that wiring
@@ -1492,27 +1599,7 @@ impl StateBuffer {
     }
 
     pub fn apply_2q(&mut self, qa: u32, qb: u32, u: &[Complex64; 16]) -> Result<(), CudaError> {
-        if qa >= self.num_qubits {
-            return Err(CudaError::QubitOutOfRange {
-                qubit: qa,
-                num_qubits: self.num_qubits,
-            });
-        }
-        if qb >= self.num_qubits {
-            return Err(CudaError::QubitOutOfRange {
-                qubit: qb,
-                num_qubits: self.num_qubits,
-            });
-        }
-        if qa == qb {
-            return Err(CudaError::DuplicateQubits { qubit: qa });
-        }
-        if self.num_qubits < 2 {
-            return Err(CudaError::QubitOutOfRange {
-                qubit: qb,
-                num_qubits: self.num_qubits,
-            });
-        }
+        self.check_2q_operands(qa, qb)?;
         let mut u_flat = [0.0f32; 32];
         for (k, c) in u.iter().enumerate() {
             u_flat[2 * k] = c.re as f32;
@@ -1534,6 +1621,257 @@ impl StateBuffer {
             builder
                 .launch(cfg)
                 .map_err(|e| CudaError::Driver(format!("launch apply_2q: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Validate a 2q operand pair the way [`Self::apply_2q`] does. Shared so
+    /// the specialised kernels below cannot drift from the generic path on
+    /// which operands they accept.
+    fn check_2q_operands(&self, qa: u32, qb: u32) -> Result<(), CudaError> {
+        if qa >= self.num_qubits {
+            return Err(CudaError::QubitOutOfRange {
+                qubit: qa,
+                num_qubits: self.num_qubits,
+            });
+        }
+        if qb >= self.num_qubits {
+            return Err(CudaError::QubitOutOfRange {
+                qubit: qb,
+                num_qubits: self.num_qubits,
+            });
+        }
+        if qa == qb {
+            return Err(CudaError::DuplicateQubits { qubit: qa });
+        }
+        if self.num_qubits < 2 {
+            return Err(CudaError::QubitOutOfRange {
+                qubit: qb,
+                num_qubits: self.num_qubits,
+            });
+        }
+        Ok(())
+    }
+
+    /// Exchange two slots of every quad — the CX and SWAP fast path.
+    ///
+    /// 2 loads + 2 stores + zero flops, against `apply_2q`'s 4 + 4 and 160
+    /// real flops. Bit-identical for every finite amplitude; the only
+    /// difference is that this preserves `-0.0` where the dense path's
+    /// `0*v0 + 0*v1 + 0*v2 + 1*v3` canonicalises it to `+0.0`.
+    pub fn apply_quad_swap(
+        &mut self,
+        qa: u32,
+        qb: u32,
+        slot_a: u32,
+        slot_b: u32,
+    ) -> Result<(), CudaError> {
+        self.check_2q_operands(qa, qb)?;
+        debug_assert!(slot_a < 4 && slot_b < 4 && slot_a != slot_b);
+        let params = QuadSwapParams {
+            qa,
+            qb,
+            slot_a,
+            slot_b,
+        };
+        let quads: u64 = 1u64 << (self.num_qubits - 2);
+        let (grid, block) = launch_dims(quads);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stream = self.handle.stream.clone();
+        let func = self.handle.kernels.apply_quad_swap.clone();
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&mut self.state).arg(&params).arg(&quads);
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| CudaError::Driver(format!("launch apply_quad_swap: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Exchange two slots, phasing each incoming value — the CY fast path.
+    /// `phase_a` lands on `slot_a`, i.e. it multiplies the value ARRIVING there
+    /// from `slot_b`.
+    pub fn apply_quad_swap_phase(
+        &mut self,
+        qa: u32,
+        qb: u32,
+        slot_a: u32,
+        phase_a: Complex64,
+        slot_b: u32,
+        phase_b: Complex64,
+    ) -> Result<(), CudaError> {
+        self.check_2q_operands(qa, qb)?;
+        debug_assert!(slot_a < 4 && slot_b < 4 && slot_a != slot_b);
+        let params = QuadSwapPhaseParams {
+            qa,
+            qb,
+            slot_a,
+            slot_b,
+            phase_a_re: phase_a.re as f32,
+            phase_a_im: phase_a.im as f32,
+            phase_b_re: phase_b.re as f32,
+            phase_b_im: phase_b.im as f32,
+        };
+        let quads: u64 = 1u64 << (self.num_qubits - 2);
+        let (grid, block) = launch_dims(quads);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stream = self.handle.stream.clone();
+        let func = self.handle.kernels.apply_quad_swap_phase.clone();
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&mut self.state).arg(&params).arg(&quads);
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| CudaError::Driver(format!("launch apply_quad_swap_phase: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Exchange two slots of every octet — the exact CCX / CSwap path.
+    /// Requires three distinct qubits and `num_qubits >= 3`.
+    pub fn apply_octet_swap(
+        &mut self,
+        q0: u32,
+        q1: u32,
+        q2: u32,
+        slot_a: u32,
+        slot_b: u32,
+    ) -> Result<(), CudaError> {
+        for &q in &[q0, q1, q2] {
+            if q >= self.num_qubits {
+                return Err(CudaError::QubitOutOfRange {
+                    qubit: q,
+                    num_qubits: self.num_qubits,
+                });
+            }
+        }
+        if q0 == q1 || q0 == q2 || q1 == q2 {
+            return Err(CudaError::DuplicateQubits { qubit: q0 });
+        }
+        if self.num_qubits < 3 {
+            return Err(CudaError::QubitOutOfRange {
+                qubit: q2,
+                num_qubits: self.num_qubits,
+            });
+        }
+        let params = OctetSwapParams {
+            q0,
+            q1,
+            q2,
+            slot_a,
+            slot_b,
+        };
+        let octets: u64 = 1u64 << (self.num_qubits - 3);
+        let (grid, block) = launch_dims(octets);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stream = self.handle.stream.clone();
+        let func = self.handle.kernels.apply_octet_swap.clone();
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&mut self.state).arg(&params).arg(&octets);
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| CudaError::Driver(format!("launch apply_octet_swap: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Single-slot phase — CZ, CP/CU1. Its own kernel; see `apply_quad_phase1`
+    /// in `kernels/apply_quad_perm.cu` for why this is not a branch.
+    fn apply_quad_phase1(
+        &mut self,
+        qa: u32,
+        qb: u32,
+        slot: u32,
+        phase: Complex64,
+    ) -> Result<(), CudaError> {
+        let params = QuadPhase1Params {
+            qa,
+            qb,
+            slot,
+            phase_re: phase.re as f32,
+            phase_im: phase.im as f32,
+        };
+        let quads: u64 = 1u64 << (self.num_qubits - 2);
+        let (grid, block) = launch_dims(quads);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stream = self.handle.stream.clone();
+        let func = self.handle.kernels.apply_quad_phase1.clone();
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&mut self.state).arg(&params).arg(&quads);
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| CudaError::Driver(format!("launch apply_quad_phase1: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Multiply the non-identity slots of every quad by their phases.
+    ///
+    /// 1 load + 1 store, against `apply_2q`'s 4 + 4. For CZ the phase is
+    /// exactly `-1`, and `x * -1.0` is exact in IEEE-754, so this is
+    /// bit-identical under the same signed-zero caveat as
+    /// [`Self::apply_quad_swap`].
+    pub fn apply_quad_phase(
+        &mut self,
+        qa: u32,
+        qb: u32,
+        entries: &[(u32, Complex64)],
+    ) -> Result<(), CudaError> {
+        self.check_2q_operands(qa, qb)?;
+        debug_assert!(!entries.is_empty() && entries.len() <= 4);
+        debug_assert!(entries.iter().all(|(s, _)| *s < 4));
+
+        // One slot is its own kernel — see `apply_quad_phase1` in the .cu for
+        // why a branch inside the multi-slot kernel was not good enough.
+        if let [(slot, phase)] = entries {
+            return self.apply_quad_phase1(qa, qb, *slot, *phase);
+        }
+
+        let mut params = QuadPhaseParams {
+            qa,
+            qb,
+            count: entries.len() as u32,
+            ..QuadPhaseParams::default()
+        };
+        for (k, (slot, phase)) in entries.iter().enumerate() {
+            params.slots[k] = *slot;
+            params.phase_re[k] = phase.re as f32;
+            params.phase_im[k] = phase.im as f32;
+        }
+        let quads: u64 = 1u64 << (self.num_qubits - 2);
+        let (grid, block) = launch_dims(quads);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stream = self.handle.stream.clone();
+        let func = self.handle.kernels.apply_quad_phase.clone();
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(&mut self.state).arg(&params).arg(&quads);
+        unsafe {
+            builder
+                .launch(cfg)
+                .map_err(|e| CudaError::Driver(format!("launch apply_quad_phase: {e}")))?;
         }
         Ok(())
     }

@@ -42,10 +42,7 @@ use omega_core::params::ParameterBinding;
 /// width 4. Reading the width off the map keeps these assertions about the
 /// value rather than about a width the test assumed.
 #[allow(dead_code)]
-fn okey(
-    map: &std::collections::HashMap<omega_core::outcome::Outcome, u32>,
-    k: u64,
-) -> u32 {
+fn okey(map: &std::collections::HashMap<omega_core::outcome::Outcome, u32>, k: u64) -> u32 {
     let w = map.keys().next().map(|o| o.width()).unwrap_or(0);
     map.get(&omega_core::outcome::Outcome::from_u64(k, w))
         .copied()

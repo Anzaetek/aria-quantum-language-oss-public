@@ -23,12 +23,28 @@ tls = ["dep:axum-server"]
 # /v1/quantum/execute routes Statevector circuits through the OpenCL
 # device (falls back to CPU statevector if no OpenCL device is usable).
 opencl = ["dep:omega-backend-statevector-opencl"]
+# CUDA statevector + the MPS (gesvdj) and PauliProp (branch) accelerator hooks.
+# Same shape as `opencl` above: opt-in, and the server falls back to the CPU
+# when the feature is off OR the device fails to open at runtime.
+#
+# Without this the daemon was CPU/OpenCL-only on a CUDA box — a job submitted
+# over HTTP could not reach the GPU by any route, however the machine was built.
+cuda = [
+    "dep:omega-backend-statevector-cuda",
+    "dep:omega-backend-mps-cuda",
+    "dep:omega-backend-pauliprop-cuda",
+]
 
 [dependencies]
 omega-core = { path = "../omega-core" }
+omega-hostgate = { path = "../omega-hostgate" }
 omega-parser = { path = "../omega-parser" }
 omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
 omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl", features = ["opencl"], optional = true }
+omega-backend-statevector-cuda = { path = "../omega-backend-statevector-cuda", features = ["cuda"], optional = true }
+omega-backend-mps-cuda = { path = "../omega-backend-mps-cuda", features = ["cuda"], optional = true }
+omega-backend-pauliprop-cuda = { path = "../omega-backend-pauliprop-cuda", features = ["cuda"], optional = true }
 omega-backend-photonics = { path = "../omega-backend-photonics" }
 omega-backend-mps = { path = "../omega-backend-mps" }
 omega-backend-pauli = { path = "../omega-backend-pauli" }

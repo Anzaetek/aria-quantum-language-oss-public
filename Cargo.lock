@@ -2467,6 +2467,7 @@ dependencies = [
  "num-complex",
  "omega-core",
  "rand 0.10.1",
+ "rayon",
  "smallvec",
 ]
 
@@ -2504,6 +2505,7 @@ dependencies = [
 name = "omega-backend-pauliprop"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "num-complex",
  "omega-backend-pauli",
  "omega-backend-statevector",
@@ -2636,6 +2638,8 @@ version = "0.1.0"
 dependencies = [
  "num-complex",
  "omega-backend-mps",
+ "omega-backend-mps-cuda",
+ "omega-backend-mps-metal",
  "omega-backend-pauli",
  "omega-backend-pauliprop",
  "omega-backend-photonics",
@@ -2646,6 +2650,7 @@ dependencies = [
  "omega-bridges",
  "omega-core",
  "omega-parser",
+ "rayon",
  "serde_json",
 ]
 
@@ -2683,6 +2688,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-hostgate"
+version = "0.1.0"
+dependencies = [
+ "omega-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omega-parser"
 version = "0.1.0"
 dependencies = [
@@ -2717,11 +2731,16 @@ dependencies = [
  "ml-dsa",
  "ml-kem",
  "omega-backend-mps",
+ "omega-backend-mps-cuda",
  "omega-backend-pauli",
+ "omega-backend-pauliprop",
+ "omega-backend-pauliprop-cuda",
  "omega-backend-photonics",
  "omega-backend-statevector",
+ "omega-backend-statevector-cuda",
  "omega-backend-statevector-opencl",
  "omega-core",
+ "omega-hostgate",
  "omega-parser",
  "omega-wasm-runtime",
  "pqcrypto-mldsa",
@@ -2781,6 +2800,7 @@ name = "omega-xcheck"
 version = "0.1.0"
 dependencies = [
  "omega-backend-pauli",
+ "omega-backend-pauliprop",
  "omega-backend-statevector",
  "omega-backend-statevector-metal",
  "omega-core",

@@ -75,6 +75,11 @@ const KERNEL_APPLY_DIAGONAL_PAULI_SUM: &str = include_str!("kernels/apply_diagon
 const KERNEL_APPLY_DIAGONAL_PRODUCT: &str = include_str!("kernels/apply_diagonal_product.cu");
 const KERNEL_APPLY_1Q: &str = include_str!("kernels/apply_1q.cu");
 const KERNEL_APPLY_2Q: &str = include_str!("kernels/apply_2q.cu");
+// P1-a: the 2q gates that are permutations or diagonals, done as such.
+// CX/SWAP/CZ previously built a dense [Complex64; 16] and paid the full
+// `apply_2q` cost — 4 loads + 4 stores and 160 real flops per quad — to
+// exchange two amplitudes or negate one. Bit-identical; see the header.
+const KERNEL_APPLY_QUAD_PERM: &str = include_str!("kernels/apply_quad_perm.cu");
 const KERNEL_INNER_PRODUCT: &str = include_str!("kernels/inner_product.cu");
 const KERNEL_PAULI_EXPECTATION: &str = include_str!("kernels/pauli_expectation.cu");
 // Pooled-param variants — same math, params come from a device
@@ -196,6 +201,16 @@ pub(crate) struct KernelLibrary {
     pub apply_diagonal_product: CudaFunction,
     pub apply_1q: CudaFunction,
     pub apply_2q: CudaFunction,
+    /// Exchange two slots of every quad — CX, SWAP.
+    pub apply_quad_swap: CudaFunction,
+    /// Exchange two slots, each phased — CY.
+    pub apply_quad_swap_phase: CudaFunction,
+    /// Multiply ONE slot of every quad by a phase — CZ, CP/CU1.
+    pub apply_quad_phase1: CudaFunction,
+    /// Multiply several slots by their phases — CRz and any 2q diagonal.
+    pub apply_quad_phase: CudaFunction,
+    /// Exchange two slots of every octet — exact CCX / CSwap.
+    pub apply_octet_swap: CudaFunction,
     pub inner_product: CudaFunction,
     pub pauli_expectation: CudaFunction,
     // Pooled-param variants for the CUDA-graph capture path.
@@ -238,6 +253,22 @@ pub(crate) struct KernelLibrary {
 }
 
 impl KernelLibrary {
+    /// The kernels this pass cares about, by name, for resource reporting.
+    /// Deliberately not exhaustive — the quad kernels plus the generic paths
+    /// they are measured against.
+    pub fn named_functions(&self) -> Vec<(&'static str, &CudaFunction)> {
+        vec![
+            ("apply_1q", &self.apply_1q),
+            ("apply_2q", &self.apply_2q),
+            ("apply_quad_swap", &self.apply_quad_swap),
+            ("apply_quad_swap_phase", &self.apply_quad_swap_phase),
+            ("apply_octet_swap", &self.apply_octet_swap),
+            ("apply_quad_phase1", &self.apply_quad_phase1),
+            ("apply_quad_phase", &self.apply_quad_phase),
+            ("apply_diagonal", &self.apply_diagonal),
+        ]
+    }
+
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, CudaError> {
         let (apply_diagonal_module, apply_diagonal) =
             load_kernel(ctx, KERNEL_APPLY_DIAGONAL, "apply_diagonal")?;
@@ -250,6 +281,24 @@ impl KernelLibrary {
             load_kernel(ctx, KERNEL_APPLY_DIAGONAL_PRODUCT, "apply_diagonal_product")?;
         let (apply_1q_module, apply_1q) = load_kernel(ctx, KERNEL_APPLY_1Q, "apply_1q")?;
         let (apply_2q_module, apply_2q) = load_kernel(ctx, KERNEL_APPLY_2Q, "apply_2q")?;
+        let (apply_quad_perm_module, quad_perm_fns) = load_kernel_multi(
+            ctx,
+            KERNEL_APPLY_QUAD_PERM,
+            "apply_quad_perm",
+            &[
+                "apply_quad_swap",
+                "apply_quad_swap_phase",
+                "apply_quad_phase1",
+                "apply_quad_phase",
+                "apply_octet_swap",
+            ],
+        )?;
+        let mut quad_perm_fns = quad_perm_fns.into_iter();
+        let apply_quad_swap = quad_perm_fns.next().expect("apply_quad_swap loaded");
+        let apply_quad_swap_phase = quad_perm_fns.next().expect("apply_quad_swap_phase loaded");
+        let apply_quad_phase1 = quad_perm_fns.next().expect("apply_quad_phase1 loaded");
+        let apply_quad_phase = quad_perm_fns.next().expect("apply_quad_phase loaded");
+        let apply_octet_swap = quad_perm_fns.next().expect("apply_octet_swap loaded");
         let (inner_product_module, inner_product) =
             load_kernel(ctx, KERNEL_INNER_PRODUCT, "inner_product")?;
         let (pauli_expectation_module, pauli_expectation) =
@@ -340,6 +389,11 @@ impl KernelLibrary {
             apply_diagonal_product,
             apply_1q,
             apply_2q,
+            apply_quad_swap,
+            apply_quad_swap_phase,
+            apply_quad_phase1,
+            apply_quad_phase,
+            apply_octet_swap,
             inner_product,
             pauli_expectation,
             apply_diagonal_pooled,
@@ -366,6 +420,7 @@ impl KernelLibrary {
                 apply_diagonal_product_module,
                 apply_1q_module,
                 apply_2q_module,
+                apply_quad_perm_module,
                 inner_product_module,
                 pauli_expectation_module,
                 apply_diagonal_pooled_module,
@@ -400,6 +455,7 @@ pub fn all_kernel_sources() -> Vec<(&'static str, &'static str)> {
         ("apply_diagonal_product", KERNEL_APPLY_DIAGONAL_PRODUCT),
         ("apply_1q", KERNEL_APPLY_1Q),
         ("apply_2q", KERNEL_APPLY_2Q),
+        ("apply_quad_perm", KERNEL_APPLY_QUAD_PERM),
         ("inner_product", KERNEL_INNER_PRODUCT),
         ("pauli_expectation", KERNEL_PAULI_EXPECTATION),
         ("apply_diagonal_pooled", KERNEL_APPLY_DIAGONAL_POOLED),
@@ -420,12 +476,18 @@ pub fn all_kernel_sources() -> Vec<(&'static str, &'static str)> {
             "inner_product_accumulate_pooled",
             KERNEL_INNER_PRODUCT_ACCUMULATE_POOLED,
         ),
-        ("pauli_z_expectation_to_slot", KERNEL_PAULI_Z_EXPECTATION_TO_SLOT),
+        (
+            "pauli_z_expectation_to_slot",
+            KERNEL_PAULI_Z_EXPECTATION_TO_SLOT,
+        ),
         (
             "apply_1q_inner_product_accumulate_pooled",
             KERNEL_APPLY_1Q_INNER_PRODUCT_ACCUMULATE_POOLED,
         ),
-        ("apply_diagonal_chain_pooled", KERNEL_APPLY_DIAGONAL_CHAIN_POOLED),
+        (
+            "apply_diagonal_chain_pooled",
+            KERNEL_APPLY_DIAGONAL_CHAIN_POOLED,
+        ),
         (
             "apply_diagonal_chain_dual_pooled",
             KERNEL_APPLY_DIAGONAL_CHAIN_DUAL_POOLED,

@@ -112,6 +112,18 @@ pub fn create_router(state: SharedState, ws_state: Option<WsSharedState>) -> Rou
             "/v1/quantum/gradient",
             post(quantum_bridge::gradient_quantum_route),
         )
+        // Template shape: the circuit ONCE plus an N x P parameter matrix,
+        // instead of N copies of the same gate list. Payload reduction only —
+        // admission is unchanged, because rows run sequentially and the worst
+        // row is already the peak.
+        .route(
+            "/v1/quantum/expectation_template",
+            post(quantum_bridge::expectation_template_route),
+        )
+        .route(
+            "/v1/quantum/gradient_template",
+            post(quantum_bridge::gradient_template_route),
+        )
         // MBQC one-way measurement patterns (C1.3): execute an OmegaPatternIR
         // on the photonic graph-state backend.
         .route(
@@ -367,6 +379,15 @@ async fn list_backends(Extension(claims): Extension<TokenClaims>) -> impl IntoRe
         serde_json::json!({ "name": "mps",         "type": "gate_based", "parametric": true }),
         serde_json::json!({ "name": "stabilizer",  "type": "gate_based", "requires": "clifford" }),
         serde_json::json!({ "name": "photonics",   "type": "photonic" }),
+        // Expectation-only by construction: it evolves the OBSERVABLE, so
+        // /execute refuses it. Advertised so a client can discover that rather
+        // than infer it from a 400.
+        serde_json::json!({
+            "name": "pauliprop",
+            "type": "gate_based",
+            "expectation_only": true,
+            "exact_on": "clifford"
+        }),
     ];
     // Append dynamically-loaded plugin backends, tagged so a client can tell
     // them apart from the compiled-in ones.

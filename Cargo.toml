@@ -41,6 +41,7 @@ members = [
     "crates/omega-backend-refplugin",
     "crates/omega-plugin-conformance",
     "crates/omega-tensor",
+    "crates/omega-hostgate",
     "crates/omega-ffi",
     "crates/omega-wasm-runtime",
     "crates/omega-server",

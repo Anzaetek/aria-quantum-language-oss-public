@@ -13,8 +13,12 @@ crate-type = ["rlib"]
 [dependencies]
 omega-core = { path = "../omega-core" }
 num-complex = { workspace = true }
+# PauliKey packs its symplectic bits into u64 words with inline capacity for
+# n <= 128, so a key allocates nothing at any width this engine is used at.
+smallvec = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 num-complex = { workspace = true }
 smallvec = { workspace = true }
 # The conditional-refusal test asserts the value pauliprop USED to return
@@ -27,3 +31,7 @@ omega-backend-statevector = { path = "../omega-backend-statevector" }
 # tableau vs Pauli-image table). Weak evidence on its own — see K3 — but it
 # would take a shared misreading to survive both representations.
 omega-backend-pauli = { path = "../omega-backend-pauli" }
+
+[[bench]]
+name = "pauliprop_bench"
+harness = false

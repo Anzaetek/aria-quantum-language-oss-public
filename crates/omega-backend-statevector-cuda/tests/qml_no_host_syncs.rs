@@ -26,6 +26,7 @@
 #![cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 
 use smallvec::smallvec;
+use std::sync::{Mutex, MutexGuard};
 
 use omega_backend_statevector_cuda::{CudaState, CudaStatevectorBackend};
 use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, ParamExpr, Qubit};
@@ -106,6 +107,44 @@ fn fresh_params() -> ParameterBinding {
     params
 }
 
+/// Serialises the two tests in this binary that observe the process-global
+/// `READ_STATE_CALL_COUNT` (`imp.rs`, bumped inside `read_state`).
+///
+/// WHY A LOCK RATHER THAN A RELAXED ASSERTION. `qml_gradient_loop_..` asserts
+/// the delta is EXACTLY zero, and that strictness is the whole point: the
+/// claim is that the gradient hot path performs no bulk host readback at all.
+/// Relaxing it to a `>=`-style bound to tolerate interference would let a
+/// genuine regression — one real `read_state` appearing in the gradient loop
+/// — pass silently, which is the only thing this test exists to catch.
+///
+/// WHAT IT PREVENTS, MEASURED. Without it the two tests race:
+/// `read_state_call_count_increments_on_each_read` performs exactly two
+/// `read_state` calls, and when they land inside the other test's
+/// before/after window the observed delta is exactly 2. Reproduced at 1/12
+/// runs with `--test-threads=2` against 0/12 with `--test-threads=1`.
+///
+/// RELATIONSHIP TO `RUST_TEST_THREADS=1`. The CUDA stage in `ci.sh` exports
+/// that, and this race was a BENEFICIARY of it, not its reason: the comment
+/// there predates this finding and attributes the setting to an unidentified
+/// crash in the `--lib` suite. That crash is real and still open — measured
+/// separately at 4/10 unserialised runs, with `CUDA_ERROR_STREAM_CAPTURE_
+/// INVALIDATED` and `CURAND_STATUS_LAUNCH_FAILURE`, appearing only at 8+
+/// threads. So this lock does NOT make that setting removable, and nothing
+/// here should be cited as licence to drop it.
+///
+/// INVARIANT FOR FUTURE TESTS: any test added to this binary that calls
+/// `read_state` — directly or through a backend operation — must take
+/// COUNTER_WINDOW, or it will corrupt the strict `delta == 0` above exactly
+/// as the sibling used to.
+static COUNTER_WINDOW: Mutex<()> = Mutex::new(());
+
+/// Take the counter window, ignoring poisoning: a panic in either test must
+/// surface as that test's own failure, not as a confusing `PoisonError` in
+/// the other one.
+fn lock_counter_window() -> MutexGuard<'static, ()> {
+    COUNTER_WINDOW.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn cuda_backend_or_skip() -> Option<CudaStatevectorBackend> {
     match CudaStatevectorBackend::new() {
         Ok(b) => Some(b),
@@ -128,6 +167,7 @@ fn qml_gradient_loop_does_not_pull_full_statevector_to_host() {
     // Counter is process-global; treat it as a delta so any
     // earlier setup-side `read_state` calls don't poison the
     // assertion.
+    let _window = lock_counter_window();
     let before = CudaState::read_state_call_count();
     let history = QmlTrainer::new(&model)
         .epochs(NUM_EPOCHS)
@@ -144,11 +184,14 @@ fn qml_gradient_loop_does_not_pull_full_statevector_to_host() {
     assert_eq!(
         delta, 0,
         "QML gradient hot path pulled the full statevector to host {delta} time(s). \
+         This test holds COUNTER_WINDOW for the whole before/after window, so a \
+         concurrent `read_state` from `read_state_call_count_increments_on_each_read` \
+         is EXCLUDED and this delta is attributable to the gradient loop itself. \
          Likely cause: a backward-sweep observable that doesn't classify as diagonal-Z \
          (so adjoint_gradient takes the host-fallback branch). The QML trainer's \
-         gradient observable is `Σ 2·r·Z` and must always classify; investigate the \
-         CUDA adjoint's diagonal-Pauli classifier and the trainer's gradient-observable \
-         factory if this trips."
+         gradient observable is `Σ 2·r·Z` — pure Z + identity — so the classifier must \
+         always return `Some`; investigate the CUDA adjoint's diagonal-Pauli classifier \
+         and the trainer's gradient-observable factory if this trips."
     );
 }
 
@@ -157,15 +200,21 @@ fn read_state_call_count_increments_on_each_read() {
     // Sanity-pins the no-host-syncs regression test's mechanism:
     // every `read_state` call must bump the counter. Without this
     // guard, a wiring bug could silently make the regression test
-    // trivially pass by never moving the counter at all. The
-    // counter is process-global and other tests can run in
-    // parallel — so we assert `>= 1` per call rather than strict
-    // equality (any concurrent test's `read_state` only inflates
-    // the delta).
+    // trivially pass by never moving the counter at all.
+    //
+    // The counter is process-global, so this test takes
+    // COUNTER_WINDOW too — not for its own sake (`>=` is already
+    // robust to inflation) but because its two `read_state` calls
+    // are precisely what used to corrupt the sibling's strict
+    // `delta == 0`. The `>=` stays: this test's claim is "at least
+    // one read happened", which is the opposite obligation from
+    // the sibling's "none did", and the two need opposite
+    // treatments.
     let Some(backend) = cuda_backend_or_skip() else {
         return;
     };
     let state = backend.allocate(3).expect("alloc");
+    let _window = lock_counter_window();
     let before = CudaState::read_state_call_count();
     let _ = state.read_state().expect("read 1");
     let mid = CudaState::read_state_call_count();

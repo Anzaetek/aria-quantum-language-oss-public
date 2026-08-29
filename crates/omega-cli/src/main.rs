@@ -13,7 +13,6 @@ use omega_core::gradient::{
     GradMethod,
 };
 use omega_core::params::ParameterBinding;
-use omega_parser::lower_to_ir;
 
 mod qubo_mode;
 mod serialize;
@@ -67,7 +66,10 @@ fn flag_parse_list<T: std::str::FromStr>(
         .map(|s| match s.trim().parse() {
             Ok(v) => v,
             Err(_) => {
-                eprintln!("{flag} expects a comma-separated list of {what}; {:?} is not one.", s.trim());
+                eprintln!(
+                    "{flag} expects a comma-separated list of {what}; {:?} is not one.",
+                    s.trim()
+                );
                 std::process::exit(1);
             }
         })
@@ -80,6 +82,10 @@ fn print_usage() {
     eprintln!("Execution modes:");
     eprintln!("  (default)              Sample with 1024 shots");
     eprintln!("  --statevector          Exact statevector output");
+    eprintln!("  --dump-state-bits F    Write the analytic state as hex float bit");
+    eprintln!("                         patterns to F (needs an explicit --device;");
+    eprintln!("                         refuses every silent fallback). For the");
+    eprintln!("                         cross-device bit-equality protocol.");
     eprintln!("  --shots N              Sample N shots");
     eprintln!("  --expectation OBS      Compute <psi|O|psi> for observable OBS");
     eprintln!("  --gradient OBS         Compute d<O>/d(params) for observable OBS");
@@ -99,20 +105,41 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  --backend NAME         statevector (default), mps, pauli, photonics,");
     eprintln!("                         pauliprop (Pauli propagation; --expectation only).");
+    eprintln!("                         `auto` picks a backend that is EXACT for the");
+    eprintln!("                         circuit and says which: Clifford-only -> pauli,");
+    eprintln!("                         otherwise statevector if it fits. It never");
+    eprintln!("                         silently substitutes an approximate backend — a");
+    eprintln!("                         circuit that needs one is refused, with options.");
+    eprintln!("                         mps takes a bond dimension: mps:<chi> pins it,");
+    eprintln!("                         mps:auto[:ceiling] grows it as needed (ceiling");
+    eprintln!("                         defaults to 1024, which is ~33 MB per site at full");
+    eprintln!("                         chi — pin a smaller chi on a memory-tight host).");
+    eprintln!("                         Every mps run reports a truncation certificate and");
+    eprintln!("                         refuses rather than return a silently-truncated result.");
     eprintln!(
         "  --truncate C           pauliprop: drop coefficients below C. With any of these three,"
     );
     eprintln!(
         "  --max-weight W         the run reports `dropped_mass`, a BOUND on the error in <O>"
     );
-    eprintln!(
-        "  --max-freq F           (not an estimate). Without them the exact engine is used."
-    );
+    eprintln!("  --max-freq F           (not an estimate). Without them the exact engine is used.");
+    eprintln!("  --max-terms N          pauliprop: raise the Pauli-term ceiling (default 2^21 =",);
+    eprintln!("                         2097152). UNLIKE the three above this does NOT change the");
+    eprintln!("                         answer -- it permits a larger EXACT sum instead of");
+    eprintln!("                         discarding terms, so it costs memory, not accuracy.");
+    eprintln!("                         Reach for it first when a run is refused at the ceiling.");
     eprintln!("                         A name matching a loaded plugin resolves after the");
     eprintln!("                         compiled-in backends.");
     eprintln!("  --backend-dir DIR      Load backend plugins (.so/.dylib/.dll) from DIR");
     eprintln!("                         (repeatable; also OMEGA_BACKEND_DIR). Plugin loading");
     eprintln!("                         is opt-in; plugins run the default sample mode.");
+    eprintln!(
+        "  --qasm-dialect D       QASM2 reader for bare rxx/ryy/rzz (none are in qelib1):\n\
+         \x20                        legacy  (default) accepts rxx/rzz, refuses ryy — qiskit from_qasm_str\n\
+         \x20                        strict  refuses all three — qiskit qasm2.loads\n\
+         \x20                        lenient accepts all three (no qiskit reader does)\n\
+         \x20                        A file carrying its own `gate` definition is read in all three."
+    );
     eprintln!("  --list-backends        List compiled-in backends and loaded plugins, then exit");
     eprintln!("  --bridge NAME          Route execution through an external simulator");
     eprintln!("                         (qiskit, perceval). Only the default sample mode");
@@ -123,6 +150,16 @@ fn print_usage() {
     eprintln!("                         statevector backend's execute and --gradient");
     eprintln!("                         paths; falls back to cpu when the requested");
     eprintln!("                         device isn't compiled in or available");
+    eprintln!("  --multi-control MODE   decompose (default) | exact — how CCX/CSwap are");
+    eprintln!("                         realised on the CUDA and Metal statevector");
+    eprintln!("                         backends. `decompose` is a 15-gate Nielsen-Chuang");
+    eprintln!("                         chain, the same sequence on both so the two GPUs");
+    eprintln!("                         agree bit-for-bit. `exact` applies the permutation");
+    eprintln!("                         directly: faster and it removes 14 gates of f32");
+    eprintln!("                         rounding, but it CHANGES THE NUMBERS, so it is");
+    eprintln!("                         opt-in. See GATE-EXACTNESS.md. Every other path");
+    eprintln!("                         (CPU included) applies the permutation directly");
+    eprintln!("                         and says so when the mode is not honoured.");
     eprintln!("  --seed N               Random seed for sampling");
     eprintln!("  --params V0,V1,...     Bind free parameters (sorted by symbol ID)");
     eprintln!(
@@ -131,6 +168,10 @@ fn print_usage() {
     );
     eprintln!("  --input N0,N1,...      Input Fock state (photonics only)");
     eprintln!("  --format FMT           Output format: text (default), json, jsonl");
+    eprintln!("  --version, -V          Print the version and the git revision this");
+    eprintln!("                         binary was built from ('-dirty' if the tree");
+    eprintln!("                         had uncommitted changes). Also emitted under");
+    eprintln!("                         \"build\" in every --format json document.");
     eprintln!("  --noise JSON           Per-gate + readout noise model. Sampled on --backend");
     eprintln!(
         "                         statevector or mps; applied to --expectation on pauliprop."
@@ -214,19 +255,125 @@ fn parse_format(args: &[String]) -> Format {
 /// sites, so a user whose circuit needed a larger bond had no way to ask for
 /// one; after the truncation gate landed they got a refusal with no route to a
 /// correct answer.
-fn mps_backend_from(name: &str) -> Option<MpsBackend> {
-    match omega_backend_mps::select::parse_mps(name) {
-        Ok(Some(omega_backend_mps::select::MpsSelect::Fixed { chi })) => Some(MpsBackend::new(chi)),
+fn mps_backend_from(name: &str, device: Option<&str>) -> Option<MpsBackend> {
+    let backend = match omega_backend_mps::select::parse_mps(name) {
+        Ok(Some(omega_backend_mps::select::MpsSelect::Fixed { chi })) => MpsBackend::new(chi),
         Ok(Some(omega_backend_mps::select::MpsSelect::Auto { max_chi })) => {
-            Some(MpsBackend::new(max_chi).with_adaptive(omega_backend_mps::select::AUTO_EPS))
+            MpsBackend::new(max_chi).with_adaptive(omega_backend_mps::select::AUTO_EPS)
         }
         // A malformed selector never reaches here: it is refused earlier, in
         // `cmd_exec`, with the parser's own message. (An earlier version of this
         // comment claimed the caller's unknown-backend path showed that message.
         // It did not — the message was discarded and each mode invented its own,
         // including two that were simply false.)
-        _ => None,
+        _ => return None,
+    };
+    Some(apply_mps_device_hooks(backend, device))
+}
+
+/// Wire the MPS GPU hooks `aria-runtime` has wired since they landed —
+/// `omega-run` never did, so `--backend mps --device metal` silently ran the
+/// pure-CPU path and every MPS benchmark through this CLI measured one core
+/// (found via an external 31-qubit measurement: zero thread scaling, 17x
+/// behind Aer at bond 256).
+///
+/// Unlike `aria-runtime`, which applies hooks unconditionally when compiled
+/// in, this honours the CLI's EXPLICIT device semantics: the Metal two-site
+/// contraction is f32 above its bond threshold, so it changes the numbers,
+/// and a `--device cpu` run must stay exact-f64 — the same reasoning that
+/// makes `--dump-state-bits` refuse silent device changes. CUDA takes the
+/// native-f64 `gesvdj` SVD hook instead (precision unchanged), and wins the
+/// arm on a dual-vendor build for that reason.
+fn apply_mps_device_hooks(backend: MpsBackend, device: Option<&str>) -> MpsBackend {
+    let requested = device.and_then(|s| omega_core::device::DeviceKind::parse(s).ok());
+    let resolved = omega_core::device::DeviceKind::resolve(requested);
+    #[cfg(feature = "cuda")]
+    let backend = if matches!(resolved, omega_core::device::DeviceKind::Cuda) {
+        // stderr directly: this is a free function and `info` is a per-mode
+        // closure; a device notice belongs on the human channel in all modes.
+        eprintln!("Device: cuda (mps bond-compression SVD)");
+        backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat)
+    } else {
+        backend
+    };
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let backend = if matches!(resolved, omega_core::device::DeviceKind::Metal) {
+        eprintln!("Device: metal (mps two-site contraction, f32 above the bond threshold)");
+        backend.with_contract_fn(omega_backend_mps_metal::metal_contract_2q)
+    } else {
+        backend
+    };
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    let _ = resolved;
+    backend
+}
+
+/// The notice to print when `--multi-control` was passed but the run cannot
+/// honour it, or `None` when there is nothing to say.
+///
+/// # Why this exists
+///
+/// `with_multi_control` is implemented by exactly two backends —
+/// `CudaStatevectorBackend` (`omega-backend-statevector-cuda/src/lib.rs`) and
+/// `MetalStatevectorBackend` (`omega-backend-statevector-metal/src/lib.rs`).
+/// Every other path, CPU included, applies `CCX`/`CSwap` as a **direct subspace
+/// permutation** (`omega-backend-statevector/src/sim.rs` `apply_ccx` /
+/// `apply_cswap`). So the flag was parsed, validated, and then dropped on the
+/// floor by every other run, saying nothing.
+///
+/// Metal was CUDA-only until the octet-permutation kernel landed
+/// (`shaders/apply_octet_swap.metal`); this doc and the message text below were
+/// both written for that era and are updated here in the same change, because
+/// "the switch is CUDA-statevector only" becomes false the moment the Metal arm
+/// exists and nothing else would catch it.
+///
+/// `GATE-EXACTNESS.md` refused to put `multi_control` on `QuantumExecuteReq`
+/// precisely because it would be "inert, advertising a capability no code path
+/// can honour". The CLI had shipped exactly that.
+///
+/// # Why a notice and not a refusal
+///
+/// The two modes are NOT symmetric here, and the asymmetry is the whole design:
+///
+/// * `exact` off CUDA — the direct permutation IS what `exact` asks for. The
+///   caller gets the numbers they wanted by another route. Refusing would break
+///   scripts that pass the flag uniformly across devices for no numeric reason.
+/// * `decompose` off CUDA — the caller asked for the 15-gate Nielsen-Chuang
+///   chain and got the permutation instead. This is the case that can mislead:
+///   it is the DEFAULT value, so it is reached by anyone comparing a CPU run
+///   against a CUDA or Metal decomposed reference, and the numbers differ.
+///
+/// So the message says which of those happened rather than emitting one line for
+/// both. `--device` next to it takes the same shape — it falls back and says so
+/// (`"cuda fallback to cpu"`), rather than refusing.
+///
+/// `honoured` is the caller's `use_cuda_sv || use_metal_sv` (or the gradient
+/// pair), each of which is already false both when its feature is absent and
+/// when the resolved device or backend is something else. That makes this a
+/// RUNTIME check: `--device cpu` or `--backend mps` on a CUDA build discard the
+/// mode too, and a `cfg` would catch none of it.
+fn multi_control_notice(
+    requested: bool,
+    mode: omega_core::executor::MultiControlMode,
+    honoured: bool,
+) -> Option<String> {
+    use omega_core::executor::MultiControlMode as M;
+    if !requested || honoured {
+        return None;
     }
+    Some(match mode {
+        M::Exact => "--multi-control exact: not applicable to this run (the switch \
+                     applies to the CUDA and Metal statevector backends only). \
+                     CCX/CSwap are applied as a direct permutation here, which is \
+                     what 'exact' means, so the numbers are unaffected."
+            .to_string(),
+        M::Decompose => "--multi-control decompose: NOT honoured by this run (the \
+                         switch applies to the CUDA and Metal statevector backends \
+                         only). CCX/CSwap are applied as a direct permutation, not \
+                         the 15-gate chain, so these numbers will NOT match a CUDA \
+                         or Metal 'decompose' run."
+            .to_string(),
+    })
 }
 
 fn build_plugin_registry(explicit_dirs: &[String]) -> omega_core::plugin::BackendRegistry {
@@ -264,6 +411,17 @@ fn scan_backend_dirs(args: &[String]) -> Vec<String> {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    // Before the usage check: `--version` is a valid whole invocation, and a
+    // consumer scripting it should not have to also pass a circuit file.
+    if args.len() >= 2 && (args[1] == "--version" || args[1] == "-V") {
+        println!(
+            "omega-run {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            serialize::build_rev()
+        );
+        return;
+    }
 
     if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
         print_usage();
@@ -326,25 +484,46 @@ fn main() {
     let mut seed: Option<u64> = None;
     let mut input_state: Option<Vec<u32>> = None;
     let mut backend_name: Option<String> = None;
+    // Which QASM2 reader to imitate for `rxx`/`ryy`/`rzz`, none of which is in
+    // qelib1. Default matches Qiskit's legacy loader; see `Qasm2Dialect`.
+    let mut qasm_dialect = omega_parser::lower::Qasm2Dialect::default();
     let mut device_name: Option<String> = None;
     let mut observable_str: Option<String> = None;
     let mut gradient_str: Option<String> = None;
     let mut gradient_fn_str: Option<String> = None;
     let mut gradient_fn_shots: Option<u32> = None;
     let mut param_values: Option<Vec<f64>> = None;
+    // How CCX/CSwap are realised on backends that can choose. Default matches
+    // the previous behaviour exactly; see `MultiControlMode`.
+    let mut multi_control = omega_core::executor::MultiControlMode::default();
+    // Whether `--multi-control` was PASSED, as distinct from what it resolved to.
+    // Only an explicit request can be silently unhonoured, so only an explicit
+    // request earns a notice — see `note_multi_control_ignored`.
+    let mut multi_control_requested = false;
     let mut grad_method_name: Option<String> = None;
     let mut noise_json: Option<String> = None;
     let mut pp_truncate: Option<f64> = None;
     let mut pp_max_weight: Option<usize> = None;
+    let mut pp_max_terms: Option<usize> = None;
+    let mut pp_max_dropped: Option<f64> = None;
     let mut pp_max_freq: Option<u32> = None;
     let mut bridge_name: Option<String> = None;
     let mut backend_dirs: Vec<String> = Vec::new();
+    // Write the final statevector as HEX FLOAT BIT PATTERNS for the
+    // cross-device bit-equality protocol (PLAN-BITEQ-CUDA-METAL.md). A
+    // measurement artifact, so its guards are hard errors, never fallbacks.
+    let mut dump_state_bits: Option<String> = None;
 
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--shots" => {
-                shots = Some(flag_parse(&args, &mut i, "--shots", "a whole number of shots"));
+                shots = Some(flag_parse(
+                    &args,
+                    &mut i,
+                    "--shots",
+                    "a whole number of shots",
+                ));
             }
             "--statevector" | "--exact" => {
                 shots = None;
@@ -358,11 +537,45 @@ fn main() {
             "--backend-dir" => {
                 backend_dirs.push(flag_value(&args, &mut i, "--backend-dir"));
             }
+            "--qasm-dialect" => {
+                let v = flag_value(&args, &mut i, "--qasm-dialect");
+                qasm_dialect = match v.as_str() {
+                    "strict" => omega_parser::lower::Qasm2Dialect::Strict,
+                    "legacy" => omega_parser::lower::Qasm2Dialect::Legacy,
+                    "lenient" => omega_parser::lower::Qasm2Dialect::Lenient,
+                    other => {
+                        eprintln!(
+                            "unknown --qasm-dialect '{other}': expected `strict` \
+                             (qiskit qasm2.loads), `legacy` (qiskit \
+                             from_qasm_str, the default), or `lenient` (also \
+                             reads a bare `ryy`, which no qiskit reader does)"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+            }
             "--bridge" => {
                 bridge_name = Some(flag_value(&args, &mut i, "--bridge"));
             }
             "--device" => {
                 device_name = Some(flag_value(&args, &mut i, "--device"));
+            }
+            "--dump-state-bits" => {
+                dump_state_bits = Some(flag_value(&args, &mut i, "--dump-state-bits"));
+            }
+            "--multi-control" => {
+                let v = flag_value(&args, &mut i, "--multi-control");
+                multi_control = match omega_core::executor::MultiControlMode::parse(&v) {
+                    Some(m) => m,
+                    None => {
+                        eprintln!(
+                            "--multi-control: unknown mode {v:?} (expected \
+                             'decompose' or 'exact')"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                multi_control_requested = true;
             }
             "--input" => {
                 input_state = Some(flag_parse_list(&args, &mut i, "--input", "photon numbers"));
@@ -377,12 +590,20 @@ fn main() {
                 gradient_fn_str = Some(flag_value(&args, &mut i, "--gradient-of-fn"));
             }
             "--score-fn-shots" => {
-                gradient_fn_shots =
-                    Some(flag_parse(&args, &mut i, "--score-fn-shots", "a whole number of shots"));
+                gradient_fn_shots = Some(flag_parse(
+                    &args,
+                    &mut i,
+                    "--score-fn-shots",
+                    "a whole number of shots",
+                ));
             }
             "--params" => {
-                param_values =
-                    Some(flag_parse_list(&args, &mut i, "--params", "parameter values"));
+                param_values = Some(flag_parse_list(
+                    &args,
+                    &mut i,
+                    "--params",
+                    "parameter values",
+                ));
             }
             "--method" => {
                 grad_method_name = Some(flag_value(&args, &mut i, "--method"));
@@ -419,6 +640,37 @@ fn main() {
                     &mut i,
                     "--max-freq",
                     "a maximum split frequency",
+                ));
+            }
+            // The ceiling has ALWAYS been configurable — `PauliPropBackend`
+            // carries `max_terms: Option<usize>` and defaults it to
+            // `DEFAULT_MAX_TERMS` (2^21). Only the flag was missing, so the
+            // refusal read as a hardcoded wall: a bug report measured being
+            // turned away at ~80 MB of terms on a 314 GB host, three orders of
+            // magnitude below the machine, with no documented way up.
+            //
+            // Unlike the other three knobs this one does NOT change the answer.
+            // Raising it lets an EXACT run complete; the others buy completion
+            // by discarding terms and moving the value. That is why it is worth
+            // reaching for first, and why it carries no `dropped_mass` cost.
+            // The bound has always been computed; the CLI printed it to
+            // stderr as prose and gated nothing on it. Now it gates, and this
+            // is the override — for a caller deliberately sweeping cutoffs, who
+            // wants the loose rows the gate would otherwise refuse.
+            "--max-dropped-mass" => {
+                pp_max_dropped = Some(flag_parse(
+                    &args,
+                    &mut i,
+                    "--max-dropped-mass",
+                    "an L1 mass ceiling, e.g. 1.0, or `inf` to disable the gate",
+                ));
+            }
+            "--max-terms" => {
+                pp_max_terms = Some(flag_parse(
+                    &args,
+                    &mut i,
+                    "--max-terms",
+                    "a maximum Pauli-term count, e.g. 16777216",
                 ));
             }
             other => {
@@ -496,7 +748,7 @@ fn main() {
     let circuit = if let Some(ir) = prebuilt_circuit {
         ir
     } else {
-        match lower_to_ir(&source) {
+        match omega_parser::lower::lower_to_ir_with_dialect(&source, qasm_dialect) {
             Ok(c) => c,
             Err(e) => {
                 if bridge_name.is_some() {
@@ -511,6 +763,26 @@ fn main() {
             }
         }
     };
+
+    // `--dump-state-bits` is defined for the PLAIN run path only. The bridge,
+    // expectation and gradient modes return early, far above the dump guards —
+    // so without this check the flag was accepted, the mode ran, and NO file
+    // was written, leaving any stale artifact from a previous run in place for
+    // diff.py to compare as if fresh (found by review; the exact
+    // silent-artifact class the flag's hard errors exist to refuse).
+    if dump_state_bits.is_some()
+        && (bridge_name.is_some()
+            || observable_str.is_some()
+            || gradient_str.is_some()
+            || gradient_fn_str.is_some())
+    {
+        eprintln!(
+            "--dump-state-bits dumps the final statevector of a plain run; \
+             --bridge/--expectation/--gradient modes produce no state to dump. \
+             Drop the mode flag, or drop --dump-state-bits."
+        );
+        std::process::exit(1);
+    }
 
     let num_modes = circuit.num_qubits;
     // Width to RENDER a counts key at. Not always `num_qubits`: in collapse mode
@@ -575,12 +847,67 @@ fn main() {
     }
 
     // Select backend
-    let chosen = backend_name
-        .as_deref()
-        .unwrap_or(match circuit.circuit_type {
-            CircuitType::GateBased => "statevector",
-            CircuitType::Photonic => "photonics",
-        });
+    let default_backend = match circuit.circuit_type {
+        CircuitType::GateBased => "statevector",
+        CircuitType::Photonic => "photonics",
+    };
+    let chosen = backend_name.as_deref().unwrap_or(default_backend);
+
+    // `--backend auto`: pick a backend that is EXACT for this circuit, and say
+    // which. It will never silently substitute an approximate one.
+    //
+    // That restriction is the whole design. The obvious `auto` also falls back
+    // to MPS at a fixed bond dimension for wide circuits, which is an
+    // approximation chosen by a heuristic the user did not see — and MPS
+    // truncation is exactly the thing this workspace spends a certificate on
+    // reporting. An `auto` that can quietly hand back a truncated answer is
+    // worse than no `auto`, so a circuit that is neither Clifford nor small
+    // enough for a dense state is REFUSED with the options spelled out rather
+    // than approximated.
+    let chosen = if matches!(chosen, "auto") {
+        if circuit.circuit_type == CircuitType::Photonic {
+            info("auto: photonic circuit -> photonics".to_string());
+            "photonics"
+        } else if omega_core::circuit::is_clifford_only(&circuit) {
+            // Exact and polynomial. Worth saying out loud, because the same
+            // circuit on the statevector backend is exponential and a user
+            // watching the clock deserves to know why it got fast.
+            info(format!(
+                "auto: Clifford-only circuit -> pauli (exact, polynomial in the {} qubits)",
+                circuit.num_qubits
+            ));
+            "pauli"
+        } else if omega_backend_statevector::capacity::check(circuit.num_qubits, shots.is_some())
+            .is_ok()
+        {
+            info(format!(
+                "auto: non-Clifford, {} qubits fits in memory -> statevector (exact)",
+                circuit.num_qubits
+            ));
+            "statevector"
+        } else {
+            eprintln!("auto: this circuit is not Clifford, so the exact stabilizer");
+            eprintln!(
+                "      backend cannot run it, and a dense statevector of {} qubits",
+                circuit.num_qubits
+            );
+            eprintln!("      does not fit on this host.");
+            eprintln!();
+            eprintln!("`auto` will not silently pick an approximate backend. An MPS run");
+            eprintln!("at some guessed bond dimension may be accurate or may not, and");
+            eprintln!("making that choice for you is what this flag refuses to do.");
+            eprintln!("Pick one explicitly:");
+            eprintln!();
+            eprintln!("  --backend mps:<chi>   approximate; reports the discarded weight");
+            eprintln!("                        it cost you, and refuses past the ceiling");
+            eprintln!("  --backend mps:auto    grows the bond only as far as needed");
+            eprintln!("  --backend pauliprop   exact for expectation values on shallow");
+            eprintln!("                        non-Clifford circuits");
+            std::process::exit(1);
+        }
+    } else {
+        chosen
+    };
 
     // A MALFORMED mps selector is reported with the parser's own message, once,
     // before any mode dispatches.
@@ -605,15 +932,73 @@ fn main() {
 
     // --- Mode: --bridge dispatch through an external simulator ---
     if let Some(ref bridge_str) = bridge_name {
-        if observable_str.is_some()
-            || gradient_str.is_some()
-            || gradient_fn_str.is_some()
-            || shots.is_none()
-        {
+        // Expectation over a bridge. The transport already existed —
+        // `omega_bridges::expectation_qasm2`, used by the cross-check harness
+        // — but it was reachable only from Rust, so the CLI turned every
+        // `--bridge --expectation` away even for backends that implement it.
+        // That is the whole of CR §8's first sub-ask: routing, not protocol.
+        if let Some(obs_str) = observable_str.as_deref() {
+            if gradient_str.is_some() || gradient_fn_str.is_some() {
+                eprintln!("--bridge cannot combine --expectation with a gradient mode.");
+                std::process::exit(1);
+            }
+            let backend = omega_bridges::Backend::parse(bridge_str).unwrap_or_else(|e| {
+                eprintln!("Invalid --bridge value: {e}");
+                std::process::exit(1);
+            });
+            // A bridge hands the circuit to an EXTERNAL runner, which has its own
+            // gate realisations and no knowledge of this switch. `honoured` is
+            // therefore false here for a stronger reason than on the local paths:
+            // not "this build cannot", but "this process does not decide".
+            if let Some(m) = multi_control_notice(multi_control_requested, multi_control, false) {
+                info(m);
+            }
+            // The wire wants an LSB-first Pauli STRING of full width; the CLI
+            // parses a sparse `Z0 X2` form. Widen here rather than teach the
+            // wire a second encoding.
+            let observable = parse_observable(obs_str);
+            let n = circuit.num_qubits as usize;
+            let wire: omega_bridges::WireObservable = observable
+                .terms
+                .iter()
+                .map(|(coeff, paulis)| {
+                    let mut s = vec![b'I'; n];
+                    for (q, p) in paulis {
+                        let c = match p {
+                            omega_core::executor::PauliOp::I => b'I',
+                            omega_core::executor::PauliOp::X => b'X',
+                            omega_core::executor::PauliOp::Y => b'Y',
+                            omega_core::executor::PauliOp::Z => b'Z',
+                        };
+                        s[*q as usize] = c;
+                    }
+                    (String::from_utf8(s).expect("ascii"), *coeff)
+                })
+                .collect();
+            info(format!("Bridge: {backend:?} (expectation)"));
+            let values = omega_bridges::expectation_qasm2(backend, &source, &[wire])
+                .unwrap_or_else(|e| {
+                    eprintln!("Bridge error: {e}");
+                    std::process::exit(1);
+                });
+            let value = values.first().copied().unwrap_or_else(|| {
+                eprintln!("Bridge returned no value for the observable");
+                std::process::exit(1);
+            });
+            match format {
+                Format::Json | Format::Jsonl => {
+                    println!("{}", serialize::expectation_to_json(obs_str, value));
+                }
+                Format::Text => {
+                    println!("\n<O> = {value:.10}");
+                }
+            }
+            return;
+        }
+        if gradient_str.is_some() || gradient_fn_str.is_some() || shots.is_none() {
             eprintln!(
-                "--bridge supports only the default sampling mode \
-                 (--shots N or default 1024). Statevector, expectation, \
-                 and gradient modes require an in-process backend."
+                "--bridge supports sampling (--shots N) and --expectation. \
+                 Statevector and gradient modes require an in-process backend."
             );
             std::process::exit(1);
         }
@@ -654,10 +1039,8 @@ fn main() {
         } else {
             num_modes
         };
-        let mut counts_u64: std::collections::HashMap<
-            omega_core::outcome::Outcome,
-            u32,
-        > = std::collections::HashMap::new();
+        let mut counts_u64: std::collections::HashMap<omega_core::outcome::Outcome, u32> =
+            std::collections::HashMap::new();
         for (key, n) in &counts_str {
             // The bridge's own key length IS the width — it is already the
             // classical register's. Building an `Outcome` from it directly
@@ -688,7 +1071,12 @@ fn main() {
             }
             Format::Jsonl => {
                 if let omega_core::executor::ExecResult::Counts(counts) = &result {
-                    serialize::emit_jsonl_counts(counts, display_qubits, &CircuitType::GateBased);
+                    serialize::emit_jsonl_counts(
+                        counts,
+                        display_qubits,
+                        &CircuitType::GateBased,
+                        "bridge",
+                    );
                 }
             }
             Format::Text => {
@@ -743,7 +1131,7 @@ fn main() {
                 &method,
             ),
             m if omega_backend_mps::select::is_mps(m) => compute_functional_gradient(
-                &mps_backend_from(m).expect("is_mps implies parse_mps"),
+                &mps_backend_from(m, device_name.as_deref()).expect("is_mps implies parse_mps"),
                 &circuit,
                 &params,
                 &functional,
@@ -831,6 +1219,13 @@ fn main() {
         let use_cuda_grad = false;
         #[cfg(not(any(feature = "metal", feature = "cuda")))]
         let _ = resolved_device;
+        if let Some(m) = multi_control_notice(
+            multi_control_requested,
+            multi_control,
+            use_cuda_grad || use_metal_grad,
+        ) {
+            info(m);
+        }
 
         let grads = match chosen {
             "statevector" | "sv" => {
@@ -838,7 +1233,9 @@ fn main() {
                     #[cfg(feature = "cuda")]
                     {
                         info("Device: cuda".to_string());
-                        match omega_backend_statevector_cuda::CudaStatevectorBackend::new() {
+                        match omega_backend_statevector_cuda::CudaStatevectorBackend::new()
+                            .map(|b| b.with_multi_control(multi_control))
+                        {
                             Ok(b) => {
                                 match compute_gradient(&b, &circuit, &params, &observable, &method)
                                 {
@@ -877,7 +1274,9 @@ fn main() {
                     #[cfg(feature = "metal")]
                     {
                         info("Device: metal".to_string());
-                        match omega_backend_statevector_metal::MetalStatevectorBackend::new() {
+                        match omega_backend_statevector_metal::MetalStatevectorBackend::new()
+                            .map(|b| b.with_multi_control(multi_control))
+                        {
                             Ok(b) => {
                                 match compute_gradient(&b, &circuit, &params, &observable, &method)
                                 {
@@ -923,7 +1322,7 @@ fn main() {
                 }
             }
             m if omega_backend_mps::select::is_mps(m) => compute_gradient(
-                &mps_backend_from(m).expect("is_mps implies parse_mps"),
+                &mps_backend_from(m, device_name.as_deref()).expect("is_mps implies parse_mps"),
                 &circuit,
                 &params,
                 &observable,
@@ -981,6 +1380,20 @@ fn main() {
 
         info(format!("Observable: {}", obs_str));
 
+        // `honoured: false`, unconditionally and in EVERY build. Unlike the
+        // execute and gradient paths, this one has no CUDA dispatch at all —
+        // `chosen == "statevector"` goes straight to the CPU `StatevectorBackend`
+        // below, with no `--device` check on the way. So `--multi-control` can
+        // never apply here, not even on a `--features cuda` build with
+        // `--device cuda`, which is exactly the invocation a user would expect to
+        // honour it. Same shape as the `--device cuda` / MPS-SVD gap recorded in
+        // CUDA_TODO.md §0: a flag that reaches one dispatch path and not its
+        // neighbour. Caught by `multi_control_is_not_silently_dropped`, which
+        // failed against a first fix that instrumented only the other two.
+        if let Some(m) = multi_control_notice(multi_control_requested, multi_control, false) {
+            info(m);
+        }
+
         // Noise on an expectation value is exact only via the pauliprop
         // Heisenberg adjoint; statevector/mps expectations are analytic and
         // noiseless, so `--noise` there would be silently dropped — reject it.
@@ -994,13 +1407,18 @@ fn main() {
             std::process::exit(1);
         }
 
+        // Set by the pauliprop arm; carried into the JSON below so a machine
+        // consumer gets the error bound instead of having to scrape stderr.
+        let mut pp_cert: Option<omega_backend_pauliprop::PauliPropCertificate> = None;
         let val = match chosen {
             "statevector" | "sv" => {
                 StatevectorBackend::new().expectation(&circuit, &params, &observable)
             }
-            m if omega_backend_mps::select::is_mps(m) => mps_backend_from(m)
-                .expect("is_mps implies parse_mps")
-                .expectation(&circuit, &params, &observable),
+            m if omega_backend_mps::select::is_mps(m) => {
+                mps_backend_from(m, device_name.as_deref())
+                    .expect("is_mps implies parse_mps")
+                    .expectation(&circuit, &params, &observable)
+            }
             "pauliprop" | "pp" => {
                 let truncating =
                     pp_truncate.is_some() || pp_max_weight.is_some() || pp_max_freq.is_some();
@@ -1013,30 +1431,48 @@ fn main() {
                 } else {
                     PauliPropBackend::new()
                 };
+                // Applied AFTER the constructor, and outside the `truncating`
+                // branch, because raising the ceiling is not truncation: it
+                // does not enter `truncating`, does not produce `dropped_mass`,
+                // and must work on an otherwise-exact run — which is the whole
+                // point of it.
+                if let Some(mt) = pp_max_terms {
+                    backend = backend.with_max_terms(Some(mt));
+                }
+                if let Some(md) = pp_max_dropped {
+                    backend = backend.with_max_dropped_mass(Some(md));
+                }
                 if let Some(model) = &exp_noise {
                     backend = backend.with_noise(model.clone());
                 }
-                if truncating {
-                    // The dropped-mass budget is a GENUINE BOUND, not an
-                    // estimate: it is the L1 mass of the coefficients thrown
-                    // away, and |<P>| <= 1 for every Pauli string, so the error
-                    // in <O> is at most that mass. No gauge caveat — unlike the
-                    // MPS fidelity, which is labelled `~` for exactly that
-                    // reason. Printed whenever truncation is on, because a
-                    // truncated expectation without its budget is a number with
-                    // no error bar.
-                    match backend.expectation_with_budget(&circuit, &params, &observable) {
-                        Ok((v, budget)) => {
+                // The certificate is taken on EVERY pauliprop run, not only
+                // truncated ones. An exact run has a certificate too — it reads
+                // zero — and the report's acceptance says so explicitly: "an
+                // untruncated run reports it as 0". Emitting it only when
+                // truncating would leave a consumer unable to tell "exact" from
+                // "this build does not report it".
+                match backend.expectation_with_certificate(&circuit, &params, &observable) {
+                    Ok((v, cert)) => {
+                        if truncating {
+                            // The dropped-mass budget is a GENUINE BOUND, not
+                            // an estimate: |<P>| <= 1 for every Pauli string,
+                            // so the error in <O> is at most the discarded L1
+                            // mass. No gauge caveat — unlike the MPS fidelity,
+                            // which is labelled `~` for exactly that reason.
                             eprintln!(
-                                "pauliprop: dropped_mass={budget:.3e} \
-                                 (a bound on |Δ⟨O⟩|, not an estimate)"
+                                "pauliprop: dropped_mass={:.3e} of range {:.3e} \
+                                 (a bound on |Δ⟨O⟩|, not an estimate); \
+                                 terms final {} peak {}",
+                                cert.dropped_mass,
+                                cert.observable_range,
+                                cert.final_terms,
+                                cert.peak_terms,
                             );
-                            Ok(v)
                         }
-                        Err(e) => Err(e),
+                        pp_cert = Some(cert);
+                        Ok(v)
                     }
-                } else {
-                    backend.expectation(&circuit, &params, &observable)
+                    Err(e) => Err(e),
                 }
             }
             "photonics" => {
@@ -1057,7 +1493,11 @@ fn main() {
         });
 
         if format.is_machine() {
-            println!("{}", serialize::expectation_to_json(obs_str, val));
+            let mut doc = serialize::expectation_to_json(obs_str, val);
+            if let Some(cert) = &pp_cert {
+                doc = serialize::attach_pauliprop_certificate(doc, cert);
+            }
+            println!("{doc}");
         } else {
             println!("\n<O> = {:.10}", val);
         }
@@ -1116,6 +1556,38 @@ fn main() {
         std::process::exit(1);
     }
 
+    // `--dump-state-bits` guards, all hard errors (PLAN-BITEQ-CUDA-METAL.md
+    // H1). The artifact claims "this device, this mode, these bits", so
+    // anything that could quietly change which device ran — OMEGA_DEVICE,
+    // a feature-gated arm compiled out, the graceful CPU fallback in the
+    // dispatch arms below — must refuse instead of falling back.
+    // (`--noise` needs no guard here: `--noise` without shots is already
+    // refused above, and the dump requires the analytic path.)
+    if dump_state_bits.is_some() {
+        if shots.is_some() {
+            eprintln!(
+                "--dump-state-bits needs the analytic state (--statevector); \
+                 sampled counts have no amplitudes to dump. Drop --shots."
+            );
+            std::process::exit(1);
+        }
+        if !matches!(chosen, "statevector" | "sv") {
+            eprintln!(
+                "--dump-state-bits is defined for the statevector backends only \
+                 (got '{chosen}')."
+            );
+            std::process::exit(1);
+        }
+        if device_name.is_none() {
+            eprintln!(
+                "--dump-state-bits requires an EXPLICIT --device (cpu, metal, \
+                 cuda, opencl). The artifact names the device it came from, so \
+                 the device cannot be left to OMEGA_DEVICE or a default."
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Resolve the compute device requested via `--device`.
     // Honours OMEGA_DEVICE if --device wasn't passed; falls back to CPU
     // with a single stderr notice when the requested device isn't
@@ -1153,6 +1625,64 @@ fn main() {
     let use_opencl_sv = false;
     #[cfg(not(any(feature = "metal", feature = "cuda", feature = "opencl")))]
     let _ = resolved_device;
+    // Whether the statevector run will ACTUALLY dispatch to the device the
+    // caller named. `DeviceKind::resolve` falls back to CPU with only a
+    // stderr notice when the feature is not compiled in, so `use_*_sv` is
+    // simply false and NO error ever fires for the arms' own fallback guard
+    // to catch — the decision has to be read here, not inferred from errors.
+    let sv_path = matches!(chosen, "statevector" | "sv");
+    let dispatches_to_requested = {
+        use omega_core::device::DeviceKind as D;
+        match requested_device {
+            Some(D::Metal) => use_metal_sv,
+            Some(D::Cuda) => use_cuda_sv,
+            Some(D::OpenCl) => use_opencl_sv,
+            Some(D::Cpu) | None => true,
+        }
+    };
+
+    // **An EXPLICIT `--device` that cannot be honoured is an error, not a
+    // downgrade.** Reported from two GPU hosts: `--device cuda` above 28
+    // qubits ran silently on the CPU and produced *plausible* numbers that
+    // supported a confident wrong conclusion about GPU performance — a whole
+    // benchmark lane was published and retracted because a silent device
+    // substitution does not look like missing data, it looks like data.
+    //
+    // Scoped deliberately: only when the flag was PASSED (not `OMEGA_DEVICE`,
+    // not the default), and only on the statevector path, which is the one
+    // these arms select. Automatic selection keeps falling back with its
+    // notice, because there the caller expressed no expectation to violate.
+    if device_name.is_some() && sv_path && !dispatches_to_requested {
+        eprintln!(
+            "--device {} was requested but this binary cannot dispatch to it \
+             (feature not compiled in). Refusing rather than running on the CPU \
+             and reporting a device result: rebuild with --features {}, or drop \
+             --device to let the run fall back deliberately.",
+            requested_device.map(|d| d.name()).unwrap_or("?"),
+            requested_device.map(|d| d.name()).unwrap_or("?"),
+        );
+        std::process::exit(1);
+    }
+    if dump_state_bits.is_some() && !dispatches_to_requested {
+        eprintln!(
+            "--dump-state-bits: --device {} was requested but this binary \
+             will not dispatch to it (feature not compiled in). Refusing to \
+             write an artifact that would silently describe the CPU.",
+            requested_device.map(|d| d.name()).unwrap_or("?"),
+        );
+        std::process::exit(1);
+    }
+    // Which arm ACTUALLY ran — the artifact's `backend` field and hex width
+    // derive from this, never from what was requested.
+    #[allow(unused_mut)]
+    let mut executed_arm: &str = "cpu-f64";
+    if let Some(m) = multi_control_notice(
+        multi_control_requested,
+        multi_control,
+        use_cuda_sv || use_metal_sv,
+    ) {
+        info(m);
+    }
 
     // For circuits with mid-circuit measurement under Collapse mode, the
     // executor returns one trajectory per call. To get a faithful shot
@@ -1160,6 +1690,10 @@ fn main() {
     // seeds and aggregate the counts. Done in the CLI rather than the
     // backend so the analytic Skip path stays a single execute(); only
     // conditional / mid-measure circuits pay the N× cost.
+    // The MPS truncation certificate, captured from whichever dispatch arm
+    // produces it so the JSON/JSONL paths can carry it as data rather than
+    // leaving it only in a stderr line a machine consumer cannot use.
+    let mut mps_run_stats: Option<omega_backend_mps::MpsRunStats> = None;
     let result = if let (true, "statevector" | "sv", None, Some(n_shots)) =
         (needs_collapse, chosen, &noise_model, shots)
     {
@@ -1202,17 +1736,43 @@ fn main() {
                     {
                         info("Device: cuda".to_string());
                         let cuda_result =
-                            match omega_backend_statevector_cuda::CudaStatevectorBackend::new() {
+                            match omega_backend_statevector_cuda::CudaStatevectorBackend::new()
+                                .map(|b| b.with_multi_control(multi_control))
+                            {
                                 Ok(b) => b.execute(&circuit, &params, &config),
                                 Err(e) => Err(omega_core::error::OmegaError::Backend(format!(
                                     "cuda unavailable: {e}"
                                 ))),
                             };
                         match cuda_result {
-                            Ok(r) => Ok(r),
+                            Ok(r) => {
+                                executed_arm = "cuda-f32";
+                                Ok(r)
+                            }
                             // Same graceful fallback semantics as Metal.
                             Err(omega_core::error::OmegaError::Unsupported(msg))
                             | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                if dump_state_bits.is_some() {
+                                    eprintln!(
+                                        "--dump-state-bits: cuda was requested but \
+                                         execution fell back to cpu ({msg}); a \
+                                         bit-dump must come from the device it names."
+                                    );
+                                    std::process::exit(1);
+                                }
+                                // Explicit --device: refuse, never substitute.
+                                // See the dispatch guard above for why a silent
+                                // CPU result is worse than no result.
+                                if device_name.is_some() {
+                                    eprintln!(
+                                        "--device cuda was requested but the run \
+                                         could not use it: {msg}. Refusing rather \
+                                         than returning a CPU result labelled as a \
+                                         device run. Drop --device to fall back \
+                                         deliberately."
+                                    );
+                                    std::process::exit(1);
+                                }
                                 info(format!("cuda fallback to cpu: {msg}"));
                                 StatevectorBackend::new().execute(&circuit, &params, &config)
                             }
@@ -1236,10 +1796,34 @@ fn main() {
                                 ))),
                             };
                         match opencl_result {
-                            Ok(r) => Ok(r),
+                            Ok(r) => {
+                                executed_arm = "opencl-f32";
+                                Ok(r)
+                            }
                             // Same graceful fallback as Metal / CUDA.
                             Err(omega_core::error::OmegaError::Unsupported(msg))
                             | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                if dump_state_bits.is_some() {
+                                    eprintln!(
+                                        "--dump-state-bits: opencl was requested but \
+                                         execution fell back to cpu ({msg}); a \
+                                         bit-dump must come from the device it names."
+                                    );
+                                    std::process::exit(1);
+                                }
+                                // Explicit --device: refuse, never substitute.
+                                // See the dispatch guard above for why a silent
+                                // CPU result is worse than no result.
+                                if device_name.is_some() {
+                                    eprintln!(
+                                        "--device opencl was requested but the run \
+                                         could not use it: {msg}. Refusing rather \
+                                         than returning a CPU result labelled as a \
+                                         device run. Drop --device to fall back \
+                                         deliberately."
+                                    );
+                                    std::process::exit(1);
+                                }
                                 info(format!("opencl fallback to cpu: {msg}"));
                                 StatevectorBackend::new().execute(&circuit, &params, &config)
                             }
@@ -1255,14 +1839,19 @@ fn main() {
                     {
                         info("Device: metal".to_string());
                         let metal_result =
-                            match omega_backend_statevector_metal::MetalStatevectorBackend::new() {
+                            match omega_backend_statevector_metal::MetalStatevectorBackend::new()
+                                .map(|b| b.with_multi_control(multi_control))
+                            {
                                 Ok(b) => b.execute(&circuit, &params, &config),
                                 Err(e) => Err(omega_core::error::OmegaError::Backend(format!(
                                     "metal unavailable: {e}"
                                 ))),
                             };
                         match metal_result {
-                            Ok(r) => Ok(r),
+                            Ok(r) => {
+                                executed_arm = "metal-f32";
+                                Ok(r)
+                            }
                             // Graceful fallback: when metal rejects a feature it
                             // doesn't implement yet (CCX/CSwap, Reset, mid-circuit
                             // measurement) or the device isn't usable, drop down
@@ -1271,6 +1860,27 @@ fn main() {
                             // drown in fallback noise.
                             Err(omega_core::error::OmegaError::Unsupported(msg))
                             | Err(omega_core::error::OmegaError::Backend(msg)) => {
+                                if dump_state_bits.is_some() {
+                                    eprintln!(
+                                        "--dump-state-bits: metal was requested but \
+                                         execution fell back to cpu ({msg}); a \
+                                         bit-dump must come from the device it names."
+                                    );
+                                    std::process::exit(1);
+                                }
+                                // Explicit --device: refuse, never substitute.
+                                // See the dispatch guard above for why a silent
+                                // CPU result is worse than no result.
+                                if device_name.is_some() {
+                                    eprintln!(
+                                        "--device metal was requested but the run \
+                                         could not use it: {msg}. Refusing rather \
+                                         than returning a CPU result labelled as a \
+                                         device run. Drop --device to fall back \
+                                         deliberately."
+                                    );
+                                    std::process::exit(1);
+                                }
                                 info(format!("metal fallback to cpu: {msg}"));
                                 StatevectorBackend::new().execute(&circuit, &params, &config)
                             }
@@ -1291,19 +1901,36 @@ fn main() {
                     omega_backend_mps::NoisyMpsBackend::with_model(
                         match omega_backend_mps::select::parse_mps(chosen) {
                             Ok(Some(omega_backend_mps::select::MpsSelect::Fixed { chi })) => chi,
-                            Ok(Some(omega_backend_mps::select::MpsSelect::Auto { max_chi })) => max_chi,
+                            Ok(Some(omega_backend_mps::select::MpsSelect::Auto { max_chi })) => {
+                                max_chi
+                            }
                             _ => omega_backend_mps::select::DEFAULT_CHI,
                         },
                         model.clone(),
                     )
-                        .execute(&circuit, &params, &config)
+                    .execute(&circuit, &params, &config)
                 } else {
                     // Hold the concrete backend so its truncation certificate
                     // can be reported to stderr (stdout/exit unchanged — K14).
-                    let backend = mps_backend_from(chosen)
+                    executed_arm = "mps-cpu";
+                    #[cfg(feature = "cuda")]
+                    if matches!(resolved_device, omega_core::device::DeviceKind::Cuda) {
+                        executed_arm = "mps-cpu+cuda-svd-hook";
+                    }
+                    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+                    if matches!(resolved_device, omega_core::device::DeviceKind::Metal) {
+                        executed_arm = "mps-cpu+metal-contract-hook";
+                    }
+                    let backend = mps_backend_from(chosen, device_name.as_deref())
                         .expect("dispatch arm is guarded by is_mps");
                     let r = backend.execute(&circuit, &params, &config);
                     let stats = backend.last_run_stats();
+                    // Keep the certificate for the machine-readable path too.
+                    // Reporting it only on stderr meant a JSON consumer had to
+                    // scrape log text to find out whether the number it was
+                    // handed had been truncated — the certificate exists
+                    // precisely so that question has an answer.
+                    mps_run_stats = Some(stats);
                     // Report REAL truncation only; a ~1e-28 rounding tail isn't
                     // worth a line (1e-12 floor sits above it, below real loss).
                     if stats.discarded_weight > 1e-12 {
@@ -1320,9 +1947,7 @@ fn main() {
                         eprintln!(
                             "mps: fidelity~{:.4} (estimate, not a bound) \
                              discarded_weight={:.3e} max_bond_reached={}",
-                            stats.fidelity_estimate,
-                            stats.discarded_weight,
-                            stats.max_bond_reached
+                            stats.fidelity_estimate, stats.discarded_weight, stats.max_bond_reached
                         );
                     }
                     r
@@ -1394,24 +2019,83 @@ fn main() {
         std::process::exit(1);
     });
 
+    if let Some(path) = &dump_state_bits {
+        let omega_core::executor::ExecResult::Statevector(amps) = &result else {
+            eprintln!(
+                "--dump-state-bits: the run produced no statevector; nothing \
+                 faithful to dump."
+            );
+            std::process::exit(1);
+        };
+        let mc = match multi_control {
+            omega_core::executor::MultiControlMode::Decompose => "decompose",
+            omega_core::executor::MultiControlMode::Exact => "exact",
+        };
+        // The exact OS build, because the verdict is scoped to a compiler
+        // pair (PLAN-BITEQ H6): Metal shaders compile at runtime, so the OS
+        // version IS part of the measurement's identity.
+        let os_version = std::process::Command::new("uname")
+            .arg("-rv")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let circuit_name = std::path::Path::new(file_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file_path.clone());
+        match serialize::state_bits_to_json(&circuit_name, executed_arm, mc, &os_version, amps) {
+            Ok(doc) => {
+                if let Err(e) = std::fs::write(path, format!("{doc}\n")) {
+                    eprintln!("--dump-state-bits: cannot write {path}: {e}");
+                    std::process::exit(1);
+                }
+                info(format!(
+                    "state bits ({executed_arm}, {mc}) written to {path}"
+                ));
+            }
+            Err(e) => {
+                eprintln!("--dump-state-bits: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     match format {
         Format::Json => {
-            let v = serialize::exec_result_to_json(
+            let mut v = serialize::exec_result_to_json(
                 &result,
                 counts_display_width,
                 shots,
                 &circuit.circuit_type,
             );
+            if let Some(stats) = &mps_run_stats {
+                v = serialize::attach_mps_certificate(v, stats);
+            }
+            v = serialize::attach_execution_identity(v, executed_arm, rayon::current_num_threads());
             println!("{}", v);
         }
         Format::Jsonl => match &result {
             omega_core::executor::ExecResult::Counts(counts) => {
-                serialize::emit_jsonl_counts(counts, counts_display_width, &circuit.circuit_type);
+                serialize::emit_jsonl_counts(
+                    counts,
+                    counts_display_width,
+                    &circuit.circuit_type,
+                    executed_arm,
+                );
             }
             other => {
                 // Non-counts results don't decompose into per-shot lines; emit a single JSON doc.
-                let v =
+                let mut v =
                     serialize::exec_result_to_json(other, num_modes, shots, &circuit.circuit_type);
+                if let Some(stats) = &mps_run_stats {
+                    v = serialize::attach_mps_certificate(v, stats);
+                }
+                v = serialize::attach_execution_identity(
+                    v,
+                    executed_arm,
+                    rayon::current_num_threads(),
+                );
                 println!("{}", v);
             }
         },

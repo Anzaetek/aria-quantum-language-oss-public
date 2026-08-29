@@ -62,13 +62,29 @@ fn a_seventy_bit_creg_with_two_measured_bits_runs() {
     let src = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[4];\ncreg c[70];\n\
                h q[0];\ncx q[0], q[1];\nmeasure q[0] -> c[0];\nmeasure q[1] -> c[1];\n";
     let c = counts(src, MidCircuitMode::Collapse);
+    // Inspected BIT BY BIT rather than through `as_u64()`. The key is 70 bits
+    // wide now that the width follows the declared register (matching qiskit),
+    // and `as_u64()` reports `None` above 64 regardless of the value — so using
+    // it here would be the test making the same "declared width == information
+    // content" conflation the code was just fixed for.
     let bad: Vec<String> = c
         .keys()
-        .filter(|o| o.as_u64().unwrap_or(u64::MAX) != 0 && o.as_u64() != Some(0b11))
+        .filter(|o| {
+            let low = (o.bit(0), o.bit(1));
+            let high_set = (2..o.width()).any(|i| o.bit(i) == 1);
+            high_set || !(low == (0, 0) || low == (1, 1))
+        })
         .map(|o| o.to_bitstring())
         .collect();
-    assert!(bad.is_empty(), "Bell pair keyed on a wide creg gave {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "Bell pair keyed on a wide creg gave {bad:?}"
+    );
     assert_eq!(c.values().sum::<u32>(), 200);
+    // The key width follows the DECLARED register, as qiskit does.
+    for o in c.keys() {
+        assert_eq!(o.width(), 70, "a creg c[70] keys 70 bits wide");
+    }
 }
 
 /// **The guarded branch.** `if (c == 1)` over a 70-bit register.
@@ -82,16 +98,21 @@ fn a_condition_over_a_wide_creg_neither_panics_nor_wraps() {
                h q[0];\nmeasure q[0] -> c[0];\nif(c==1) x q[3];\n\
                measure q[3] -> c[1];\n";
     let c = counts(src, MidCircuitMode::Collapse);
+    // Bit by bit, for the reason given in the test above: the key is 70 bits.
     let bad: Vec<String> = c
         .keys()
-        .filter(|o| o.as_u64().unwrap_or(u64::MAX) != 0 && o.as_u64() != Some(0b11))
+        .filter(|o| {
+            let low = (o.bit(0), o.bit(1));
+            let high_set = (2..o.width()).any(|i| o.bit(i) == 1);
+            high_set || !(low == (0, 0) || low == (1, 1))
+        })
         .map(|o| o.to_bitstring())
         .collect();
     assert!(
         bad.is_empty(),
         "q3 must equal q0 in every shot (the guard copies it), got keys {bad:?} \
-         — a key of 0b01 means the guard fired when it should not have, or the \
-         reverse"
+         — a key with bit1 != bit0 means the guard fired when it should not \
+         have, or the reverse"
     );
     assert_eq!(c.len(), 2, "both branches must occur over 200 shots: {c:?}");
 }

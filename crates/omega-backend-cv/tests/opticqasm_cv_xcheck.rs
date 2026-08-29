@@ -138,10 +138,17 @@ fn to_opticqasm_source(ops: &[serde_json::Value]) -> Option<String> {
 ///
 /// Preparation conventions match `piquasso_xcheck.rs::build` exactly, and they
 /// are not arbitrary: on a pristine vacuum both `squeeze` and `displace` use the
-/// **constructors**, which carry an exact analytic tail, while `displace` on a
-/// state with structure uses the operator. Diverging from that here would make
+/// **constructors**, which carry an exact analytic tail, and on a state with
+/// structure both use the **operators**. Diverging from that here would make
 /// this test disagree with its sibling for reasons having nothing to do with
 /// OPTICQASM.
+///
+/// The two must be kept in step by hand, and they briefly were not: when
+/// `squeeze` gained an operator form the sibling was updated and this was not,
+/// so five corpus cases fell out of THIS lane's comparison. Nothing was wrong
+/// with the answer — the cases were simply no longer being checked, which is
+/// the failure the skip assertion at the bottom of this file exists to catch,
+/// and it caught it.
 fn execute(program: &omega_parser::CvProgram, cutoff: usize) -> Result<FockState, String> {
     let mut state: Option<FockState> = None;
     let mut pristine = true;
@@ -149,13 +156,28 @@ fn execute(program: &omega_parser::CvProgram, cutoff: usize) -> Result<FockState
     for (i, op) in program.ops.iter().enumerate() {
         match *op {
             CvOp::Squeeze { r, phi, .. } => {
-                if !pristine {
-                    return Err(format!("op {i}: squeeze after preparation"));
-                }
+                // `phi != 0` is still refused, and by BOTH forms: neither the
+                // constructor nor the operator implements a phased squeeze, and
+                // the operator refuses it in its signature rather than at
+                // runtime. Silently dropping the phase would make this lane
+                // disagree with piquasso for a reason that looks like a
+                // numerical bug.
                 if phi != 0.0 {
-                    return Err(format!("op {i}: squeezed_vacuum takes only r"));
+                    return Err(format!("op {i}: squeeze takes only real r here"));
                 }
-                state = Some(FockState::squeezed_vacuum(r, cutoff).map_err(|e| e.to_string())?);
+                match state.as_mut() {
+                    // Pristine vacuum: CONSTRUCTOR, for its exact analytic tail.
+                    None => {
+                        state =
+                            Some(FockState::squeezed_vacuum(r, cutoff).map_err(|e| e.to_string())?)
+                    }
+                    Some(_) if pristine => {
+                        state =
+                            Some(FockState::squeezed_vacuum(r, cutoff).map_err(|e| e.to_string())?)
+                    }
+                    // Anything with structure: OPERATOR.
+                    Some(st) => st.squeeze(r).map_err(|e| e.to_string())?,
+                }
                 pristine = false;
             }
             CvOp::Displace { re, im, .. } => {

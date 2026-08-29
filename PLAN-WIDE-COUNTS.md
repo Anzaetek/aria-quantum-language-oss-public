@@ -1,10 +1,20 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # PLAN — counts keys wider than 64 qubits
 
-**Status: PLAN. Not implemented, and NOT fully reviewed** — the adversarial
-review of this document was cut short by a session limit before it reported. Its
-one parting note (the plugin protocol) turned out to be a real gap and is folded
-in below; the rest of the plan has not had a second pair of eyes.
+**Status: IMPLEMENTED (verified 2026-08-16).** `ExecResult::Counts` is keyed by
+`Outcome`, which carries as many words as the register needs, and
+`crates/omega-cli/tests/counts_width_boundary.rs` pins 63/64/65/128/256/1024
+qubits on both `mps` and `pauli`, asserting key *contents* rather than counts.
+The four feature-gated backends the migration initially missed were fixed in a
+follow-up — this document's own warning, that "`from_str_radix` still funnels
+through `u64` … the conversion sites are where the defect will survive if it
+survives anywhere", named that class correctly in advance.
+
+The header below said "PLAN. Not implemented" for some time after it shipped.
+
+*Original caveat, kept for provenance:* the adversarial review of this document
+was cut short by a session limit before it reported. Its one parting note (the
+plugin protocol) turned out to be a real gap and is folded in below.
 
 ## Why now
 

@@ -26,6 +26,13 @@ error rather than calling into a library that may have a different struct
 layout. An unversioned library is rejected too — silently loading one is how a
 plugin ABI turns into undefined behaviour.
 
+### ABI history
+
+| version | change |
+|---|---|
+| 2 | **Removed `BackendCaps::opt_in_cpu_fallback`.** It was declared, set by the reference plugin, and read by nothing. Honouring it was rejected rather than merely unimplemented: `cpu_fallback` substitutes a *different engine's* result for the requested one, `ExecResult` has no provenance field to record that, and the same struct declares `kind` and `noise` — so a hardware or noisy plugin's results could have been replaced by the built-in ideal CPU statevector with no diagnostic. A plugin built against v1 is refused with a version error; rebuild against v2 by deleting that field from your `BackendCaps` initialiser. |
+| 1 | initial ABI |
+
 The vtable supplies:
 
 | entry | purpose |

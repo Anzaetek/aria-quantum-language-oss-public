@@ -68,7 +68,9 @@ fn build(n: usize, chi: usize, depth: usize, seed: u64) -> Mps {
     let mut m = Mps::zero_state(n, chi);
     let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     let mut next = || {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((x >> 33) as f64 / (1u64 << 31) as f64) * std::f64::consts::TAU
     };
     for _ in 0..depth {

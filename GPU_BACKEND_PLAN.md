@@ -55,9 +55,9 @@
 >    by `expectation_matches_cpu_pauli_string` (was off by ~0.5, now ≤1e-5) and
 >    added a Metal mirror. The full statevector-CUDA suite is now CI-gated.
 
-> **Status (2026-08-05): `Reset` was WRONG everywhere — corrected; Metal
-> PENDING.** This supersedes item 3 above, which described the amplitude
-> *fold* as the intended semantics. It is not. `reset q` is the non-unitary
+> **Status (2026-08-05, Metal closed 2026-08-16): `Reset` was WRONG everywhere
+> — corrected on every backend, Metal included.** This supersedes item 3 above,
+> which described the amplitude *fold* as the intended semantics. It is not. `reset q` is the non-unitary
 > channel `ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ)`: the qubit is discarded and any
 > entanglement it had is **destroyed**, not transferred.
 >
@@ -96,16 +96,17 @@
 >
 > **Open items — do not close this section until both are done:**
 >
-> 1. ⚠️ **Metal statevector `Reset` is still the old fold — PENDING.** It could
->    not be ported here: the crate is macOS-gated, so it cannot be compiled or
->    run off a Mac, and this plan has already been burned once by landing
->    unverified Metal code (`f11a9f5` found 2/70 failing on the M4). On the Mac
->    box, mirror the CUDA change in
->    `omega-backend-statevector-metal/src/lib.rs`: `reset_p0` from `⟨Z_q⟩`, the
->    fused `apply_1q` for project+renormalise+X, a `reset_rng` parameter through
->    `apply_ops_fused`, and per-shot trajectories in `execute`. `reset_matches_cpu`
->    **will fail** under `ARIA_METAL=1` until then — that failure is correct and
->    is the signal this item is outstanding. Tracked in `LIMITATIONS.md`.
+> 1. ✅ **Metal statevector `Reset` — DONE.** The port landed on the Mac box and
+>    was re-verified 2026-08-16: `reset_matches_cpu` passes and the whole Metal
+>    suite is 81/81 green under `ARIA_METAL=1`.
+>
+>    This item said `reset_matches_cpu` "**will fail** … that failure is correct
+>    and is the signal this item is outstanding". The signal was right and the
+>    close-out never happened, so the marker outlived the defect by some margin
+>    — in `LIMITATIONS.md` too, where it told users to treat correct Metal
+>    results as wrong. Worth noting as a process point: this plan gave the
+>    failing test as the tracking mechanism but nothing re-read it once it went
+>    green.
 > 2. **Validate the reset mechanism in Lean 4 — deferred, not scheduled.**
 >    Prove that sample→project→flip implements `ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ)`, i.e.
 >    that averaging the two branches weighted by their Born probabilities gives

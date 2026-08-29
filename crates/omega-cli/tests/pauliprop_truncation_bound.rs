@@ -41,6 +41,8 @@ use omega_core::executor::{Observable, PauliOp};
 use omega_core::params::ParameterBinding;
 use std::path::PathBuf;
 
+mod common;
+
 fn runner_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -48,7 +50,9 @@ fn runner_dir() -> PathBuf {
         .join("python")
 }
 fn venv_python() -> PathBuf {
-    runner_dir().join(".venv-qiskit").join("bin").join("python")
+    // Shared resolver: honours ARIA_QISKIT_PY and both venv locations. See
+    // `common` for why a bridge-local-only lookup is a silent-skip hazard.
+    common::venv_python("qiskit")
 }
 fn force_env() {
     std::env::set_var(
@@ -113,13 +117,19 @@ fn dropped_mass_bounds_the_truncation_error() {
         "coeff_min", "E_truncated", "|E - exact|", "dropped_mass", "slack"
     );
     for coeff_min in sweep {
-        let backend = PauliPropBackend::with_truncation(coeff_min, None);
+        // A bound-verification sweep: the point is to check the budget
+        // BOUNDS the error, so vacuous rows are the evidence and the
+        // informativeness gate is lifted explicitly.
+        let backend = PauliPropBackend::with_truncation(coeff_min, None)
+            .with_max_dropped_mass(Some(f64::INFINITY));
         let (val, dropped) = backend
             .expectation_with_budget(&ir, &ParameterBinding::new(), &obs)
             .expect("pauliprop");
         let err = (val - exact).abs();
         let slack = dropped - err;
-        eprintln!("  {coeff_min:>10.0e}  {val:>14.9}  {err:>12.3e}  {dropped:>12.3e}  {slack:>10.3e}");
+        eprintln!(
+            "  {coeff_min:>10.0e}  {val:>14.9}  {err:>12.3e}  {dropped:>12.3e}  {slack:>10.3e}"
+        );
 
         assert!(
             err <= dropped + 1e-12,
@@ -147,8 +157,10 @@ fn dropped_mass_bounds_the_truncation_error() {
          more.",
         sweep.len()
     );
-    eprintln!("  {fired} of {} sweep points truncated; tightest slack {worst_slack:.3e}",
-              sweep.len());
+    eprintln!(
+        "  {fired} of {} sweep points truncated; tightest slack {worst_slack:.3e}",
+        sweep.len()
+    );
 }
 
 /// The bound must be reachable, not absurdly loose.
@@ -168,11 +180,17 @@ fn the_bound_is_informative_not_merely_true() {
     let (obs, wire) = observable();
     let exact = expectation_qasm2(Backend::Qiskit, QASM, &[wire]).expect("qiskit")[0];
 
+    // Deliberately extreme (0.7 floor) to force a large budget; the value is
+    // checked against `exact`, not quoted, so the gate is lifted.
     let (val, dropped) = PauliPropBackend::with_truncation(0.7, None)
+        .with_max_dropped_mass(Some(f64::INFINITY))
         .expectation_with_budget(&ir, &ParameterBinding::new(), &obs)
         .expect("pauliprop");
     let err = (val - exact).abs();
-    assert!(dropped > 1e-9, "no mass dropped at coeff_min = 0.7: {dropped:e}");
+    assert!(
+        dropped > 1e-9,
+        "no mass dropped at coeff_min = 0.7: {dropped:e}"
+    );
     assert!(
         dropped < 1e4,
         "dropped_mass = {dropped:e} is so large it bounds nothing useful"

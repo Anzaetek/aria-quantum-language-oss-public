@@ -54,7 +54,11 @@ circuit C {
         .iter()
         .filter(|op| format!("{:?}", op.gate) == "CRz")
         .collect();
-    assert_eq!(crz.len(), 1, "exactly one CRz should come back from:\n{qasm}");
+    assert_eq!(
+        crz.len(),
+        1,
+        "exactly one CRz should come back from:\n{qasm}"
+    );
 }
 
 /// **CRZ must NOT be lowered as CP.** They differ by a relative phase on the

@@ -72,7 +72,7 @@ pub fn metal_branch(
     max_freq: Option<u32>,
     n: usize,
 ) -> bool {
-    if sum.terms.len() < min_terms() {
+    if sum.len() < min_terms() {
         return false; // too small — let the CPU path handle it
     }
     #[cfg(all(target_os = "macos", feature = "metal"))]

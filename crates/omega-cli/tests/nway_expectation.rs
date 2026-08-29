@@ -34,10 +34,33 @@
 //!
 //! # Mid-circuit constructs are refused from the IR, not filtered by name
 //!
-//! Expectation is a property of unitary evolution. Terminal measures are a
-//! no-op and are elided; a *mid-circuit* measure, a `reset`, or a classical
-//! condition makes the circuit a mixture, and the engines do **not** agree on
-//! what to do about it:
+//! **This paragraph described a contract that no longer holds.** It said
+//! "expectation is a property of unitary evolution", which was this repository's
+//! own invention rather than anyone's convention, and it is what let a measured
+//! circuit be answered as though the measurement had not happened.
+//!
+//! What holds now (`omega_core::defer_measure`): an INERT measurement — nothing
+//! reads the bit it wrote, nothing touches the qubit again — is elided, which is
+//! what `remove_final_measurements()` does on the Qiskit side. A measurement
+//! whose bit is read by a later guard is DEFERRED into a quantum control and the
+//! observable is dephased on that qubit. A measured qubit that is then used
+//! coherently is REFUSED.
+//!
+//! The lane's admission rule caught up on 2026-08-20: a conditioned circuit is
+//! ADMITTED, and its anchor comes from the runner's `expectation-mixture` mode
+//! — branch-exact evolution over Qiskit's linear algebra, one branch per
+//! measurement outcome, no shots — so fixtures 12 and 14 enter the matrix and
+//! the tolerance stays the flat analytic `1e-12` (the earlier plan assumed an
+//! Aer shot-based oracle and a √N tolerance split; branch evolution makes both
+//! unnecessary). What stays out: `reset` (a channel neither side models here)
+//! and a measured qubit later used coherently, which the engines refuse by
+//! contract. The 12/14 pair is ALSO the mutation guard for the new oracle: an
+//! oracle that drops guards agrees on 14 and disagrees on 12 by design.
+//! `crates/omega-cli/tests/deferred_expectation.rs` still covers the contract
+//! across engines; this lane is where correctness (an external anchor) lives.
+//!
+//! The historical divergence that motivated the strict rule, kept because it
+//! explains the shape of the code below:
 //!
 //! - `StatevectorBackend::expectation` runs in `Skip` mode, so conditionals
 //!   evaluate against a classical register no measure ever writes — an
@@ -58,6 +81,8 @@ use std::collections::BTreeMap;
 use omega_bridges::WireObservable;
 use omega_core::circuit::{CircuitIR, GateKind};
 use omega_core::executor::{Backend as CoreBackend, Observable, PauliOp};
+
+mod common;
 
 /// Analytic gate. Every engine here does exact linear algebra on ≤ 3 qubits;
 /// accumulated double-precision error is ~1e-15, so 1e-12 leaves three orders
@@ -151,31 +176,67 @@ fn label(term: &[(u32, PauliOp)], n: u32) -> String {
 // --------------------------------------------------------------------------
 
 /// Why a circuit cannot enter the expectation lane, if it cannot.
+///
+/// Conditioned gates and mid-circuit measurement are ADMITTED since the
+/// `expectation-mixture` anchor exists; what remains out is what neither side
+/// answers: `reset`, and a measured qubit later used coherently (the product
+/// contract refuses it — `omega_core::defer_measure`).
 fn rejection_reason(ir: &CircuitIR) -> Option<String> {
-    if ir.ops.iter().any(|op| op.condition.is_some()) {
-        return Some("classically-conditioned gate (a mixture, not one unitary)".into());
-    }
     if ir.ops.iter().any(|op| matches!(op.gate, GateKind::Reset)) {
         return Some("reset (non-unitary channel)".into());
     }
-    // A measure with any non-measure operation after it is mid-circuit.
-    let mid = ir.ops.iter().enumerate().any(|(i, op)| {
-        matches!(op.gate, GateKind::Measure)
-            && ir.ops[i + 1..]
-                .iter()
-                .any(|next| !matches!(next.gate, GateKind::Measure | GateKind::Barrier))
-    });
-    if mid {
-        return Some("mid-circuit measurement".into());
+    // A measured qubit touched by a later GATE is coherent reuse. A later
+    // measure of the same qubit is fine (it re-measures the collapsed state),
+    // and a conditioned gate on OTHER qubits is the admitted feedforward case.
+    for (i, op) in ir.ops.iter().enumerate() {
+        if !matches!(op.gate, GateKind::Measure) {
+            continue;
+        }
+        let q = op.qubits[0];
+        if ir.ops[i + 1..].iter().any(|later| {
+            !matches!(later.gate, GateKind::Measure | GateKind::Barrier)
+                && later.qubits.contains(&q)
+        }) {
+            return Some(format!(
+                "qubit {} is used coherently after being measured (refused by \
+                 the deferred-measurement contract)",
+                q.0
+            ));
+        }
     }
     None
 }
 
-/// Drop terminal `Measure` ops. They are a no-op for expectation — every
-/// in-tree `expectation()` already elides them by running in `Skip` mode — but
-/// dropping them explicitly means the IR handed to each engine is identical to
-/// the one the Qiskit runner sees after `remove_final_measurements`, so a
+/// Whether the anchor must be the mixture mode: any conditioned gate, or any
+/// measure that is not terminal-inert. (A purely-terminal-measure circuit
+/// keeps the plain `Statevector` anchor, unchanged from before.)
+fn needs_mixture_anchor(ir: &CircuitIR) -> bool {
+    if ir.ops.iter().any(|op| op.condition.is_some()) {
+        return true;
+    }
+    ir.ops.iter().enumerate().any(|(i, op)| {
+        matches!(op.gate, GateKind::Measure)
+            && ir.ops[i + 1..]
+                .iter()
+                .any(|next| !matches!(next.gate, GateKind::Measure | GateKind::Barrier))
+    })
+}
+
+/// Drop terminal `Measure` ops, so the IR handed to each engine is identical to
+/// the one the Qiskit runner sees after `remove_final_measurements` and a
 /// disagreement cannot be blamed on the two sides having stripped differently.
+///
+/// This is now REDUNDANT rather than load-bearing: `prepare_for_expectation`
+/// elides inert measurements inside the product code, so stripping here removes
+/// ops that the engines would have removed themselves. It is retained only
+/// because it keeps the two sides' inputs visibly identical at the call site.
+///
+/// It is worth being clear about what removing it would and would not achieve.
+/// It does NOT expose the feedforward divergence: `rejection_reason` refuses
+/// conditioned circuits before this function is ever reached, so fixtures 12 and
+/// 14 are already out of the lane. An earlier plan claimed deleting this call was
+/// the one-line change that would make the new contract visible here; that was
+/// wrong on both counts.
 fn strip_terminal_measures(ir: &CircuitIR) -> CircuitIR {
     let mut out = ir.clone();
     out.ops.retain(|op| !matches!(op.gate, GateKind::Measure));
@@ -196,7 +257,10 @@ fn runner_dir() -> std::path::PathBuf {
 
 #[allow(dead_code)]
 fn venv_python(slug: &str) -> std::path::PathBuf {
-    runner_dir().join(format!(".venv-{slug}")).join("bin").join("python")
+    // Shared resolver: honours ARIA_QISKIT_PY and both venv locations. A
+    // bridge-local-only lookup made this lane self-skip on hosts whose venv
+    // sits where ci.sh puts it — green, but comparing against nothing.
+    common::venv_python(slug)
 }
 
 #[allow(dead_code)]
@@ -253,7 +317,10 @@ fn score_engine(
     if worst <= TOL {
         Status::Agree(worst)
     } else {
-        Status::Disagree { worst, observable: worst_obs }
+        Status::Disagree {
+            worst,
+            observable: worst_obs,
+        }
     }
 }
 
@@ -306,7 +373,9 @@ fn nway_expectation_matrix_agrees_with_qiskit() {
 
     for path in &corpus.files {
         let fixture = path.file_name().unwrap().to_string_lossy().to_string();
-        let Ok(qasm) = std::fs::read_to_string(path) else { continue };
+        let Ok(qasm) = std::fs::read_to_string(path) else {
+            continue;
+        };
         let ir = match omega_parser::lower_to_ir(&qasm) {
             Ok(ir) => ir,
             Err(e) => {
@@ -318,19 +387,32 @@ fn nway_expectation_matrix_agrees_with_qiskit() {
             refused.push((fixture, why));
             continue;
         }
-        let ir = strip_terminal_measures(&ir);
+        // A mixture fixture keeps its RAW ir: the engines' own
+        // `prepare_for_expectation` elides/defers measurements, and stripping
+        // here would delete the mid-circuit measure the guard reads. The
+        // unitary fixtures keep the historical strip (redundant but visibly
+        // identical to what the plain anchor sees).
+        let mixture = needs_mixture_anchor(&ir);
+        let ir = if mixture {
+            ir
+        } else {
+            strip_terminal_measures(&ir)
+        };
         let n = ir.num_qubits;
         let terms = weight_le_2_paulis(n);
         let wire: Vec<_> = terms.iter().map(|t| to_wire(t, n)).collect();
 
         // The anchor. A fixture Qiskit cannot evaluate says nothing about our
         // engines, so it is recorded and skipped rather than compared
-        // internally.
-        let anchor = match omega_bridges::expectation_qasm2(
-            omega_bridges::Backend::Qiskit,
-            &qasm,
-            &wire,
-        ) {
+        // internally. A mixture fixture is anchored by branch-exact
+        // evolution; both anchors are analytic, so ONE tolerance covers the
+        // whole matrix.
+        let anchor_result = if mixture {
+            omega_bridges::expectation_mixture_qasm2(omega_bridges::Backend::Qiskit, &qasm, &wire)
+        } else {
+            omega_bridges::expectation_qasm2(omega_bridges::Backend::Qiskit, &qasm, &wire)
+        };
+        let anchor = match anchor_result {
             Ok(v) => v,
             Err(e) => {
                 refused.push((fixture, format!("qiskit anchor: {e}")));
@@ -341,14 +423,22 @@ fn nway_expectation_matrix_agrees_with_qiskit() {
 
         for (name, backend) in &engines {
             let status = score_engine(*backend, &ir, &terms, &anchor);
-            rows.push(Row { fixture: fixture.clone(), engine: name, status });
+            rows.push(Row {
+                fixture: fixture.clone(),
+                engine: name,
+                status,
+            });
         }
     }
 
     // Report
     let mut per_engine: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
     for r in &rows {
-        *per_engine.entry(r.engine).or_default().entry(r.status.tag()).or_insert(0) += 1;
+        *per_engine
+            .entry(r.engine)
+            .or_default()
+            .entry(r.status.tag())
+            .or_insert(0) += 1;
     }
     eprintln!(
         "  {:<14}{:>7}{:>10}{:>16}{:>7}",
@@ -358,12 +448,19 @@ fn nway_expectation_matrix_agrees_with_qiskit() {
         let g = |t: &str| tally.get(t).copied().unwrap_or(0);
         eprintln!(
             "  {engine:<14}{:>7}{:>10}{:>16}{:>7}   ({} of {admitted} admitted fixtures compared)",
-            g("agree"), g("disagree"), g("cannot-express"), g("error"),
+            g("agree"),
+            g("disagree"),
+            g("cannot-express"),
+            g("error"),
             g("agree") + g("disagree"),
         );
     }
     if !refused.is_empty() {
-        eprintln!("\n  {} of {} fixtures not admitted:", refused.len(), corpus.files.len());
+        eprintln!(
+            "\n  {} of {} fixtures not admitted:",
+            refused.len(),
+            corpus.files.len()
+        );
         for (f, why) in &refused {
             eprintln!("    {f:<36} {why}");
         }
@@ -388,16 +485,22 @@ fn nway_expectation_matrix_agrees_with_qiskit() {
     // this lane admits far fewer fixtures, so "at least one cell" could be
     // satisfied by a single trivial circuit.
     assert!(
-        admitted >= 8,
+        admitted >= 13,
         "only {admitted} fixtures were admitted — the lane is not exercising \
-         the corpus. Expected ~11 (14 minus the 3 genuinely mid-circuit ones)."
+         the corpus. Expected 13 (14 minus 13_reset_midcircuit); the two \
+         feedforward fixtures are admitted through the mixture anchor and \
+         must not silently fall back out."
     );
     let compared = rows
         .iter()
         .filter(|r| matches!(r.status, Status::Agree(_) | Status::Disagree { .. }))
         .count();
     assert!(compared > 0, "the matrix compared ZERO cells");
-    assert!(bad.is_empty(), "{} cells disagreed with Qiskit or errored", bad.len());
+    assert!(
+        bad.is_empty(),
+        "{} cells disagreed with Qiskit or errored",
+        bad.len()
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -440,7 +543,9 @@ fn the_observable_set_is_the_full_weight_le_2_family() {
     }
 }
 
-/// Mid-circuit constructs are rejected from the IR, and terminal ones are not.
+/// Admission is decided from the IR: reset and coherent-reuse are rejected,
+/// feedforward is admitted through the mixture anchor, terminal measures need
+/// no mixture at all.
 #[test]
 fn admission_is_decided_by_the_ir_not_the_filename() {
     use omega_core::circuit::{CircuitType, GateOp, Qubit};
@@ -460,24 +565,41 @@ fn admission_is_decided_by_the_ir_not_the_filename() {
         op(GateKind::Measure, 0, Some(0)),
         op(GateKind::Measure, 1, Some(1)),
     ];
-    assert!(rejection_reason(&ir).is_none(), "terminal measures are a no-op");
+    assert!(
+        rejection_reason(&ir).is_none(),
+        "terminal measures are a no-op"
+    );
     assert_eq!(strip_terminal_measures(&ir).ops.len(), 1);
 
-    // a gate after a measure -> mid-circuit
+    // and terminal measures do NOT need the mixture anchor.
     ir.ops = vec![
+        op(GateKind::H, 0, None),
         op(GateKind::Measure, 0, Some(0)),
-        op(GateKind::X, 1, None),
+        op(GateKind::Measure, 1, Some(1)),
     ];
-    assert!(rejection_reason(&ir).unwrap().contains("mid-circuit"));
+    assert!(!needs_mixture_anchor(&ir));
 
-    // reset -> rejected. Qiskit's anchor would return a RANDOM trajectory
-    // here (measured: 2 distinct states over 30 runs on Bell + reset).
+    // a gate on ANOTHER qubit after a measure -> admitted (the measure is
+    // inert or deferred, both sides handle it), via the mixture anchor.
+    ir.ops = vec![op(GateKind::Measure, 0, Some(0)), op(GateKind::X, 1, None)];
+    assert!(rejection_reason(&ir).is_none());
+    assert!(needs_mixture_anchor(&ir));
+
+    // the measured qubit itself reused coherently -> rejected, matching the
+    // deferred-measurement contract's refusal.
+    ir.ops = vec![op(GateKind::Measure, 0, Some(0)), op(GateKind::X, 0, None)];
+    assert!(rejection_reason(&ir).unwrap().contains("coherently"));
+
+    // reset -> rejected. Qiskit's plain anchor would return a RANDOM
+    // trajectory here (measured: 2 distinct states over 30 runs on Bell +
+    // reset), and the mixture mode refuses it too.
     ir.ops = vec![op(GateKind::Reset, 0, None)];
     assert!(rejection_reason(&ir).unwrap().contains("reset"));
 
-    // conditional -> rejected
+    // conditional -> ADMITTED (fixtures 12/14), via the mixture anchor.
     let mut guarded = op(GateKind::X, 1, None);
     guarded.condition = Some((0, 1, 1));
     ir.ops = vec![op(GateKind::Measure, 0, Some(0)), guarded];
-    assert!(rejection_reason(&ir).unwrap().contains("conditioned"));
+    assert!(rejection_reason(&ir).is_none());
+    assert!(needs_mixture_anchor(&ir));
 }

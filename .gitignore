@@ -1,5 +1,7 @@
 /target
 **/target
+# Cross-build target dir used by the Linux/CUDA passes (--target-dir target-linux)
+/target-linux
 **/*.rs.bk
 Cargo.lock.bk
 
@@ -31,3 +33,6 @@ tch-env.sh
 
 # TLA+ model checker (fetched locally; see tools/tla/check.sh)
 tools/tla/tla2tools.jar
+# Cross-build target dir used by the tch/libtorch pass (CARGO_BUILD_TARGET splits
+# host and target artifacts, so cargo puts them here).
+/target-tch

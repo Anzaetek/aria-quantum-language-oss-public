@@ -9,6 +9,15 @@ path, `omega-backend-statevector-cuda/src/f64_path.rs`).
 `SUPPORTED` / `PARTIAL` / `—` (unsupported). Line numbers drift; treat them as
 starting points, not contracts.
 
+> **When to actually use each backend** — measured CPU→GPU crossover sizes per
+> algorithm are in `BACKEND-CROSSOVER.md`. Headline: statevector switches at
+> ~24 qubits (~26 for shallow circuits), PauliProp has no crossover at all on a
+> GB10, and MPS is unmeasured.
+>
+> **Exactness is a separate axis from capability.** A gate can be SUPPORTED
+> here and still not be applied exactly — CUDA's `CCX` is supported and is a
+> 15-gate f32 decomposition. See `GATE-EXACTNESS.md`.
+
 ## Capability matrix
 
 | Capability | Metal | OpenCL | CUDA-f32 | CUDA-f64 |

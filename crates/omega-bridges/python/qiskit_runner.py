@@ -69,12 +69,36 @@ def main() -> int:
     # then emit the QPY blob via `qpy.dump` for round-trip /
     # interop with downstream Qiskit-only tooling.
     mode = req.get("mode") or "execute"
+    if mode == "capabilities":
+        # Capability handshake — see the note in tsim_runner.py. Answering
+        # before a run is what lets a caller avoid discovering a mismatch as a
+        # mid-run error, or, for noise, not discovering it at all.
+        _emit(
+            {
+                "ok": True,
+                "capabilities": {
+                    "backend": "qiskit",
+                    "modes": [
+                        "execute",
+                        "expectation",
+                        "expectation-mixture",
+                        "qpy_to_qasm2",
+                        "qasm2_to_qpy",
+                    ],
+                    "noise_keys": ["depolarizing"],
+                    "notes": "scalar depolarizing only; per-qubit and per-pair forms are refused",
+                },
+            }
+        )
+        return 0
     if mode == "qpy_to_qasm2":
         return _qpy_to_qasm2(req)
     if mode == "qasm2_to_qpy":
         return _qasm2_to_qpy(req)
     if mode == "expectation":
         return _expectation(req)
+    if mode == "expectation-mixture":
+        return _expectation_mixture(req)
     if mode != "execute":
         _err(f"unknown mode {mode!r}", kind="bad-request")
         return 0
@@ -129,7 +153,34 @@ def main() -> int:
         # Minimal noise wiring: depolarizing channel after each gate.
         # Operators that need the full Aer noise model can build it
         # themselves and pass via a richer noise spec in a follow-up.
+        # A noise key this bridge cannot honour must be REFUSED, not dropped.
+        # Only `depolarizing` is wired below; `amplitude_damping`,
+        # `phase_damping`, `pauli` and `readout` were accepted and silently
+        # ignored, so a caller asking for amplitude damping got a distribution
+        # with none and no way to tell. The per-PAIR `2q` form is refused for
+        # the same reason: the scalar path below applies one rate everywhere,
+        # which is a DIFFERENT noise model from the one requested.
+        supported = {"depolarizing"}
+        unsupported = sorted(set(noise) - supported)
+        if unsupported:
+            _err(
+                "the qiskit bridge implements only `depolarizing`; it cannot "
+                f"honour {unsupported} and will not silently drop them. Remove "
+                "the unsupported keys, or use an in-process backend "
+                "(statevector / mps), which implements the full model.",
+                kind="qiskit-noise-key-not-supported",
+            )
+            return 0
         depol = noise.get("depolarizing")
+        if isinstance(depol, dict):
+            _err(
+                "the qiskit bridge implements only a SCALAR `depolarizing` "
+                "rate; the per-qubit / per-pair form would be applied as one "
+                "uniform rate here, which is a different noise model than the "
+                "one requested. Use an in-process backend for per-pair rates.",
+                kind="qiskit-noise-key-not-supported",
+            )
+            return 0
         if depol:
             try:
                 from qiskit_aer.noise import NoiseModel, depolarizing_error
@@ -305,6 +356,247 @@ def _expectation(req: dict) -> int:
         try:
             op = SparsePauliOp.from_list(terms)
             values.append(float(state.expectation_value(op).real))
+        except Exception as e:  # noqa: BLE001
+            _err(f"expectation_value: {e}", kind="execute")
+            return 0
+
+    _emit({"ok": True, "values": values})
+    return 0
+
+
+def _expectation_mixture(req: dict) -> int:
+    """`{"mode":"expectation-mixture","qasm":...,"observables":[...]}` ->
+    `{"ok":true,"values":[...]}`.
+
+    The oracle `_expectation` refuses to be: EXACT expectation of a circuit
+    that is a MIXTURE over measurement outcomes — mid-circuit measurement
+    plus classically-conditioned gates. Same wire format as `_expectation`
+    (dense LSB-first Pauli strings, reversed before Qiskit sees them).
+
+    ## How, and why it is still analytic
+
+    Branch-exact evolution over Qiskit's own linear algebra: the state is a
+    list of (unnormalised `Statevector`, classical-bit values). A measurement
+    projects into both outcome branches (weights carried in the norms, so
+    `expectation_value` — a raw quadratic form, verified — needs no explicit
+    reweighting); a conditioned gate applies only on branches whose register
+    matches. `⟨O⟩ = Σ_branches ⟨ψ_b|O|ψ_b⟩`. No shots anywhere, so this lane
+    keeps its flat analytic tolerance rather than needing a √N split.
+
+    Qiskit 2.x lowers `if (c==k) g q;` to an `if_else` block instruction; the
+    legacy `.condition` attribute on a plain gate is handled too. `reset` and
+    a conditioned/in-block measure are refused, and the branch count is
+    capped: it grows as 2^measurements and a runaway corpus should fail
+    loudly rather than swap.
+
+    ## An INERT final measurement is ELIDED, not branch-split
+
+    Matching `omega_core::defer_measure` and `remove_final_measurements`: a
+    measure whose bit no later condition reads and whose qubit nothing later
+    touches does not enter the branching — expectation is of the state
+    BEFORE it. Splitting instead would silently dephase every later X/Y
+    observable on that qubit, which is a different (post-measurement)
+    question than the one every other engine in the lane answers. Qiskit's
+    own `remove_final_measurements` is NOT used here: on these circuits the
+    guard-read register is shared with the final measure, and what that
+    method does to a half-used register is exactly the kind of behaviour
+    this runner exists to not depend on.
+    """
+    qasm = req.get("qasm")
+    obs_in = req.get("observables")
+    if not isinstance(qasm, str) or not qasm.strip():
+        _err("`qasm` must be a non-empty string", kind="bad-request")
+        return 0
+    if not isinstance(obs_in, list) or not obs_in:
+        _err("`observables` must be a non-empty list", kind="bad-request")
+        return 0
+
+    try:
+        import numpy as np
+        from qiskit import qasm2
+        from qiskit.quantum_info import Operator, SparsePauliOp, Statevector
+    except ImportError as e:
+        _err(f"qiskit import failed: {e}", kind="qiskit-not-installed")
+        return 0
+
+    try:
+        circuit = qasm2.loads(
+            qasm,
+            include_path=qasm2.LEGACY_INCLUDE_PATH,
+            custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS,
+            custom_classical=qasm2.LEGACY_CUSTOM_CLASSICAL,
+            strict=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        _err(f"qasm2.loads: {e}", kind="qasm-parse")
+        return 0
+
+    n = circuit.num_qubits
+    MAX_BRANCHES = 64
+
+    def cond_of(op):
+        return getattr(op, "condition", None)
+
+    def _reg_members(reg):
+        # A condition target is a ClassicalRegister (index by iteration order)
+        # or a single Clbit. Registers in current Qiskit are not `__iter__`
+        # iterable, only indexable, so probe by list().
+        try:
+            return list(reg)
+        except TypeError:
+            return [reg]
+
+    # ---- inert-measure elision (see docstring) ----------------------------
+    data = list(circuit.data)
+    read_later_clbits = set()  # clbit indices read by a condition AFTER position i
+    used_later_qubits = set()
+    keep = [True] * len(data)
+    for i in range(len(data) - 1, -1, -1):
+        instr = data[i]
+        op = instr.operation
+        # A CONDITIONED measure (legacy .condition, unreachable from qasm2
+        # today) must never be elided here — it would silently drop the
+        # conditional collapse the forward pass exists to refuse.
+        if op.name == "measure" and cond_of(op) is None:
+            cidx = circuit.find_bit(instr.clbits[0]).index
+            qidx = circuit.find_bit(instr.qubits[0]).index
+            if cidx not in read_later_clbits and qidx not in used_later_qubits:
+                keep[i] = False
+                continue
+        cond = cond_of(op)
+        if cond is not None:
+            for b in _reg_members(cond[0]):
+                read_later_clbits.add(circuit.find_bit(b).index)
+        if op.name != "barrier":
+            for q in instr.qubits:
+                used_later_qubits.add(circuit.find_bit(q).index)
+
+    # ---- branch evolution -------------------------------------------------
+    def creg_value(bits, reg):
+        return sum(
+            bits.get(circuit.find_bit(b).index, 0) << k
+            for k, b in enumerate(_reg_members(reg))
+        )
+
+    branches = [(Statevector.from_int(0, 2**n), {})]
+    for i, instr in enumerate(data):
+        if not keep[i]:
+            continue
+        op = instr.operation
+        name = op.name
+        qargs = [circuit.find_bit(q).index for q in instr.qubits]
+        if name == "barrier":
+            continue
+        if name == "reset":
+            _err(
+                "expectation is undefined for a circuit containing `reset` "
+                "(non-unitary channel outside this mode's mixture model)",
+                kind="qiskit-not-supported",
+            )
+            return 0
+        if name == "measure":
+            if cond_of(op) is not None:
+                _err("a conditioned measure is refused", kind="qiskit-not-supported")
+                return 0
+            cidx = circuit.find_bit(instr.clbits[0]).index
+            axis = n - 1 - qargs[0]
+            new = []
+            for sv, bits in branches:
+                arr = np.asarray(sv.data).reshape([2] * n)
+                for outcome in (0, 1):
+                    sel = np.zeros_like(arr)
+                    idx = [slice(None)] * n
+                    idx[axis] = outcome
+                    sel[tuple(idx)] = arr[tuple(idx)]
+                    if float(np.vdot(sel, sel).real) > 1e-30:
+                        new.append(
+                            (Statevector(sel.reshape(-1)), {**bits, cidx: outcome})
+                        )
+            branches = new
+            if len(branches) > MAX_BRANCHES:
+                _err(
+                    f"more than {MAX_BRANCHES} measurement branches",
+                    kind="qiskit-not-supported",
+                )
+                return 0
+            continue
+
+        cond = cond_of(op)
+        if name == "if_else":
+            reg, val = cond
+            body = op.blocks[0]
+            if len(op.blocks) > 1 and op.blocks[1] is not None and op.blocks[1].data:
+                _err("an else-branch is refused", kind="qiskit-not-supported")
+                return 0
+            for binstr in body.data:
+                if binstr.operation.name in ("measure", "reset"):
+                    _err(
+                        "a measure/reset inside a conditioned block is refused",
+                        kind="qiskit-not-supported",
+                    )
+                    return 0
+            new = []
+            for sv, bits in branches:
+                if creg_value(bits, reg) == val:
+                    for binstr in body.data:
+                        bq = [qargs[body.find_bit(q).index] for q in binstr.qubits]
+                        try:
+                            sv = sv.evolve(Operator(binstr.operation), bq)
+                        except Exception as e:  # noqa: BLE001
+                            _err(
+                                f"cannot express {binstr.operation.name}: {e}",
+                                kind="qiskit-not-supported",
+                            )
+                            return 0
+                new.append((sv, bits))
+            branches = new
+            continue
+
+        try:
+            u = Operator(op)
+        except Exception as e:  # noqa: BLE001
+            _err(f"cannot express {name}: {e}", kind="qiskit-not-supported")
+            return 0
+        if cond is not None:
+            reg, val = cond
+            branches = [
+                (sv.evolve(u, qargs) if creg_value(bits, reg) == val else sv, bits)
+                for sv, bits in branches
+            ]
+        else:
+            branches = [(sv.evolve(u, qargs), bits) for sv, bits in branches]
+
+    total = sum(float(np.vdot(sv.data, sv.data).real) for sv, _ in branches)
+    if abs(total - 1.0) > 1e-9:
+        _err(
+            f"mixture branches carry total probability {total!r}, not 1 — the "
+            "evolution itself is wrong, refusing to answer",
+            kind="execute",
+        )
+        return 0
+
+    values = []
+    for obs in obs_in:
+        terms = []
+        for term in obs:
+            try:
+                pauli, coeff = term[0], float(term[1])
+            except Exception:  # noqa: BLE001
+                _err(f"malformed observable term {term!r}", kind="bad-request")
+                return 0
+            if not isinstance(pauli, str) or len(pauli) != n or set(pauli) - set("IXYZ"):
+                _err(
+                    f"pauli {pauli!r} must be {n} chars over IXYZ (dense, LSB-first)",
+                    kind="bad-request",
+                )
+                return 0
+            # LSB-first on the wire -> MSB-first for Qiskit.
+            terms.append((pauli[::-1], coeff))
+        try:
+            op = SparsePauliOp.from_list(terms)
+            values.append(
+                sum(float(sv.expectation_value(op).real) for sv, _ in branches)
+            )
         except Exception as e:  # noqa: BLE001
             _err(f"expectation_value: {e}", kind="execute")
             return 0

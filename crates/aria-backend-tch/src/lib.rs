@@ -383,6 +383,14 @@ impl Backend for TchBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        // `evolve` skips `Measure`, which answers the circuit-with-the-measurement-
+        // deleted rather than the circuit. Defer first; see
+        // `omega_core::defer_measure` for why an inert measurement is elided while
+        // a consequential one becomes a control.
+        let (deferred, observable) =
+            omega_core::defer_measure::prepare_for_expectation(circuit, observable)?;
+        let circuit = &deferred;
+        let observable = &observable;
         let st = self.evolve(circuit, params)?;
         let mut total = 0.0;
         for (coeff, paulis) in &observable.terms {

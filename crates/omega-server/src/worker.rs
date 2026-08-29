@@ -77,6 +77,14 @@ pub enum CostKind {
     /// The default input is one photon in each of `ceil(m/2)` modes
     /// (`omega-backend-photonics/src/sim.rs:88`), which is enough to price it.
     Photonic,
+    /// Pauli propagation: memory is the TERM COUNT, not `2^n`.
+    ///
+    /// This is the one backend that is genuinely width-unbounded — it runs at
+    /// 100+ qubits — so pricing it as `Opaque` would subject it to the qubit
+    /// ceiling and refuse jobs it handles fine. What actually bounds it is the
+    /// engine's own `max_terms` cap (on by default precisely because each
+    /// non-Clifford rotation can double the term count).
+    PauliProp { max_terms: u64 },
     /// A backend whose memory profile this server cannot know — today, a
     /// dynamically-loaded plugin. Not priceable, so governed by the qubit
     /// ceiling alone. Stated plainly rather than dressed up as a priced
@@ -210,6 +218,9 @@ impl JobShape {
         match self.kind {
             CostKind::DenseStatevector | CostKind::Opaque => true,
             CostKind::Mps { .. } | CostKind::Stabilizer => self.densifies,
+            // Width-unbounded by construction: the term cap is the bound, and
+            // the qubit ceiling is the wrong instrument. See `PauliProp`.
+            CostKind::PauliProp { .. } => false,
             // Photonic width is combinatorial and priced exactly; the ceiling
             // is not the right instrument for it.
             CostKind::Photonic => false,
@@ -311,6 +322,18 @@ pub fn estimate_peak_bytes(shape: &JobShape) -> Option<u64> {
             // Each basis state is a Vec<u32> of length m plus its amplitude.
             let per_state = modes.checked_mul(4)?.checked_add(48)?;
             states.checked_mul(per_state)?
+        }
+        CostKind::PauliProp { max_terms } => {
+            // Per term: the packed symplectic key (2 words per 64 qubits),
+            // a Complex64 coefficient, a u32 frequency, and the hash-map slot
+            // overhead. Two sums are live during a rebuild (`drain` into a
+            // fresh map), hence the factor of two.
+            let words = (n as u64).div_ceil(64).max(1);
+            let per_term = words
+                .checked_mul(2)?
+                .checked_mul(8)?
+                .checked_add(16 + 4 + 32)?;
+            max_terms.checked_mul(per_term)?.checked_mul(2)?
         }
         CostKind::Opaque => return None,
     };
@@ -903,6 +926,125 @@ impl Governor {
 /// Deliberately not part of `AppState`: admission must not queue behind the
 /// state lock, and the budget is fixed at boot anyway.
 static GOVERNOR: OnceLock<Governor> = OnceLock::new();
+/// A zero-sized handle to the process-wide [`governor`].
+///
+/// The governor is a `&'static` singleton, but `HostState` needs something
+/// `Arc`-able and object-safe. A unit struct that forwards is cheaper and
+/// clearer than teaching the trait a lifetime it does not need.
+pub struct GovernorHandle;
+
+impl omega_core::admission::Admission for GovernorHandle {
+    fn admit_circuit(&self, num_qubits: u32) -> Result<(), omega_core::admission::Refusal> {
+        governor().admit_circuit(num_qubits)
+    }
+    fn admit_run(
+        &self,
+        num_qubits: u32,
+        analytic: bool,
+    ) -> Result<omega_core::admission::RunTicket, omega_core::admission::Refusal> {
+        omega_core::admission::Admission::admit_run(governor(), num_qubits, analytic)
+    }
+}
+
+/// The WASM route's view of admission.
+///
+/// `omega-server` already depends on `omega-wasm-runtime`, so the runtime cannot
+/// call this directly — the dependency points the wrong way. The trait lives in
+/// `omega-core`, which both crates already depend on, and this is the only
+/// implementation. No admission POLICY moves: pricing, pools and the ledger stay
+/// here.
+///
+/// # It prices the DENSE worst case, and takes no reservation
+///
+/// At registration the guest has not yet said whether it will run analytically
+/// or in shot mode, and only the analytic path materialises `2^n` amplitudes. So
+/// this asks whether the dense shape would be admissible. That errs toward
+/// refusing a job that might have been cheap — the correct direction, since the
+/// opposite error admits a job that then cannot fit, which is the
+/// oversubscription this closes.
+///
+/// **Registration deliberately does NOT hold a `Reservation`.** A ticket taken
+/// at registration would have to live across the guest's whole run, and a guest
+/// may register several circuits and execute them in any order or not at all —
+/// so the permit would be held against work that never happens, and the ledger
+/// would be wrong in the other direction. The charge lives where the work
+/// lives: `admit_run` below issues one HELD ticket per execution, taken by the
+/// runtime immediately before backend work and dropped when the call returns,
+/// which closes the admission-races-execution gap that P6 originally left
+/// open (`PLAN-SIX-PROGRAMMES.md` P6, "still open" note — now closed).
+impl omega_core::admission::Admission for Governor {
+    fn admit_circuit(&self, num_qubits: u32) -> Result<(), omega_core::admission::Refusal> {
+        let shape = JobShape {
+            num_qubits,
+            kind: CostKind::DenseStatevector,
+            batch: 1,
+            gradient: false,
+            densifies: true,
+            target: ExecTarget::Cpu,
+            // The guest may ask for the raw statevector later; pricing as if it
+            // will is the same worst-case reasoning as `densifies`.
+            returns_statevector: true,
+        };
+        match self.admit(&shape) {
+            Ok(reservation) => {
+                // Released immediately, and that is the point: this is an
+                // admissibility question, not a charge. Holding it would reserve
+                // against a run the guest may never start. The CHARGE happens
+                // per-execution via `admit_run` below.
+                drop(reservation);
+                Ok(())
+            }
+            Err(rejection) => Err(refusal_of(rejection)),
+        }
+    }
+
+    /// The charging half: one ticket per EXECUTION, held by the caller for
+    /// the duration of the backend call and released on drop. The
+    /// `Reservation` itself is the ticket — its permits return to the pool
+    /// when the box drops, so the ledger's view of WASM-route work matches
+    /// the interval it actually occupies the machine.
+    ///
+    /// `analytic` is accepted but does not change the price TODAY: the WASM
+    /// route's backend is the dense CPU statevector in both shot and
+    /// analytic mode, so the dense worst case is the honest price for both.
+    /// The parameter is plumbed so a future non-densifying backend can be
+    /// priced differently without touching the seam again.
+    fn admit_run(
+        &self,
+        num_qubits: u32,
+        _analytic: bool,
+    ) -> Result<omega_core::admission::RunTicket, omega_core::admission::Refusal> {
+        let shape = JobShape {
+            num_qubits,
+            kind: CostKind::DenseStatevector,
+            batch: 1,
+            gradient: false,
+            densifies: true,
+            target: ExecTarget::Cpu,
+            returns_statevector: true,
+        };
+        match self.admit(&shape) {
+            Ok(reservation) => Ok(Box::new(reservation)),
+            Err(rejection) => Err(refusal_of(rejection)),
+        }
+    }
+}
+
+/// One mapping from the governor's rejection to the guest-facing refusal, so
+/// `admit_circuit` and `admit_run` cannot drift apart on retryability.
+///
+/// Busy and MachinePressure are the two the operator docs map to 429;
+/// everything else is 413. Retryability is exactly that distinction, so it is
+/// derived from the same match rather than restated.
+fn refusal_of(rejection: Rejection) -> omega_core::admission::Refusal {
+    omega_core::admission::Refusal {
+        reason: rejection.message(),
+        retryable: matches!(
+            rejection,
+            Rejection::Busy { .. } | Rejection::MachinePressure { .. }
+        ),
+    }
+}
 
 /// The process-wide governor.
 pub fn governor() -> &'static Governor {

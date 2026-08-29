@@ -25,7 +25,21 @@ extern "C" {
 typedef struct OmegaRuntime OmegaRuntime;
 typedef struct OmegaResult OmegaResult;
 
-/* API version */
+/* API version.
+ *
+ * A single integer, incremented when an EXISTING entry point changes behaviour
+ * or signature. Adding a new function does not bump it, so a caller that does
+ * not use the new function is unaffected.
+ *
+ * Check this BEFORE calling anything else and refuse a version you do not
+ * recognise, rather than discovering the mismatch inside the library.
+ *
+ *   1  initial surface
+ *   2  omega_execute REFUSES a parameter count that does not match the
+ *      circuit's free-symbol count. Version 1 padded a short array with 0.0
+ *      and ignored extras, which silently executed a DIFFERENT circuit.
+ *      Pass one value per symbol; omega_circuit_num_params gives the count.
+ */
 uint32_t omega_api_version(void);
 
 /* Lifecycle */
@@ -56,6 +70,33 @@ OmegaResult* omega_execute(
     uint32_t num_params,
     uint32_t shots,
     uint64_t seed
+);
+
+/* Expectation value <psi|O|psi>.
+ *
+ * observable: null-terminated Pauli string, e.g. "Z0 Z1" or "0.5*X0 + Z1".
+ *             Spaces are ignored.
+ * params/num_params: one value per free symbol, exactly (see version 2 above).
+ * out: receives the value ONLY on success.
+ *
+ * Returns 0 on success, non-zero on failure.
+ *
+ * A scalar has no NULL to signal failure, and a NaN sentinel would be a trap —
+ * NaN compares false against everything including itself, so a caller that
+ * forgot to check would propagate it silently. Hence a status code and an
+ * out-parameter that is LEFT UNTOUCHED on error: ignoring the status code reads
+ * back your own initial value, not a stale or partial answer.
+ *
+ * Refused (non-zero, *out untouched): null rt/observable/out, an unknown
+ * circuit id, an unparseable observable, a parameter-count mismatch, and a
+ * photonic circuit (which has no Pauli observable). */
+int32_t omega_expectation(
+    const OmegaRuntime* rt,
+    uint32_t circuit_id,
+    const double* params,
+    uint32_t num_params,
+    const char* observable,
+    double* out
 );
 
 /* Result access - counts */

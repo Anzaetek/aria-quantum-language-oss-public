@@ -77,9 +77,7 @@ fn a_single_bit_guard_is_exported_as_an_if() {
         "the guard must reach the file; got:\n{qasm}"
     );
     // And the guarded gate must NOT also appear unguarded anywhere.
-    let unguarded = qasm
-        .lines()
-        .any(|l| l.trim() == "x q[1];");
+    let unguarded = qasm.lines().any(|l| l.trim() == "x q[1];");
     assert!(
         !unguarded,
         "found an UNGUARDED `x q[1];` — the guard was dropped, which is the \
@@ -140,10 +138,10 @@ fn to_qasm3_emits_the_single_bit_guard_qasm2_cannot() {
         "QASM 2.0 must still refuse a single-bit guard on a 2-bit register"
     );
 
-    let out = to_qasm3(&c);
+    let out = to_qasm3(&c).expect("qasm3 export");
     assert!(out.contains("OPENQASM 3.0;"), "got:\n{out}");
     assert!(
-        out.contains("if (c[0] == 1) x q[1];"),
+        out.contains("if (c[0] == true) x q[1];"),
         "QASM 3 must carry the guard the 2.0 path cannot express — that is the \
          entire premise of `to_qasm`'s refusal message. Got:\n{out}"
     );
@@ -154,15 +152,80 @@ fn to_qasm3_emits_the_single_bit_guard_qasm2_cannot() {
     );
 }
 
+/// **A bit compares to a BOOLEAN, not an integer.**
+///
+/// This emitted `if (c[0] == 1)`, which qiskit 2.2.3 refuses outright:
+///
+/// ```text
+///   QASM3ImporterError: conditions must be 'bit == const bool' or
+///                       'bitarray == const int', not 'bit == const int'
+/// ```
+///
+/// So the headline QASM3 feature — the guard `to_qasm`'s refusal message
+/// directs users to — produced a file no strict OpenQASM 3 consumer would
+/// load, and the two assertions above pinned the invalid string as correct.
+/// The test guaranteed the bug.
+///
+/// Nothing caught it because the QASM3 dialect corpus is three single-gate
+/// rotation files and contains no conditional at all.
+///
+/// Verified against qiskit rather than reasoned: `c[0] == true` resolves to
+/// `(Clbit index=0, True)` and `c[1] == true` to `(Clbit index=1, True)`, so
+/// bit and value both land where Aria means them.
+#[test]
+fn the_guard_uses_a_boolean_literal_not_an_integer() {
+    let out = to_qasm3(&feedforward("c", 2)).expect("qasm3 export");
+    assert!(
+        out.contains("== true"),
+        "a single-bit guard must compare to a boolean; got:\n{out}"
+    );
+    assert!(
+        !out.contains("c[0] == 1"),
+        "`bit == const int` is rejected by strict OpenQASM 3 consumers; got:\n{out}"
+    );
+}
+
+/// The QASM 2.0 refusal must *advise* the spelling `to_qasm3` actually emits.
+///
+/// It printed the raw value, so it recommended `if (c[0] == 1)` — the invalid
+/// form. Following our own advice produced an unloadable file, which is the
+/// misdirection the emitter's own comment warns about.
+#[test]
+fn the_qasm2_refusal_advises_a_loadable_spelling() {
+    let err = to_qasm(&feedforward("c", 2)).expect_err("a size-2 creg must be refused");
+    assert!(
+        err.contains("== true"),
+        "the advice must show the boolean form the QASM3 emitter writes; got: {err}"
+    );
+    assert!(
+        !err.contains("c[0] == 1)"),
+        "the advice must not recommend `bit == const int`; got: {err}"
+    );
+}
+
+/// A value a single bit can never take is refused rather than exported as an
+/// unsatisfiable guard.
+#[test]
+fn a_guard_value_wider_than_one_bit_is_refused() {
+    let mut c = feedforward("c", 2);
+    for inst in &mut c.instructions {
+        if let Some((_, v)) = &mut inst.condition {
+            *v = 2;
+        }
+    }
+    let err = to_qasm3(&c).expect_err("a bit cannot equal 2");
+    assert!(
+        err.contains('2') && err.to_lowercase().contains("bit"),
+        "the message must say why a bit cannot equal 2; got: {err}"
+    );
+}
+
 /// A size-1 register works too, so the fix is not special-cased to the wide
 /// case that motivated it.
 #[test]
 fn to_qasm3_guards_a_size_one_register_as_well() {
-    let out = to_qasm3(&feedforward("c", 1));
-    assert!(
-        out.contains("if (c[0] == 1) x q[1];"),
-        "got:\n{out}"
-    );
+    let out = to_qasm3(&feedforward("c", 1)).expect("qasm3 export");
+    assert!(out.contains("if (c[0] == true) x q[1];"), "got:\n{out}");
 }
 
 /// **The Aria emitter had the same defect**, and it was missed entirely by the
@@ -180,15 +243,13 @@ fn to_qasm3_guards_a_size_one_register_as_well() {
 #[test]
 fn the_aria_emitter_carries_the_guard_too() {
     use aria_core::ast::to_aria_source;
-    let src = to_aria_source(&feedforward("c", 1), "Feedforward");
+    let src = to_aria_source(&feedforward("c", 1), "Feedforward").expect("emit");
     assert!(
         src.contains("when c[0] == 1"),
         "the Aria emitter must wrap the guarded gate in `when`; got:\n{src}"
     );
     // And the guarded gate must not ALSO appear bare.
-    let bare = src
-        .lines()
-        .any(|l| l.trim() == "apply X on q[1]");
+    let bare = src.lines().any(|l| l.trim() == "apply X on q[1]");
     assert!(
         !bare,
         "found a BARE `apply X on q[1]` — the guard was dropped. Full output:\n{src}"
@@ -233,7 +294,7 @@ fn aria_emitter_output_reparses_with_guards_and_reset() {
         condition: Some((Clbit::new("c", 0), 1)),
     });
 
-    let src = to_aria_source(&c, "Feedforward");
+    let src = to_aria_source(&c, "Feedforward").expect("emit");
     let back = parse_aria_circuit(&src, "Feedforward").unwrap_or_else(|e| {
         panic!("the Aria emitter's own output must re-parse; got {e}\n\n{src}")
     });
@@ -252,7 +313,11 @@ fn aria_emitter_output_reparses_with_guards_and_reset() {
     );
 
     // And the guards survived.
-    let guarded = back.instructions.iter().filter(|i| i.condition.is_some()).count();
+    let guarded = back
+        .instructions
+        .iter()
+        .filter(|i| i.condition.is_some())
+        .count();
     assert!(
         guarded >= 1,
         "at least one guard must survive the round trip; source was:\n{src}"

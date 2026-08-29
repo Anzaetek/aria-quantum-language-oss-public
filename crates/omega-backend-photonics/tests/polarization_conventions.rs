@@ -80,18 +80,18 @@ fn c(re: f64, im: f64) -> Complex64 {
 /// `i · [[cos2θ, sin2θ], [sin2θ, −cos2θ]]`.
 fn perceval_hwp(theta: f64) -> Vec<Vec<Complex64>> {
     let (c2, s2) = ((2.0 * theta).cos(), (2.0 * theta).sin());
-    vec![
-        vec![c(0.0, c2), c(0.0, s2)],
-        vec![c(0.0, s2), c(0.0, -c2)],
-    ]
+    vec![vec![c(0.0, c2), c(0.0, s2)], vec![c(0.0, s2), c(0.0, -c2)]]
 }
 
 #[test]
 fn hwp_matches_perceval_including_the_global_phase() {
-    for theta in [0.0, std::f64::consts::FRAC_PI_8, 0.37, std::f64::consts::FRAC_PI_4] {
-        let src = format!(
-            "OPTICQASM 1.0;\nphoton q[1] pol;\nhwp({theta}) q[0];\n"
-        );
+    for theta in [
+        0.0,
+        std::f64::consts::FRAC_PI_8,
+        0.37,
+        std::f64::consts::FRAC_PI_4,
+    ] {
+        let src = format!("OPTICQASM 1.0;\nphoton q[1] pol;\nhwp({theta}) q[0];\n");
         let (modes, u) = unitary_of(&src);
         assert_eq!(modes, 2, "a 1-spatial-mode pol register is 2 optical modes");
 
@@ -113,10 +113,7 @@ fn the_i_less_textbook_hwp_is_rejected() {
     let (_, u) = unitary_of(&src);
 
     let (c2, s2) = ((2.0 * theta).cos(), (2.0 * theta).sin());
-    let textbook = vec![
-        vec![c(c2, 0.0), c(s2, 0.0)],
-        vec![c(s2, 0.0), c(-c2, 0.0)],
-    ];
+    let textbook = vec![vec![c(c2, 0.0), c(s2, 0.0)], vec![c(s2, 0.0), c(-c2, 0.0)]];
 
     let d = max_diff(&u, &textbook);
     assert!(
@@ -135,7 +132,10 @@ fn the_i_less_textbook_hwp_is_rejected() {
 fn pbs_swaps_h_and_transmits_v() {
     let src = "OPTICQASM 1.0;\nphoton q[2] pol;\npbs q[0], q[1];\n";
     let (modes, u) = unitary_of(src);
-    assert_eq!(modes, 4, "2 spatial modes with polarization = 4 optical modes");
+    assert_eq!(
+        modes, 4,
+        "2 spatial modes with polarization = 4 optical modes"
+    );
 
     let mut want = vec![vec![c(0.0, 0.0); 4]; 4];
     want[0][2] = c(1.0, 0.0); // out a_H <- in b_H
@@ -204,9 +204,9 @@ fn polarization_gates_refuse_unpolarized_registers() {
 /// spatial mode, so the ceiling arrives at 8 spatial modes.
 #[test]
 fn shots_mode_refuses_beyond_the_encodable_mode_count() {
+    use omega_backend_photonics::sim::PhotonicsBackend;
     use omega_core::executor::{Backend, ExecConfig};
     use omega_core::params::ParameterBinding;
-    use omega_backend_photonics::sim::PhotonicsBackend;
 
     // 9 spatial modes with polarization = 18 optical modes > 16.
     let ir = lower_to_ir("OPTICQASM 1.0;\nphoton q[9] pol;\nps(0.3) q[0];\n").expect("lower");

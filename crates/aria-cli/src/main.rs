@@ -953,7 +953,7 @@ fn cmd_export(raw: &[String]) -> Result<(), String> {
     let out = if a.has("qasm") {
         aria_core::ast::to_qasm(&circuit)?
     } else if a.has("qasm3") {
-        aria_core::ast::to_qasm3(&circuit)
+        aria_core::ast::to_qasm3(&circuit)?
     } else if a.has("json") {
         aria_core::ast::to_json(&circuit)?
     } else if a.has("lean") {
@@ -1305,7 +1305,7 @@ fn cmd_import(raw: &[String]) -> Result<(), String> {
     let name = a.opt("name").unwrap_or("Imported");
     let qasm = read_source(path)?;
     let circuit = aria_core::ast::from_qasm(&qasm)?;
-    let out = aria_core::ast::to_aria_source(&circuit, name);
+    let out = aria_core::ast::to_aria_source(&circuit, name)?;
     print!("{out}");
     Ok(())
 }

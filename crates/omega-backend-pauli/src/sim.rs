@@ -10,11 +10,11 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use omega_core::circuit::*;
+use omega_core::defer_measure::{prepare_for_expectation, prepare_for_expectation_multi};
 use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
 use omega_core::outcome::Outcome;
 use omega_core::params::ParameterBinding;
-
 
 use crate::stabilizer::pauli_mult_phase;
 use crate::stabilizer::{PauliRow, StabilizerTableau};
@@ -74,14 +74,13 @@ impl Backend for PauliBackend {
             // returned a perfectly representable creg-width key. Over-refusal,
             // but the same guard/sampler split that produced wrong ANSWERS in
             // the MPS backend twice.
-            let collapse = config.mid_circuit_mode == omega_core::executor::MidCircuitMode::Collapse
+            let collapse = config.mid_circuit_mode
+                == omega_core::executor::MidCircuitMode::Collapse
                 && circuit.num_classical_bits > 0;
-            omega_core::executor::check_counts_width(
-                omega_core::executor::counts_outcome_width(
-                    circuit,
-                    omega_core::executor::counts_keyed_on_creg(circuit, collapse),
-                ),
-            )?;
+            omega_core::executor::check_counts_width(omega_core::executor::counts_outcome_width(
+                circuit,
+                omega_core::executor::counts_keyed_on_creg(circuit, collapse),
+            ))?;
         }
 
         // One width for the key and for everything that renders it — the same
@@ -250,7 +249,13 @@ impl Backend for PauliBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        // `stabilizer_expectation` indexes the tableau by the observable's
+        // qubit and panics past the register. See `Observable::validate_qubits`.
+        observable.validate_qubits(circuit.num_qubits)?;
         let n = circuit.num_qubits as usize;
+        let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+        let circuit = &deferred;
+        let observable = &observable;
         let mut tab = StabilizerTableau::zero_state(n);
         apply_circuit(&mut tab, circuit, params, &mut analytic_rng(), true)?;
 
@@ -268,6 +273,12 @@ impl Backend for PauliBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> Result<Vec<f64>> {
+        for o in observables {
+            o.validate_qubits(circuit.num_qubits)?;
+        }
+        let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+        let circuit = &deferred;
+        let observables = &dephased[..];
         // Apply the circuit to a fresh stabilizer tableau once, then
         // evaluate every observable against the same `&tab`. The
         // default trait impl loops `expectation`, which rebuilds the
@@ -685,7 +696,6 @@ fn mul_pauli_row(x: &mut [bool], z: &mut [bool], sign: &mut bool, row: &PauliRow
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     /// **Regression: MEASUREMENT sampling and exact probabilities must agree
@@ -754,10 +764,7 @@ mod tests {
                     "probabilities sum to {sum}, not 1 (n={n})"
                 );
                 for (i, (a, b)) in p.iter().zip(truth.iter()).enumerate() {
-                    assert!(
-                        (a - b).abs() < 1e-9,
-                        "P({i}) = {a} vs dense {b} (n={n})"
-                    );
+                    assert!((a - b).abs() < 1e-9, "P({i}) = {a} vs dense {b} (n={n})");
                 }
             }
 
@@ -784,7 +791,10 @@ mod tests {
                 nondiag += 1;
             }
         }
-        assert!(checked > 100, "only {checked} circuits reached probabilities mode");
+        assert!(
+            checked > 100,
+            "only {checked} circuits reached probabilities mode"
+        );
         assert!(
             nondiag > 50,
             "only {nondiag} circuits had a spread support — the sweep is too degenerate \
@@ -932,8 +942,14 @@ mod tests {
 
         // Non-degeneracy: agreement on a set of all-zeros proves nothing, and
         // the Y observables are the ones the phase-table bug corrupted.
-        assert!(nonzero > 20, "only {nonzero} non-trivial expectations sampled");
-        assert!(with_y > 0, "no Y observable produced a non-zero expectation");
+        assert!(
+            nonzero > 20,
+            "only {nonzero} non-trivial expectations sampled"
+        );
+        assert!(
+            with_y > 0,
+            "no Y observable produced a non-zero expectation"
+        );
     }
 
     /// Dense `<psi|P|psi>` for a Clifford circuit — an independent oracle that
@@ -1063,7 +1079,10 @@ mod tests {
         // Bell state: only |00⟩ and |11⟩
         let bell = |k: u64| omega_core::outcome::Outcome::from_u64(k, 2);
         for bs in counts.keys() {
-            assert!(*bs == bell(0) || *bs == bell(3), "unexpected bitstring: {bs:?}");
+            assert!(
+                *bs == bell(0) || *bs == bell(3),
+                "unexpected bitstring: {bs:?}"
+            );
         }
         assert!(counts.contains_key(&bell(0)));
         assert!(counts.contains_key(&bell(3)));
@@ -1089,7 +1108,10 @@ mod tests {
 
         let ghz = |k: u64| omega_core::outcome::Outcome::from_u64(k, 3);
         for bs in counts.keys() {
-            assert!(*bs == ghz(0) || *bs == ghz(7), "unexpected bitstring: {bs:?}");
+            assert!(
+                *bs == ghz(0) || *bs == ghz(7),
+                "unexpected bitstring: {bs:?}"
+            );
         }
     }
 
@@ -1110,7 +1132,11 @@ mod tests {
         let counts = result.counts();
         // X|0⟩ = |1⟩, always measure 1
         assert_eq!(counts.len(), 1);
-        assert_eq!(counts[&omega_core::outcome::Outcome::from_u64(1, counts.keys().next().unwrap().width())], 100);
+        assert_eq!(
+            counts
+                [&omega_core::outcome::Outcome::from_u64(1, counts.keys().next().unwrap().width())],
+            100
+        );
     }
 
     #[test]
@@ -1201,7 +1227,11 @@ mod tests {
         let result = backend.execute(&circuit, &params, &config).unwrap();
         let counts = result.counts();
         assert_eq!(counts.len(), 1, "should only have |0⟩");
-        assert_eq!(counts[&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().unwrap().width())], 100);
+        assert_eq!(
+            counts
+                [&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().unwrap().width())],
+            100
+        );
     }
 
     #[test]
@@ -1221,7 +1251,11 @@ mod tests {
         let result = backend.execute(&circuit, &params, &config).unwrap();
         let counts = result.counts();
         assert_eq!(counts.len(), 1, "should only have |0⟩");
-        assert_eq!(counts[&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().unwrap().width())], 100);
+        assert_eq!(
+            counts
+                [&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().unwrap().width())],
+            100
+        );
     }
 
     #[test]
@@ -1293,7 +1327,16 @@ mod tests {
             .unwrap();
         let counts = result.counts();
         // Should only have |0⟩
-        assert_eq!(counts.get(&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().map(|o| o.width()).unwrap_or(1))).copied().unwrap_or(0), 100);
+        assert_eq!(
+            counts
+                .get(&omega_core::outcome::Outcome::from_u64(
+                    0,
+                    counts.keys().next().map(|o| o.width()).unwrap_or(1)
+                ))
+                .copied()
+                .unwrap_or(0),
+            100
+        );
     }
 
     #[test]
@@ -1354,8 +1397,20 @@ mod tests {
 
         // creg values: c1c0 = 00 (0) and 11 (3). The anti-correlated 01 / 10
         // must be absent.
-        let c00 = counts.get(&omega_core::outcome::Outcome::from_u64(0, counts.keys().next().map(|o| o.width()).unwrap_or(1))).copied().unwrap_or(0);
-        let c11 = counts.get(&omega_core::outcome::Outcome::from_u64(3, counts.keys().next().map(|o| o.width()).unwrap_or(1))).copied().unwrap_or(0);
+        let c00 = counts
+            .get(&omega_core::outcome::Outcome::from_u64(
+                0,
+                counts.keys().next().map(|o| o.width()).unwrap_or(1),
+            ))
+            .copied()
+            .unwrap_or(0);
+        let c11 = counts
+            .get(&omega_core::outcome::Outcome::from_u64(
+                3,
+                counts.keys().next().map(|o| o.width()).unwrap_or(1),
+            ))
+            .copied()
+            .unwrap_or(0);
         assert_eq!(
             c00 + c11,
             500,

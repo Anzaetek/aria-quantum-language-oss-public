@@ -70,23 +70,34 @@ fn cv_profile_emitted_here_imports_in_omega_parser() {
         (
             GateKind::Squeezing,
             vec![0.4, 0.2],
-            CvOp::Squeeze { mode: 0, r: 0.4, phi: 0.2 },
+            CvOp::Squeeze {
+                mode: 0,
+                r: 0.4,
+                phi: 0.2,
+            },
         ),
         (
             GateKind::Displacement,
             vec![0.7, -0.1],
-            CvOp::Displace { mode: 0, re: 0.7, im: -0.1 },
+            CvOp::Displace {
+                mode: 0,
+                re: 0.7,
+                im: -0.1,
+            },
         ),
-        (GateKind::Kerr, vec![0.15], CvOp::Kerr { mode: 0, chi: 0.15 }),
+        (
+            GateKind::Kerr,
+            vec![0.15],
+            CvOp::Kerr { mode: 0, chi: 0.15 },
+        ),
     ];
 
     for (kind, params, want) in cases {
         let text = emit(kind, params, 1, &[0]);
         let program = parse_opticqasm(&text)
             .unwrap_or_else(|e| panic!("our own OPTICQASM does not PARSE: {e}\n{text}"));
-        let cv = lower_opticqasm_cv(&program).unwrap_or_else(|e| {
-            panic!("our own CV export does not IMPORT: {e}\n{text}")
-        });
+        let cv = lower_opticqasm_cv(&program)
+            .unwrap_or_else(|e| panic!("our own CV export does not IMPORT: {e}\n{text}"));
         assert_eq!(
             cv.ops,
             vec![want],
@@ -165,7 +176,12 @@ fn the_bs_alias_lowers_on_both_profiles() {
     let cv = lower_opticqasm_cv(&program).expect("`bs` is two-mode CV too");
     assert_eq!(
         cv.ops,
-        vec![CvOp::BeamSplitter { a: 0, b: 1, theta: 1.2, phi: 0.3 }]
+        vec![CvOp::BeamSplitter {
+            a: 0,
+            b: 1,
+            theta: 1.2,
+            phi: 0.3
+        }]
     );
 }
 
@@ -227,7 +243,10 @@ fn polarization_survives_emit_and_reimport_with_its_mode_semantics() {
         vec![GateKind::HalfWavePlate, GateKind::PolarizingBeamSplitter],
         "the spellings must survive the AST round trip:\n{text}"
     );
-    assert!(back.registers[0].polarized, "the pol flag was lost on re-import");
+    assert!(
+        back.registers[0].polarized,
+        "the pol flag was lost on re-import"
+    );
 }
 
 /// `pbs` is emitted with no parameter list at all, which the grammar allows

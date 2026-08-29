@@ -87,9 +87,33 @@ fn bridge_rejects_statevector_mode() {
     ]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
+    // Asserts the two facts, not the sentence: statevector mode is refused,
+    // and the refusal says where to go instead. The wording changed when
+    // `--expectation` became routable over a bridge, and pinning the old
+    // sentence made a deliberate capability gain look like a regression.
     assert!(
-        stderr.contains("--bridge supports only the default sampling mode"),
+        stderr.contains("Statevector") && stderr.contains("in-process backend"),
         "expected mode-rejection notice, got: {stderr}"
+    );
+}
+
+/// The counterpart: `--expectation` IS supported over a bridge now, so the
+/// refusal above must not have widened to cover it. Without this, tightening
+/// the guard back to "sampling only" would pass every remaining test.
+#[test]
+fn bridge_accepts_expectation_mode() {
+    let path = fixture();
+    let output = run(&[
+        path.to_str().unwrap(),
+        "--bridge",
+        "qiskit",
+        "--expectation",
+        "Z0",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("require an in-process backend"),
+        "expectation must not be refused as an unsupported bridge mode: {stderr}"
     );
 }
 

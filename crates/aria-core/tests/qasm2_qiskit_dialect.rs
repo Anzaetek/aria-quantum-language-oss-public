@@ -113,7 +113,7 @@ fn emit_one(kind: GateKind, params: Vec<f64>, nq: usize) -> String {
 fn emit_the_qiskit_dialect_corpus() {
     let mut out = String::new();
     for (name, kind, params, nq) in corpus() {
-        let text = emit_one(kind.clone(), params, nq);
+        let text = emit_one(kind, params, nq);
         // Our own parser must read it back. This is not the Qiskit claim — it
         // is the cheap half, and it localises a failure to the emitter before
         // the Python harness even runs.

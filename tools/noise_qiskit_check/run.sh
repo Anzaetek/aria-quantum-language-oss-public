@@ -9,7 +9,8 @@ repo="$(cd "$here/../.." && pwd)"
 
 # A Python with qiskit + qiskit-aer. Override with AER_PYTHON=/path/to/python.
 # Defaults to a sibling venv that already has a compiled Aer.
-PY="${AER_PYTHON:-/Users/renaudbechade/work/initial-tests/.venv/bin/python}"
+# Set AER_PYTHON to a venv with qiskit-aer; plain python3 is the neutral fallback.
+PY="${AER_PYTHON:-python3}"
 if ! "$PY" -c "import qiskit_aer" >/dev/null 2>&1; then
   echo "No qiskit-aer for '$PY'. Set AER_PYTHON to a venv with qiskit + qiskit-aer" >&2
   echo "(e.g. python -m venv .venv && .venv/bin/pip install qiskit qiskit-aer)." >&2

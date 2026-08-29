@@ -68,7 +68,9 @@ fn dft(m: usize) -> Vec<Vec<Complex64>> {
 fn gram_schmidt_unitary(m: usize, seed: u64) -> Vec<Vec<Complex64>> {
     let mut s = seed;
     let mut next = || {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((s >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0
     };
 
@@ -146,7 +148,10 @@ fn reck_recomposes_independently_generated_unitaries() {
             let ops = reck_decompose(&u);
             let back = build_unitary(m, &ops);
             let d = max_diff(&u, &back);
-            assert!(d < TOL, "m={m} seed={seed} recomposition differs by {d:.3e}");
+            assert!(
+                d < TOL,
+                "m={m} seed={seed} recomposition differs by {d:.3e}"
+            );
         }
     }
 }

@@ -16,3 +16,10 @@ description = "libtorch (tch) statevector backend for the Aria Quantum Language.
 omega-core = { path = "../omega-core" }
 num-complex = "0.4"
 tch = "0.20"
+
+# Test-only, so the deferred-measurement contract can be checked against the
+# REAL corpus fixture read from disk rather than a hand-copied approximation of
+# it. Not pedantry: a hand-copied `12_feedforward_*.qasm` missing its last line
+# is exactly what hid a control-resolution defect that panicked the CPU backend.
+[dev-dependencies]
+omega-parser = { path = "../omega-parser" }

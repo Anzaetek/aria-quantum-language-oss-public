@@ -275,9 +275,12 @@ pub(crate) fn invoke_runner(
             Ok(ParsedResponse::Qasm2(qasm2.to_string()))
         }
         ParseAs::Values => {
-            let arr = resp.get("values").and_then(|v| v.as_array()).ok_or_else(|| {
-                BridgeError::Backend(spec.backend, "runner response missing `values`".into())
-            })?;
+            let arr = resp
+                .get("values")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    BridgeError::Backend(spec.backend, "runner response missing `values`".into())
+                })?;
             let mut out = Vec::with_capacity(arr.len());
             for (i, v) in arr.iter().enumerate() {
                 // Reject non-finite values rather than propagating them. A NaN
@@ -285,10 +288,7 @@ pub(crate) fn invoke_runner(
                 // FALSE, so a defect would surface as an unexplained
                 // disagreement; and a NaN reaching a `>= ` test would pass.
                 let x = v.as_f64().ok_or_else(|| {
-                    BridgeError::Backend(
-                        spec.backend,
-                        format!("values[{i}] is not a number: {v}"),
-                    )
+                    BridgeError::Backend(spec.backend, format!("values[{i}] is not a number: {v}"))
                 })?;
                 if !x.is_finite() {
                     return Err(BridgeError::Backend(
@@ -547,7 +547,6 @@ mod tests {
         }
     }
 }
-
 
 /// Map a runner's `kind` string onto a typed [`BridgeError`].
 ///

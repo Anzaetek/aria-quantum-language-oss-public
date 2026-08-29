@@ -11,7 +11,7 @@ use std::os::raw::c_char;
 /// Bump this only for a layout-breaking change to the FFI types below;
 /// additive growth is carved from [`BackendVTable::reserved`] and does **not**
 /// bump the version.
-pub const OMEGA_BACKEND_ABI_VERSION: u32 = 1;
+pub const OMEGA_BACKEND_ABI_VERSION: u32 = 2;
 
 /// Circuit type enum for C ABI.
 #[repr(C)]
@@ -171,9 +171,24 @@ pub struct BackendCaps {
     pub device: u32,
     /// Bitmask over the `GATE_*` constants of natively supported gate kinds.
     pub native_gates: u64,
-    /// Whether the host may apply the trait `cpu_fallback` default for this
-    /// plugin. Off by default: plugins error loudly instead of falling back.
-    pub opt_in_cpu_fallback: bool,
+    // REMOVED in ABI v2: `opt_in_cpu_fallback: bool`.
+    //
+    // It was declared here, set to `false` by the only in-tree plugin, and
+    // read by NOTHING — a contract the ABI advertised and no code honoured.
+    //
+    // Honouring it was considered and rejected. `cpu_fallback` does not
+    // reroute a job, it substitutes a DIFFERENT ENGINE'S result for the one
+    // that was asked for, and `ExecResult` carries no provenance field, so the
+    // substitution would be invisible to every machine consumer. Worse, this
+    // same struct declares `kind` (`CAPS_KIND_HARDWARE`) and a `noise` level:
+    // honouring the flag would let a hardware or noisy plugin's results be
+    // replaced by the built-in ideal, noiseless CPU statevector. That is the
+    // silent-substitution class this tree is repeatedly audited for, and it
+    // would have been introduced deliberately.
+    //
+    // Removal is the LOUD option, not a silent narrowing: the loader refuses
+    // on ABI mismatch before it reads the vtable, so a plugin built against v1
+    // gets a version error rather than a subtly different contract.
     /// Optional engine version string (null-terminated); may be null.
     pub engine_version: *const c_char,
 }

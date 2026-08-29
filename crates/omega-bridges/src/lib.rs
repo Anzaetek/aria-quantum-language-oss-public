@@ -255,6 +255,27 @@ pub fn expectation_qasm2(
     }
 }
 
+/// Exact expectation of a circuit that is a MIXTURE over measurement
+/// outcomes (mid-circuit measurement + classically-conditioned gates).
+/// Qiskit-only: the runner's `expectation-mixture` mode evolves every
+/// measurement branch exactly, so the value is analytic — no shots, no √N.
+/// See `qiskit_runner.py::_expectation_mixture` for the semantics, including
+/// the inert-final-measure elision that keeps it aligned with
+/// `omega_core::defer_measure`.
+pub fn expectation_mixture_qasm2(
+    backend: Backend,
+    qasm: &str,
+    observables: &[WireObservable],
+) -> Result<Vec<f64>, BridgeError> {
+    match backend {
+        Backend::Qiskit => qiskit::expectation_mixture(qasm, observables),
+        other => Err(BridgeError::CannotExpress(
+            other,
+            format!("{other:?} has no expectation-mixture mode"),
+        )),
+    }
+}
+
 /// Convenience: parse a backend name and dispatch.
 pub fn run_qasm2_named(
     name: &str,

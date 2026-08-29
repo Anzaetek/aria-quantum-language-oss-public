@@ -1,5 +1,6 @@
 #![allow(clippy::needless_range_loop)]
 
+pub mod capacity;
 pub mod gates;
 pub mod mps;
 mod sim;
@@ -91,13 +92,24 @@ pub mod select {
 
         #[test]
         fn the_whole_grammar_parses() {
-            assert_eq!(parse_mps("mps").unwrap(), Some(MpsSelect::Fixed { chi: DEFAULT_CHI }));
-            assert_eq!(parse_mps("mps:512").unwrap(), Some(MpsSelect::Fixed { chi: 512 }));
+            assert_eq!(
+                parse_mps("mps").unwrap(),
+                Some(MpsSelect::Fixed { chi: DEFAULT_CHI })
+            );
+            assert_eq!(
+                parse_mps("mps:512").unwrap(),
+                Some(MpsSelect::Fixed { chi: 512 })
+            );
             assert_eq!(
                 parse_mps("mps:auto").unwrap(),
-                Some(MpsSelect::Auto { max_chi: DEFAULT_AUTO_CEILING })
+                Some(MpsSelect::Auto {
+                    max_chi: DEFAULT_AUTO_CEILING
+                })
             );
-            assert_eq!(parse_mps("mps:auto:256").unwrap(), Some(MpsSelect::Auto { max_chi: 256 }));
+            assert_eq!(
+                parse_mps("mps:auto:256").unwrap(),
+                Some(MpsSelect::Auto { max_chi: 256 })
+            );
         }
 
         /// Not-an-MPS-name is `Ok(None)`, not an error — the caller owns its own

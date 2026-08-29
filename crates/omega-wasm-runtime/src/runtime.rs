@@ -12,6 +12,18 @@ use omega_core::error::{OmegaError, Result};
 use omega_core::executor::Observable;
 use omega_parser::lower_to_ir;
 
+/// Returned by `omega_register_qasm` when admission control refuses the circuit.
+///
+/// Distinct from `-1`, which that function already returns for malformed input.
+/// The two are different conditions with different correct responses: `-1` is a
+/// bug in the guest, `-2` is the host declining — possibly temporarily. A guest
+/// that cannot tell them apart must treat a retryable refusal as fatal.
+///
+/// **A code, not a trap.** A guest killed mid-optimisation cannot report what it
+/// had achieved or why it stopped, which is the whole reason this path returns
+/// rather than aborting.
+pub const REGISTER_REFUSED_BY_ADMISSION: i32 = -2;
+
 /// Default memory cap for guest WASM linear memory, in bytes (256 MiB).
 /// Adjustable via the `OMEGA_WASM_MEMORY_LIMIT` env var on the host.
 pub const DEFAULT_GUEST_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
@@ -566,7 +578,19 @@ fn add_host_functions(linker: &mut Linker<StoreData>) -> Result<()> {
                 };
                 let host = Arc::clone(caller.data().host());
                 let mut state = host.lock().unwrap();
-                state.register_circuit(circuit) as i32
+                // -1 is already "bad input" above. A refusal is a DIFFERENT
+                // condition and gets its own code, because the guest's correct
+                // response differs: bad input is a bug in the guest, admission
+                // refusal is the host saying "not now" or "not ever", and the
+                // message says which. Returning -1 for both would collapse a
+                // retryable condition into a permanent one.
+                match state.register_circuit_admitted(circuit) {
+                    Ok(id) => id as i32,
+                    Err(refusal) => {
+                        eprintln!("omega_register_qasm: {refusal}");
+                        REGISTER_REFUSED_BY_ADMISSION
+                    }
+                }
             },
         )
         .map_err(|e| OmegaError::Backend(e.to_string()))?;

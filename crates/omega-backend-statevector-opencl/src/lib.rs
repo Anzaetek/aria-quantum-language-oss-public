@@ -47,6 +47,8 @@ use num_complex::Complex64;
 pub use execute::pauli_masks;
 
 use omega_core::circuit::{CircuitIR, SymbolId};
+#[cfg(feature = "opencl")]
+use omega_core::defer_measure::{prepare_for_expectation, prepare_for_expectation_multi};
 use omega_core::error::{OmegaError, Result as OmegaResult};
 use omega_core::executor::{
     Backend, ExecConfig, ExecResult, ExpectationsAndGradient, GradientObservableFactory, Observable,
@@ -402,6 +404,11 @@ impl Backend for OpenClStatevectorBackend {
     ) -> OmegaResult<f64> {
         #[cfg(feature = "opencl")]
         {
+            // The device sweep skips `Measure`; defer first so what reaches it
+            // is a circuit with no measurements. See `omega_core::defer_measure`.
+            let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+            let circuit = &deferred;
+            let observable = &observable;
             execute::expectation(&self.handle, circuit, params, observable)
         }
         #[cfg(not(feature = "opencl"))]
@@ -419,6 +426,11 @@ impl Backend for OpenClStatevectorBackend {
     ) -> OmegaResult<Vec<f64>> {
         #[cfg(feature = "opencl")]
         {
+            // The device sweep skips `Measure`; defer first so what reaches it
+            // is a circuit with no measurements. See `omega_core::defer_measure`.
+            let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+            let circuit = &deferred;
+            let observables = &dephased[..];
             execute::expectation_multi(&self.handle, circuit, params, observables)
         }
         #[cfg(not(feature = "opencl"))]
@@ -436,6 +448,11 @@ impl Backend for OpenClStatevectorBackend {
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
         #[cfg(feature = "opencl")]
         {
+            // A gradient must obey the same contract as the expectation it
+            // differentiates; the adjoint sweep skips `Measure` outright.
+            let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+            let circuit = &deferred;
+            let observable = &observable;
             adjoint::adjoint_gradient(&self.handle, &self.pool, circuit, params, observable)
         }
         #[cfg(not(feature = "opencl"))]

@@ -10,8 +10,13 @@
 //! Cost model: exact and width-unbounded for **Clifford** circuits (a single
 //! Pauli never branches), a tunable approximation for non-Clifford gates.
 
+pub mod bound;
 pub mod pauli;
 pub mod sim;
 
+pub use bound::{branch_calls, term_ceiling, term_upper_bound, MAX_BRANCH_CALLS_PER_GATE};
 pub use pauli::{PauliKey, PauliSum, Weighted};
-pub use sim::{pack_bits, unpack_bits, BranchHook, PauliPropBackend};
+pub use sim::{
+    gates_skipped, observable_l1_norm, pack_bits, peak_terms, reset_peak_terms, unpack_bits,
+    BranchHook, PauliPropBackend, PauliPropCertificate, DEFAULT_MAX_TERMS,
+};

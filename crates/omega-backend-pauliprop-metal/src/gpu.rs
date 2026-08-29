@@ -16,7 +16,7 @@ use metal::{
     MTLSize,
 };
 use num_complex::Complex64;
-use omega_backend_pauliprop::{pack_bits, unpack_bits, PauliKey, PauliSum};
+use omega_backend_pauliprop::{PauliKey, PauliSum};
 
 const SHADER: &str = include_str!("shaders/branch_symplectic.metal");
 
@@ -77,7 +77,7 @@ pub fn branch_on_gpu(
     // produces for every term. Bail to the CPU on the degenerate n == 0 /
     // empty-sum cases rather than fudge widths.
     let w = rx.len();
-    let num = sum.terms.len();
+    let num = sum.len();
     if num == 0 || w == 0 {
         return false;
     }
@@ -93,9 +93,9 @@ pub fn branch_on_gpu(
     let mut freqs: Vec<u32> = Vec::with_capacity(num);
     let mut x_host = Vec::with_capacity(num * w);
     let mut z_host = Vec::with_capacity(num * w);
-    for (key, wt) in &sum.terms {
-        x_host.extend_from_slice(&pack_bits(&key.x));
-        z_host.extend_from_slice(&pack_bits(&key.z));
+    for (key, wt) in sum.iter() {
+        x_host.extend_from_slice(key.x_words());
+        z_host.extend_from_slice(key.z_words());
         keys.push(key);
         coeffs.push(wt.coeff);
         freqs.push(wt.freq);
@@ -175,7 +175,11 @@ pub fn branch_on_gpu(
 
     // --- Merge on the CPU, in f64, identically to the CPU branch. ---
     let i_unit = Complex64::new(0.0, 1.0);
-    let mut out = PauliSum::new();
+    // Sized at `num`, not the 2n worst case — see the CPU `branch()` for the
+    // measurement. 2n measured SLOWER than no pre-sizing at all: an over-sized
+    // table is a sparser table, and the locality costs more than the rehashes
+    // it saves.
+    let mut out = PauliSum::with_capacity(num);
     out.dropped_mass = sum.dropped_mass;
     for i in 0..num {
         let coeff = coeffs[i];
@@ -197,10 +201,13 @@ pub fn branch_on_gpu(
             continue;
         }
         let base = i * w;
-        let key1 = PauliKey {
-            x: unpack_bits(&ox1[base..base + w], n),
-            z: unpack_bits(&oz1[base..base + w], n),
-        };
+        // `PauliKey` is packed into `u64` words now, so build it from the words
+        // the device already produced. This used to be
+        // `PauliKey { x: unpack_bits(..), z: unpack_bits(..) }`, which no longer
+        // compiles — and the packed form is strictly better here anyway: the GPU
+        // hands back words, so unpacking to `Vec<bool>` only to have the
+        // constructor repack them was pure round trip.
+        let key1 = PauliKey::from_words(&ox1[base..base + w], &oz1[base..base + w], n);
         out.add_weighted(key1, sin_coeff * sign, child_freq);
     }
 

@@ -114,8 +114,10 @@ fn run_counts_keys_on_the_creg_at_seventy_qubits() {
 
 #[test]
 fn run_counts_noisy_keys_on_the_creg_at_seventy_qubits() {
-    let mut model = NoiseModel::default();
-    model.readout = ReadoutError::symmetric(0.02);
+    let model = NoiseModel {
+        readout: ReadoutError::symmetric(0.02),
+        ..Default::default()
+    };
     let r = run_counts_noisy(
         &circuit(70),
         &HashMap::new(),

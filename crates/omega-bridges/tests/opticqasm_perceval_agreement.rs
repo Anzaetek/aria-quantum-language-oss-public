@@ -51,7 +51,10 @@ fn runner_dir() -> PathBuf {
 }
 
 fn venv_python() -> PathBuf {
-    runner_dir().join(".venv-perceval").join("bin").join("python")
+    runner_dir()
+        .join(".venv-perceval")
+        .join("bin")
+        .join("python")
 }
 
 fn force_runner_env() {
@@ -152,16 +155,10 @@ fn photonics_counts(source: &str, input_fock: &[u32]) -> Counts {
 /// Returns `None` when the venv is absent, so the caller reports a skip rather
 /// than passing quietly.
 fn compare(label: &str, circuit: &Circuit, input_fock: &[u32]) -> Option<(f64, f64)> {
-    let source = to_opticqasm(circuit)
-        .unwrap_or_else(|e| panic!("{label}: circuit is not emittable: {e}"));
+    let source =
+        to_opticqasm(circuit).unwrap_or_else(|e| panic!("{label}: circuit is not emittable: {e}"));
 
-    let perceval = match run_opticqasm(
-        Backend::Perceval,
-        &source,
-        SHOTS,
-        Some(input_fock),
-        None,
-    ) {
+    let perceval = match run_opticqasm(Backend::Perceval, &source, SHOTS, Some(input_fock), None) {
         Ok(c) => c,
         Err(BridgeError::Unavailable(_, msg)) => {
             eprintln!("{label}: perceval unavailable ({msg})");
@@ -197,7 +194,10 @@ fn compare(label: &str, circuit: &Circuit, input_fock: &[u32]) -> Option<(f64, f
         ours.keys().collect::<Vec<_>>()
     );
 
-    Some((count_l2(&perceval, &ours, p_total, o_total), l2_gate(&perceval, &ours)))
+    Some((
+        count_l2(&perceval, &ours, p_total, o_total),
+        l2_gate(&perceval, &ours),
+    ))
 }
 
 fn skip_if_no_venv(what: &str) -> bool {

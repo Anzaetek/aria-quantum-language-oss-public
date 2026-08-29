@@ -42,6 +42,49 @@ are installed here, **each in its own venv** — never system Python:
 | `.venv-qiskit` | `ARIA_QISKIT_XCHECK=1` | qiskit 2.5.1, qiskit-aer 0.17.2, numpy 2.5.1, scipy 1.18.0 | 193 MB |
 | `tools/qec_cross_check/.venv` | `ARIA_QEC_XCHECK=1` | qiskit 2.5.1, PyMatching 2.4.0, stim 1.16.0 | 566 MB |
 | `.venv-piquasso` | `ARIA_CV_XCHECK=1` | piquasso 8.0.1, numpy 2.4.6 | 400 MB |
+| `bindings/aria-py/.venv` | aria-py python tests | maturin, pytest, the built `aria_py` wheel. Build it with a **CPython &le; 3.13** (`python3.13 -m venv bindings/aria-py/.venv`) — pyo3 0.23 refuses anything newer, and ci.sh then auto-detects this venv. See `ARIA_PY_PYTHON` in `OPTIONAL_TESTS.md` | 120 MB |
+| `crates/omega-bridges/python/.venv-qiskit` | bridge runner python tests | qiskit, qiskit-aer, **pytest** | 200 MB |
+| `crates/omega-bridges/python/.venv-{perceval,bloqade,tsim,ppvm}` | `ARIA_BRIDGE_XCHECK=1` | see `requirements-*.txt` | ~3 GB total |
+
+### Which arms can this machine run?
+
+```sh
+$ make -C crates/omega-bridges/python check-env
+ARM        VENV      PYTHON   STATUS
+qiskit     built     3.12     ready
+perceval   built     3.12     ready
+...
+```
+
+It probes each venv by importing the package, not by testing for a directory —
+a venv can exist and be unusable, and one of the two ways that happens is the
+trap below. It also prints which `ARIA_*` flag each arm gates, so "why did that
+stage skip?" has a one-command answer instead of a trail through `ci.sh`, the
+Makefile and five requirements files.
+
+### The bridge venvs need Python ≥ 3.10 — including perceval
+
+`crates/omega-bridges/python/Makefile` defaults to `PY ?= python3`, which on
+macOS is often **3.9**. The `tsim` and `ppvm` requirement files already say they
+need ≥ 3.10 and fail loudly on 3.9. **Perceval does not fail loudly**, and that
+is the trap: on 3.9, pip silently resolves `perceval-quandela` back to **1.0.1**,
+whose `Sampler.samples()` returns `None` where 1.2.x returns a dict. The runner
+then dies with `AttributeError: 'NoneType' object has no attribute 'get'`, the
+cross-backend harness records it as "skipping", and the stage reports success
+having compared **nothing** on that arm — the same shape as the anchor that
+reported "7 passed" while comparing zero cells.
+
+Build all four with an explicit interpreter:
+
+```sh
+$ P=$(uv python find 3.12)          # or any python3.12 on PATH
+$ make -C crates/omega-bridges/python perceval-venv bloqade-venv tsim-venv ppvm-venv PY="$P"
+```
+
+Verified on 3.12: perceval-quandela 1.2.4, bloqade-circuit 0.14.4,
+bloqade-tsim 0.1.5, ppvm 0.1.0 (git + maturin build, needs the Rust toolchain).
+With those the cross-backend arms genuinely compare — perceval 3 fixtures,
+ppvm 10 of 14, tsim 11 of 14, the rest refused with typed reasons.
 
 Two separate environments is deliberate, not an accident: the QEC script
 **self-provisions** its own (`tools/qec_cross_check/run.sh` creates it and

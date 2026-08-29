@@ -242,12 +242,24 @@ pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
                 // decomposition RBS(θ) = (H⊗H)·CZ·(Ry(−θ)⊗Ry(θ))·CZ·(H⊗H)
                 // (full angle θ, verified against exp(−iθ/2(YX−XY)) in
                 // `omega-backend-statevector` tests).
-                let theta = inst
-                    .gate
-                    .params
-                    .first()
-                    .and_then(|p| p.try_as_f64())
-                    .unwrap_or(0.0);
+                // `.unwrap_or(0.0)` here had the SAME defect the `_` arm below
+                // was fixed for, and outlived that fix because RBS expands to
+                // its own statement sequence and never reaches the generic
+                // parameter path. A symbolic angle became `rbs(0)` — eight
+                // well-formed lines describing a different circuit.
+                //
+                // The refusal test only exercised `RZ`, which goes through the
+                // `_` arm, so nothing covered this.
+                let theta = match inst.gate.params.first() {
+                    Some(p) => p.try_as_f64().ok_or_else(|| {
+                        format!(
+                            "QASM2 cannot express the symbolic parameter `{p:?}` \
+                             (argument 0 of `rbs`): the format has no syntax for one. \
+                             Bind it to a concrete value before exporting."
+                        )
+                    })?,
+                    None => 0.0,
+                };
                 let (a, b) = (&inst.qubits[0], &inst.qubits[1]);
                 lines.push(format!("// rbs({}) {}, {}", format_param(theta), a, b));
                 lines.push(format!("h {a};"));
@@ -354,10 +366,23 @@ pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
                      a silent change of meaning. Use `to_qasm3` (OpenQASM 3's \
                      `if ({}[{}] == {})` addresses a single bit), or restructure the \
                      circuit so the guard reads a size-1 register.",
-                    clbit.register, clbit.index, value,
-                    clbit.register, reg.size,
-                    clbit.register, value, value,
-                    clbit.register, clbit.index, value,
+                    clbit.register,
+                    clbit.index,
+                    value,
+                    clbit.register,
+                    reg.size,
+                    clbit.register,
+                    value,
+                    value,
+                    clbit.register,
+                    clbit.index,
+                    // The advice must show the spelling `to_qasm3` actually
+                    // emits, and OpenQASM 3 compares a bit to a BOOLEAN. This
+                    // printed the raw value — `if (c[0] == 1)` — which qiskit
+                    // refuses, so following our own advice produced an
+                    // unloadable file. Misdirection is worse than silence, and
+                    // the comment four lines from the emitter says exactly that.
+                    if *value == 0 { "false" } else { "true" },
                 ));
             }
 
@@ -410,12 +435,46 @@ fn format_param3(p: f64) -> String {
 /// comments, as in 2.0), `barrier`, `reset`, and single-bit
 /// `creg[i] = measure qreg[i];` measurements. No pulse blocks, no classical
 /// control flow (`if`), no gate/subroutine definitions are emitted.
-pub fn to_qasm3(circuit: &Circuit) -> String {
+pub fn to_qasm3(circuit: &Circuit) -> Result<String, String> {
     let mut lines = vec![
         "OPENQASM 3.0;".to_string(),
         "include \"stdgates.inc\";".to_string(),
         String::new(),
     ];
+
+    // `stdgates.inc` defines no rxx/ryy/rzz — verified against the OpenQASM 3
+    // standard library, whose gate set stops at the controlled-single-qubit
+    // family. Emitting those names bare would produce a file a strict consumer
+    // rejects, which is why this function used to drop them into
+    // `// unsupported gate:` comments instead.
+    //
+    // Dropping them is the worse of the two options: the file then parses,
+    // refuses nothing, and is missing an operation. So do here what the 2.0
+    // emitter already does — carry the definition. QASM 3 has `gate`
+    // declarations with the same shape, and the bodies are the same qelib1-only
+    // decompositions `GATE_DEFS` uses (verified exact against qiskit's native
+    // gates: max|Δ| = 1.214e-16 for ryy).
+    let mut needed_defs: Vec<GateKind> = Vec::new();
+    for inst in &circuit.instructions {
+        if matches!(
+            inst.gate.kind,
+            GateKind::RXX | GateKind::RYY | GateKind::RZZ
+        ) && !needed_defs.contains(&inst.gate.kind)
+        {
+            needed_defs.push(inst.gate.kind);
+        }
+    }
+    if !needed_defs.is_empty() {
+        for kind in &needed_defs {
+            let body = GATE_DEFS
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map(|(_, def)| *def)
+                .ok_or_else(|| format!("no definition available for {kind:?} in QASM3 export"))?;
+            lines.push(body.to_string());
+        }
+        lines.push(String::new());
+    }
 
     for reg in &circuit.registers {
         match reg.kind {
@@ -447,12 +506,19 @@ pub fn to_qasm3(circuit: &Circuit) -> String {
             GateKind::RBS => {
                 // Same exact decomposition as the 2.0 path (stdgates has no
                 // RBS): RBS(θ) = (H⊗H)·CZ·(Ry(−θ)⊗Ry(θ))·CZ·(H⊗H).
-                let theta = inst
-                    .gate
-                    .params
-                    .first()
-                    .and_then(|p| p.try_as_f64())
-                    .unwrap_or(0.0);
+                // Same silent-zero defect as the 2.0 RBS arm, and same reason it
+                // survived: RBS expands to its own statements, so it never
+                // reaches the `_` arm's parameter check below.
+                let theta = match inst.gate.params.first() {
+                    Some(p) => p.try_as_f64().ok_or_else(|| {
+                        format!(
+                            "OpenQASM 3 cannot express the symbolic parameter `{p:?}` \
+                             (argument 0 of `rbs`): the format has no syntax for one. \
+                             Bind it to a concrete value before exporting."
+                        )
+                    })?,
+                    None => 0.0,
+                };
                 let (a, b) = (&inst.qubits[0], &inst.qubits[1]);
                 lines.push(format!("// rbs({}) {}, {}", format_param3(theta), a, b));
                 lines.push(format!("h {a};"));
@@ -465,22 +531,54 @@ pub fn to_qasm3(circuit: &Circuit) -> String {
                 lines.push(format!("h {b};"));
             }
             _ => {
-                if let Some(qasm_name) = gate_to_qasm3(inst.gate.kind) {
+                // The three two-qubit rotations have no stdgates spelling but
+                // now carry their own definition in the preamble, so their
+                // lowercase names are legal in this file.
+                let spelled = gate_to_qasm3(inst.gate.kind).or(match inst.gate.kind {
+                    GateKind::RXX => Some("rxx"),
+                    GateKind::RYY => Some("ryy"),
+                    GateKind::RZZ => Some("rzz"),
+                    _ => None,
+                });
+                if let Some(qasm_name) = spelled {
                     let params = if inst.gate.params.is_empty() {
                         String::new()
                     } else {
-                        let ps: Vec<String> = inst
-                            .gate
-                            .params
-                            .iter()
-                            .map(|p| format_param3(p.try_as_f64().unwrap_or(0.0)))
-                            .collect();
+                        // `unwrap_or(0.0)` here exported a symbolic angle as a
+                        // literal ZERO: `rz(theta)` became `rz(0)`. That is a
+                        // well-formed file describing a DIFFERENT circuit, with
+                        // no diagnostic on either side — strictly worse than an
+                        // omitted gate, which at least changes the gate count.
+                        // `to_qasm` was fixed for exactly this; this path was
+                        // not.
+                        let mut ps: Vec<String> = Vec::with_capacity(inst.gate.params.len());
+                        for (i, p) in inst.gate.params.iter().enumerate() {
+                            let v = p.try_as_f64().ok_or_else(|| {
+                                format!(
+                                    "OpenQASM 3 cannot express the symbolic parameter \
+                                     `{p:?}` (argument {i} of `{qasm_name}`): the format \
+                                     has no syntax for one. Bind it to a concrete value \
+                                     before exporting."
+                                )
+                            })?;
+                            ps.push(format_param3(v));
+                        }
                         format!("({})", ps.join(", "))
                     };
                     let qrefs: Vec<String> = inst.qubits.iter().map(|q| q.to_string()).collect();
                     lines.push(format!("{qasm_name}{params} {};", qrefs.join(", ")));
                 } else {
-                    lines.push(format!("// unsupported gate: {:?}", inst.gate.kind));
+                    // Refuse rather than comment out. A `// unsupported gate:`
+                    // line produces a file that parses, refuses nothing, and is
+                    // silently missing an operation — the same defect `to_qasm`
+                    // was fixed for.
+                    return Err(format!(
+                        "OpenQASM 3 export does not support gate {:?}: it has no \
+                         stdgates spelling and no definition this emitter can \
+                         write. Refusing rather than emitting a file that is \
+                         silently missing the operation.",
+                        inst.gate.kind
+                    ));
                 }
             }
         }
@@ -504,15 +602,45 @@ pub fn to_qasm3(circuit: &Circuit) -> String {
                 if line.starts_with("//") || line.is_empty() {
                     continue;
                 }
+                // A single bit compares to a **boolean**, not an integer.
+                // This wrote `if (c[0] == 1)`, which qiskit 2.2.3 refuses:
+                //
+                //   conditions must be 'bit == const bool' or
+                //   'bitarray == const int', not 'bit == const int'
+                //
+                // So the emitter's headline QASM3 feature — the guard
+                // `to_qasm`'s refusal message directs users to — produced a
+                // file no strict OpenQASM 3 consumer would load. The reasoning
+                // above is right (OpenQASM 3 *can* address a single bit); only
+                // the spelling was wrong.
+                //
+                // Verified against qiskit rather than assumed: `c[0] == true`
+                // resolves to `(Clbit index=0, True)` and `c[1] == true` to
+                // `(Clbit index=1, True)`, so the bit and the value both land
+                // where Aria means them to.
+                let literal = match value {
+                    0 => "false",
+                    1 => "true",
+                    other => {
+                        return Err(format!(
+                            "OpenQASM 3 compares a single bit to a boolean, so the Aria \
+                             condition `{}[{}] == {other}` cannot be expressed: a bit is \
+                             0 or 1 and can never equal {other}. This is an unsatisfiable \
+                             guard — fix the condition rather than exporting a circuit \
+                             whose guarded operations can never run.",
+                            clbit.register, clbit.index
+                        ));
+                    }
+                };
                 *line = format!(
                     "if ({}[{}] == {}) {}",
-                    clbit.register, clbit.index, value, line
+                    clbit.register, clbit.index, literal, line
                 );
             }
         }
     }
 
-    lines.join("\n") + "\n"
+    Ok(lines.join("\n") + "\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +680,88 @@ fn qasm_to_gate(name: &str) -> Option<GateKind> {
         "rzz" => Some(GateKind::RZZ),
         _ => None,
     }
+}
+
+/// How many qubits a gate takes, for the register-broadcast rule only.
+///
+/// `None` for anything this importer does not read as a gate application
+/// (`Measure`, `Reset`, `Barrier` have their own statement arms) and for the
+/// photonic kinds, which `qasm_to_gate` never returns.
+///
+/// Deliberately a second table rather than a field on [`GateKind`]: broadcast
+/// is the only caller, and the alternative — inferring arity from how many
+/// operands were written — is exactly the bug being fixed, since a bare
+/// register that expands to two qubits would then satisfy a two-qubit gate.
+/// `omega-parser` extracted `gate_signature` from its arity check for the same
+/// reason (`lower.rs:1379`); the two tables are mirrors and
+/// `readers_agree_on_register_broadcast` pins them together.
+fn gate_qubit_arity(kind: GateKind) -> Option<usize> {
+    use GateKind::*;
+    Some(match kind {
+        I | X | Y | Z | H | S | Sdg | T | Tdg | SX | RX | RY | RZ | P | U => 1,
+        CX | CY | CZ | SWAP | RXX | RYY | RZZ | CP | CRz | RBS => 2,
+        CCX | CSWAP => 3,
+        Barrier | Reset | Measure => return None,
+        BeamSplitter
+        | PhaseShifter
+        | Squeezing
+        | Displacement
+        | Kerr
+        | HalfWavePlate
+        | PolarizingBeamSplitter => return None,
+    })
+}
+
+/// One operand of a gate application: `q[3]` or a bare register `q`.
+enum Operand<'a> {
+    Indexed(&'a str, usize),
+    Whole(&'a str),
+}
+
+/// Split a gate's operand list into [`Operand`]s.
+///
+/// Written as a split-and-classify rather than a single regex because the
+/// previous code used a regex that matched only `name[index]` — so a bare
+/// register did not match, the operand vector came back EMPTY, and the reader
+/// reported "no indexed qubit operands". A construct that is legal OpenQASM 2.0
+/// was diagnosed as a malformed one.
+fn parse_operands<'a>(list: &'a str, lineno: usize) -> Result<Vec<Operand<'a>>, String> {
+    let mut out = Vec::new();
+    for raw in list.split(',') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        match tok.split_once('[') {
+            Some((name, rest)) => {
+                let idx = rest
+                    .strip_suffix(']')
+                    .ok_or_else(|| format!("unterminated qubit index '{tok}' at line {lineno}"))?;
+                // Same fail-loud contract as the nested `parse_idx` inside
+                // `from_qasm_with_dialect`: an oversized literal like
+                // `q[99999999999999999999]` must return Err, not panic on an
+                // unwrapped parse. Duplicated rather than shared because that
+                // one is a closure over the reader's locals; the message is
+                // kept identical so a user sees one wording.
+                let i = idx.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "'{}' at line {lineno} is not a valid non-negative integer",
+                        idx.trim()
+                    )
+                })?;
+                out.push(Operand::Indexed(name.trim(), i));
+            }
+            None => {
+                if !tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return Err(format!(
+                        "unrecognised qubit operand '{tok}' at line {lineno}"
+                    ));
+                }
+                out.push(Operand::Whole(tok));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Parse a single QASM parameter atom: a decimal literal (incl. scientific
@@ -624,6 +834,164 @@ fn parse_param(s: &str) -> Result<f64, String> {
 /// fuller pest-based pipeline that accepts a QASM 3 minimal subset lives in the
 /// `omega-parser` crate and is unaffected by this function.)
 pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
+    from_qasm_with_dialect(qasm_str, Qasm2Dialect::default())
+}
+
+/// Which OpenQASM 2.0 dialect to read — see [`Qasm2Dialect`] in `omega-parser`
+/// for the measured Qiskit behaviour this mirrors.
+///
+/// Kept as its own type rather than shared with `omega-parser` because
+/// `aria-core` deliberately depends on nothing but `serde` and `regex`; the two
+/// definitions are mirrors and the acceptance matrix is pinned by a test in
+/// each crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Qasm2Dialect {
+    /// `qiskit.qasm2.loads`: a bare `rxx`/`ryy`/`rzz` is an error.
+    Strict,
+    /// `QuantumCircuit.from_qasm_str` (**default**): bare `rxx`/`rzz` accepted,
+    /// bare `ryy` refused.
+    #[default]
+    Legacy,
+    /// Accept all three bare. No Qiskit reader does this.
+    Lenient,
+}
+
+impl Qasm2Dialect {
+    fn accepts_bare(self, name: &str) -> bool {
+        match self {
+            Qasm2Dialect::Strict => false,
+            Qasm2Dialect::Legacy => matches!(name, "rxx" | "rzz"),
+            Qasm2Dialect::Lenient => matches!(name, "rxx" | "ryy" | "rzz"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Qasm2Dialect::Strict => "strict",
+            Qasm2Dialect::Legacy => "legacy",
+            Qasm2Dialect::Lenient => "lenient",
+        }
+    }
+}
+
+/// Spellings whose bare readability depends on the dialect. Exactly the set
+/// [`GATE_DEFS`] carries a definition for and `qelib1.inc` does not define.
+const DIALECT_GATED: &[&str] = &["rxx", "ryy", "rzz"];
+
+/// Strip `gate NAME(...) qs { ... }` definitions out of `src`, returning the
+/// remaining source plus the set of names the file defined.
+///
+/// # Why this exists
+///
+/// [`to_qasm`] emits a definition for every spelling that is not in
+/// `qelib1.inc` (`rxx`, `ryy`, `rzz`, `swap`, `cswap`) so that its output loads
+/// under *both* Qiskit readers. This importer then could not read its own
+/// emitter's output: a definition is one line carrying several `;`, and the
+/// line-oriented loop below rejects that as "multiple statements on line N".
+/// Every one of those five gates therefore failed `to_qasm` -> `from_qasm`,
+/// while Qiskit read the same file without complaint.
+///
+/// Definitions are **stripped, not interpreted**. This importer resolves names
+/// through its own table, so a definition's only job here is to license the
+/// name. That is safe precisely when the body says what this importer already
+/// believes the name means — so a body that is not the canonical one is
+/// refused rather than silently replaced by the built-in operator, which is the
+/// silent-substitution defect this file is repeatedly audited for.
+///
+/// Consumed lines are replaced by blank ones so every later line number in an
+/// error message still points at the user's actual line.
+fn split_gate_defs(src: &str) -> Result<(String, std::collections::HashSet<String>), String> {
+    let mut out = String::with_capacity(src.len());
+    let mut declared = std::collections::HashSet::new();
+    let mut pending: Option<(usize, String)> = None;
+
+    for (idx, raw) in src.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw.trim();
+        let starts = pending.is_none() && line.starts_with("gate ");
+        if !starts && pending.is_none() {
+            out.push_str(raw);
+            out.push('\n');
+            continue;
+        }
+        // Accumulate until the braces balance — a definition may be written on
+        // one line (what this emitter does) or spread over several.
+        let (start_line, mut acc) = pending.take().unwrap_or((lineno, String::new()));
+        if !acc.is_empty() {
+            acc.push(' ');
+        }
+        acc.push_str(line);
+        out.push('\n'); // keep line numbering aligned
+        let opens = acc.matches('{').count();
+        let closes = acc.matches('}').count();
+        if opens == 0 || closes < opens {
+            pending = Some((start_line, acc));
+            continue;
+        }
+        let name = canonical_def_name(&acc, start_line)?;
+        declared.insert(name);
+    }
+    if let Some((start_line, acc)) = pending {
+        return Err(format!(
+            "unterminated `gate` definition starting at line {start_line}: '{acc}'"
+        ));
+    }
+    Ok((out, declared))
+}
+
+/// Validate one `gate ... { ... }` block and return the name it defines.
+///
+/// Accepts only a body this importer can honour: the canonical text [`to_qasm`]
+/// writes for that name. Anything else is refused with the reason, because
+/// reading the name while ignoring a body that means something different would
+/// substitute one operator for another without saying so.
+fn canonical_def_name(def: &str, lineno: usize) -> Result<String, String> {
+    let normalise = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let def_n = normalise(def);
+    let name = def_n
+        .strip_prefix("gate ")
+        .and_then(|rest| {
+            let end = rest
+                .find(|c: char| c == '(' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            let n = rest[..end].trim();
+            (!n.is_empty()).then(|| n.to_string())
+        })
+        .ok_or_else(|| format!("malformed `gate` definition at line {lineno}: '{def}'"))?;
+
+    for (_, canonical) in GATE_DEFS {
+        if normalise(canonical) == def_n {
+            return Ok(name);
+        }
+    }
+    Err(format!(
+        "`gate {name}` at line {lineno} is defined with a body this importer does \
+         not implement, so reading it would risk applying a different operator \
+         than the file describes. This importer reads the canonical definitions \
+         `to_qasm` emits; for an arbitrary definition body use the `omega-parser` \
+         reader, which inlines definitions instead of resolving names. Body was: \
+         '{def}'"
+    ))
+}
+
+fn dialect_refusal(name: &str, dialect: Qasm2Dialect) -> String {
+    let qiskit = match name {
+        "ryy" => "no Qiskit reader accepts a bare `ryy` either",
+        _ => "Qiskit's strict `qasm2.loads` refuses it too",
+    };
+    format!(
+        "`{name}` is not defined in this file, and the `{}` QASM2 dialect does \
+         not supply it — {qiskit}. `{name}` is not in qelib1.inc, so the file \
+         must carry its own `gate {name}(param0) q0,q1 {{ ... }}` definition \
+         (which `to_qasm` writes, and every Qiskit reader accepts).",
+        dialect.name()
+    )
+}
+
+/// [`from_qasm`] in an explicit dialect.
+pub fn from_qasm_with_dialect(qasm_str: &str, dialect: Qasm2Dialect) -> Result<Circuit, String> {
+    let (qasm_owned, declared_gates) = split_gate_defs(qasm_str)?;
+    let qasm_str: &str = &qasm_owned;
     // Parse a `\d+` capture as a non-negative index. The regexes below accept
     // arbitrarily long digit runs, so an oversized literal (`q[99999999999999999999]`)
     // must fail loudly here rather than panic on `.parse().unwrap()` — the same
@@ -732,37 +1100,93 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
 
         // Measure
         if line.starts_with("measure") {
-            let refs: Vec<(String, usize)> = bit_re
-                .captures_iter(line)
-                .map(|c| Ok((c[1].to_string(), parse_idx(&c[2], lineno)?)))
-                .collect::<Result<Vec<_>, String>>()?;
-            if refs.len() < 2 {
+            // `measure q -> c;` pairs the registers bit for bit. Legal
+            // OpenQASM 2.0, and it requires EQUAL widths — a mismatch is an
+            // error in the specification, not a truncation. `omega-parser`
+            // learned that the hard way: it zipped the two and silently
+            // dropped the tail.
+            let body = line
+                .trim_start_matches("measure")
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            let Some((qside, cside)) = body.split_once("->") else {
                 return Err(format!(
-                    "unsupported measure at line {lineno}: '{line}' — only the indexed \
-                     form `measure q[i] -> c[j];` is supported (register-broadcast \
-                     `measure q -> c;` is not)"
+                    "unsupported measure at line {lineno}: '{line}' — expected \
+                     `measure <qubits> -> <clbits>;`"
                 ));
+            };
+            let qops = parse_operands(qside, lineno)?;
+            let cops = parse_operands(cside, lineno)?;
+            match (qops.as_slice(), cops.as_slice()) {
+                ([Operand::Indexed(qr, qi)], [Operand::Indexed(cr, ci)]) => {
+                    check_ref(&qreg_sizes, "qubit", qr, *qi, lineno)?;
+                    check_ref(&creg_sizes, "clbit", cr, *ci, lineno)?;
+                    circuit.measure(&Qubit::new(qr, *qi), &Clbit::new(cr, *ci));
+                }
+                ([Operand::Whole(qr)], [Operand::Whole(cr)]) => {
+                    let qw = qreg_sizes.get(*qr).copied().ok_or_else(|| {
+                        format!("undeclared qubit register '{qr}' at line {lineno}: '{line}'")
+                    })?;
+                    let cw = creg_sizes.get(*cr).copied().ok_or_else(|| {
+                        format!("undeclared clbit register '{cr}' at line {lineno}: '{line}'")
+                    })?;
+                    if qw != cw {
+                        return Err(format!(
+                            "measure at line {lineno} pairs registers of different \
+                             widths: '{qr}' has {qw} qubit(s) and '{cr}' has {cw} \
+                             bit(s). OpenQASM requires them equal; refusing rather \
+                             than measuring the first {} and dropping the rest. \
+                             '{line}'",
+                            qw.min(cw)
+                        ));
+                    }
+                    for i in 0..qw {
+                        circuit.measure(&Qubit::new(qr, i), &Clbit::new(cr, i));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported measure at line {lineno}: '{line}' — either both \
+                         sides are indexed (`measure q[i] -> c[j];`) or both are whole \
+                         registers (`measure q -> c;`). Mixing them has no meaning in \
+                         OpenQASM."
+                    ))
+                }
             }
-            check_ref(&qreg_sizes, "qubit", &refs[0].0, refs[0].1, lineno)?;
-            check_ref(&creg_sizes, "clbit", &refs[1].0, refs[1].1, lineno)?;
-            let q = Qubit::new(&refs[0].0, refs[0].1);
-            let c = Clbit::new(&refs[1].0, refs[1].1);
-            circuit.measure(&q, &c);
             continue;
         }
 
         // Reset
         if line.starts_with("reset") {
-            let Some(caps) = bit_re.captures(line) else {
-                return Err(format!(
-                    "unsupported reset at line {lineno}: '{line}' — only the indexed \
-                     form `reset q[i];` is supported"
-                ));
-            };
-            let i = parse_idx(&caps[2], lineno)?;
-            check_ref(&qreg_sizes, "qubit", &caps[1], i, lineno)?;
-            let q = Qubit::new(&caps[1], i);
-            circuit.reset_qubit(&q);
+            // `reset q;` resets every qubit of the register — legal OpenQASM
+            // 2.0, and refused here until now for the same reason gate
+            // broadcast was: the operand regex only matched `name[index]`.
+            let arg = line
+                .trim_start_matches("reset")
+                .trim()
+                .trim_end_matches(';')
+                .trim();
+            match parse_operands(arg, lineno)?.as_slice() {
+                [Operand::Indexed(reg, i)] => {
+                    check_ref(&qreg_sizes, "qubit", reg, *i, lineno)?;
+                    circuit.reset_qubit(&Qubit::new(reg, *i));
+                }
+                [Operand::Whole(reg)] => {
+                    let w = qreg_sizes.get(*reg).copied().ok_or_else(|| {
+                        format!("undeclared qubit register '{reg}' at line {lineno}: '{line}'")
+                    })?;
+                    for i in 0..w {
+                        circuit.reset_qubit(&Qubit::new(reg, i));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported reset at line {lineno}: '{line}' — expected \
+                         `reset q[i];` or `reset q;`, which take exactly one operand"
+                    ))
+                }
+            }
             continue;
         }
 
@@ -771,6 +1195,22 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
             let gate_name = &caps[1];
             let params_str = caps.get(2).map(|m| m.as_str());
             let _operands_str = &caps[3];
+
+            // `rxx`/`ryy`/`rzz` are not in qelib1, so a BARE one is readable
+            // only in a dialect that supplies it — and only when the file did
+            // not define it itself, in which case `declared_gates` licenses it
+            // in every dialect. Checked before `qasm_to_gate`, which knows the
+            // names unconditionally and would otherwise accept a spelling the
+            // dialect refuses.
+            if DIALECT_GATED.contains(&gate_name)
+                && !declared_gates.contains(gate_name)
+                && !dialect.accepts_bare(gate_name)
+            {
+                return Err(format!(
+                    "{} (line {lineno}: '{line}')",
+                    dialect_refusal(gate_name, dialect)
+                ));
+            }
 
             let Some(kind) = qasm_to_gate(gate_name) else {
                 return Err(format!(
@@ -784,27 +1224,116 @@ pub fn from_qasm(qasm_str: &str) -> Result<Circuit, String> {
                     .collect::<Result<Vec<f64>, String>>()?,
                 _ => vec![],
             };
-            let qubits: Vec<Qubit> = bit_re
-                .captures_iter(&caps[3])
-                .map(|c| {
-                    let i = parse_idx(&c[2], lineno)?;
-                    check_ref(&qreg_sizes, "qubit", &c[1], i, lineno)?;
-                    Ok(Qubit::new(&c[1], i))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            if qubits.is_empty() {
+            // ----- operands, with register broadcast -----
+            //
+            // `h q;` where `q` is a register is legal OpenQASM 2.0 and means
+            // `h q[0]; h q[1]; …`. This reader used to refuse it: the operand
+            // regex matched only `name[index]`, so a bare register produced an
+            // EMPTY operand list and the error said "no indexed qubit
+            // operands". Two of the specification's own example programs
+            // (`inverseqft2.qasm`, `qpt.qasm`) are refused by nothing else.
+            //
+            // The rule mirrors `omega-parser`'s (`lower.rs:747-805`) exactly,
+            // because the two readers accepting different languages is worse
+            // than either restriction on its own: only a SINGLE-QUBIT gate
+            // broadcasts, and only over ONE register argument. OpenQASM defines
+            // no broadcast for a multi-qubit gate over one register, and
+            // flattening `cz q;` into `cz q[0], q[1]` is a confident wrong
+            // answer rather than a refusal.
+            let operands = parse_operands(&caps[3], lineno)?;
+            if operands.is_empty() {
                 return Err(format!(
-                    "gate '{gate_name}' at line {lineno} has no indexed qubit operands: \
-                     '{line}' (register-broadcast forms like `h q;` are not supported)"
+                    "gate '{gate_name}' at line {lineno} has no qubit operands: '{line}'"
                 ));
             }
+            let widths: Vec<usize> = operands
+                .iter()
+                .map(|o| match o {
+                    Operand::Indexed(reg, i) => {
+                        check_ref(&qreg_sizes, "qubit", reg, *i, lineno)?;
+                        Ok(1usize)
+                    }
+                    Operand::Whole(reg) => qreg_sizes.get(*reg).copied().ok_or_else(|| {
+                        format!("undeclared qubit register '{reg}' at line {lineno}: '{line}'")
+                    }),
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
             let gate = GateDef::with_params(kind, params);
+
+            if widths.iter().any(|w| *w != 1) {
+                let arity = gate_qubit_arity(kind);
+                let (Operand::Whole(reg), 1, Some(1)) = (&operands[0], operands.len(), arity)
+                else {
+                    return Err(format!(
+                        "gate '{gate_name}' at line {lineno} cannot be broadcast over a \
+                         whole register: it acts on {} qubit(s) and was given {} \
+                         argument(s) of width {:?}. Only a single-qubit gate broadcasts \
+                         over one register; index the operands explicitly instead. \
+                         '{line}'",
+                        arity.map_or("?".to_string(), |a| a.to_string()),
+                        operands.len(),
+                        widths
+                    ));
+                };
+                for i in 0..widths[0] {
+                    circuit.apply(gate.clone(), vec![Qubit::new(reg, i)]);
+                }
+                continue;
+            }
+
+            let qubits: Vec<Qubit> = operands
+                .iter()
+                .map(|o| match o {
+                    Operand::Indexed(reg, i) => Qubit::new(reg, *i),
+                    // width 1 and not indexed: a one-qubit register written
+                    // bare. `h q;` with `qreg q[1]` is the same statement as
+                    // `h q[0];` and must not become a different one.
+                    Operand::Whole(reg) => Qubit::new(reg, 0),
+                })
+                .collect();
             circuit.apply(gate, qubits);
             continue;
         }
 
         // Nothing matched — a non-empty statement we do not understand. Fail
         // loudly instead of dropping it (the failure mode this importer had).
+        //
+        // OpenQASM 3 made the version header optional, so a 3.0 file can reach
+        // here without tripping the header check that names the version. If
+        // the statement starts with a keyword that exists only in 3.0, say so:
+        // "unparsed statement" sent users hunting for a syntax error in a file
+        // that has none.
+        let head = line.split([' ', '\t', '[', '(']).next().unwrap_or("");
+        if matches!(
+            head,
+            "qubit"
+                | "bit"
+                | "def"
+                | "defcal"
+                | "cal"
+                | "let"
+                | "input"
+                | "output"
+                | "const"
+                | "gphase"
+                | "ctrl"
+                | "negctrl"
+                | "inv"
+                | "pow"
+                | "box"
+                | "duration"
+                | "stretch"
+                | "for"
+                | "while"
+                | "array"
+        ) {
+            return Err(format!(
+                "OpenQASM 3 statement ('{head}') at line {lineno}: '{line}'. This \
+                 importer reads OpenQASM 2.0 only; use the `omega-parser` reader \
+                 (the `omega` CLI), which reads OpenQASM 3."
+            ));
+        }
         return Err(format!("unparsed statement at line {lineno}: '{line}'"));
     }
 
@@ -893,7 +1422,7 @@ mod tests {
             .rz(1, PI / 4.0)
             .measure_all()
             .build();
-        let out = to_qasm3(&circ);
+        let out = to_qasm3(&circ).expect("qasm3 export");
 
         assert!(out.contains("OPENQASM 3.0;"));
         assert!(out.contains("include \"stdgates.inc\";"));
@@ -936,19 +1465,135 @@ mod tests {
         assert!(from_qasm(garbage).unwrap_err().contains("unparsed"));
     }
 
+    /// A headerless OpenQASM 3 file (the header is OPTIONAL in 3.0) must be
+    /// named as OpenQASM 3, not reported as a generic "unparsed statement" —
+    /// the real-world case is `inverseqft2.qasm`, whose only 3.0 construct is
+    /// `qubit[4] q;`.
+    ///
+    /// Mutation check: the garbage case above still says "unparsed", so the
+    /// detection cannot be a blanket rewording of the fallback error.
     #[test]
-    fn from_qasm_fails_loud_on_silent_drop_forms() {
-        // Register-broadcast measure / reset and gate-on-a-register were
-        // previously dropped silently; they must now error.
-        assert!(from_qasm("qreg q[2];\ncreg c[2];\nmeasure q -> c;\n")
-            .unwrap_err()
-            .contains("measure"));
-        assert!(from_qasm("qreg q[1];\nreset q;\n")
-            .unwrap_err()
-            .contains("reset"));
-        assert!(from_qasm("qreg q[2];\nh q;\n")
-            .unwrap_err()
-            .contains("no indexed qubit"));
+    fn from_qasm_names_openqasm3_statements_without_a_header() {
+        let headerless_q3 = "qubit[4] q;\nh q[0];\n";
+        let err = from_qasm(headerless_q3).unwrap_err();
+        assert!(err.contains("OpenQASM 3"), "should name OpenQASM 3: {err}");
+        assert!(err.contains("qubit"), "should name the construct: {err}");
+        assert!(
+            err.contains("omega"),
+            "should point at the 3.0 reader: {err}"
+        );
+
+        // `bit` via the split-on-'[' path, and a keyword with '(' after it.
+        let bit_decl = "OPENQASM 2.0;\nqreg q[1];\nbit[2] c;\n";
+        assert!(from_qasm(bit_decl).unwrap_err().contains("OpenQASM 3"));
+
+        // A 2.0-legal keyword must NOT be caught: `if` exists in 2.0 and its
+        // failures should keep whatever error they had.
+        let two_oh_if = "OPENQASM 2.0;\nqreg q[1];\ncreg c[1];\nif (c==1) banana q[0];\n";
+        let err = from_qasm(two_oh_if).unwrap_err();
+        assert!(
+            !err.contains("OpenQASM 3"),
+            "an if-statement failure must not be blamed on OpenQASM 3: {err}"
+        );
+    }
+
+    /// Register broadcast is LEGAL OpenQASM 2.0 and now lowers.
+    ///
+    /// This test replaces `from_qasm_fails_loud_on_silent_drop_forms`, which
+    /// asserted that all three of these forms ERROR. That assertion was correct
+    /// when written and is wrong now, and the distinction matters: the forms
+    /// were originally dropped SILENTLY, and turning a silent drop into a loud
+    /// refusal was the right first move. Turning it into the right answer is
+    /// the second, and it had not been made — so the reader refused programs
+    /// from the specification's own example corpus (`inverseqft2.qasm`,
+    /// `qpt.qasm`) and disagreed with `omega-parser`, which reads the same
+    /// language for `omega run`, the C FFI, WASM and the server.
+    ///
+    /// What is asserted is the EXPANSION, not merely that it is accepted. A
+    /// broadcast that parses to the wrong number of gates, or to gates on the
+    /// wrong qubits, is the silent-drop failure wearing a different hat.
+    #[test]
+    fn from_qasm_expands_register_broadcast() {
+        // Counted over `instructions`, not `gate_count()`: Measure and Reset
+        // are META kinds and `gate_count()` filters them out, so asserting on
+        // it would have read 0 for the two broadcast forms that matter most.
+        let kinds = |c: &Circuit| -> Vec<(GateKind, Vec<usize>)> {
+            c.instructions
+                .iter()
+                .map(|i| (i.gate.kind, i.qubits.iter().map(|q| q.index).collect()))
+                .collect()
+        };
+
+        // `h q;` over a 3-qubit register is three H gates, one per qubit, IN
+        // ORDER. The order is asserted because a broadcast that expands to the
+        // right count on the wrong qubits is the silent-drop bug again.
+        let c = from_qasm("qreg q[3];\nh q;\n").expect("single-qubit broadcast is legal");
+        assert_eq!(
+            kinds(&c),
+            vec![
+                (GateKind::H, vec![0]),
+                (GateKind::H, vec![1]),
+                (GateKind::H, vec![2])
+            ]
+        );
+
+        // `measure q -> c;` pairs bit for bit.
+        let c = from_qasm("qreg q[2];\ncreg c[2];\nmeasure q -> c;\n")
+            .expect("equal-width measure broadcast is legal");
+        assert_eq!(
+            kinds(&c),
+            vec![(GateKind::Measure, vec![0]), (GateKind::Measure, vec![1])]
+        );
+        // ...and each measurement lands in the MATCHING classical bit, which a
+        // qubit-only check cannot see.
+        let clbits: Vec<Vec<usize>> = c
+            .instructions
+            .iter()
+            .map(|i| i.clbits.iter().map(|b| b.index).collect())
+            .collect();
+        assert_eq!(clbits, vec![vec![0], vec![1]]);
+
+        // `reset q;` resets every qubit.
+        let c = from_qasm("qreg q[4];\nreset q;\n").expect("reset broadcast is legal");
+        assert_eq!(c.instructions.len(), 4);
+        assert!(c
+            .instructions
+            .iter()
+            .all(|i| i.gate.kind == GateKind::Reset));
+
+        // A one-qubit register written bare is the same statement as `q[0]`,
+        // not a different one.
+        let c = from_qasm("qreg q[1];\nreset q;\n").expect("width-1 register");
+        assert_eq!(kinds(&c), vec![(GateKind::Reset, vec![0])]);
+    }
+
+    /// The three cases where broadcast has no meaning must still be refused,
+    /// and the refusal must say which one happened.
+    ///
+    /// Without this half, "accept everything" would pass the test above. The
+    /// `cz q;` case is the one that matters most: OpenQASM defines no broadcast
+    /// for a two-qubit gate over one register, and flattening it into
+    /// `cz q[0], q[1]` is a confident wrong answer rather than a refusal —
+    /// which is precisely the bug `omega-parser` had before its D1 fix.
+    #[test]
+    fn from_qasm_refuses_broadcasts_that_have_no_meaning() {
+        // A two-qubit gate over one register: NOT `cz q[0], q[1]`.
+        let e = from_qasm("qreg q[2];\ncz q;\n").unwrap_err();
+        assert!(e.contains("cannot be broadcast"), "{e}");
+        assert!(e.contains("acts on 2 qubit(s)"), "{e}");
+
+        // Mismatched widths are an error, not a truncation to the shorter.
+        let e = from_qasm("qreg q[3];\ncreg c[2];\nmeasure q -> c;\n").unwrap_err();
+        assert!(e.contains("different"), "{e}");
+        assert!(e.contains("3 qubit(s)") && e.contains("2 bit(s)"), "{e}");
+
+        // Half-indexed measure has no meaning.
+        let e = from_qasm("qreg q[2];\ncreg c[2];\nmeasure q -> c[0];\n").unwrap_err();
+        assert!(e.contains("either both sides"), "{e}");
+
+        // An undeclared register is still caught on the broadcast path.
+        let e = from_qasm("qreg q[2];\nh r;\n").unwrap_err();
+        assert!(e.contains("undeclared"), "{e}");
     }
 
     #[test]

@@ -21,7 +21,9 @@ use omega_backend_mps_cuda::CudaSvdContext;
 
 const N_QUBITS: usize = 14;
 const DEPTH: usize = 12;
-const CHI: usize = 128;
+/// Default χ. Overridable from argv so the crossover can be swept — a single
+/// χ says whether the GPU wins *there*, not whether it ever wins.
+const CHI_DEFAULT: usize = 128;
 const RZ_THETA: f64 = 0.25;
 const RX_THETA: f64 = 0.15;
 
@@ -86,17 +88,26 @@ fn time<F: FnOnce()>(label: &str, f: F) -> std::time::Duration {
     elapsed
 }
 
+/// χ from the first CLI argument, else the default.
+fn chi_from_argv() -> usize {
+    std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CHI_DEFAULT)
+}
+
 fn main() {
-    println!("MPS bench: n={N_QUBITS}q, depth={DEPTH}, χ={CHI}, RZ={RZ_THETA}, RX={RX_THETA}");
+    let chi = chi_from_argv();
+    println!("MPS bench: n={N_QUBITS}q, depth={DEPTH}, χ={chi}, RZ={RZ_THETA}, RX={RX_THETA}");
 
     // Warm-up CPU
     {
-        let mut mps = Mps::zero_state(N_QUBITS, CHI);
+        let mut mps = Mps::zero_state(N_QUBITS, chi);
         run_circuit_cpu(&mut mps);
     }
 
     let cpu = time("cpu_apply_2q", || {
-        let mut mps = Mps::zero_state(N_QUBITS, CHI);
+        let mut mps = Mps::zero_state(N_QUBITS, chi);
         run_circuit_cpu(&mut mps);
         std::hint::black_box(&mps);
     });
@@ -110,11 +121,11 @@ fn main() {
             Some(ctx) => {
                 // Warm-up: builds the shape cache + cuSOLVER handle.
                 {
-                    let mut mps = Mps::zero_state(N_QUBITS, CHI);
+                    let mut mps = Mps::zero_state(N_QUBITS, chi);
                     run_circuit_cuda(&mut mps, &ctx);
                 }
                 let cuda = time("cuda_apply_2q", || {
-                    let mut mps = Mps::zero_state(N_QUBITS, CHI);
+                    let mut mps = Mps::zero_state(N_QUBITS, chi);
                     run_circuit_cuda(&mut mps, &ctx);
                     std::hint::black_box(&mps);
                 });

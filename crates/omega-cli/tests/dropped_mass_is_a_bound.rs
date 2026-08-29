@@ -36,7 +36,10 @@ fn circuit(n: usize, depth: usize) -> omega_core::circuit::CircuitIR {
     let mut src = format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\n");
     for d in 0..depth {
         for i in 0..n {
-            src.push_str(&format!("ry({}) q[{i}];\n", 0.3 + 0.17 * i as f64 + 0.11 * d as f64));
+            src.push_str(&format!(
+                "ry({}) q[{i}];\n",
+                0.3 + 0.17 * i as f64 + 0.11 * d as f64
+            ));
         }
         for i in 0..n - 1 {
             src.push_str(&format!("cx q[{i}], q[{}];\n", i + 1));
@@ -61,20 +64,56 @@ fn the_dropped_mass_bounds_the_actual_error() {
                 .expect("exact engine");
 
             for (label, backend) in [
-                ("truncate 0.05", PauliPropBackend::with_truncation_freq(0.05, None, None)),
-                ("truncate 0.1", PauliPropBackend::with_truncation_freq(0.1, None, None)),
-                ("max_weight 1", PauliPropBackend::with_truncation_freq(0.0, Some(1), None)),
-                ("max_weight 2", PauliPropBackend::with_truncation_freq(0.0, Some(2), None)),
-                ("max_freq 1", PauliPropBackend::with_truncation_freq(0.0, None, Some(1))),
+                (
+                    "truncate 0.05",
+                    PauliPropBackend::with_truncation_freq(0.05, None, None),
+                ),
+                (
+                    "truncate 0.1",
+                    PauliPropBackend::with_truncation_freq(0.1, None, None),
+                ),
+                (
+                    "max_weight 1",
+                    PauliPropBackend::with_truncation_freq(0.0, Some(1), None),
+                ),
+                (
+                    "max_weight 2",
+                    PauliPropBackend::with_truncation_freq(0.0, Some(2), None),
+                ),
+                (
+                    "max_freq 1",
+                    PauliPropBackend::with_truncation_freq(0.0, None, Some(1)),
+                ),
             ] {
-                let (val, budget) = backend
-                    .expectation_with_budget(&ir, &params, &obs)
+                // This is a deliberate sweep across aggressive settings whose
+                // whole purpose is to check that the bound BOUNDS the error, so
+                // the vacuous rows are evidence rather than answers and the
+                // informativeness gate is lifted explicitly. Leaving it on
+                // would refuse the rows the test exists to examine.
+                let (val, cert) = backend
+                    .with_max_dropped_mass(Some(f64::INFINITY))
+                    .expectation_with_certificate(&ir, &params, &obs)
                     .expect("truncated engine");
+                let budget = cert.dropped_mass;
                 let err = (exact - val).abs();
                 compared += 1;
                 // Only a budget that is both non-zero and non-vacuous is
-                // evidence: `⟨O⟩ ∈ [−1, 1]`, so `budget ≥ 2` holds for free.
-                if budget > 1e-12 && budget < 2.0 {
+                // evidence.
+                //
+                // This read `budget < 2.0` — a hand-rolled vacuity test, and
+                // the SECOND one in this repo: the truncation gate was first
+                // written as `budget < range`. Two live constants a factor of
+                // two apart, both defensible, neither derived. They disagreed,
+                // which is the only reason anyone noticed; had they matched, a
+                // coincidence would have shipped as a rule.
+                //
+                // The condition is derivable. The run asserts `⟨O⟩ ∈ [v−m, v+m]`
+                // and `⟨O⟩ ∈ [−R, R]` was already known, so nothing was learned
+                // exactly when the first contains the second — `m ≥ R + |v|`.
+                // `budget < 2.0` is the loosest case (|v| = R) and `budget < R`
+                // the tightest (v = 0). Both are now replaced by the single
+                // derived form, which the certificate computes.
+                if budget > 1e-12 && cert.is_informative() {
                     informative += 1;
                     worst_slack = worst_slack.min(budget - err);
                 }
@@ -124,7 +163,10 @@ fn an_untruncated_run_reports_zero_and_is_exact() {
     let (val, budget) = PauliPropBackend::new()
         .expectation_with_budget(&ir, &params, &obs)
         .expect("budget form");
-    assert!(budget < 1e-12, "the exact engine must drop nothing, got {budget:.3e}");
+    assert!(
+        budget < 1e-12,
+        "the exact engine must drop nothing, got {budget:.3e}"
+    );
     assert!(
         (val - exact).abs() < 1e-12,
         "the budget form must agree with the plain one: {val} vs {exact}"
@@ -150,5 +192,8 @@ fn the_budget_shrinks_as_truncation_relaxes() {
         );
         prev = budget;
     }
-    assert!(prev < 1e-12, "max_weight 6 should drop nothing on this circuit, got {prev:.3e}");
+    assert!(
+        prev < 1e-12,
+        "max_weight 6 should drop nothing on this circuit, got {prev:.3e}"
+    );
 }

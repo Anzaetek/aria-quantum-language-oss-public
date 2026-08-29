@@ -386,9 +386,22 @@ pub fn compute_gradient_for(
         .iter()
         .any(|op| matches!(op.gate, GateKind::Measure));
 
+    // A measurement that can be DEFERRED is no obstacle to the adjoint: the
+    // backends' expectation and adjoint paths both run the deferral first, so
+    // what the sweep sees is a fully unitary circuit. Only a circuit that cannot
+    // be deferred — coherent reuse of a measured qubit, i.e. reset-and-reuse —
+    // needs the stochastic path.
+    //
+    // This distinction is worth making rather than keying off `has_measurements`:
+    // `StochasticParameterShift { shots: 100 }` returns a NOISY gradient, so
+    // treating every feedforward circuit as un-differentiable cost exactness on
+    // circuits that are now exactly differentiable.
+    let needs_stochastic =
+        has_measurements && crate::defer_measure::defer_measurements(circuit).is_err();
+
     // Auto: select best method based on circuit
     if matches!(method, GradMethod::Auto) {
-        let resolved = if has_measurements {
+        let resolved = if needs_stochastic {
             GradMethod::StochasticParameterShift { shots: 100 }
         } else {
             GradMethod::Adjoint
@@ -398,10 +411,11 @@ pub fn compute_gradient_for(
 
     // Adjoint: reject circuits with measurements, then try batch AD
     if matches!(method, GradMethod::Adjoint) {
-        if has_measurements {
+        if needs_stochastic {
             return Err(OmegaError::Unsupported(
-                "adjoint gradient not supported for circuits with mid-circuit measurements; \
-                 use StochasticParameterShift or Auto instead"
+                "adjoint gradient not supported for a circuit whose mid-circuit \
+                 measurement cannot be deferred (a measured qubit is reused \
+                 coherently); use StochasticParameterShift or Auto instead"
                     .into(),
             ));
         }

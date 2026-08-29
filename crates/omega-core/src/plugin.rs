@@ -410,7 +410,15 @@ mod tests {
     fn abi_version_is_pinned() {
         // A bump here is a deliberate layout-breaking change; the reserved
         // tail is for additive growth and must not require it.
-        assert_eq!(OMEGA_BACKEND_ABI_VERSION, 1);
+        //
+        // v1 -> v2 (2026-08-16): removed `BackendCaps::opt_in_cpu_fallback`,
+        // a field read by nothing. It could not go in the reserved tail
+        // because this is a REMOVAL, which changes the layout of everything
+        // after it. Honouring the field instead was rejected — it would let a
+        // plugin's results be replaced by the built-in CPU statevector with no
+        // provenance anywhere in `ExecResult` to record it. See the note at
+        // its former site in `ffi_types.rs`.
+        assert_eq!(OMEGA_BACKEND_ABI_VERSION, 2);
     }
 
     #[test]

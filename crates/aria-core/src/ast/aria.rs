@@ -2339,8 +2339,7 @@ circuit C {
     when m[0] == 1 { when m[1] == 1 { apply X on q[2] } }
 }
 "#;
-        let err = parse_aria_circuit(SRC, "C")
-            .expect_err("nested runtime `when` must not lower");
+        let err = parse_aria_circuit(SRC, "C").expect_err("nested runtime `when` must not lower");
         assert!(err.contains("nested"), "{err}");
         assert!(err.contains("m[0] == 1"), "{err}");
     }

@@ -92,6 +92,24 @@ def main() -> int:
     mode = req.get("mode") or "execute"
     if mode == "expectation":
         return _expectation(req)
+    if mode == "capabilities":
+        # Capability handshake. Without it, a mismatch between what a caller
+        # wants and what a bridge implements only surfaces as a mid-run error —
+        # after the circuit has been converted and sent — and for noise it did
+        # not surface at all. Answering here lets the caller decide before it
+        # commits to a run.
+        _emit(
+            {
+                "ok": True,
+                "capabilities": {
+                    "backend": "tsim",
+                    "modes": ["execute", "expectation", "gates"],
+                    "noise_keys": [],
+                    "notes": "no noise model",
+                },
+            }
+        )
+        return 0
     if mode == "gates":
         # Introspection mode: report the QASM2 gate names this bridge
         # can lower. `tests/cross_backend.rs` asks the runner for this

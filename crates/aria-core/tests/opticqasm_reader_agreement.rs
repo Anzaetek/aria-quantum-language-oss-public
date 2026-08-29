@@ -75,10 +75,22 @@ const ACCEPT: &[(&str, &str)] = &[
         "leading comment",
         "OPTICQASM 1.0;\n// a note\nphoton q[2];\nps(0.5) q[0];\n",
     ),
-    ("cv gates", "OPTICQASM 1.0;\nphoton q[1];\nsqueeze(0.4, 0.2) q[0];\nkerr(0.15) q[0];\n"),
-    ("bs alias", "OPTICQASM 1.0;\nphoton q[2];\nbs(1.2, 0.3) q[0], q[1];\n"),
-    ("two registers", "OPTICQASM 1.0;\nphoton a[1];\nphoton b[1];\nps(0.5) b[0];\n"),
-    ("negative parameter", "OPTICQASM 1.0;\nphoton q[1];\ndisplace(-0.7, -0.1) q[0];\n"),
+    (
+        "cv gates",
+        "OPTICQASM 1.0;\nphoton q[1];\nsqueeze(0.4, 0.2) q[0];\nkerr(0.15) q[0];\n",
+    ),
+    (
+        "bs alias",
+        "OPTICQASM 1.0;\nphoton q[2];\nbs(1.2, 0.3) q[0], q[1];\n",
+    ),
+    (
+        "two registers",
+        "OPTICQASM 1.0;\nphoton a[1];\nphoton b[1];\nps(0.5) b[0];\n",
+    ),
+    (
+        "negative parameter",
+        "OPTICQASM 1.0;\nphoton q[1];\ndisplace(-0.7, -0.1) q[0];\n",
+    ),
     // Moved here from KNOWN_ASYMMETRIC when O4 landed. That move IS the signal
     // O4 is done — the plan says so explicitly, rather than us asserting it.
     (
@@ -121,7 +133,10 @@ const REJECT: &[(&str, &str)] = &[
         "too few parameters",
         "OPTICQASM 1.0;\nphoton q[2];\nbs_rx(1.2) q[0], q[1];\n",
     ),
-    ("unknown gate", "OPTICQASM 1.0;\nphoton q[1];\nwibble(0.5) q[0];\n"),
+    (
+        "unknown gate",
+        "OPTICQASM 1.0;\nphoton q[1];\nwibble(0.5) q[0];\n",
+    ),
     (
         "junk in the mode list",
         "OPTICQASM 1.0;\nphoton q[1];\nkerr(0.1) garbage q[0];\n",
@@ -167,8 +182,12 @@ fn both_readers_accept_the_same_valid_sources() {
             (Ok(_), Ok(())) => {}
             (a, o) => failures.push(format!(
                 "{name}: aria-core={} omega-parser={}\n    {src:?}",
-                a.as_ref().map(|_| "Ok".into()).unwrap_or_else(|e| e.clone()),
-                o.as_ref().map(|_| "Ok".to_string()).unwrap_or_else(|e| e.clone()),
+                a.as_ref()
+                    .map(|_| "Ok".into())
+                    .unwrap_or_else(|e| e.clone()),
+                o.as_ref()
+                    .map(|_| "Ok".to_string())
+                    .unwrap_or_else(|e| e.clone()),
             )),
         }
         // Accepting is not enough: `Ok` with an empty circuit is how the
@@ -183,7 +202,11 @@ fn both_readers_accept_the_same_valid_sources() {
             }
         }
     }
-    assert!(failures.is_empty(), "readers disagree:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "readers disagree:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -196,7 +219,11 @@ fn both_readers_reject_the_same_invalid_sources() {
             failures.push(format!(
                 "{name}: aria-core={} omega-parser={}\n    {src:?}",
                 if aria.is_ok() { "ACCEPTED" } else { "rejected" },
-                if omega.is_ok() { "ACCEPTED" } else { "rejected" },
+                if omega.is_ok() {
+                    "ACCEPTED"
+                } else {
+                    "rejected"
+                },
             ));
         }
     }
@@ -224,7 +251,10 @@ fn the_known_scope_differences_are_exactly_these() {
          be justified, but it must be justified out loud — and this assertion is \
          what forces the list to be read rather than accumulated.",
         KNOWN_ASYMMETRIC.len(),
-        KNOWN_ASYMMETRIC.iter().map(|(n, _, _)| *n).collect::<Vec<_>>()
+        KNOWN_ASYMMETRIC
+            .iter()
+            .map(|(n, _, _)| *n)
+            .collect::<Vec<_>>()
     );
 
     // Runs only if an entry is added back. Each must still BE asymmetric —
@@ -250,6 +280,14 @@ fn the_corpus_is_not_empty() {
     // on the count is how a shrinking corpus passes — see the OPTICQASM
     // acceptance test, which shipped with `>= 10` against exactly 10 surviving
     // cases.
-    assert!(ACCEPT.len() >= 12, "accept corpus shrank to {}", ACCEPT.len());
-    assert!(REJECT.len() >= 12, "reject corpus shrank to {}", REJECT.len());
+    assert!(
+        ACCEPT.len() >= 12,
+        "accept corpus shrank to {}",
+        ACCEPT.len()
+    );
+    assert!(
+        REJECT.len() >= 12,
+        "reject corpus shrank to {}",
+        REJECT.len()
+    );
 }

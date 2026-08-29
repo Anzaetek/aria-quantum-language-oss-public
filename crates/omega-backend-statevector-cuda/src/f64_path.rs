@@ -251,3 +251,110 @@ impl StateF64 {
         Ok(acc)
     }
 }
+
+// ---------------------------------------------------------------------------
+// f64 twins for the quad kernels (item 6a)
+// ---------------------------------------------------------------------------
+//
+// NOTHING LAUNCHES THESE YET, and they exist for exactly that reason.
+// `KernelsF64::load` compiles only `apply_1q` and `apply_2q`, so the quad
+// kernels are f32-only in practice — but `all_kernel_sources()` includes
+// `apply_quad_perm`, so `precision_compile` builds it under
+// `-DOMEGA_REAL=double` and reports green. That green proves the kernel
+// COMPILES at f64; it says nothing about the host struct.
+//
+// Without these twins, the first person to add `apply_quad_swap` /
+// `apply_quad_phase` to `KernelsF64` would see a passing precision gate and
+// ship a kernel reading `phase_re` from the wrong offset — silent wrong
+// answers, not a crash. The f32 host structs are 20 B / 60 B; the f64 device
+// structs are 32 B / 96 B.
+//
+// `QuadSwapParams` needs no twin: it is all `unsigned int` on both sides.
+
+/// f64 twin of `imp::QuadSwapPhaseParams` (CY).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct QuadSwapPhaseParamsF64 {
+    pub qa: u32,
+    pub qb: u32,
+    pub slot_a: u32,
+    pub slot_b: u32,
+    /// Four u32s = 16 B, already 8-aligned, so no padding here — unlike the
+    /// other two twins. Stated because "add a _pad like the others" would be
+    /// wrong and would silently shift every phase by 8 bytes.
+    pub phase_a_re: f64,
+    pub phase_a_im: f64,
+    pub phase_b_re: f64,
+    pub phase_b_im: f64,
+}
+unsafe impl DeviceRepr for QuadSwapPhaseParamsF64 {}
+unsafe impl ValidAsZeroBits for QuadSwapPhaseParamsF64 {}
+
+/// f64 twin of `imp::QuadPhase1Params`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct QuadPhase1ParamsF64 {
+    pub qa: u32,
+    pub qb: u32,
+    pub slot: u32,
+    /// Three `unsigned int` then `real`: with real = double the compiler pads
+    /// to an 8-byte boundary. At f32 there is no padding at all, which is why
+    /// swapping the field types on the f32 struct would NOT produce this
+    /// layout.
+    _pad: u32,
+    pub phase_re: f64,
+    pub phase_im: f64,
+}
+unsafe impl DeviceRepr for QuadPhase1ParamsF64 {}
+unsafe impl ValidAsZeroBits for QuadPhase1ParamsF64 {}
+
+/// f64 twin of `imp::QuadPhaseParams`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct QuadPhaseParamsF64 {
+    pub qa: u32,
+    pub qb: u32,
+    pub count: u32,
+    pub slots: [u32; 4],
+    /// `3 + 4 = 7` u32s = 28 B, so one more u32 aligns the doubles to 32.
+    _pad: u32,
+    pub phase_re: [f64; 4],
+    pub phase_im: [f64; 4],
+}
+unsafe impl DeviceRepr for QuadPhaseParamsF64 {}
+unsafe impl ValidAsZeroBits for QuadPhaseParamsF64 {}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The Rust `#[repr(C)]` structs and the `struct`s re-declared in each
+    /// `.cu` are hand-duplicated with nothing tying them together. These pin
+    /// the sizes a C compiler produces for the same field sequence, so a field
+    /// added on one side and not the other fails here rather than in a kernel.
+    ///
+    /// Sizes derived by hand from the `.cu` declarations, not read back from a
+    /// device — the point is to catch a Rust-side edit, and a device readback
+    /// would only agree with whatever Rust currently says.
+    #[test]
+    fn quad_param_layouts_match_the_kernel_declarations() {
+        use std::mem::size_of;
+
+        // f32: 3 u32 + 2 f32, no padding.
+        assert_eq!(size_of::<crate::imp::QuadPhase1Params>(), 20);
+        // f64: 3 u32 + 4 pad + 2 f64.
+        assert_eq!(size_of::<QuadPhase1ParamsF64>(), 32);
+
+        // f32: (2 + 1 + 4) u32 + 8 f32 = 28 + 32.
+        assert_eq!(size_of::<crate::imp::QuadPhaseParams>(), 60);
+        // f64: 7 u32 + 4 pad + 8 f64 = 32 + 64.
+        assert_eq!(size_of::<QuadPhaseParamsF64>(), 96);
+
+        // All-u32 on both sides, so one struct serves both precisions.
+        assert_eq!(size_of::<crate::imp::QuadSwapParams>(), 16);
+
+        // CY: 4 u32 (already 8-aligned, NO padding) + 4 phases.
+        assert_eq!(size_of::<crate::imp::QuadSwapPhaseParams>(), 32);
+        assert_eq!(size_of::<QuadSwapPhaseParamsF64>(), 48);
+    }
+}

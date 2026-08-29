@@ -26,17 +26,23 @@
 //! `ops` is structured data, and the interpreter below refuses anything the
 //! backend cannot express rather than approximating it. Today that means:
 //!
-//! * **Preparations** (`vacuum`, `squeeze`, `displace`) are CONSTRUCTORS in this
-//!   crate, not operators. There is no `displace(&mut self, ..)` and no
-//!   `squeeze(&mut self, ..)`, so a preparation can only appear FIRST.
+//! * `vacuum` is a preparation and can only appear first.
+//! * `displace` and `squeeze` have BOTH forms: a constructor, used on a
+//!   pristine vacuum because it carries an exact analytic tail the operator can
+//!   only measure, and an operator for everything after.
 //! * **Diagonal gates** (`kerr`, `phase_shift`) are real operators and may
 //!   follow in any sequence.
 //!
-//! So `squeeze then displace` — a perfectly ordinary CV circuit — is
-//! **unexpressible here**, and the test says so out loud and counts it, instead
-//! of quietly comparing only the cases that happen to be easy. A differential
-//! check that silently narrows its own corpus is the failure mode this file is
-//! built to avoid.
+//! This paragraph is worth reading against the code below rather than trusting:
+//! it claimed for a while that neither `displace` nor `squeeze` had an operator
+//! form, when `displace` had gained one and the interpreter 200 lines down
+//! already used it. The header described a narrower crate than the file itself
+//! relied on.
+//!
+//! When a shape genuinely IS unexpressible, the test says so out loud and counts
+//! it rather than quietly comparing only the easy cases. A differential check
+//! that silently narrows its own corpus is the failure mode this file is built
+//! to avoid — so the skip count is reported even when it is zero.
 
 use std::path::PathBuf;
 
@@ -202,16 +208,15 @@ fn load() -> (String, Vec<Case>) {
                 .collect(),
             amps: v["amps"]
                 .as_array()
-                .expect("amps array — regenerate the fixture, it predates the \
+                .expect(
+                    "amps array — regenerate the fixture, it predates the \
                          amplitude comparison and the diagonal gates are not \
-                         actually tested without it")
+                         actually tested without it",
+                )
                 .iter()
                 .map(|a| {
                     let pair = a.as_array().expect("amp is [re, im]");
-                    Complex64::new(
-                        pair[0].as_f64().expect("re"),
-                        pair[1].as_f64().expect("im"),
-                    )
+                    Complex64::new(pair[0].as_f64().expect("re"), pair[1].as_f64().expect("im"))
                 })
                 .collect(),
             mean_n: v["mean_n"].as_f64().expect("mean_n"),
@@ -245,9 +250,9 @@ fn build(ops: &[serde_json::Value], cutoff: usize) -> Result<FockState, Skip> {
         let kind = op["op"].as_str().unwrap_or("");
         let is_prep = matches!(kind, "vacuum" | "squeeze" | "displace");
 
-        // `displace` now has an OPERATOR form, so it is legal anywhere.
-        // `squeeze` does not yet, so it remains prep-only.
-        if is_prep && !pristine_vacuum && kind != "displace" {
+        // `displace` and `squeeze` both have OPERATOR forms now, so both are
+        // legal anywhere. Only `vacuum` is still preparation-only.
+        if is_prep && !pristine_vacuum && kind != "displace" && kind != "squeeze" {
             // Not a limitation of the harness — a limitation of the crate.
             return Err(Skip::PrepNotFirst(kind.to_string()));
         }
@@ -263,7 +268,21 @@ fn build(ops: &[serde_json::Value], cutoff: usize) -> Result<FockState, Skip> {
             "vacuum" => state = Some(FockState::vacuum(cutoff).expect("vacuum")),
             "squeeze" => {
                 let r = op["r"].as_f64().expect("r");
-                state = Some(FockState::squeezed_vacuum(r, cutoff).expect("squeezed_vacuum"));
+                match state.as_mut() {
+                    // On vacuum use the CONSTRUCTOR: exact analytic tail.
+                    None => {
+                        state =
+                            Some(FockState::squeezed_vacuum(r, cutoff).expect("squeezed_vacuum"))
+                    }
+                    Some(_) if pristine_vacuum => {
+                        state =
+                            Some(FockState::squeezed_vacuum(r, cutoff).expect("squeezed_vacuum"))
+                    }
+                    // On a state with structure, use the OPERATOR. These are the
+                    // only rows that reach columns n>=1 of the squeeze matrix;
+                    // a vacuum input multiplies column 0 alone.
+                    Some(st) => st.squeeze(r).expect("squeeze"),
+                }
             }
             "displace" => {
                 // Cartesian on both sides — K15. The generator converts to
@@ -285,7 +304,11 @@ fn build(ops: &[serde_json::Value], cutoff: usize) -> Result<FockState, Skip> {
             }
             "kerr" => {
                 let chi = op["chi"].as_f64().expect("chi");
-                state.as_mut().expect("gate before prep").kerr(chi).expect("kerr");
+                state
+                    .as_mut()
+                    .expect("gate before prep")
+                    .kerr(chi)
+                    .expect("kerr");
             }
             "phase_shift" => {
                 let phi = op["phi"].as_f64().expect("phi");
@@ -421,7 +444,10 @@ fn cv_backend_agrees_with_piquasso_on_equivalent_circuits() {
 
     // Report the corpus, always. A differential check that quietly compares
     // three cases is worse than no check, because it reads as coverage.
-    eprintln!("piquasso {version}: compared {compared}/{} cases", cases.len());
+    eprintln!(
+        "piquasso {version}: compared {compared}/{} cases",
+        cases.len()
+    );
     eprintln!("  worst agreeing diff: {} at {:.3e}", worst.0, worst.1);
     for t in &truncation_seen {
         eprintln!("  residual above the noise floor — {t}");
@@ -441,16 +467,24 @@ fn cv_backend_agrees_with_piquasso_on_equivalent_circuits() {
 
 /// The unexpressible cases are a **property of the crate**, and this pins them.
 ///
-/// It used to assert `["squeezed_r=0.5_phase_then_displace"]` and carried the
-/// note that gaining operator forms should make it fail, as a reminder to move
-/// the case into the compared corpus. `displace` now HAS an operator form, so
-/// that happened, and the set is empty: every case in the corpus is expressible.
+/// The set is empty, and has now been empty for two different reasons in
+/// succession. It first asserted `["squeezed_r=0.5_phase_then_displace"]` with
+/// a note that gaining an operator form should make it fail — a reminder to
+/// move the case into the compared corpus. `displace` gained one and it did.
+/// The doc then said `squeeze` was still prep-only and that a corpus case
+/// squeezing a state with structure would reappear here; five such cases were
+/// added, `squeeze` gained an operator form in the same change, and the set
+/// stayed empty.
 ///
-/// `squeeze` is still prep-only, so a corpus case applying `squeeze` to a state
-/// with structure would reappear here. That is the intended behaviour, not a
-/// hole — the set is pinned exactly so a new gap cannot arrive unnoticed.
+/// That is the mechanism working as intended twice, and it is worth keeping
+/// the history in view: the value of this test is not the empty vector, it is
+/// that the vector cannot grow silently. A skip that nobody counts is how a
+/// differential corpus quietly narrows to the cases that already pass.
+///
+/// Renamed from `preparations_are_still_constructors_only`, which described the
+/// crate as it was two capabilities ago.
 #[test]
-fn preparations_are_still_constructors_only() {
+fn no_corpus_case_is_unexpressible() {
     let (_, cases) = load();
 
     let unexpressible: Vec<&str> = cases

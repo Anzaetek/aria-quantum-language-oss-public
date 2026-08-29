@@ -310,8 +310,24 @@ fn apply_op_dagger(state: &MetalState, op: &GateOp, params: &ParameterBinding) -
         GateKind::S => state.apply_sdg(q0),
         GateKind::Sdg => state.apply_s(q0),
         // sx† = sxdg (verified `sx @ sxdg == I` to 0.000e+00).
-        GateKind::Sx => state.apply_1q(q0, &[Complex64::new(0.5, -0.5), Complex64::new(0.5, 0.5), Complex64::new(0.5, 0.5), Complex64::new(0.5, -0.5)]),
-        GateKind::Sxdg => state.apply_1q(q0, &[Complex64::new(0.5, 0.5), Complex64::new(0.5, -0.5), Complex64::new(0.5, -0.5), Complex64::new(0.5, 0.5)]),
+        GateKind::Sx => state.apply_1q(
+            q0,
+            &[
+                Complex64::new(0.5, -0.5),
+                Complex64::new(0.5, 0.5),
+                Complex64::new(0.5, 0.5),
+                Complex64::new(0.5, -0.5),
+            ],
+        ),
+        GateKind::Sxdg => state.apply_1q(
+            q0,
+            &[
+                Complex64::new(0.5, 0.5),
+                Complex64::new(0.5, -0.5),
+                Complex64::new(0.5, -0.5),
+                Complex64::new(0.5, 0.5),
+            ],
+        ),
         GateKind::T => state.apply_tdg(q0),
         GateKind::Tdg => state.apply_t(q0),
 

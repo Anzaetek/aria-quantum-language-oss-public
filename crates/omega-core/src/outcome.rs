@@ -89,17 +89,31 @@ impl Outcome {
     ///
     /// The bridge from every site that still produces a `u64` key. Bits at or
     /// above `width` are dropped, so the invariant holds by construction.
+    ///
+    /// **`width` may exceed 64.** A `u64` cannot *carry* more than 64 bits of
+    /// information, but a wide register whose written bits are all low is an
+    /// ordinary, legal thing: `creg c[70]; measure q[0] -> c[0];` is a 70-bit
+    /// outcome with two significant bits. The words above the first are zero,
+    /// which is exactly right for that circuit.
+    ///
+    /// This used to `debug_assert!(width <= 64)` and store a single word —
+    /// which would have violated the `words.len() == words_for(width)`
+    /// invariant anyway. It was the third site to conflate "the register is
+    /// declared wide" with "the outcome carries wide information", after
+    /// `counts_outcome_width` and `ExecResult::counts_from_u64`;
+    /// `creg_to_u64`'s comment had already identified the distinction and
+    /// gotten it right.
     pub fn from_u64(bits: u64, width: u32) -> Self {
-        debug_assert!(width <= 64, "use `from_bits` above 64 bits, not `from_u64`");
         let masked = if width >= 64 {
             bits
         } else {
             bits & ((1u64 << width) - 1)
         };
-        Self {
-            width,
-            words: smallvec::smallvec![masked],
+        let mut words: Words = smallvec::smallvec![0u64; Self::words_for(width)];
+        if let Some(w0) = words.first_mut() {
+            *w0 = masked;
         }
+        Self { width, words }
     }
 
     /// The outcome as a `u64`, or `None` if it does not fit.

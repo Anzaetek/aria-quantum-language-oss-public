@@ -27,9 +27,9 @@ semantics."**
 
 | dialect | emitter | consumer that must read it | checked? |
 |---|---|---|---|
-| QASM 2.0 | `to_qasm` | Qiskit (strict `qasm2.loads`), `omega-parser` | **partly** — guards fixed; `cp`/`rxx`/`rzz`/`ryy` open (P5) |
-| QASM 3.0 | `to_qasm3` | any OQ3 consumer, `omega-parser` | **guards just fixed**; nothing else verified, and **no OQ3 parser exists in-tree to re-parse against** |
-| Aria | `to_aria_source` | `parse_aria_circuit` | **just fixed** (RESET, guarded comments) |
+| QASM 2.0 | `to_qasm` | Qiskit (strict `qasm2.loads`), `omega-parser` | **DONE (2026-08-16)** — guards, `cp`, `rxx`/`rzz`/`ryy` all round-trip; the CI dialect check confirms 25 gates match qiskit's own operators to 1e-12, 24/25 under the strict parser (`sx` exempt and unfixable, see LIMITATIONS) |
+| QASM 3.0 | `to_qasm3` | any OQ3 consumer | **DONE (2026-08-16)** — verified against a REAL OpenQASM 3 parser (`qiskit.qasm3.loads`) with operator comparison, worst \|Δ\| = 3.331e-16, by `tools/qiskit_xcheck/qasm3_dialect.py`. The note that no in-tree OQ3 parser exists was right and is why the check is external: re-parsing with `omega-parser` runs the QASM2 grammar, which accepts names absent from `stdgates.inc` and would certify a file a strict consumer rejects |
+| Aria | `to_aria_source` | `parse_aria_circuit` | **DONE** (RESET, guards); as of 2026-08-16 it also refuses a symbolic angle and an unspellable gate instead of writing `0` / a comment |
 | **OPTICQASM** | ? | `omega-parser::parse_opticqasm`, Perceval | **NOT CHECKED — see below** |
 | **CV (photonic)** | ? | piquasso, our CV backend | **NOT CHECKED — see below** |
 
@@ -359,7 +359,7 @@ over.
   (QASM2) and `every_photonic_gate_round_trips.rs` (OPTICQASM), both verified to
   produce `error[E0004]` when a `GateKind` is added. The source-scraping guard
   P3 warned against was never shipped.
-* **P5** — round-trip gaps: a guarded `measure`/`reset` still cannot re-parse.
+* **P5** — round-trip gaps. **CLOSED (verified 2026-08-16).** A guarded `measure` and a guarded `reset` both parse *and* carry their condition through `omega-parser` — grammar `if_stmt` at `qasm2.pest:78` accepts `measure_stmt | reset_stmt | gate_app_stmt`, and `crates/omega-parser/tests/guarded_measure_and_reset.rs` pins it. This line survived the fix by some margin.
 * ~~**P6 residual — `is_runtime_cond` routes by register NAME.**~~ **FIXED
   2026-08-13**: it now consults the circuit's declared classical registers.
   Original description below.

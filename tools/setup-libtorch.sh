@@ -91,6 +91,7 @@ fi
 #     hence the extra -L and -rpath in the env file below. Without them the
 #     link fails with `undefined reference to _gfortran_concat_string`.
 LIBTORCH_PIP_SITE=""
+LIBTORCH_PIP_LIBS=""
 if [ -z "$LIBTORCH_URL" ] && [ "$uname_s/$uname_m" = "Linux/aarch64" ] && \
    [ ! -f "$LIBTORCH_DIR/build-version" ]; then
   TORCH_VENV="${ARIA_TORCH_VENV:-$REPO_DIR/.venv-libtorch}"
@@ -149,12 +150,17 @@ if [ -z "$LIBTORCH_URL" ] && [ "$uname_s/$uname_m" = "Linux/aarch64" ] && \
   fi
   LIBTORCH_DIR="$pip_torch"
   LIBTORCH_PIP_SITE="$(dirname "$pip_torch")"
+  # Only advertise torch.libs/ when it exists — see PIP_LINK_FLAGS below.
+  [ -d "$LIBTORCH_PIP_SITE/torch.libs" ] && LIBTORCH_PIP_LIBS="$LIBTORCH_PIP_SITE/torch.libs"
   printf '%s' "$pip_ver" > "$LIBTORCH_DIR/build-version"
-  # The OpenBLAS/libgfortran the link needs live in a sibling torch.libs/ (the
-  # auditwheel layout). Warn if it is absent — a CUDA sbsa wheel may stage those
-  # under nvidia/*/lib instead, and the link would then fail on gfortran.
-  [ -d "$LIBTORCH_PIP_SITE/torch.libs" ] || \
-    echo "WARN: $LIBTORCH_PIP_SITE/torch.libs not found — link may fail on _gfortran_concat_string" >&2
+  # The OpenBLAS/libgfortran the link needs live either in a sibling
+  # torch.libs/ (auditwheel layout) or inside torch/lib/ itself. 2.7.0+cu128
+  # aarch64 uses the latter, so an absent torch.libs/ is NOT a problem — only
+  # an absent libgfortran is. Check for the thing that actually matters.
+  if [ ! -d "$LIBTORCH_PIP_SITE/torch.libs" ] && \
+     ! ls "$LIBTORCH_DIR"/lib/libgfortran.so* >/dev/null 2>&1; then
+    echo "WARN: no torch.libs/ and no libgfortran in torch/lib — link may fail on _gfortran_concat_string" >&2
+  fi
   echo "==> libtorch $pip_ver from the wheel at $LIBTORCH_DIR"
 fi
 
@@ -223,9 +229,17 @@ esac
 # rpath (see 0b). Empty for a normal C++ dist, so the env file is unchanged there.
 PIP_LINK_FLAGS=""
 if [ -n "$LIBTORCH_PIP_SITE" ]; then
-  PIP_LINK_FLAGS="-L native=$LIBTORCH_PIP_SITE/torch.libs \
--C link-arg=-Wl,-rpath,$LIBTORCH_DIR/lib \
+  PIP_LINK_FLAGS="-C link-arg=-Wl,-rpath,$LIBTORCH_DIR/lib"
+  # `torch.libs/` is the auditwheel sibling layout, and it is NOT universal:
+  # torch 2.7.0+cu128 aarch64 ships libgfortran.so.5 and libarm_compute.so
+  # INSIDE torch/lib/ and has no sibling directory at all. Pointing -L and an
+  # rpath at a path that does not exist is silently wrong — it makes the flags
+  # look configured while contributing nothing — so add them only when the
+  # directory is really there.
+  if [ -d "$LIBTORCH_PIP_SITE/torch.libs" ]; then
+    PIP_LINK_FLAGS="$PIP_LINK_FLAGS -L native=$LIBTORCH_PIP_SITE/torch.libs \
 -C link-arg=-Wl,-rpath,$LIBTORCH_PIP_SITE/torch.libs"
+  fi
 fi
 
 # ---- CUDA link retention ----
@@ -249,6 +263,30 @@ if [ -f "$LIBTORCH_DIR/lib/libtorch_cuda.so" ]; then
   command -v nvcc >/dev/null 2>&1 && echo "    nvcc:   $(nvcc --version | tail -1)"
 fi
 
+# ---- host/target split: REQUIRED once CUDA_LINK_FLAGS is non-empty ----
+#
+# RUSTFLAGS applies to EVERY rustc invocation, including the proc-macro crates
+# cargo builds for the host and then dlopens into the compiler. With
+# `--no-as-needed -ltorch_cuda`, a proc macro such as libserde_derive.so ends up
+# with libtorch_cuda / libc10_cuda / libcudart / libcusparse / libcufft in its
+# DT_NEEDED — verified with ldd — so loading it drags the whole CUDA stack into
+# the rustc process. On aarch64 that SIGSEGVs the compiler, on unrelated crates:
+#
+#     error: could not compile `serde` (lib)
+#     process didn't exit successfully: rustc ... (signal: 11, SIGSEGV)
+#
+# Setting CARGO_BUILD_TARGET to the host triple makes cargo build host artifacts
+# (proc macros, build scripts) WITHOUT the target rustflags, which is the
+# documented way to keep them separate. It is equivalent to passing --target on
+# every invocation, without every caller having to remember.
+#
+# Only set when CUDA flags are in play: an unconditional CARGO_BUILD_TARGET
+# changes target/ layout for everyone and would surprise the non-tch builds.
+CARGO_TARGET_TRIPLE=""
+if [ -n "$CUDA_LINK_FLAGS" ]; then
+  CARGO_TARGET_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+fi
+
 # Everything that belongs in RUSTFLAGS, in one place.
 LINK_FLAGS="$(printf '%s %s' "$PIP_LINK_FLAGS" "$CUDA_LINK_FLAGS" | sed -e 's/^ *//' -e 's/ *$//')"
 
@@ -257,7 +295,7 @@ cat > "$ENV_FILE" <<EOF
 # Source before building the Aria tch backend:  source ./tch-env.sh
 export LIBTORCH="$LIBTORCH_DIR"
 export DYLD_LIBRARY_PATH="\$LIBTORCH/lib:\${DYLD_LIBRARY_PATH:-}"  # macOS
-export LD_LIBRARY_PATH="\$LIBTORCH/lib:${LIBTORCH_PIP_SITE:+$LIBTORCH_PIP_SITE/torch.libs:}\${LD_LIBRARY_PATH:-}"      # Linux
+export LD_LIBRARY_PATH="\$LIBTORCH/lib:${LIBTORCH_PIP_LIBS:+$LIBTORCH_PIP_LIBS:}\${LD_LIBRARY_PATH:-}"      # Linux
 export CXXFLAGS="$TCH_CXXFLAGS"
 unset LIBTORCH_USE_PYTORCH   # any value makes torch-sys hunt for a pip torch
 EOF
@@ -268,13 +306,18 @@ EOF
 if [ -n "$LINK_FLAGS" ]; then
   printf 'export RUSTFLAGS="%s ${RUSTFLAGS:-}"\n' "$LINK_FLAGS" >> "$ENV_FILE"
 fi
+if [ -n "$CARGO_TARGET_TRIPLE" ]; then
+  printf '# Keeps the CUDA link flags off host proc macros — without this rustc SIGSEGVs.\n' >> "$ENV_FILE"
+  printf 'export CARGO_BUILD_TARGET="%s"\n' "$CARGO_TARGET_TRIPLE" >> "$ENV_FILE"
+fi
 echo "==> wrote env file: $ENV_FILE  (source it in future shells)"
 
 # ---- 3. set the env for this script's own builds ----
 export LIBTORCH="$LIBTORCH_DIR"
 export DYLD_LIBRARY_PATH="$LIBTORCH/lib:${DYLD_LIBRARY_PATH:-}"
-export LD_LIBRARY_PATH="$LIBTORCH/lib:${LIBTORCH_PIP_SITE:+$LIBTORCH_PIP_SITE/torch.libs:}${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$LIBTORCH/lib:${LIBTORCH_PIP_LIBS:+$LIBTORCH_PIP_LIBS:}${LD_LIBRARY_PATH:-}"
 [ -n "$LINK_FLAGS" ] && export RUSTFLAGS="$LINK_FLAGS ${RUSTFLAGS:-}"
+[ -n "$CARGO_TARGET_TRIPLE" ] && export CARGO_BUILD_TARGET="$CARGO_TARGET_TRIPLE"
 export CXXFLAGS="$TCH_CXXFLAGS"
 unset LIBTORCH_USE_PYTORCH || true
 

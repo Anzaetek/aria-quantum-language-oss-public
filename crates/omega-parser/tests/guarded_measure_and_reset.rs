@@ -41,12 +41,21 @@ fn each_guarded_form_lowers_with_its_condition() {
     use omega_core::circuit::GateKind;
     let cases: &[(&str, &str, GateKind)] = &[
         ("gate", "if (c==1) x q[0];", GateKind::X),
-        ("measure", "if (c==1) measure q[0] -> c[1];", GateKind::Measure),
+        (
+            "measure",
+            "if (c==1) measure q[0] -> c[1];",
+            GateKind::Measure,
+        ),
         ("reset", "if (c==1) reset q[0];", GateKind::Reset),
     ];
     for (name, body, want) in cases {
         let ir = ir(&format!("{HDR}{body}\n"));
-        assert_eq!(ir.ops.len(), 1, "{name}: expected one op, got {}", ir.ops.len());
+        assert_eq!(
+            ir.ops.len(),
+            1,
+            "{name}: expected one op, got {}",
+            ir.ops.len()
+        );
         assert_eq!(&ir.ops[0].gate, want, "{name}: wrong gate kind");
         assert!(
             ir.ops[0].condition.is_some(),
@@ -68,7 +77,10 @@ fn the_unguarded_forms_are_unchanged() {
     ] {
         let ir = ir(&format!("{HDR}{body}\n"));
         assert_eq!(ir.ops.len(), 1, "{name}");
-        assert_eq!(ir.ops[0].gate, want, "{name}: wrong kind — did the ordered choice change?");
+        assert_eq!(
+            ir.ops[0].gate, want,
+            "{name}: wrong kind — did the ordered choice change?"
+        );
         assert!(
             ir.ops[0].condition.is_none(),
             "{name}: an UNGUARDED statement acquired a condition"

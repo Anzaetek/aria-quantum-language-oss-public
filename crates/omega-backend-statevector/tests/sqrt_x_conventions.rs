@@ -81,7 +81,10 @@ fn matrices_match_the_qiskit_closed_form() {
 #[test]
 fn sx_squared_is_x() {
     let d = max_diff(&mul(&gates::sx(), &gates::sx()), &x_gate());
-    assert!(d < 1e-15, "sx*sx must equal X exactly, got max diff {d:.3e}");
+    assert!(
+        d < 1e-15,
+        "sx*sx must equal X exactly, got max diff {d:.3e}"
+    );
 }
 
 /// `sxdg = sx†`, so the adjoint pass may substitute one for the other.

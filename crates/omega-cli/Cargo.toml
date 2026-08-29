@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Command-line interface for the omega quantum runtime."
+# Stamps the git revision into the binary; see build.rs for why a stale or
+# dirty stamp is worse than none.
+build = "build.rs"
 
 [[bin]]
 name = "omega-run"
@@ -21,15 +24,24 @@ default = []
 metal = [
     "dep:omega-backend-statevector-metal",
     "omega-backend-statevector-metal/metal",
+    "dep:omega-backend-mps-metal",
+    "omega-backend-mps-metal/metal",
     "omega-core/metal",
 ]
 # Pulls in the CUDA statevector backend so `--device cuda` is real
 # rather than a graceful CPU fallback. Off by default; gated behind
-# `--features cuda` on the Linux+NVIDIA host (sibling `ci-linux-cuda.sh`
-# is the CI gate, not this host's `ci.sh`).
+# `--features cuda` on the Linux+NVIDIA host.
+#
+# The gate is `./ci.sh` with ARIA_CUDA=1, which clippies this crate under
+# `--features cuda`. This comment used to name a sibling `ci-linux-cuda.sh` as
+# the gate instead; no such file exists, in the tree or in any commit, so for
+# its whole life the pointer named nothing and the featured build was linted by
+# nothing. Found while widening stage 2.
 cuda = [
     "dep:omega-backend-statevector-cuda",
     "omega-backend-statevector-cuda/cuda",
+    "dep:omega-backend-mps-cuda",
+    "omega-backend-mps-cuda/cuda",
     "omega-core/cuda",
 ]
 # Pulls in the OpenCL statevector backend so `--device opencl` is real
@@ -58,10 +70,13 @@ omega-backend-statevector = { path = "../omega-backend-statevector" }
 omega-backend-statevector-metal = { path = "../omega-backend-statevector-metal", optional = true }
 omega-backend-statevector-cuda = { path = "../omega-backend-statevector-cuda", optional = true }
 omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl", optional = true }
+omega-backend-mps-metal = { path = "../omega-backend-mps-metal", optional = true }
+omega-backend-mps-cuda = { path = "../omega-backend-mps-cuda", optional = true }
 omega-backend-photonics = { path = "../omega-backend-photonics" }
 omega-backend-mps = { path = "../omega-backend-mps" }
 omega-backend-pauli = { path = "../omega-backend-pauli" }
 omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
 omega-bridges = { path = "../omega-bridges" }
 serde_json = { workspace = true }
+rayon = { workspace = true }
 num-complex = { workspace = true }

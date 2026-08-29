@@ -139,7 +139,34 @@ impl Backend for PhotonicsBackend {
                 let counts = sample_from_distribution(&distribution, shots, config.seed)?;
                 // Photonic keys index Fock basis states, not qubits, and the
                 // dense distribution is bounded well below 2^64 entries.
-                Ok(ExecResult::counts_from_u64(counts, circuit.num_qubits))
+                //
+                // The width is **4 bits per MODE**, not one bit per mode.
+                // `sample_from_distribution` packs each mode's occupation into
+                // a nibble, so an M-mode key needs 4M bits — and
+                // `Outcome::from_u64` MASKS to the width it is given. Passing
+                // `num_qubits` (= M) therefore discarded all but the low M bits
+                // of every key, silently.
+                //
+                // What that looked like: the shipped `hom_dip.opticqasm`
+                // example, two photons in, reported `|0,0>` — photon number not
+                // conserved, which is impossible for passive optics. `|0,2>`
+                // packs as 0x20, masked to 2 bits gives 0. Worse, on the
+                // polarization example two distinct outcomes both masked to 0
+                // and the `HashMap` kept whichever came last, so ~800 of 8192
+                // shots vanished. Every shots-mode photonic run has been wrong
+                // since the `Outcome` migration in `89da782`; the analytic path
+                // and all the matrix-level convention tests were unaffected,
+                // which is why nothing caught it.
+                //
+                // 4 * MAX_ENCODABLE_MODES = 64 = MAX_COUNTS_QUBITS exactly, so
+                // this cannot exceed the executor's width assertion.
+                let result = ExecResult::counts_from_u64(counts, 4 * circuit.num_qubits);
+                // Passive-only op set (see `all_ops_are_passive`), so the
+                // conservation law holds unconditionally here.
+                if all_ops_are_passive(&ops) {
+                    check_photon_number_conserved(&result, &input, num_modes)?;
+                }
+                Ok(result)
             }
         }
     }
@@ -294,6 +321,84 @@ fn evaluate_observable_against_distribution(
 }
 
 /// Largest mode count the u64 nibble encoding can represent without collision.
+/// Does every op in this circuit conserve photon number?
+///
+/// Today this is unconditionally TRUE, and the exhaustive match is the point
+/// rather than the answer. `PhotonicOp` contains only passive elements — a
+/// phase shifter and a beam splitter — so `build_unitary` produces a unitary
+/// transfer matrix and a circuit this backend can express cannot create or
+/// destroy photons. Loss lives in `omega-backend-cv`, by explicit dilation,
+/// and never reaches here.
+///
+/// Adding a lossy or amplifying variant (loss, dilation, squeezing, an ancilla
+/// trace-out) will fail to COMPILE at this match. That is deliberate: whoever
+/// adds it has to decide what the invariant becomes, instead of silently
+/// inheriting one that no longer holds. A `_ => true` arm here would hand the
+/// next author a check that quietly stops being true.
+fn all_ops_are_passive(ops: &[PhotonicOp]) -> bool {
+    ops.iter().all(|op| match op {
+        PhotonicOp::PhaseShifter { .. } => true,
+        PhotonicOp::BeamSplitterRx { .. } => true,
+    })
+}
+
+/// Total photon number packed into a Fock key, 4 bits per mode.
+fn photons_in_key(key: u64, num_modes: usize) -> u32 {
+    (0..num_modes)
+        .map(|i| ((key >> (i * 4)) & 0xF) as u32)
+        .sum()
+}
+
+/// Passive linear optics redistributes photons; it does not create or destroy
+/// them. So for every outcome, `sum(occupations out) == sum(photons in)` —
+/// an EXACT integer identity, per key, on every shot. Not a tolerance.
+///
+/// This is checked on the `ExecResult`, deliberately NOT on the `u64` counts
+/// map that feeds it. The map's keys were already correct when this class of
+/// bug last shipped; what was wrong was the WIDTH handed to
+/// `counts_from_u64`. `num_qubits` (= modes) was passed where the key is four
+/// bits per mode, so `Outcome::from_u64` masked away all but the low M bits:
+///
+///   * `hom_dip.opticqasm`, two photons in, reported `|0,0>` — photon number
+///     not conserved, impossible for passive optics. `|0,2>` packs as `0x20`,
+///     masked to 2 bits gives 0.
+///   * on the polarization example two distinct outcomes both masked to 0 and
+///     the `HashMap` kept whichever arrived last: ~800 of 8192 shots vanished.
+///
+/// Every shots-mode photonic run was wrong from the `Outcome` migration until
+/// it was found. Nothing caught it because the analytic path and the
+/// matrix-level convention tests do not go through this packing — so checking
+/// the pre-packing map would reproduce exactly the blind spot that let it
+/// ship. The invariant has to sit on what the caller actually receives.
+fn check_photon_number_conserved(
+    result: &ExecResult,
+    input: &slos::FockState,
+    num_modes: usize,
+) -> Result<()> {
+    let want: u32 = input.iter().sum();
+    let ExecResult::Counts(counts) = result else {
+        return Ok(());
+    };
+    for outcome in counts.keys() {
+        let Some(key) = outcome.as_u64() else {
+            continue;
+        };
+        let got = photons_in_key(key, num_modes);
+        if got != want {
+            return Err(OmegaError::Backend(format!(
+                "photon number is not conserved: outcome {} carries {got} \
+                 photon(s) but the input state carries {want}. Passive linear \
+                 optics cannot create or destroy photons, so this is a defect in \
+                 this backend, not a property of the circuit. The usual cause is \
+                 an outcome width that does not match the 4-bits-per-mode Fock \
+                 packing, which truncates keys.",
+                decode_fock_string(key, num_modes)
+            )));
+        }
+    }
+    Ok(())
+}
+
 const MAX_ENCODABLE_MODES: usize = 16;
 /// Largest photon count per mode the 4-bit nibble can hold.
 const MAX_PHOTONS_PER_MODE: u32 = 15;
@@ -445,6 +550,84 @@ mod tests {
         }
     }
 
+    /// Photon-number conservation over SHOTS-MODE counts, for passive optics.
+    ///
+    /// Independent of the backend's own opinion of the width: the expected
+    /// total comes from the INPUT Fock state, which the test chooses, and is
+    /// never read back out of the result. That is the distinction that matters
+    /// here — `test_photonics_hom_effect` used to re-mask its lookup keys with
+    /// the width the backend returned, so it agreed with whatever the backend
+    /// did and passed for the entire period when every shots run was wrong.
+    ///
+    /// Sums, so it does not depend on WHICH outcomes appear or their
+    /// probabilities — only on the conservation law. A truncating width shows
+    /// up immediately: `|0,2>` packs as 0x20 and masks to 0, giving 0 photons
+    /// where 2 went in.
+    #[test]
+    fn shots_mode_counts_conserve_photon_number() {
+        for (input, theta) in [
+            (vec![1u32, 1], std::f64::consts::FRAC_PI_4), // HOM: the |0,2>/|2,0> case
+            (vec![2u32, 0], std::f64::consts::FRAC_PI_4), // 2 photons, one mode
+            (vec![1u32, 0], 0.3),                         // asymmetric, off 50:50
+            (vec![3u32, 1], 0.7),                         // 4 photons, unequal split
+        ] {
+            let mut circuit = CircuitIR::new(2, CircuitType::Photonic);
+            circuit.add_op(GateOp {
+                gate: GateKind::BeamSplitterRx,
+                qubits: smallvec![Qubit(0), Qubit(1)],
+                params: smallvec![ParamExpr::Concrete(theta), ParamExpr::Concrete(0.0)],
+                classical_bit: None,
+                condition: None,
+            });
+            let want: u32 = input.iter().sum();
+            let backend = PhotonicsBackend::with_input(input.clone());
+            let config = ExecConfig {
+                shots: Some(500),
+                seed: Some(7),
+                mid_circuit_mode: MidCircuitMode::Skip,
+            };
+            let result = backend
+                .execute(&circuit, &ParameterBinding::new(), &config)
+                .unwrap_or_else(|e| panic!("input {input:?} theta {theta}: {e}"));
+
+            let counts = result.counts();
+            assert!(!counts.is_empty(), "input {input:?}: no outcomes sampled");
+            let mut shots_seen = 0u32;
+            for (outcome, n) in counts {
+                let key = outcome.as_u64().expect("2-mode key fits in u64");
+                let got = photons_in_key(key, 2);
+                assert_eq!(
+                    got,
+                    want,
+                    "input {input:?} theta {theta}: outcome |{}> has {got} photons, want {want}",
+                    decode_fock_string(key, 2)
+                );
+                shots_seen += n;
+            }
+            assert_eq!(
+                shots_seen, 500,
+                "input {input:?}: shots lost from the histogram"
+            );
+        }
+    }
+
+    /// The op set is passive, so the guard above is unconditional. If this
+    /// stops holding, `all_ops_are_passive` needs a real predicate and the
+    /// call site in `execute` needs revisiting — not a wider `_ => true` arm.
+    #[test]
+    fn every_photonic_op_is_passive_today() {
+        let ops = [
+            PhotonicOp::PhaseShifter { mode: 0, phi: 0.4 },
+            PhotonicOp::BeamSplitterRx {
+                mode0: 0,
+                mode1: 1,
+                theta: 0.3,
+                phi: 0.1,
+            },
+        ];
+        assert!(all_ops_are_passive(&ops));
+    }
+
     #[test]
     fn test_photonics_hom_effect() {
         // |1,1> through 50:50 BS -> bunching
@@ -471,11 +654,18 @@ mod tests {
             .unwrap();
         let counts = result.counts();
 
-        // Encode |1,1> = 0x11 = 17
-        // Photonic keys pack 4 bits of occupancy per mode; the width is the
-        // mode count, as `counts_from_u64` records it.
-        let w = counts.keys().next().map(|o| o.width()).unwrap_or(2);
-        let key = |k: u64| omega_core::outcome::Outcome::from_u64(k, w);
+        // Encode |1,1> = 0x11: 4 bits of occupancy per MODE, so a 2-mode key
+        // is 8 bits wide.
+        //
+        // This used to read the width back OUT of the returned outcomes and
+        // re-mask its own lookup keys with it. That made the test agree with
+        // whatever the backend did: when the backend was masking to 2 bits,
+        // 0x11/0x02/0x20 collapsed to 1/2/0 and the assertions below still
+        // passed against the corrupted keys. A test that launders its
+        // expectation through the value under test cannot fail, and this one
+        // did not — for the whole time every photonic shots run was wrong.
+        // The width is now a literal.
+        let key = |k: u64| omega_core::outcome::Outcome::from_u64(k, 8);
         let count_11 = counts.get(&key(0x11)).copied().unwrap_or(0);
         assert_eq!(count_11, 0, "HOM: |1,1> should have 0 counts");
 

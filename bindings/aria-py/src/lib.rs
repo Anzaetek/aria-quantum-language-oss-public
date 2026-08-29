@@ -83,7 +83,7 @@ const ACCELERATOR: Option<&str> = if cfg!(feature = "metal") {
 /// speeds up one step inside an otherwise-identical algorithm, so falling back
 /// changes speed, not semantics.
 #[allow(unreachable_code, unused_variables)]
-fn make_gpu(pin: Option<&str>) -> PyResult<Box<dyn Backend>> {
+fn make_gpu(pin: Option<&str>) -> PyResult<Box<dyn Backend + Send + Sync>> {
     if let (Some(want), Some(have)) = (pin, ACCELERATOR) {
         if want != have {
             return Err(err(format!(
@@ -96,19 +96,19 @@ fn make_gpu(pin: Option<&str>) -> PyResult<Box<dyn Backend>> {
     #[cfg(feature = "metal")]
     {
         return omega_backend_statevector_metal::MetalStatevectorBackend::new()
-            .map(|b| Box::new(b) as Box<dyn Backend>)
+            .map(|b| Box::new(b) as Box<dyn Backend + Send + Sync>)
             .map_err(|e| err(format!("Metal statevector unavailable: {e:?}")));
     }
     #[cfg(feature = "cuda")]
     {
         return omega_backend_statevector_cuda::CudaStatevectorBackend::new()
-            .map(|b| Box::new(b) as Box<dyn Backend>)
+            .map(|b| Box::new(b) as Box<dyn Backend + Send + Sync>)
             .map_err(|e| err(format!("CUDA statevector unavailable: {e:?}")));
     }
     #[cfg(feature = "opencl")]
     {
         return omega_backend_statevector_opencl::OpenClStatevectorBackend::new()
-            .map(|b| Box::new(b) as Box<dyn Backend>)
+            .map(|b| Box::new(b) as Box<dyn Backend + Send + Sync>)
             .map_err(|e| err(format!("OpenCL statevector unavailable: {e:?}")));
     }
     Err(err(
@@ -135,7 +135,7 @@ fn make_gpu(pin: Option<&str>) -> PyResult<Box<dyn Backend>> {
 /// `"sv:cuda"`, `"mps:cuda[:<chi>]"` and `"pauliprop:cuda"` are **deprecated
 /// aliases** kept so wheels already in use keep working; prefer the neutral
 /// spellings.
-fn make_backend(spec: &str) -> PyResult<Box<dyn Backend>> {
+fn make_backend(spec: &str) -> PyResult<Box<dyn Backend + Send + Sync>> {
     match spec {
         "sv" | "sim" | "statevector" => Ok(Box::new(StatevectorBackend::new())),
         "mps" => Ok(Box::new(make_mps(64))),
@@ -190,17 +190,34 @@ fn make_backend(spec: &str) -> PyResult<Box<dyn Backend>> {
 /// one for anything with a device behind it.
 ///
 /// **Deliberately `unsendable`: a `Backend` belongs to the thread that built
-/// it.** Not conservatism — `CudaStatevectorBackend` holds a captured
-/// `CudaGraph` wrapping a raw `*mut CUgraph_st`, so it implements neither `Send`
-/// nor `Sync`, and CUDA stream capture really is invalidated by concurrent work
-/// from other threads in the same context (the same effect that makes that
-/// crate's own tests flaky under cargo's default test threads). Touching a
-/// `Backend` from another Python thread therefore raises, rather than quietly
-/// corrupting a device handle. For parallel work build **one `Backend` per
-/// thread or per process**.
+/// it.** For parallel work build **one `Backend` per thread or per process**.
+///
+/// The reason has CHANGED, and the old one is no longer true. This used to say
+/// `CudaStatevectorBackend` implements neither `Send` nor `Sync`; it now does,
+/// via `unsafe impl`s that were written blind on an Apple host and then
+/// **verified on a CUDA host** (DGX Spark GB10, CUDA 13.0.88, 2026-08-17). So
+/// `unsendable` is now a POLICY choice, not a soundness necessity:
+///
+/// * The soundness argument for the CUDA impls reduces to one `Mutex` — the
+///   graph cache — and holds only while every use of a cached `CUgraphExec`
+///   stays inside that guard. That invariant is upheld today and the compiler
+///   will not notice if a future change breaks it.
+/// * Sharing one backend across threads buys nothing anyway: all CUDA calls go
+///   through ONE stream, so two host threads serialise on the device even with
+///   the GIL released.
+///
+/// `unsendable` costs nothing given the per-thread guidance, and keeps a
+/// mis-shared handle raising a Python exception instead of relying on that
+/// `Mutex` invariant surviving future edits.
+///
+/// Note this is independent of the GIL release added to `Model`'s compute
+/// methods: [`Python::allow_threads`] runs its closure on the SAME thread, so
+/// `unsendable` does not block it. What the release needed was
+/// `dyn Backend + Send + Sync`, which is a property of the trait object, not of
+/// this pyclass.
 #[pyclass(name = "Backend", unsendable)]
 struct PyBackend {
-    inner: Box<dyn Backend>,
+    inner: Box<dyn Backend + Send + Sync>,
     spec: String,
 }
 
@@ -253,12 +270,20 @@ impl PyBackend {
 
 /// Either a backend built for this one call, or a borrowed reusable one.
 enum Be<'py> {
-    Owned(Box<dyn Backend>),
+    Owned(Box<dyn Backend + Send + Sync>),
     Reused(PyRef<'py, PyBackend>),
 }
 
 impl Be<'_> {
-    fn as_dyn(&self) -> &dyn Backend {
+    /// The `+ Send + Sync` is what lets the returned reference cross into a
+    /// [`Python::allow_threads`] closure: that closure must be `Send`, so the
+    /// `&dyn Backend` it captures must be `Send`, which requires the trait
+    /// object to be `Sync`.
+    ///
+    /// Measured, not assumed — `crates/omega-cli/tests/backends_are_send_sync.rs`
+    /// asserts it for every backend at compile time and names the ones a given
+    /// host could not check.
+    fn as_dyn(&self) -> &(dyn Backend + Send + Sync) {
         match self {
             Be::Owned(b) => b.as_ref(),
             Be::Reused(r) => r.inner.as_ref(),
@@ -340,14 +365,16 @@ impl Model {
     #[pyo3(signature = (params, observable, backend=None))]
     fn expectation(
         &self,
+        py: Python<'_>,
         params: Vec<f64>,
         observable: &str,
         backend: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<f64> {
         let obs = Observable::parse(observable).map_err(err)?;
         let be = resolve_backend(backend)?;
-        be.as_dyn()
-            .expectation(&self.ir, &self.binding(&params)?, &obs)
+        let bnd = self.binding(&params)?;
+        let dyn_be = be.as_dyn();
+        py.allow_threads(|| dyn_be.expectation(&self.ir, &bnd, &obs))
             .map_err(|e| err(e.to_string()))
     }
 
@@ -355,21 +382,20 @@ impl Model {
     #[pyo3(signature = (params, observable, backend=None))]
     fn gradient(
         &self,
+        py: Python<'_>,
         params: Vec<f64>,
         observable: &str,
         backend: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<f64>> {
         let obs = Observable::parse(observable).map_err(err)?;
         let be = resolve_backend(backend)?;
-        let g = compute_gradient_for(
-            be.as_dyn(),
-            &self.ir,
-            &self.binding(&params)?,
-            &obs,
-            &GradMethod::Adjoint,
-            None,
-        )
-        .map_err(|e| err(e.to_string()))?;
+        let bnd = self.binding(&params)?;
+        let dyn_be = be.as_dyn();
+        let g = py
+            .allow_threads(|| {
+                compute_gradient_for(dyn_be, &self.ir, &bnd, &obs, &GradMethod::Adjoint, None)
+            })
+            .map_err(|e| err(e.to_string()))?;
         Ok(self.align(g))
     }
 
@@ -378,6 +404,7 @@ impl Model {
     #[pyo3(signature = (rows, observable, backend=None))]
     fn expectation_batch(
         &self,
+        py: Python<'_>,
         rows: Vec<Vec<f64>>,
         observable: &str,
         backend: Option<&Bound<'_, PyAny>>,
@@ -389,8 +416,8 @@ impl Model {
             .map(|r| self.binding(r))
             .collect::<PyResult<_>>()?;
         let refs: Vec<&ParameterBinding> = bnds.iter().collect();
-        be.as_dyn()
-            .expectation_batch(&self.ir, &refs, &obs)
+        let dyn_be = be.as_dyn();
+        py.allow_threads(|| dyn_be.expectation_batch(&self.ir, &refs, &obs))
             .map_err(|e| err(e.to_string()))
     }
 
@@ -400,6 +427,7 @@ impl Model {
     #[pyo3(signature = (rows, observable, backend=None))]
     fn gradient_batch(
         &self,
+        py: Python<'_>,
         rows: Vec<Vec<f64>>,
         observable: &str,
         backend: Option<&Bound<'_, PyAny>>,
@@ -411,29 +439,36 @@ impl Model {
             .map(|r| self.binding(r))
             .collect::<PyResult<_>>()?;
         let refs: Vec<&ParameterBinding> = bnds.iter().collect();
-        let batched = be
-            .as_dyn()
-            .adjoint_gradient_batch(&self.ir, &refs, &obs)
-            .map_err(|e| err(e.to_string()))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (i, row) in batched.into_iter().enumerate() {
-            match row {
-                Some(g) => out.push(self.align(g)),
-                None => {
-                    let g = compute_gradient_for(
-                        be.as_dyn(),
+        let dyn_be = be.as_dyn();
+
+        // ONE release around the whole loop, not one per row. The
+        // parameter-shift fallback runs `2 * num_params` circuits per row and is
+        // the slowest of the four methods, so re-acquiring the GIL between rows
+        // would hand most of the benefit back — and `align` is pure arithmetic
+        // on `Vec<f64>`, needing no GIL, so there is nothing forcing a break.
+        let raw: Result<Vec<Vec<(u32, f64)>>, _> = py.allow_threads(|| {
+            let batched = dyn_be.adjoint_gradient_batch(&self.ir, &refs, &obs)?;
+            let mut out = Vec::with_capacity(batched.len());
+            for (i, row) in batched.into_iter().enumerate() {
+                match row {
+                    Some(g) => out.push(g),
+                    None => out.push(compute_gradient_for(
+                        dyn_be,
                         &self.ir,
                         &bnds[i],
                         &obs,
                         &GradMethod::ParameterShift,
                         None,
-                    )
-                    .map_err(|e| err(e.to_string()))?;
-                    out.push(self.align(g));
+                    )?),
                 }
             }
-        }
-        Ok(out)
+            Ok::<_, omega_core::error::OmegaError>(out)
+        });
+        Ok(raw
+            .map_err(|e| err(e.to_string()))?
+            .into_iter()
+            .map(|g| self.align(g))
+            .collect())
     }
 }
 

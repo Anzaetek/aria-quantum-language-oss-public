@@ -33,6 +33,11 @@ pub fn gpu_branch_count() -> u64 {
     gpu::GPU_BRANCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Per-phase timings for the GPU branch (`PAULIPROP_GPU_PROFILE=1`). See
+/// `gpu::PhaseTimes` for why whole-run wall clock was not enough.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+pub use gpu::{phase_times, reset_phase_times, PhaseTimes};
+
 /// Telemetry stub on non-CUDA builds: the GPU path never runs.
 #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")))]
 pub fn gpu_branch_count() -> u64 {
@@ -60,7 +65,7 @@ pub fn cuda_branch(
     max_freq: Option<u32>,
     n: usize,
 ) -> bool {
-    if sum.terms.len() < min_terms() {
+    if sum.len() < min_terms() {
         return false; // too small — let the CPU path handle it
     }
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]

@@ -90,7 +90,12 @@ pub enum CvOp {
     /// that a two-mode CV file *imports* rather than being rejected as
     /// unreadable; **do not** build an executor on it without first pinning the
     /// unitary against piquasso, as the DV side is pinned against Perceval.
-    BeamSplitter { a: u32, b: u32, theta: f64, phi: f64 },
+    BeamSplitter {
+        a: u32,
+        b: u32,
+        theta: f64,
+        phi: f64,
+    },
 }
 
 impl CvOp {
@@ -351,13 +356,21 @@ mod tests {
     fn the_three_cv_gates_import() {
         let p = cv("OPTICQASM 1.0;\nphoton q[2];\nsqueeze(0.4, 0.2) q[0];\n\
                     displace(0.7, -0.1) q[0];\nkerr(0.15) q[1];\n")
-            .expect("squeeze/displace/kerr must import");
+        .expect("squeeze/displace/kerr must import");
         assert_eq!(p.modes, 2);
         assert_eq!(
             p.ops,
             vec![
-                CvOp::Squeeze { mode: 0, r: 0.4, phi: 0.2 },
-                CvOp::Displace { mode: 0, re: 0.7, im: -0.1 },
+                CvOp::Squeeze {
+                    mode: 0,
+                    r: 0.4,
+                    phi: 0.2
+                },
+                CvOp::Displace {
+                    mode: 0,
+                    re: 0.7,
+                    im: -0.1
+                },
                 CvOp::Kerr { mode: 1, chi: 0.15 },
             ],
             "parameters or modes were reordered"
@@ -427,17 +440,22 @@ mod tests {
     fn executor_limits_are_reported_separately_from_import() {
         let multi = cv("OPTICQASM 1.0;\nphoton q[2];\nkerr(0.1) q[0];\n").unwrap();
         assert!(
-            multi.executable_on_builtin_cv().unwrap_err().contains("single-mode"),
+            multi
+                .executable_on_builtin_cv()
+                .unwrap_err()
+                .contains("single-mode"),
             "two modes must import but not execute on the built-in backend"
         );
 
         let bs = cv("OPTICQASM 1.0;\nphoton q[2];\nbs_rx(0.5, 0.1) q[0], q[1];\n").unwrap();
         assert!(bs.executable_on_builtin_cv().is_err(), "no two-mode state");
 
-        let late = cv("OPTICQASM 1.0;\nphoton q[1];\nkerr(0.1) q[0];\nsqueeze(0.3, 0.0) q[0];\n")
-            .unwrap();
+        let late =
+            cv("OPTICQASM 1.0;\nphoton q[1];\nkerr(0.1) q[0];\nsqueeze(0.3, 0.0) q[0];\n").unwrap();
         assert!(
-            late.executable_on_builtin_cv().unwrap_err().contains("FIRST"),
+            late.executable_on_builtin_cv()
+                .unwrap_err()
+                .contains("FIRST"),
             "squeezing is a constructor there, so it cannot follow another op"
         );
 
@@ -449,7 +467,7 @@ mod tests {
 
         let ok = cv("OPTICQASM 1.0;\nphoton q[1];\nsqueeze(0.3, 0.0) q[0];\n\
                      displace(0.2, 0.0) q[0];\nkerr(0.1) q[0];\n")
-            .unwrap();
+        .unwrap();
         ok.executable_on_builtin_cv()
             .expect("single mode, squeeze first, phi=0 — this one does run");
     }

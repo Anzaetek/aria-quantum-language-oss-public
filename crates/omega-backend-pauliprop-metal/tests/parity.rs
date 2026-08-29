@@ -155,11 +155,13 @@ fn gpu_branch_matches_cpu_with_max_freq() {
     for max_freq in [2u32, 4, 8] {
         let cpu = PauliPropBackend::new()
             .max_freq(Some(max_freq))
+            .with_max_dropped_mass(Some(f64::INFINITY))
             .expectation_with_budget(&c, &params, &o)
             .unwrap();
         let before = gpu_branch_count();
         let gpu = PauliPropBackend::new()
             .max_freq(Some(max_freq))
+            .with_max_dropped_mass(Some(f64::INFINITY))
             .with_branch_hook(metal_branch)
             .expectation_with_budget(&c, &params, &o)
             .unwrap();

@@ -4,10 +4,10 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use num_complex::Complex64;
-use omega_backend_pauliprop::{pack_bits, unpack_bits, PauliKey, PauliSum};
+use omega_backend_pauliprop::{PauliKey, PauliSum};
 
 /// Virtual arch target for the NVRTC compile, detected from the live device's
 /// compute capability (`compute_{major}{minor}`), matching statevector-cuda.
@@ -119,9 +119,129 @@ extern "C" __global__ void branch_expand(
 }
 "#;
 
+/// Cumulative nanoseconds per phase of `run`, and how many times it ran.
+///
+/// **Why this exists.** The claim "the host merge dominates, so buffer reuse
+/// will not help" was asserted in three places in this repo and measured in
+/// none — there was no pauliprop bench and no per-phase timer, only whole-run
+/// wall clock, which cannot attribute cost to a phase. Optimising against that
+/// is guessing. Enabled by `PAULIPROP_GPU_PROFILE=1`; zero cost otherwise (one
+/// `bool` read per call, resolved once).
+#[derive(Default, Clone, Copy)]
+pub struct PhaseTimes {
+    pub calls: u64,
+    pub soa_ns: u64,
+    pub alloc_ns: u64,
+    pub upload_ns: u64,
+    pub launch_sync_ns: u64,
+    pub download_ns: u64,
+    pub merge_ns: u64,
+}
+
+impl PhaseTimes {
+    pub fn total_ns(&self) -> u64 {
+        self.soa_ns
+            + self.alloc_ns
+            + self.upload_ns
+            + self.launch_sync_ns
+            + self.download_ns
+            + self.merge_ns
+    }
+}
+
+thread_local! {
+    static PHASES: RefCell<PhaseTimes> = const { RefCell::new(PhaseTimes {
+        calls: 0, soa_ns: 0, alloc_ns: 0, upload_ns: 0,
+        launch_sync_ns: 0, download_ns: 0, merge_ns: 0,
+    }) };
+}
+
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PAULIPROP_GPU_PROFILE").is_ok())
+}
+
+/// Per-phase timings accumulated on this thread since the last reset.
+pub fn phase_times() -> PhaseTimes {
+    PHASES.with(|p| *p.borrow())
+}
+
+/// Zero the counters — call between measured configurations.
+pub fn reset_phase_times() {
+    PHASES.with(|p| *p.borrow_mut() = PhaseTimes::default());
+}
+
+/// Time `f` into `field` when profiling is on, else just run it.
+#[inline]
+fn phase<R>(field: fn(&mut PhaseTimes) -> &mut u64, f: impl FnOnce() -> R) -> R {
+    if !profiling() {
+        return f();
+    }
+    let t0 = std::time::Instant::now();
+    let r = f();
+    let dt = t0.elapsed().as_nanos() as u64;
+    PHASES.with(|p| *field(&mut p.borrow_mut()) += dt);
+    r
+}
+
+/// Device buffers held across calls, grown on demand and never shrunk.
+///
+/// **Why.** `run` allocated 14 buffers per call — each a `cuMemAlloc` PLUS a
+/// memset, so 28 driver operations per rotation gate. With the packed
+/// `PauliKey` landing, that phase went from 1% of the branch step to
+/// **15-17%** in the wide/shallow regime (many small branch calls), because
+/// everything around it got faster. It is now the largest cheap win here.
+///
+/// **The trap, and it is silent.** Reused buffers are LONGER than the current
+/// call needs, so any consumer that reads a whole buffer instead of its live
+/// prefix picks up the previous call's tail. `odropped` is summed into
+/// `dropped_mass` — the CERTIFIED truncation bound — so a stale tail would
+/// inflate an error budget that downstream code trusts, with nothing to
+/// notice. Every download below is sliced to the live length for that reason;
+/// the `[..num]` on the dropped-mass sum landed earlier for the same reason.
+#[derive(Default)]
+struct Buffers {
+    x: Option<CudaSlice<u64>>,
+    z: Option<CudaSlice<u64>>,
+    rx: Option<CudaSlice<u64>>,
+    rz: Option<CudaSlice<u64>>,
+    cre: Option<CudaSlice<f64>>,
+    cim: Option<CudaSlice<f64>>,
+    freq: Option<CudaSlice<u32>>,
+    ox: Option<CudaSlice<u64>>,
+    oz: Option<CudaSlice<u64>>,
+    ocre: Option<CudaSlice<f64>>,
+    ocim: Option<CudaSlice<f64>>,
+    ofreq: Option<CudaSlice<u32>>,
+    ovalid: Option<CudaSlice<u32>>,
+    odropped: Option<CudaSlice<f64>>,
+}
+
+/// Ensure `slot` holds at least `len` elements, allocating only on growth.
+///
+/// Zeroed on (re)allocation only. That is sound because the kernel writes
+/// `ovalid` and `odropped` for EVERY slot it processes (`ovalid[c0]`,
+/// `ovalid[c1]`, `odropped[i]` are unconditional), so no consumer depends on
+/// a zero it did not write — and the reads are prefix-bounded regardless.
+fn ensure<T>(stream: &Arc<CudaStream>, slot: &mut Option<CudaSlice<T>>, len: usize) -> Option<()>
+where
+    T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits,
+{
+    let len = len.max(1);
+    let need = match slot {
+        Some(b) => b.len() < len,
+        None => true,
+    };
+    if need {
+        *slot = Some(stream.alloc_zeros::<T>(len).ok()?);
+    }
+    Some(())
+}
+
 struct Ctx {
     stream: Arc<CudaStream>,
     func: CudaFunction,
+    bufs: Buffers,
     _module: Arc<CudaModule>,
     _ctx: Arc<CudaContext>,
 }
@@ -141,6 +261,7 @@ impl Ctx {
         Some(Ctx {
             stream,
             func,
+            bufs: Buffers::default(),
             _module: module,
             _ctx: ctx,
         })
@@ -174,7 +295,7 @@ pub fn branch_on_gpu(
         if slot.is_none() {
             *slot = Some(Ctx::new());
         }
-        let Some(ctx) = slot.as_ref().and_then(|c| c.as_ref()) else {
+        let Some(ctx) = slot.as_mut().and_then(|c| c.as_mut()) else {
             return false;
         };
         run(ctx, sum, rx, rz, factor, cos, sin, max_freq, n)
@@ -183,7 +304,7 @@ pub fn branch_on_gpu(
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     sum: &mut PauliSum,
     rx: &[u64],
     rz: &[u64],
@@ -200,76 +321,90 @@ fn run(
     // produces for every term, keeping the SoA layout consistent. Bail to the
     // CPU on the degenerate `n == 0` / empty-sum cases rather than fudge widths.
     let w = rx.len();
-    let num = sum.terms.len();
+    let num = sum.len();
     if num == 0 || w == 0 {
         return false;
     }
 
     // Host SoA. Deterministic term order isn't required (the merge is
     // commutative), so iterate the map directly.
-    let mut x_host = Vec::with_capacity(num * w);
-    let mut z_host = Vec::with_capacity(num * w);
-    let mut cre = Vec::with_capacity(num);
-    let mut cim = Vec::with_capacity(num);
-    let mut freq = Vec::with_capacity(num);
-    for (key, wt) in &sum.terms {
-        x_host.extend_from_slice(&pack_bits(&key.x));
-        z_host.extend_from_slice(&pack_bits(&key.z));
-        cre.push(wt.coeff.re);
-        cim.push(wt.coeff.im);
-        freq.push(wt.freq);
-    }
+    let (x_host, z_host, cre, cim, freq) = phase(
+        |p| &mut p.soa_ns,
+        || {
+            let mut x_host = Vec::with_capacity(num * w);
+            let mut z_host = Vec::with_capacity(num * w);
+            let mut cre = Vec::with_capacity(num);
+            let mut cim = Vec::with_capacity(num);
+            let mut freq = Vec::with_capacity(num);
+            for (key, wt) in sum.iter() {
+                x_host.extend_from_slice(key.x_words());
+                z_host.extend_from_slice(key.z_words());
+                cre.push(wt.coeff.re);
+                cim.push(wt.coeff.im);
+                freq.push(wt.freq);
+            }
+            (x_host, z_host, cre, cim, freq)
+        },
+    );
 
-    let s = &ctx.stream;
-    // Upload inputs.
-    let (mut x_dev, mut z_dev) =
-        match (s.alloc_zeros::<u64>(num * w), s.alloc_zeros::<u64>(num * w)) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => return false,
-        };
-    if s.memcpy_htod(&x_host, &mut x_dev).is_err() || s.memcpy_htod(&z_host, &mut z_dev).is_err() {
+    let s = ctx.stream.clone();
+    let s = &s;
+    // Upload inputs. Allocation and H2D are timed together per buffer group
+    // below; the split that matters is alloc-vs-copy, so `alloc_ns` counts the
+    // `alloc_zeros` calls (cuMemAlloc + memset) and `upload_ns` the memcpys.
+    // Grow the pool once, then borrow. All sizes are known here.
+    if phase(
+        |p| &mut p.alloc_ns,
+        || {
+            let b = &mut ctx.bufs;
+            ensure(s, &mut b.x, num * w)?;
+            ensure(s, &mut b.z, num * w)?;
+            ensure(s, &mut b.rx, rx.len())?;
+            ensure(s, &mut b.rz, rz.len())?;
+            ensure(s, &mut b.cre, num)?;
+            ensure(s, &mut b.cim, num)?;
+            ensure(s, &mut b.freq, num)?;
+            ensure(s, &mut b.ox, 2 * num * w)?;
+            ensure(s, &mut b.oz, 2 * num * w)?;
+            ensure(s, &mut b.ocre, 2 * num)?;
+            ensure(s, &mut b.ocim, 2 * num)?;
+            ensure(s, &mut b.ofreq, 2 * num)?;
+            ensure(s, &mut b.ovalid, 2 * num)?;
+            ensure(s, &mut b.odropped, num)?;
+            Some(())
+        },
+    )
+    .is_none()
+    {
         return false;
     }
-    let mk = |v: &[u64]| -> Option<cudarc::driver::CudaSlice<u64>> {
-        let mut d = s.alloc_zeros::<u64>(v.len().max(1)).ok()?;
-        s.memcpy_htod(v, &mut d).ok()?;
-        Some(d)
-    };
-    let (Some(rx_dev), Some(rz_dev)) = (mk(rx), mk(rz)) else {
-        return false;
-    };
-    let upload_f64 = |v: &[f64]| -> Option<cudarc::driver::CudaSlice<f64>> {
-        let mut d = s.alloc_zeros::<f64>(v.len().max(1)).ok()?;
-        s.memcpy_htod(v, &mut d).ok()?;
-        Some(d)
-    };
-    let (Some(cre_dev), Some(cim_dev)) = (upload_f64(&cre), upload_f64(&cim)) else {
-        return false;
-    };
-    let mut freq_dev = match s.alloc_zeros::<u32>(num) {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    if s.memcpy_htod(&freq, &mut freq_dev).is_err() {
+    // Borrow the pool. Uploads write only the live prefix; the tail beyond it
+    // is last call's data and is never read — see `Buffers`.
+    let bufs = &mut ctx.bufs;
+    let (x_dev, z_dev, rx_dev, rz_dev, cre_dev, cim_dev, freq_dev) = (
+        bufs.x.as_mut().unwrap(),
+        bufs.z.as_mut().unwrap(),
+        bufs.rx.as_mut().unwrap(),
+        bufs.rz.as_mut().unwrap(),
+        bufs.cre.as_mut().unwrap(),
+        bufs.cim.as_mut().unwrap(),
+        bufs.freq.as_mut().unwrap(),
+    );
+    if phase(
+        |p| &mut p.upload_ns,
+        || {
+            s.memcpy_htod(&x_host, &mut x_dev.slice_mut(..x_host.len()))
+                .and_then(|_| s.memcpy_htod(&z_host, &mut z_dev.slice_mut(..z_host.len())))
+                .and_then(|_| s.memcpy_htod(rx, &mut rx_dev.slice_mut(..rx.len())))
+                .and_then(|_| s.memcpy_htod(rz, &mut rz_dev.slice_mut(..rz.len())))
+                .and_then(|_| s.memcpy_htod(&cre, &mut cre_dev.slice_mut(..cre.len())))
+                .and_then(|_| s.memcpy_htod(&cim, &mut cim_dev.slice_mut(..cim.len())))
+                .and_then(|_| s.memcpy_htod(&freq, &mut freq_dev.slice_mut(..freq.len())))
+                .is_err()
+        },
+    ) {
         return false;
     }
-
-    // Output buffers (zeroed → invalid slots skip cleanly).
-    let alloc_u64 = |len: usize| s.alloc_zeros::<u64>(len);
-    let alloc_f64 = |len: usize| s.alloc_zeros::<f64>(len);
-    let alloc_u32 = |len: usize| s.alloc_zeros::<u32>(len);
-    let (Ok(mut ox), Ok(mut oz)) = (alloc_u64(2 * num * w), alloc_u64(2 * num * w)) else {
-        return false;
-    };
-    let (Ok(mut ocre), Ok(mut ocim)) = (alloc_f64(2 * num), alloc_f64(2 * num)) else {
-        return false;
-    };
-    let (Ok(mut ofreq), Ok(mut ovalid)) = (alloc_u32(2 * num), alloc_u32(2 * num)) else {
-        return false;
-    };
-    let Ok(mut odropped) = alloc_f64(num) else {
-        return false;
-    };
 
     // Scalars.
     let fre = factor.re;
@@ -284,14 +419,38 @@ fn run(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let mut b = s.launch_builder(&ctx.func);
-    b.arg(&x_dev)
-        .arg(&z_dev)
-        .arg(&cre_dev)
-        .arg(&cim_dev)
-        .arg(&freq_dev)
-        .arg(&rx_dev)
-        .arg(&rz_dev)
+    // Input views, sliced to this call's extent for the same reason the outputs
+    // are: a reused buffer is longer than the call needs, and the kernel's
+    // bounds must agree with the host's.
+    let x_in = x_dev.slice(..num * w);
+    let z_in = z_dev.slice(..num * w);
+    let rx_in = rx_dev.slice(..rx.len());
+    let rz_in = rz_dev.slice(..rz.len());
+    let cre_in = cre_dev.slice(..num);
+    let cim_in = cim_dev.slice(..num);
+    let freq_in = freq_dev.slice(..num);
+
+    // Output views, SLICED to this call's extent. Passing the whole reused
+    // buffer would let the kernel's bounds and the host's disagree.
+    let (mut ox, mut oz, mut ocre, mut ocim, mut ofreq, mut ovalid, mut odropped) = (
+        bufs.ox.as_mut().unwrap().slice_mut(..2 * num * w),
+        bufs.oz.as_mut().unwrap().slice_mut(..2 * num * w),
+        bufs.ocre.as_mut().unwrap().slice_mut(..2 * num),
+        bufs.ocim.as_mut().unwrap().slice_mut(..2 * num),
+        bufs.ofreq.as_mut().unwrap().slice_mut(..2 * num),
+        bufs.ovalid.as_mut().unwrap().slice_mut(..2 * num),
+        bufs.odropped.as_mut().unwrap().slice_mut(..num),
+    );
+
+    let func = ctx.func.clone();
+    let mut b = s.launch_builder(&func);
+    b.arg(&x_in)
+        .arg(&z_in)
+        .arg(&cre_in)
+        .arg(&cim_in)
+        .arg(&freq_in)
+        .arg(&rx_in)
+        .arg(&rz_in)
         .arg(&mut ox)
         .arg(&mut oz)
         .arg(&mut ocre)
@@ -307,46 +466,97 @@ fn run(
         .arg(&mf)
         .arg(&num_i)
         .arg(&w_i);
-    if unsafe { b.launch(cfg) }.is_err() {
-        return false;
-    }
-    if s.synchronize().is_err() {
+    let launched = phase(
+        |p| &mut p.launch_sync_ns,
+        || unsafe { b.launch(cfg) }.is_ok() && s.synchronize().is_ok(),
+    );
+    if !launched {
         return false;
     }
 
     // Download.
-    let (Ok(ox_h), Ok(oz_h)) = (s.clone_dtoh(&ox), s.clone_dtoh(&oz)) else {
+    let Some((ox_h, oz_h, ocre_h, ocim_h, ofreq_h, ovalid_h, odropped_h)) = phase(
+        |p| &mut p.download_ns,
+        || {
+            // Every one of these reads a SLICE, so a reused buffer's tail
+            // cannot leak into the merge. See `Buffers`.
+            let (Ok(a), Ok(b)) = (s.clone_dtoh(&ox), s.clone_dtoh(&oz)) else {
+                return None;
+            };
+            let (Ok(c), Ok(d)) = (s.clone_dtoh(&ocre), s.clone_dtoh(&ocim)) else {
+                return None;
+            };
+            let (Ok(e), Ok(f)) = (s.clone_dtoh(&ofreq), s.clone_dtoh(&ovalid)) else {
+                return None;
+            };
+            let Ok(g) = s.clone_dtoh(&odropped) else {
+                return None;
+            };
+            Some((a, b, c, d, e, f, g))
+        },
+    ) else {
         return false;
     };
-    let (Ok(ocre_h), Ok(ocim_h)) = (s.clone_dtoh(&ocre), s.clone_dtoh(&ocim)) else {
-        return false;
-    };
-    let (Ok(ofreq_h), Ok(ovalid_h)) = (s.clone_dtoh(&ofreq), s.clone_dtoh(&ovalid)) else {
-        return false;
-    };
-    let Ok(odropped_h) = s.clone_dtoh(&odropped) else {
-        return false;
-    };
+
+    // STRUCTURAL CHECK on the buffer pool, not an argument in a comment.
+    //
+    // Every download above reads a sliced VIEW, so each vector must come back at
+    // exactly this call's extent. If a view is ever widened back to the whole
+    // reused buffer — the mutation that produced a 47x inflated `dropped_mass`
+    // in testing — these lengths change and this fires HERE, rather than a
+    // previous call's tail silently folding into a certified bound.
+    // Seven integer compares per gate.
+    debug_assert_eq!(ox_h.len(), 2 * num * w, "ox download is not prefix-sized");
+    debug_assert_eq!(oz_h.len(), 2 * num * w, "oz download is not prefix-sized");
+    debug_assert_eq!(ocre_h.len(), 2 * num, "ocre download is not prefix-sized");
+    debug_assert_eq!(ocim_h.len(), 2 * num, "ocim download is not prefix-sized");
+    debug_assert_eq!(ofreq_h.len(), 2 * num, "ofreq download is not prefix-sized");
+    debug_assert_eq!(
+        ovalid_h.len(),
+        2 * num,
+        "ovalid download is not prefix-sized"
+    );
+    // NOT a debug_assert: this one guards a CERTIFIED bound, so it holds in
+    // release too.
+    assert_eq!(
+        odropped_h.len(),
+        num,
+        "odropped download is not prefix-sized — a stale tail would inflate \
+         dropped_mass, which callers treat as a certified bound"
+    );
 
     // Merge children back into a fresh sum (add_weighted: sum coeffs, min freq).
-    let mut out = PauliSum::new();
-    out.dropped_mass = sum.dropped_mass + odropped_h.iter().sum::<f64>();
-    for slot in 0..(2 * num) {
-        if ovalid_h[slot] == 0 {
-            continue;
-        }
-        let base = slot * w;
-        let key = PauliKey {
-            x: unpack_bits(&ox_h[base..base + w], n),
-            z: unpack_bits(&oz_h[base..base + w], n),
-        };
-        out.add_weighted(
-            key,
-            Complex64::new(ocre_h[slot], ocim_h[slot]),
-            ofreq_h[slot],
-        );
-    }
+    let out = phase(
+        |p| &mut p.merge_ns,
+        || {
+            // Sized at `num`, not the 2n worst case — see the CPU `branch()`
+            // for the measurement. 2n measured SLOWER than no pre-sizing at
+            // all: an over-sized table is a sparser table, and the locality
+            // costs more than the rehashes it saves.
+            let mut out = PauliSum::with_capacity(num);
+            // Slice to the LIVE length. `odropped` is `num` long today, but under
+            // buffer reuse it would be longer, and summing a stale tail silently
+            // inflates `dropped_mass` — the certified truncation bound.
+            out.dropped_mass = sum.dropped_mass + odropped_h[..num].iter().sum::<f64>();
+            for slot in 0..(2 * num) {
+                if ovalid_h[slot] == 0 {
+                    continue;
+                }
+                let base = slot * w;
+                let key = PauliKey::from_words(&ox_h[base..base + w], &oz_h[base..base + w], n);
+                out.add_weighted(
+                    key,
+                    Complex64::new(ocre_h[slot], ocim_h[slot]),
+                    ofreq_h[slot],
+                );
+            }
+            out
+        },
+    );
 
+    if profiling() {
+        PHASES.with(|p| p.borrow_mut().calls += 1);
+    }
     *sum = out;
     GPU_BRANCHES.fetch_add(1, Ordering::Relaxed);
     true

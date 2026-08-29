@@ -11,6 +11,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
 use omega_core::circuit::*;
+use omega_core::defer_measure::{prepare_for_expectation, prepare_for_expectation_multi};
 use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
 use omega_core::noise::{NoiseModel, ReadoutError};
@@ -316,6 +317,47 @@ impl MpsBackend {
     /// Route this backend's bond-compression SVDs through `f` (e.g. the CUDA
     /// `gesvdj` accelerator). Falls back to CPU inside `f` when no GPU is
     /// present, so callers can wire it unconditionally under a `cuda` build.
+    /// Evolve `circuit` to its final MPS for an ANALYTIC (shots-free) read.
+    ///
+    /// Everything `execute`'s `shots: None` arm does *except* the final
+    /// densification: the tensor-allocation capacity guard, the
+    /// dense-is-cheaper advisory, the stats reset/record, and the truncation
+    /// certificate — which gates the result here exactly as it gates it there,
+    /// so a starved bond is still refused rather than silently answered.
+    ///
+    /// `capacity::check_dense` is deliberately NOT among them. That guard
+    /// bounds the `2^n` statevector, and an expectation taken through
+    /// `Mps::contract_product_operator` never materialises one; applying it
+    /// here is what refused a χ=2 GHZ chain at 31 qubits for wanting 32 GiB it
+    /// did not need. It stays on the `ExecResult::Statevector` path, which does
+    /// materialise.
+    fn evolve_for_analytic(&self, circuit: &CircuitIR, params: &ParameterBinding) -> Result<Mps> {
+        if circuit.circuit_type == CircuitType::Photonic {
+            return Err(OmegaError::Unsupported(
+                "MPS backend does not support photonic circuits".into(),
+            ));
+        }
+        crate::capacity::check(circuit.num_qubits as usize, self.max_bond_dim)?;
+        if let Some(msg) =
+            crate::capacity::dense_is_cheaper(circuit.num_qubits as usize, self.max_bond_dim)
+        {
+            eprintln!("NOTE: {msg}");
+        }
+        self.reset_stats();
+        let config = ExecConfig {
+            shots: None,
+            seed: None,
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        // `evolve_once` draws only for `Reset`, which the analytic gate has
+        // already refused by the time we get here.
+        let mut rng: StdRng = rand::make_rng::<StdRng>();
+        let (mps, _cbits) = self.evolve_once(circuit, params, &config, &mut rng)?;
+        self.record_stats(&mps);
+        self.check_truncation()?;
+        Ok(mps)
+    }
+
     pub fn with_svd_fn(mut self, f: SvdFlatFn) -> Self {
         self.svd_fn = f;
         self
@@ -346,6 +388,20 @@ impl Backend for MpsBackend {
             return Err(OmegaError::Unsupported(
                 "MPS backend does not support photonic circuits".into(),
             ));
+        }
+        // Refuse before allocating tensors. The fourth unbounded allocator in
+        // the workspace: a site tensor is 32*chi^2 bytes, i.e. 33 MB per site
+        // at `mps:auto`'s default ceiling of 1024.
+        crate::capacity::check(circuit.num_qubits as usize, self.max_bond_dim)?;
+        // The truncation certificate refuses when chi is too SMALL. This is the
+        // opposite end: chi so large that nothing is discarded, the certificate
+        // is clean, and the run proceeds at maximum cost. B4 lived in that gap
+        // — 158 s at 19 qubits against the dense path's 0.08 s. Advisory rather
+        // than refusal; see `capacity::dense_is_cheaper`.
+        if let Some(msg) =
+            crate::capacity::dense_is_cheaper(circuit.num_qubits as usize, self.max_bond_dim)
+        {
+            eprintln!("NOTE: {msg}");
         }
         // Stats are worst-over-trajectory now, so they must start empty or a
         // previous run's certificate would gate this one.
@@ -397,15 +453,17 @@ impl Backend for MpsBackend {
                 circuit,
                 by_creg || circuit_has_reset(circuit),
             );
-            omega_core::executor::check_counts_width(
-                omega_core::executor::counts_outcome_width(circuit, keyed_on_creg),
-            )?;
+            omega_core::executor::check_counts_width(omega_core::executor::counts_outcome_width(
+                circuit,
+                keyed_on_creg,
+            ))?;
         }
 
         if let (true, Some(shots)) = (by_creg || circuit_has_reset(circuit), config.shots) {
             // Same predicate as the guard above: above the cliff a measured
             // circuit is keyed on the creg, whichever branch produces it.
-            let project_wide = !by_creg && omega_core::executor::counts_keyed_on_creg(circuit, false);
+            let project_wide =
+                !by_creg && omega_core::executor::counts_keyed_on_creg(circuit, false);
             let mut cbit_of = vec![None; circuit.num_qubits as usize];
             if project_wide {
                 for (q, c) in omega_core::executor::measure_pairs(circuit) {
@@ -422,10 +480,8 @@ impl Backend for MpsBackend {
             // `counts_outcome_width(.., true)` = 0 for exactly that shape, and
             // every shot packed into an empty outcome. Measured: 0/4000 ones on
             // a qubit that must be mixed.
-            let width = omega_core::executor::counts_outcome_width(
-                circuit,
-                by_creg || project_wide,
-            ) as u32;
+            let width =
+                omega_core::executor::counts_outcome_width(circuit, by_creg || project_wide) as u32;
             let mut sbits: Vec<u8> = Vec::new();
             let mut counts = HashMap::new();
             for _ in 0..shots {
@@ -477,6 +533,9 @@ impl Backend for MpsBackend {
 
         match config.shots {
             None => {
+                // The analytic path contracts to a DENSE 2^n vector, which the
+                // bond dimension does not bound. Refuse before allocating.
+                crate::capacity::check_dense(circuit.num_qubits)?;
                 let sv = mps.to_statevector();
                 Ok(ExecResult::Statevector(sv))
             }
@@ -484,7 +543,6 @@ impl Backend for MpsBackend {
                 // Right environments depend only on the final state, not on
                 // the outcomes drawn — compute once, reuse for every shot.
                 let envs = mps.right_environments();
-                let mut counts = HashMap::new();
                 // Above 64 qubits the full-register key does not exist — the
                 // shift `bit << q` runs out of range — so a wide circuit
                 // measuring a narrow register is keyed on the CLASSICAL
@@ -499,28 +557,66 @@ impl Backend for MpsBackend {
                 // Same predicate the guard used — `collapse: false`, because
                 // this is the skip path.
                 let project = omega_core::executor::counts_keyed_on_creg(circuit, false);
-                let width =
-                    omega_core::executor::counts_outcome_width(circuit, project) as u32;
-                let mut sbits: Vec<u8> = Vec::new();
-                if project {
-                    let mut cbit_of = vec![None; circuit.num_qubits as usize];
+                let width = omega_core::executor::counts_outcome_width(circuit, project) as u32;
+                let cbit_of: Option<Vec<Option<u32>>> = if project {
+                    let mut m = vec![None; circuit.num_qubits as usize];
                     for &(q, c) in &pairs {
-                        cbit_of[q as usize] = Some(c);
+                        m[q as usize] = Some(c);
                     }
-                    for _ in 0..shots {
-                        mps.sample_bits_with_envs_into(&envs, &mut rng, &mut sbits);
-                        *counts
-                            .entry(Mps::pack_outcome(&sbits, Some(&cbit_of), width))
-                            .or_insert(0) += 1;
-                    }
+                    Some(m)
                 } else {
-                    for _ in 0..shots {
-                        mps.sample_bits_with_envs_into(&envs, &mut rng, &mut sbits);
-                        *counts
-                            .entry(Mps::pack_outcome(&sbits, None, width))
-                            .or_insert(0) += 1;
+                    None
+                };
+
+                // Shots are drawn from PER-SHOT RNGs derived from (base, shot
+                // index), not from one stream advanced serially. This is a
+                // DECLARED count-stream change: a given seed produces a
+                // different (statistically identical) count map than the old
+                // serial draw did. What it buys is the property the old code
+                // could not have: the counts are a pure function of (state,
+                // seed, shot index), so serial and parallel execution — at ANY
+                // thread count — produce bitwise-identical maps, pinned by
+                // `sampling_counts_do_not_depend_on_thread_count`. Audited
+                // before landing: no in-tree test pinned the old exact stream.
+                //
+                // Measured motive (DGX Arm A, pinned uniform cores): the serial
+                // sampler was a FLAT ~7.0 s at every thread count — 16% of the
+                // 1-thread run but 41% of the 10-thread run, because everything
+                // around it got faster and it did not.
+                let sample_base: u64 = rng.random();
+                let shot_outcome = |s: u64, sbits: &mut Vec<u8>| {
+                    // SplitMix-style spread so adjacent shot indices land far
+                    // apart in seed space.
+                    let mut srng =
+                        StdRng::seed_from_u64(sample_base ^ s.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    mps.sample_bits_with_envs_into(&envs, &mut srng, sbits);
+                    Mps::pack_outcome(sbits, cbit_of.as_deref(), width)
+                };
+                // Grain gate as elsewhere in this crate: below it, the SAME
+                // derivation runs serially, so the gate cannot change results.
+                let counts: HashMap<omega_core::outcome::Outcome, u32> = if shots >= 64 {
+                    use rayon::prelude::*;
+                    (0..u64::from(shots))
+                        .into_par_iter()
+                        .map_init(Vec::new, |sbits, s| shot_outcome(s, sbits))
+                        .fold(HashMap::new, |mut m, o| {
+                            *m.entry(o).or_insert(0u32) += 1;
+                            m
+                        })
+                        .reduce(HashMap::new, |mut a, b| {
+                            for (k, v) in b {
+                                *a.entry(k).or_insert(0) += v;
+                            }
+                            a
+                        })
+                } else {
+                    let mut m = HashMap::new();
+                    let mut sbits: Vec<u8> = Vec::new();
+                    for s in 0..u64::from(shots) {
+                        *m.entry(shot_outcome(s, &mut sbits)).or_insert(0) += 1;
                     }
-                }
+                    m
+                };
                 Ok(ExecResult::Counts(counts))
             }
         }
@@ -532,25 +628,15 @@ impl Backend for MpsBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        // `expectation_pauli` indexes by the observable's qubit and panics past
+        // the register; nothing upstream bounds it. See
+        // `Observable::validate_qubits`.
+        observable.validate_qubits(circuit.num_qubits)?;
         reject_reset_in_analytic_mode(circuit)?;
-        let config = ExecConfig {
-            shots: None,
-            seed: None,
-            mid_circuit_mode: MidCircuitMode::Skip,
-        };
-        let result = self.execute(circuit, params, &config)?;
-        let sv = match &result {
-            ExecResult::Statevector(sv) => sv,
-            _ => unreachable!(),
-        };
-
-        let n = circuit.num_qubits;
-        let mut total = 0.0;
-        for (coeff, pauli_string) in &observable.terms {
-            let val = expectation_pauli(sv, n, pauli_string);
-            total += coeff * val;
-        }
-        Ok(total)
+        let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+        let mps = self.evolve_for_analytic(&deferred, params)?;
+        let norm_sq = mps.state_norm_sqr_contracted();
+        Ok(expectation_from_mps(&mps, &observable, norm_sq))
     }
 
     fn expectation_multi(
@@ -559,35 +645,33 @@ impl Backend for MpsBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> Result<Vec<f64>> {
-        // Contract the MPS once into a flat statevector, then evaluate
-        // every observable against the same `&sv`. The default trait
-        // impl loops `expectation`, which re-runs the full MPS contract
-        // per observable — N copies of the heavy sweep when the QML
-        // trainer asks for ⟨Z_q⟩ on N measurement qubits. Mirrors the
-        // CPU StatevectorBackend's override.
-        if observables.is_empty() {
+        for o in observables {
+            o.validate_qubits(circuit.num_qubits)?;
+        }
+        // `expectation` refused an analytic Reset and this did not, so the same
+        // circuit and observable answered differently depending on which entry
+        // point the caller used: a refusal through one, a single trajectory's
+        // number reported as analytic through the other. Same gate, both doors.
+        reject_reset_in_analytic_mode(circuit)?;
+        let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+        // Evolve the chain ONCE, then contract every observable against the
+        // same tensors. The default trait impl loops `expectation`, which
+        // re-runs the full circuit per observable — N sweeps when the QML
+        // trainer asks for ⟨Z_q⟩ on N measurement qubits.
+        if dephased.is_empty() {
             return Ok(Vec::new());
         }
-        let config = ExecConfig {
-            shots: None,
-            seed: None,
-            mid_circuit_mode: MidCircuitMode::Skip,
-        };
-        let result = self.execute(circuit, params, &config)?;
-        let sv = match &result {
-            ExecResult::Statevector(sv) => sv,
-            _ => unreachable!(),
-        };
-        let n = circuit.num_qubits;
-        let mut out = Vec::with_capacity(observables.len());
-        for obs in observables {
-            let mut total = 0.0;
-            for (coeff, pauli_string) in &obs.terms {
-                total += coeff * expectation_pauli(sv, n, pauli_string);
-            }
-            out.push(total);
-        }
-        Ok(out)
+        let mps = self.evolve_for_analytic(&deferred, params)?;
+        // Hoisted out of the loop: the norm is a property of the STATE, so
+        // recomputing it per observable (and, inside `expectation_from_mps`,
+        // per TERM) is the same per-observable rework the dense readout was
+        // criticised for — a Hamiltonian of T terms over N observables would
+        // sweep the chain 2·N·T times instead of N·T + 1.
+        let norm_sq = mps.state_norm_sqr_contracted();
+        Ok(dephased
+            .iter()
+            .map(|obs| expectation_from_mps(&mps, obs, norm_sq))
+            .collect())
     }
 }
 
@@ -798,15 +882,13 @@ impl Backend for NoisyMpsBackend {
         // `executor.rs`, shipping again because adding a noise model routed
         // around the guard. Debug builds panicked on the shift instead.
         if config.shots.is_some() {
-            omega_core::executor::check_counts_width(
-                omega_core::executor::counts_outcome_width(
+            omega_core::executor::check_counts_width(omega_core::executor::counts_outcome_width(
+                circuit,
+                omega_core::executor::counts_keyed_on_creg(
                     circuit,
-                    omega_core::executor::counts_keyed_on_creg(
-                        circuit,
-                        mps_collapses(circuit, config) || circuit_has_reset(circuit),
-                    ),
+                    mps_collapses(circuit, config) || circuit_has_reset(circuit),
                 ),
-            )?;
+            ))?;
         }
         // The guard above admits a wide run at CREG width, promising the key
         // will be the creg. Both non-collapse arms below then built a FULL
@@ -852,6 +934,7 @@ impl Backend for NoisyMpsBackend {
                     self.evolve(circuit, params, &config_skip_shots(config), &mut rng)?;
                 self.record_stats(&mps);
                 self.check_truncation()?;
+                crate::capacity::check_dense(circuit.num_qubits)?;
                 Ok(ExecResult::Statevector(mps.to_statevector()))
             }
             // Per-trajectory when a channel acts during evolution OR when
@@ -1085,6 +1168,24 @@ fn circuit_has_reset(circuit: &CircuitIR) -> bool {
 /// well-defined pure-state quantity — the channel leaves the register mixed and
 /// one chain holds a single trajectory, so the answer would silently depend on
 /// an RNG draw. Refuse instead. Mirrors the CPU statevector backend.
+/// Refuse an analytic (`shots = None`) expectation of a circuit containing
+/// `Reset`.
+///
+/// **Unconditional on purpose — do not make this per-qubit.** A peer's
+/// `measurement_deferral` pass asks a different question about the same gate
+/// and correctly answers it with a *conditional* rule: a `Reset` on a qubit
+/// nothing has touched is a no-op (the register starts in |0…0⟩), so a
+/// defensive `reset` on every qubit at the top of a circuit does not force
+/// per-shot re-simulation. That reasoning is right there and wrong here.
+///
+/// This gate asks whether the backend can compute an EXACT expectation at all.
+/// `Reset` is non-unitary, so the answer is no whether or not the qubit was
+/// live — and the asymmetry in the cost of being wrong runs the other way:
+/// over-refusing an analytic run costs an error message, while over-reporting
+/// a per-shot cliff sends someone optimising a cost they are not paying.
+///
+/// Two gates on the same gate kind with deliberately different strictness, and
+/// the difference is the question, not an inconsistency.
 fn reject_reset_in_analytic_mode(circuit: &CircuitIR) -> Result<()> {
     if circuit_has_reset(circuit) {
         return Err(OmegaError::Unsupported(
@@ -1293,7 +1394,88 @@ fn apply_fredkin_decomposed(mps: &mut Mps, ctrl: u32, a: u32, b: u32) {
     mps.apply_2q_distant(b_u, a_u, &gates::cx());
 }
 
-/// Compute <psi|P|psi> for a single Pauli string.
+/// The 2×2 matrix of a [`PauliOp`], row-major `[m00, m01, m10, m11]`.
+///
+/// The Y convention is `Y|0⟩ = i|1⟩`, `Y|1⟩ = −i|0⟩` — the same one
+/// [`expectation_pauli`] hard-codes as a phase, and the one the SIGN of every
+/// odd-Y term depends on. Getting it conjugated here would negate exactly those
+/// terms and leave every other one right, which is the shape of the bug
+/// `expectation_pauli`'s own comment records having already been fixed once.
+fn pauli_matrix(op: PauliOp) -> [Complex64; 4] {
+    let z = Complex64::new(0.0, 0.0);
+    let p1 = Complex64::new(1.0, 0.0);
+    let m1 = Complex64::new(-1.0, 0.0);
+    let pi = Complex64::new(0.0, 1.0);
+    let mi = Complex64::new(0.0, -1.0);
+    match op {
+        PauliOp::I => [p1, z, z, p1],
+        PauliOp::X => [z, p1, p1, z],
+        PauliOp::Y => [z, mi, pi, z],
+        PauliOp::Z => [p1, z, z, m1],
+    }
+}
+
+/// Per-site operators for a Pauli string, identities included.
+///
+/// `Mps::contract_product_operator` needs one operator per site — see its doc
+/// for why an identity site cannot be skipped on a non-canonical MPS.
+///
+/// The string is a SPARSE list and nothing in `Observable` forbids it naming
+/// the same qubit twice. [`expectation_pauli`] applies the entries to the ket in
+/// list order, so a repeated site's operator is the product in that order, and
+/// applying `a` after the accumulated `m` is `a·m`. Composing rather than
+/// assigning makes the two paths agree on such a term instead of this one
+/// silently keeping only the last entry — `Z0 Z0` is the identity, not `Z`.
+fn pauli_site_ops(n: usize, paulis: &[(u32, PauliOp)]) -> Vec<[Complex64; 4]> {
+    let mut ops = vec![pauli_matrix(PauliOp::I); n];
+    for (q, p) in paulis {
+        let m = ops[*q as usize];
+        let a = pauli_matrix(*p);
+        ops[*q as usize] = [
+            a[0] * m[0] + a[1] * m[2],
+            a[0] * m[1] + a[1] * m[3],
+            a[2] * m[0] + a[3] * m[2],
+            a[2] * m[1] + a[3] * m[3],
+        ];
+    }
+    ops
+}
+
+/// ⟨ψ|O|ψ⟩ for an observable, contracted term by term through the tensors.
+///
+/// This is the whole of 3b.1: it replaces `to_statevector()` followed by
+/// [`expectation_pauli`] over the dense `2^n` vector. Cost per term is
+/// `O(n · χ³)` rather than `O(2^n)`, and the peak allocation is `O(χ²)` rather
+/// than `2^n · 16` bytes.
+///
+/// Note what did NOT change: the evolution. `MpsBackend` was always running a
+/// genuinely truncated MPS with a real bond cap, and only the READOUT
+/// densified — so the numbers this used to return were right, and any
+/// cross-check built on them stays valid. What was wrong was the cost of
+/// getting them.
+fn expectation_from_mps(mps: &Mps, observable: &Observable, norm_sq: f64) -> f64 {
+    observable
+        .terms
+        .iter()
+        .map(|(coeff, pauli_string)| {
+            coeff
+                * crate::mps::normalize_expectation(
+                    mps.contract_product_operator(&pauli_site_ops(mps.n, pauli_string)),
+                    norm_sq,
+                )
+        })
+        .sum()
+}
+
+/// Compute <psi|P|psi> for a single Pauli string, over a DENSE statevector.
+///
+/// No longer on any execution path — [`expectation_from_mps`] replaced it in
+/// 3b.1 — and kept as the **dense oracle** the tensor contraction is checked
+/// against. It is the independent second implementation: a different algorithm
+/// (enumerate 2^n basis states) reaching the same number, which is what makes
+/// the agreement test worth anything. Deleting it would leave the contraction
+/// with nothing to disagree with.
+#[cfg(test)]
 fn expectation_pauli(sv: &[Complex64], num_qubits: u32, paulis: &[(u32, PauliOp)]) -> f64 {
     let n = num_qubits as usize;
     let dim = 1usize << n;
@@ -1370,6 +1552,258 @@ mod tests {
         }
     }
 
+    // ---- 3b.1: analytic expectation contracts, it does not densify --------
+
+    /// The regression test for the whole item.
+    ///
+    /// A 31-qubit GHZ chain has bond dimension 2 — the least entangled
+    /// non-trivial state there is — and the old readout asked for a dense
+    /// 32 GiB statevector to measure ⟨Z₀⟩ on it. macOS refused in milliseconds
+    /// (2.8 GiB free, guard tripped); a 314 GB Xeon accepted and spent 1479 s.
+    /// Same defect, two faces. 40 qubits here so the premise holds on ANY host:
+    /// 16 TB is not available anywhere.
+    #[test]
+    fn an_analytic_expectation_no_longer_builds_a_dense_statevector() {
+        const N: u32 = 40;
+        // Assert the premise. If the dense ceiling ever moved, this test would
+        // otherwise keep passing while testing nothing.
+        crate::capacity::check_dense(N)
+            .expect_err("premise: a dense 40-qubit readout must still be refused");
+
+        let mut circuit = empty_circuit(N);
+        circuit.ops.push(make_op(GateKind::H, &[0]));
+        for q in 0..N - 1 {
+            circuit.ops.push(make_op(GateKind::CX, &[q, q + 1]));
+        }
+        let backend = MpsBackend::new(2);
+        let params = ParameterBinding::new();
+
+        // GHZ: ⟨Z₀⟩ = 0, ⟨Z₀Z₁⟩ = +1, ⟨Z₀Z₃₉⟩ = +1 (the correlation spans the
+        // whole chain, so this also pins that the sweep reaches the far end).
+        let z0 = Observable {
+            terms: vec![(1.0, vec![(0, PauliOp::Z)])],
+        };
+        let z0z1 = Observable {
+            terms: vec![(1.0, vec![(0, PauliOp::Z), (1, PauliOp::Z)])],
+        };
+        let z0zlast = Observable {
+            terms: vec![(1.0, vec![(0, PauliOp::Z), (N - 1, PauliOp::Z)])],
+        };
+        let got_z0 = backend.expectation(&circuit, &params, &z0).unwrap();
+        let got_z0z1 = backend.expectation(&circuit, &params, &z0z1).unwrap();
+        let got_span = backend.expectation(&circuit, &params, &z0zlast).unwrap();
+        assert!(got_z0.abs() < 1e-9, "<Z0> on GHZ must be 0, got {got_z0}");
+        assert!(
+            (got_z0z1 - 1.0).abs() < 1e-9,
+            "<Z0 Z1> on GHZ must be +1, got {got_z0z1}"
+        );
+        assert!(
+            (got_span - 1.0).abs() < 1e-9,
+            "<Z0 Z39> on GHZ must be +1, got {got_span}"
+        );
+
+        // And through the multi door, which had the same dense readout.
+        let multi = backend
+            .expectation_multi(&circuit, &params, &[z0, z0z1, z0zlast])
+            .unwrap();
+        assert!(multi[0].abs() < 1e-9, "{multi:?}");
+        assert!((multi[1] - 1.0).abs() < 1e-9, "{multi:?}");
+        assert!((multi[2] - 1.0).abs() < 1e-9, "{multi:?}");
+    }
+
+    /// The contracted readout agrees with the dense one it replaced, across a
+    /// class of circuits and Pauli strings rather than a hand-picked case.
+    ///
+    /// `S`/`T` are in the corpus deliberately: they put complex phases in the
+    /// amplitudes, which is what makes a conjugation error or a transposed Y
+    /// visible. A real-amplitude corpus passes with the bra and ket swapped.
+    #[test]
+    fn the_contracted_expectation_matches_the_dense_readout_it_replaced() {
+        use omega_core::executor::ExecResult;
+        const N: u32 = 5;
+        let params = ParameterBinding::new();
+        let layers: Vec<Vec<(GateKind, Vec<u32>)>> = vec![
+            vec![(GateKind::H, vec![0]), (GateKind::CX, vec![0, 1])],
+            vec![
+                (GateKind::H, vec![0]),
+                (GateKind::S, vec![0]),
+                (GateKind::CX, vec![0, 1]),
+                (GateKind::T, vec![1]),
+                (GateKind::CX, vec![1, 2]),
+            ],
+            vec![
+                (GateKind::H, vec![0]),
+                (GateKind::H, vec![1]),
+                (GateKind::H, vec![2]),
+                (GateKind::T, vec![0]),
+                (GateKind::CX, vec![0, 1]),
+                (GateKind::S, vec![2]),
+                (GateKind::CX, vec![1, 2]),
+                (GateKind::CX, vec![2, 3]),
+                (GateKind::T, vec![3]),
+                (GateKind::CX, vec![3, 4]),
+                (GateKind::H, vec![4]),
+            ],
+        ];
+        let strings: Vec<Vec<(u32, PauliOp)>> = vec![
+            vec![(0, PauliOp::Z)],
+            vec![(0, PauliOp::X)],
+            vec![(0, PauliOp::Y)],
+            vec![(2, PauliOp::Y)],
+            vec![(0, PauliOp::Y), (1, PauliOp::Y)],
+            vec![(0, PauliOp::X), (1, PauliOp::Y), (2, PauliOp::Z)],
+            vec![
+                (0, PauliOp::Y),
+                (1, PauliOp::X),
+                (3, PauliOp::Y),
+                (4, PauliOp::Y),
+            ],
+            vec![(4, PauliOp::X)],
+        ];
+
+        let mut checked = 0usize;
+        for (li, layer) in layers.iter().enumerate() {
+            let mut circuit = empty_circuit(N);
+            for (g, qs) in layer {
+                circuit.ops.push(make_op(g.clone(), qs));
+            }
+            // Exact (chi=64) and STARVED (chi=2). The starved arm is the one
+            // that leaves the chain non-canonical, where a contraction that
+            // assumed canonical form would diverge; the truncation ceiling is
+            // lifted so the run is not refused before it can be compared.
+            for chi in [64usize, 2] {
+                let backend = MpsBackend::new(chi).with_max_discarded_weight(f64::INFINITY);
+                let config = ExecConfig {
+                    shots: None,
+                    seed: None,
+                    mid_circuit_mode: MidCircuitMode::Skip,
+                };
+                let ExecResult::Statevector(sv) =
+                    backend.execute(&circuit, &params, &config).unwrap()
+                else {
+                    unreachable!()
+                };
+                for (si, s) in strings.iter().enumerate() {
+                    let want = expectation_pauli(&sv, N, s);
+                    let obs = Observable {
+                        terms: vec![(1.0, s.clone())],
+                    };
+                    let got = backend.expectation(&circuit, &params, &obs).unwrap();
+                    assert!(
+                        (got - want).abs() < 1e-9,
+                        "layer {li} chi={chi} string {si} ({s:?}): \
+                         contracted {got} vs dense {want}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, layers.len() * 2 * strings.len());
+    }
+
+    /// A Pauli string is a sparse LIST, and nothing in `Observable` stops it
+    /// naming a qubit twice. The dense readout applied the entries in order, so
+    /// `Z₀Z₀` was the identity; a per-site table that ASSIGNS rather than
+    /// composes would make it `Z₀`. Different answer, same input, no error.
+    #[test]
+    fn a_repeated_qubit_in_a_pauli_string_composes_rather_than_overwrites() {
+        let mut circuit = empty_circuit(2);
+        circuit.ops.push(make_op(GateKind::H, &[0]));
+        circuit.ops.push(make_op(GateKind::CX, &[0, 1]));
+        let backend = MpsBackend::new(16);
+        let params = ParameterBinding::new();
+
+        // On a Bell state <Z0> = 0, so an overwriting table returns 0 here.
+        let zz_same = Observable {
+            terms: vec![(1.0, vec![(0, PauliOp::Z), (0, PauliOp::Z)])],
+        };
+        let got = backend.expectation(&circuit, &params, &zz_same).unwrap();
+        assert!(
+            (got - 1.0).abs() < 1e-9,
+            "Z0 Z0 is the identity, so <Z0 Z0> = 1; got {got} \
+             (0 means the site table overwrote instead of composing)"
+        );
+
+        // X0 Y0 = iZ0 up to phase; the real part on a Bell state is 0 either
+        // way, so pin the non-commuting pair on a state where it separates:
+        // |0>, where <Z0> = 1 and <X0 Z0> = 0.
+        let plain = empty_circuit(2);
+        let xz = Observable {
+            terms: vec![(1.0, vec![(0, PauliOp::X), (0, PauliOp::Z)])],
+        };
+        let got = backend.expectation(&plain, &params, &xz).unwrap();
+        assert!(got.abs() < 1e-9, "<X0 Z0> on |00> must be 0, got {got}");
+    }
+
+    /// The property that makes `reject_reset_in_analytic_mode` unconditional,
+    /// asserted rather than left in its doc comment.
+    ///
+    /// A `Reset` on a qubit nothing has touched is a genuine no-op — the
+    /// register starts in |0…0⟩ — and a peer's per-shot-cost pass correctly
+    /// permits exactly this shape for that reason. Someone who reads that pass
+    /// and then finds this gate will be tempted to "fix" the gate to match.
+    /// They must not: this one asks whether an EXACT expectation exists, and a
+    /// non-unitary op means it does not, live qubit or otherwise.
+    ///
+    /// So the test computes the case the "improvement" would allow — a
+    /// defensive leading reset on every qubit, touching nothing — and asserts
+    /// it is still refused. Prose saying "do not make this per-qubit" is
+    /// deletable; this fires.
+    #[test]
+    fn a_reset_on_an_untouched_qubit_is_still_refused_in_analytic_mode() {
+        let mut circuit = empty_circuit(3);
+        // The defensive-reset idiom: reset everything before doing anything.
+        // Nothing has acted on any qubit, so every one of these is a no-op.
+        for q in 0..3 {
+            circuit.ops.push(make_op(GateKind::Reset, &[q]));
+        }
+        circuit.ops.push(make_op(GateKind::H, &[0]));
+        circuit.ops.push(make_op(GateKind::CX, &[0, 1]));
+        let backend = MpsBackend::new(16);
+        let params = ParameterBinding::new();
+        let obs = Observable {
+            terms: vec![(1.0, vec![(0, PauliOp::Z)])],
+        };
+        assert!(
+            backend.expectation(&circuit, &params, &obs).is_err(),
+            "a leading no-op Reset must STILL be refused: this gate asks whether \
+             an exact expectation exists, not what the run costs per shot. If \
+             this now passes, the gate was made per-qubit — see its doc comment \
+             before assuming that was an improvement"
+        );
+        assert!(
+            backend
+                .expectation_multi(&circuit, &params, &[obs])
+                .is_err(),
+            "and through the multi door too"
+        );
+    }
+
+    /// `expectation` refused an analytic Reset and `expectation_multi` did not,
+    /// so the same circuit answered differently depending on the door: a
+    /// refusal through one, one trajectory's number reported as analytic
+    /// through the other.
+    #[test]
+    fn an_analytic_reset_is_refused_through_both_expectation_doors() {
+        let mut circuit = empty_circuit(2);
+        circuit.ops.push(make_op(GateKind::H, &[0]));
+        circuit.ops.push(make_op(GateKind::CX, &[0, 1]));
+        circuit.ops.push(make_op(GateKind::Reset, &[0]));
+        let backend = MpsBackend::new(16);
+        let params = ParameterBinding::new();
+        let obs = Observable {
+            terms: vec![(1.0, vec![(1, PauliOp::Z)])],
+        };
+        let single = backend.expectation(&circuit, &params, &obs);
+        assert!(single.is_err(), "analytic Reset must be refused");
+        let multi = backend.expectation_multi(&circuit, &params, &[obs]);
+        assert!(
+            multi.is_err(),
+            "expectation_multi must refuse the same circuit expectation does, \
+             not report a single trajectory as though it were analytic"
+        );
+    }
+
     #[test]
     fn test_bell_state_matches_statevector() {
         let mut circuit = empty_circuit(2);
@@ -1392,6 +1826,60 @@ mod tests {
         assert!(sv[1].norm() < 1e-8);
         assert!(sv[2].norm() < 1e-8);
         assert!((sv[3].re - expected).abs() < 1e-8);
+    }
+
+    /// The parallel sampler's contract, pinned as a GATE rather than left in
+    /// a commit message: counts are a pure function of (state, seed, shot
+    /// index), so the SAME seed must yield a bitwise-identical count map at
+    /// any thread count. The pre-landing audit found no in-tree test could
+    /// see this property — sums, widths and σ-gated distributions all pass
+    /// whether or not it holds — so this test is the only thing standing
+    /// between the next RNG-derivation edit and a silently nondeterministic
+    /// sampler. Pool sizes are INSTALLED in-process, never read from an env
+    /// var that might not have taken effect.
+    #[test]
+    fn sampling_counts_do_not_depend_on_thread_count() {
+        let mut circuit = empty_circuit(4);
+        circuit.ops.push(make_op(GateKind::H, &[0]));
+        circuit.ops.push(make_op(GateKind::CX, &[0, 1]));
+        circuit.ops.push(make_op(GateKind::CX, &[1, 2]));
+        circuit.ops.push(make_op(GateKind::H, &[3]));
+
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool")
+                .install(|| {
+                    let backend = MpsBackend::new(16);
+                    let config = ExecConfig {
+                        // 200 >= the 64-shot grain gate, so the PARALLEL path
+                        // runs (at 1 thread it degenerates to serial inside
+                        // the pool, which is the comparison the test needs).
+                        shots: Some(200),
+                        seed: Some(0xC0FFEE),
+                        mid_circuit_mode: MidCircuitMode::Skip,
+                    };
+                    match backend
+                        .execute(&circuit, &ParameterBinding::new(), &config)
+                        .unwrap()
+                    {
+                        ExecResult::Counts(c) => c,
+                        other => panic!("expected counts, got {other:?}"),
+                    }
+                })
+        };
+        let c1 = run(1);
+        let c8 = run(8);
+        assert_eq!(
+            c1, c8,
+            "same seed must give identical counts at 1 and 8 threads"
+        );
+        assert_eq!(c1.values().sum::<u32>(), 200);
+        assert!(
+            c1.len() >= 2,
+            "the circuit is stochastic; a single key means the sampler broke"
+        );
     }
 
     #[test]
@@ -1648,10 +2136,7 @@ mod tests {
 
     use omega_core::noise::{Depolarizing, NoiseModel, Rate};
 
-    fn p1_of(
-        counts: &HashMap<omega_core::outcome::Outcome, u32>,
-        shots: u32,
-    ) -> f64 {
+    fn p1_of(counts: &HashMap<omega_core::outcome::Outcome, u32>, shots: u32) -> f64 {
         let w = counts.keys().next().map(|o| o.width()).unwrap_or(1);
         *counts
             .get(&omega_core::outcome::Outcome::from_u64(1, w))
@@ -1869,6 +2354,64 @@ mod tests {
         );
     }
 
+    /// **The case the original instability report actually specified**: n=11,
+    /// χ=32, swept to 150 layers.
+    ///
+    /// In-tree coverage stopped at n=8 / 60 layers for unitarity and n=6 / 80
+    /// for dense agreement. That left the reported configuration itself
+    /// unchecked — and it is the harder one: 11 qubits means the maximum
+    /// Schmidt rank across the middle cut is 2^5 = 32, so χ=32 is *exactly*
+    /// sufficient and every split must be lossless. There is no slack to hide
+    /// a small non-unitarity in, and the failure mode being guarded against
+    /// (normal-equations SVD) got worse with depth, not better.
+    ///
+    /// Checks the RAW norm from the tensors at several depths rather than only
+    /// the deepest: the old defect drifted monotonically, so a sweep localises
+    /// a regression instead of just reporting that the end is wrong.
+    ///
+    /// Memory: an 11-qubit dense state is 32 KiB and the MPS is smaller, so
+    /// this is free — it was simply never written.
+    #[test]
+    fn the_reported_deep_instability_case_is_exact() {
+        const N: u32 = 11;
+        const CHI: usize = 32; // 2^(11/2) rounded down = 32: exactly enough
+        for layers in [10usize, 50, 100, 150] {
+            let circuit = brickwork(N, layers, 0x5EED);
+            let raw = brickwork_mps(&circuit, CHI).norm_sqr();
+            assert!(
+                (raw - 1.0).abs() < 1e-9,
+                "n={N}, chi={CHI}, {layers} layers: raw ‖ψ‖² = {raw}, expected 1 \
+                 (chi is exactly the maximum Schmidt rank here, so every split \
+                 must be lossless; drift means the split is not unitary)"
+            );
+        }
+    }
+
+    /// The same configuration must also *agree with the truth*, not merely stay
+    /// normalised — a wrong state can be perfectly normalised.
+    ///
+    /// Uses n=10 so the dense reference is 16 KiB and the middle-cut rank is
+    /// 2^5 = 32 = χ, keeping the "exactly sufficient bond" property that makes
+    /// the assertion sharp.
+    #[test]
+    fn the_reported_deep_case_matches_a_dense_reference() {
+        const N: u32 = 10;
+        const CHI: usize = 32;
+        let circuit = brickwork(N, 150, 0x5EED);
+        let got = statevector_of(&circuit, CHI);
+        let want = dense_reference(&circuit);
+        let worst = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst < 1e-9,
+            "n={N}, chi={CHI}, 150 layers: worst amplitude error {worst:.3e} \
+             against an independent dense simulator"
+        );
+    }
+
     /// Independent dense reference simulator (RY + CX only) — deliberately not
     /// another MPS, so the parity check has a genuinely separate ground truth.
     /// Qubit q is bit q, LSB-first (matches `to_statevector`).
@@ -1998,9 +2541,9 @@ mod tests {
         // exact requirement — i.e. it grows only as far as the entanglement needs.
         let circuit = brickwork(8, 60, 0xBEEF);
         let exact = statevector_of(&circuit, 16); // 2^(8/2), exact reference
-        // Adaptive mode truncates by design; the assertion below is that it
-        // stays within its stated tolerance, so the ceiling is lifted here and
-        // the tolerance does the gating.
+                                                  // Adaptive mode truncates by design; the assertion below is that it
+                                                  // stays within its stated tolerance, so the ceiling is lifted here and
+                                                  // the tolerance does the gating.
         let backend = MpsBackend::new(16)
             .with_adaptive(1e-8)
             .with_max_discarded_weight(f64::INFINITY);

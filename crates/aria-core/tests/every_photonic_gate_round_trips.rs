@@ -76,8 +76,8 @@ fn shape(kind: &GateKind) -> Shape {
         // Everything qubit-side. Barrier is the one exception that is emitted
         // (as a comment) rather than refused, because it has no operational
         // meaning to lose — handled separately below.
-        I | X | Y | Z | H | S | Sdg | T | Tdg | SX | RX | RY | RZ | P | U | CX | CY | CZ
-        | SWAP | RXX | RYY | RZZ | CP | CRz | RBS | CCX | CSWAP | Barrier | Reset | Measure => {
+        I | X | Y | Z | H | S | Sdg | T | Tdg | SX | RX | RY | RZ | P | U | CX | CY | CZ | SWAP
+        | RXX | RYY | RZZ | CP | CRz | RBS | CCX | CSWAP | Barrier | Reset | Measure => {
             s(Profile::NotPhotonic, 0, 1, false)
         }
     }
@@ -86,16 +86,43 @@ fn shape(kind: &GateKind) -> Shape {
 /// Every variant, once. The compiler checks `shape()` is total; this list
 /// checks nothing is left out of the *run*.
 const ALL: &[GateKind] = &[
-    GateKind::I, GateKind::X, GateKind::Y, GateKind::Z, GateKind::H,
-    GateKind::S, GateKind::Sdg, GateKind::T, GateKind::Tdg, GateKind::SX,
-    GateKind::RX, GateKind::RY, GateKind::RZ, GateKind::P, GateKind::U,
-    GateKind::CX, GateKind::CY, GateKind::CZ, GateKind::SWAP,
-    GateKind::RXX, GateKind::RYY, GateKind::RZZ, GateKind::CP, GateKind::CRz,
-    GateKind::RBS, GateKind::CCX, GateKind::CSWAP,
-    GateKind::Barrier, GateKind::Reset, GateKind::Measure,
-    GateKind::BeamSplitter, GateKind::PhaseShifter,
-    GateKind::Squeezing, GateKind::Displacement, GateKind::Kerr,
-    GateKind::HalfWavePlate, GateKind::PolarizingBeamSplitter,
+    GateKind::I,
+    GateKind::X,
+    GateKind::Y,
+    GateKind::Z,
+    GateKind::H,
+    GateKind::S,
+    GateKind::Sdg,
+    GateKind::T,
+    GateKind::Tdg,
+    GateKind::SX,
+    GateKind::RX,
+    GateKind::RY,
+    GateKind::RZ,
+    GateKind::P,
+    GateKind::U,
+    GateKind::CX,
+    GateKind::CY,
+    GateKind::CZ,
+    GateKind::SWAP,
+    GateKind::RXX,
+    GateKind::RYY,
+    GateKind::RZZ,
+    GateKind::CP,
+    GateKind::CRz,
+    GateKind::RBS,
+    GateKind::CCX,
+    GateKind::CSWAP,
+    GateKind::Barrier,
+    GateKind::Reset,
+    GateKind::Measure,
+    GateKind::BeamSplitter,
+    GateKind::PhaseShifter,
+    GateKind::Squeezing,
+    GateKind::Displacement,
+    GateKind::Kerr,
+    GateKind::HalfWavePlate,
+    GateKind::PolarizingBeamSplitter,
 ];
 
 /// Distinct, generic values — no 0, no repeats — so a swapped or dropped
@@ -110,7 +137,7 @@ fn emit(kind: &GateKind, sh: &Shape) -> Result<String, String> {
         c.qreg("q", sh.modes)
     };
     c.apply(
-        GateDef::with_params(kind.clone(), PARAMS[..sh.params].to_vec()),
+        GateDef::with_params(*kind, PARAMS[..sh.params].to_vec()),
         modes.to_vec(),
     );
     to_opticqasm(&c)
@@ -136,7 +163,9 @@ fn every_photonic_gate_emits_and_is_read_by_its_own_profile() {
         let program = match parse_opticqasm(&text) {
             Ok(p) => p,
             Err(e) => {
-                broken.push(format!("{kind:?}: our own output does not PARSE: {e}\n{text}"));
+                broken.push(format!(
+                    "{kind:?}: our own output does not PARSE: {e}\n{text}"
+                ));
                 continue;
             }
         };
@@ -180,12 +209,18 @@ fn every_photonic_gate_emits_and_is_read_by_its_own_profile() {
                     ));
                 }
             }
-            Err(e) => broken.push(format!("{kind:?}: our own output does not re-import: {e}\n{text}")),
+            Err(e) => broken.push(format!(
+                "{kind:?}: our own output does not re-import: {e}\n{text}"
+            )),
         }
         checked += 1;
     }
 
-    assert!(broken.is_empty(), "photonic lane defects:\n{}", broken.join("\n"));
+    assert!(
+        broken.is_empty(),
+        "photonic lane defects:\n{}",
+        broken.join("\n")
+    );
     assert_eq!(
         checked, 7,
         "expected 7 photonic gates (ps, bs_rx, squeeze, displace, kerr, hwp, pbs); \
@@ -217,7 +252,7 @@ fn no_qubit_gate_is_silently_commented_into_opticqasm() {
         // Measure/Reset need a classical bit and one qubit respectively; the
         // emitter refuses before arity matters, which is the point.
         let _ = c.creg("m", 1);
-        c.apply(GateDef::new(kind.clone()), vec![q[0].clone()]);
+        c.apply(GateDef::new(*kind), vec![q[0].clone()]);
         match to_opticqasm(&c) {
             Err(_) => {}
             Ok(text) => leaked.push(format!("{kind:?}: emitted instead of refused:\n{text}")),

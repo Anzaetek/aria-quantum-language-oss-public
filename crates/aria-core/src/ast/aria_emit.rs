@@ -48,7 +48,7 @@ fn gate_to_aria(kind: GateKind) -> Option<&'static str> {
 /// emitted as `--` comments rather than silently dropped or rendered as invalid
 /// source. An unsupported gate becomes a `-- unsupported gate:` comment for the
 /// same reason.
-pub fn to_aria_source(circuit: &Circuit, name: &str) -> String {
+pub fn to_aria_source(circuit: &Circuit, name: &str) -> Result<String, String> {
     let mut lines = vec![format!("circuit {name} {{")];
 
     for reg in &circuit.registers {
@@ -95,19 +95,38 @@ pub fn to_aria_source(circuit: &Circuit, name: &str) -> String {
                 lines.push(format!("    apply RESET on {}", inst.qubits[0]));
             }
             kind => {
+                // Refuse rather than comment out. This file's own header says
+                // Aria -> Aria "is the one export where a reader is most likely
+                // to assume fidelity, which makes the silence worse rather than
+                // better" — and then emitted `-- unsupported gate:` and carried
+                // on, producing a program that parses and is missing an
+                // operation.
                 let Some(gate_name) = gate_to_aria(kind) else {
-                    lines.push(format!("    -- unsupported gate: {kind:?}"));
-                    continue;
+                    return Err(format!(
+                        "the Aria emitter has no spelling for gate {kind:?}, so the \
+                         exported program would be missing this operation. Refusing \
+                         rather than emitting source that parses and computes \
+                         something else."
+                    ));
                 };
                 let params = if inst.gate.params.is_empty() {
                     String::new()
                 } else {
-                    let ps: Vec<String> = inst
-                        .gate
-                        .params
-                        .iter()
-                        .map(|p| format!("{}", p.try_as_f64().unwrap_or(0.0)))
-                        .collect();
+                    // `unwrap_or(0.0)` turned a symbolic angle into a literal
+                    // zero here too — the same silent substitution `to_qasm`
+                    // was fixed for, in the export where fidelity is most
+                    // assumed.
+                    let mut ps: Vec<String> = Vec::with_capacity(inst.gate.params.len());
+                    for (i, p) in inst.gate.params.iter().enumerate() {
+                        let v = p.try_as_f64().ok_or_else(|| {
+                            format!(
+                                "the Aria emitter cannot write the symbolic parameter \
+                                 `{p:?}` (argument {i} of `{gate_name}`) as a literal. \
+                                 Bind it to a concrete value before exporting."
+                            )
+                        })?;
+                        ps.push(format!("{v}"));
+                    }
                     format!("({})", ps.join(", "))
                 };
                 let targets: Vec<String> = inst.qubits.iter().map(|q| q.to_string()).collect();
@@ -157,7 +176,7 @@ pub fn to_aria_source(circuit: &Circuit, name: &str) -> String {
     }
 
     lines.push("}".to_string());
-    lines.join("\n") + "\n"
+    Ok(lines.join("\n") + "\n")
 }
 
 #[cfg(test)]
@@ -173,7 +192,7 @@ mod tests {
             .ry(1, PI / 4.0)
             .cx(0, 1)
             .build();
-        let src = to_aria_source(&circ, "Demo");
+        let src = to_aria_source(&circ, "Demo").expect("emit");
         assert!(src.contains("circuit Demo {"));
         assert!(src.contains("qreg q[2]"));
         assert!(src.contains("apply H on q[0]"));
@@ -191,7 +210,7 @@ mod tests {
     fn round_trips_qasm_import_to_aria() {
         let qasm = "OPENQASM 2.0;\nqreg q[2];\ncreg c[2];\nh q[0];\ncx q[0], q[1];\n";
         let circ = from_qasm(qasm).unwrap();
-        let src = to_aria_source(&circ, "Imported");
+        let src = to_aria_source(&circ, "Imported").expect("emit");
         let prog = parse_aria(&src).expect("imported-then-emitted .aria must parse");
         let reparsed = prog.instantiate("Imported", &[]).unwrap();
         assert_eq!(reparsed.n_qubits(), 2);

@@ -20,6 +20,7 @@ const SHADER_APPLY_DIAGONAL_PRODUCT: &str = include_str!("shaders/apply_diagonal
 const SHADER_APPLY_1Q: &str = include_str!("shaders/apply_1q.metal");
 const SHADER_APPLY_1Q_INTO: &str = include_str!("shaders/apply_1q_into.metal");
 const SHADER_APPLY_2Q: &str = include_str!("shaders/apply_2q.metal");
+const SHADER_APPLY_OCTET_SWAP: &str = include_str!("shaders/apply_octet_swap.metal");
 const SHADER_INNER_PRODUCT: &str = include_str!("shaders/inner_product.metal");
 const SHADER_PAULI_EXPECTATION: &str = include_str!("shaders/pauli_expectation.metal");
 const SHADER_SHOT_SAMPLE: &str = include_str!("shaders/shot_sample.metal");
@@ -38,6 +39,8 @@ pub(crate) struct KernelLibrary {
     pub apply_1q: ComputePipelineState,
     pub apply_1q_into: ComputePipelineState,
     pub apply_2q: ComputePipelineState,
+    /// Exact CCX/CSwap as an octet permutation — see `apply_octet_swap.metal`.
+    pub apply_octet_swap: ComputePipelineState,
     pub inner_product: ComputePipelineState,
     pub pauli_expectation: ComputePipelineState,
     pub shot_probs: ComputePipelineState,
@@ -65,6 +68,7 @@ impl KernelLibrary {
         let apply_1q = compile_kernel(device, SHADER_APPLY_1Q, "apply_1q")?;
         let apply_1q_into = compile_kernel(device, SHADER_APPLY_1Q_INTO, "apply_1q_into")?;
         let apply_2q = compile_kernel(device, SHADER_APPLY_2Q, "apply_2q")?;
+        let apply_octet_swap = compile_kernel(device, SHADER_APPLY_OCTET_SWAP, "apply_octet_swap")?;
         let inner_product = compile_kernel(device, SHADER_INNER_PRODUCT, "inner_product")?;
         let pauli_expectation =
             compile_kernel(device, SHADER_PAULI_EXPECTATION, "pauli_expectation")?;
@@ -80,6 +84,7 @@ impl KernelLibrary {
             apply_1q,
             apply_1q_into,
             apply_2q,
+            apply_octet_swap,
             inner_product,
             pauli_expectation,
             shot_probs,

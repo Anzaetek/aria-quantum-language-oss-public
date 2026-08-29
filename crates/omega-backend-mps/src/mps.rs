@@ -126,6 +126,18 @@ pub struct Mps {
     contract_fn: Option<Contract2qFn>,
 }
 
+/// Divide a raw contraction by the state norm, with the degenerate-state floor.
+///
+/// One place, so `expectation_product` and the batched `expectation_from_mps`
+/// cannot drift on what happens at `⟨ψ|ψ⟩ ≈ 0`.
+pub(crate) fn normalize_expectation(value: Complex64, norm_sq: f64) -> f64 {
+    if norm_sq > 1e-300 {
+        value.re / norm_sq
+    } else {
+        0.0
+    }
+}
+
 impl Mps {
     /// Create |00...0> state as MPS with bond dimension 1.
     pub fn zero_state(n: usize, max_bond_dim: usize) -> Self {
@@ -260,21 +272,31 @@ impl Mps {
         // So we build Theta' directly as the SVD's input buffer and
         // skip the host-side reshape that the old API needed.
 
-        // Step 1: Contract two sites into Theta[l, s0, s1, r]
+        // Step 1: Contract two sites into Theta[l, s0, s1, r].
+        //
+        // Parallel over `l` (one output block per left-bond value), inner sum
+        // untouched — each element's summation order is exactly the serial
+        // loop's, so the result is BIT-IDENTICAL at any thread count. O(4χ³)
+        // work; secondary to the SVD but no longer negligible once the SVD is
+        // parallel too (Amdahl).
+        use rayon::prelude::*;
         let mut theta = vec![Complex64::new(0.0, 0.0); bl * 4 * br];
-        for l in 0..bl {
-            for s0 in 0..2 {
-                for s1 in 0..2 {
-                    for r in 0..br {
-                        let mut val = Complex64::new(0.0, 0.0);
-                        for m in 0..bm {
-                            val += tl.get(l, s0, m) * tr.get(m, s1, r);
+        theta
+            .par_chunks_mut(4 * br)
+            .enumerate()
+            .for_each(|(l, block)| {
+                for s0 in 0..2 {
+                    for s1 in 0..2 {
+                        for r in 0..br {
+                            let mut val = Complex64::new(0.0, 0.0);
+                            for m in 0..bm {
+                                val += tl.get(l, s0, m) * tr.get(m, s1, r);
+                            }
+                            block[s0 * 2 * br + s1 * br + r] = val;
                         }
-                        theta[l * 4 * br + s0 * 2 * br + s1 * br + r] = val;
                     }
                 }
-            }
-        }
+            });
 
         // Step 2: Apply gate to physical indices. We write directly
         // into the row-major matrix layout consumed by Step 3 (SVD).
@@ -500,6 +522,163 @@ impl Mps {
     /// ⟨ψ|ψ⟩ (bond_left(0) = 1).
     pub fn norm_sqr(&self) -> f64 {
         self.right_environments()[0][0].re
+    }
+
+    /// ⟨ψ|O|ψ⟩ for a **product operator** `O = ⊗_q O_q`, contracted straight
+    /// through the tensors — never through a dense statevector.
+    ///
+    /// `site_ops[q]` is site `q`'s 2×2 operator, row-major `[m00, m01, m10,
+    /// m11]`, in the same physical basis [`Self::to_statevector`] uses: bit `q`
+    /// of the basis index is site `q`'s physical index.
+    ///
+    /// # Identity sites must still be passed
+    ///
+    /// `site_ops` has length `self.n`, and a site outside the operator's
+    /// support is passed as an explicit `[1,0,0,1]` rather than skipped. That
+    /// is not a convenience of the signature — it is required. Skipping the
+    /// sites outside the support is valid **only in canonical gauge**, where
+    /// the untouched chain contracts to the identity. This MPS is deliberately
+    /// not canonical (see [`Self::fidelity_estimate`] and the truncation note
+    /// in `split_two_site`), so every site contributes its gauge and the sweep
+    /// must cross all of them. This is the same assumption whose violation
+    /// biased sampled counts until [`Self::right_environments`] replaced it.
+    ///
+    /// # Cost
+    ///
+    /// `O(n · χ³)` time, `O(χ²)` live memory: one left-to-right sweep carrying
+    /// `L[l,l']` between the ket bond `l` and the bra bond `l'`. Contrast the
+    /// dense route — [`Self::to_statevector`] and then index the `2^n` vector —
+    /// which is `O(2^n)` in **both**, and which the bond dimension does not
+    /// bound at all: a χ=2 GHZ chain at n=31 needs 32 GiB there.
+    ///
+    /// Memory is `O(χ²)` and not `O(n·χ²)` because only one environment is live
+    /// at a time; [`Self::right_environments`]keeps all `n+1`, which is why
+    /// the norm is taken from this sweep (see [`Self::expectation_product`])
+    /// rather than from [`Self::norm_sqr`].
+    ///
+    /// The returned value is **unnormalized** — see
+    /// [`Self::expectation_product`].
+    pub fn contract_product_operator(&self, site_ops: &[[Complex64; 4]]) -> Complex64 {
+        assert_eq!(
+            site_ops.len(),
+            self.n,
+            "contract_product_operator needs one 2x2 operator per site, \
+             identities included"
+        );
+        let zero = Complex64::new(0.0, 0.0);
+        // L[l, l'] over (ket bond, bra bond). Site 0 has bond_left == 1, so the
+        // sweep opens on the 1x1 scalar 1.
+        let mut left = vec![Complex64::new(1.0, 0.0)];
+        for q in 0..self.n {
+            let t = &self.tensors[q];
+            let (bl, br) = (t.bond_left, t.bond_right);
+            let o = &site_ops[q];
+
+            // tmp[l', s, r] = Σ_l L[l,l'] · A[l,s,r]      — O(χ³)
+            let mut tmp = vec![zero; bl * 2 * br];
+            for l in 0..bl {
+                for lp in 0..bl {
+                    let c = left[l * bl + lp];
+                    for s in 0..2 {
+                        let base = (lp * 2 + s) * br;
+                        for r in 0..br {
+                            tmp[base + r] += c * t.get(l, s, r);
+                        }
+                    }
+                }
+            }
+
+            // u[l', s', r] = Σ_s O[s',s] · tmp[l', s, r]  — O(χ²), and written
+            // densely over all four entries on purpose: branching past a zero
+            // operator entry would make the result depend on the sign of a zero
+            // amplitude for some inputs and not others.
+            let mut u = vec![zero; bl * 2 * br];
+            for lp in 0..bl {
+                for sp in 0..2 {
+                    for s in 0..2 {
+                        let coeff = o[sp * 2 + s];
+                        let src = (lp * 2 + s) * br;
+                        let dst = (lp * 2 + sp) * br;
+                        for r in 0..br {
+                            u[dst + r] += coeff * tmp[src + r];
+                        }
+                    }
+                }
+            }
+
+            // L'[r, r'] = Σ_{l',s'} u[l',s',r] · conj(A[l',s',r'])  — O(χ³)
+            let mut next = vec![zero; br * br];
+            for lp in 0..bl {
+                for sp in 0..2 {
+                    let src = (lp * 2 + sp) * br;
+                    for r in 0..br {
+                        let uv = u[src + r];
+                        for rp in 0..br {
+                            next[r * br + rp] += uv * t.get(lp, sp, rp).conj();
+                        }
+                    }
+                }
+            }
+            left = next;
+        }
+        // bond_right(n-1) == 1, so the sweep closes on a 1x1.
+        left[0]
+    }
+
+    /// ⟨ψ|O|ψ⟩ / ⟨ψ|ψ⟩ for a product operator — the normalized expectation, and
+    /// the number a caller actually wants.
+    ///
+    /// The normalization is what [`Self::to_statevector`] applies at readout, so
+    /// this agrees with a dense readout to floating point.
+    ///
+    /// # Batching
+    ///
+    /// This recomputes the state norm on every call. The norm is a property of
+    /// the STATE, not of the operator, so a caller evaluating many operators
+    /// against one chain — every term of a Hamiltonian, every observable of a
+    /// `expectation_multi` — must hoist it: take
+    /// [`Self::state_norm_sqr_contracted`] once and divide
+    /// [`Self::contract_product_operator`] by it per term. Not doing so is the
+    /// same per-observable rework that made the dense readout this replaced
+    /// worth complaining about, just one level down. `expectation_from_mps`
+    /// hoists; this entry point is the single-shot convenience.
+    ///
+    /// # Degenerate states
+    ///
+    /// Returns `0.0` when `⟨ψ|ψ⟩ ≤ 1e-300`, rather than dividing and yielding
+    /// `NaN` or `inf`. Note this does NOT match `to_statevector`, which at that
+    /// floor SKIPS its normalization and returns the raw tiny vector, so a
+    /// dense readout of such a state would give some unnormalized number. The
+    /// two disagree there deliberately: a state of that norm carries no
+    /// information, and `0.0` is the honest answer where the dense path's is an
+    /// artefact of the amplitudes that happened to survive.
+    ///
+    /// Only the real part is returned: a Pauli string is Hermitian, so the
+    /// imaginary part is zero up to rounding.
+    pub fn expectation_product(&self, site_ops: &[[Complex64; 4]]) -> f64 {
+        normalize_expectation(
+            self.contract_product_operator(site_ops),
+            self.state_norm_sqr_contracted(),
+        )
+    }
+
+    /// `⟨ψ|ψ⟩` via the same sweep [`Self::contract_product_operator`] uses, with
+    /// identity operators on every site.
+    ///
+    /// Equal to [`Self::norm_sqr`] by construction — pinned by
+    /// `the_identity_contraction_is_the_state_norm` — and preferred on the
+    /// expectation path because `norm_sqr` routes through
+    /// [`Self::right_environments`], which holds all `n+1` environments live at
+    /// once (`O(n · χ²)`). This sweep keeps one, so an expectation stays
+    /// `O(χ²)` in memory end to end, which is the point of the whole item.
+    pub fn state_norm_sqr_contracted(&self) -> f64 {
+        let ident = [
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(1.0, 0.0),
+        ];
+        self.contract_product_operator(&vec![ident; self.n]).re
     }
 
     /// Right-environment matrices for exact sequential sampling.
@@ -837,6 +1016,239 @@ fn swap_matrix() -> [Complex64; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 3b.1: contracting an operator through the tensors ----------------
+
+    /// Deterministic xorshift. The corpus below is a *class* assertion, so it
+    /// has to be the same class on every machine and every run — a randomized
+    /// oracle test that fails one time in fifty teaches nothing.
+    struct Xs(u64);
+    impl Xs {
+        fn f(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+    }
+
+    fn u3(theta: f64, phi: f64, lam: f64) -> [Complex64; 4] {
+        let (c, s) = ((theta / 2.0).cos(), (theta / 2.0).sin());
+        [
+            Complex64::new(c, 0.0),
+            -Complex64::from_polar(s, lam),
+            Complex64::from_polar(s, phi),
+            Complex64::from_polar(c, phi + lam),
+        ]
+    }
+
+    fn cx_gate() -> [Complex64; 16] {
+        let z = Complex64::new(0.0, 0.0);
+        let o = Complex64::new(1.0, 0.0);
+        // |00>,|01>,|10>,|11> with qubit0 = LOW bit, control = first argument
+        // of apply_2q. Whatever this is exactly, both sides of the comparison
+        // see the same state, which is all the oracle test needs.
+        [
+            o, z, z, z, //
+            z, o, z, z, //
+            z, z, z, o, //
+            z, z, o, z,
+        ]
+    }
+
+    fn pauli_ops() -> Vec<(&'static str, [Complex64; 4])> {
+        let z = Complex64::new(0.0, 0.0);
+        let p1 = Complex64::new(1.0, 0.0);
+        let m1 = Complex64::new(-1.0, 0.0);
+        let pi = Complex64::new(0.0, 1.0);
+        let mi = Complex64::new(0.0, -1.0);
+        vec![
+            ("I", [p1, z, z, p1]),
+            ("X", [z, p1, p1, z]),
+            ("Y", [z, mi, pi, z]),
+            ("Z", [p1, z, z, m1]),
+        ]
+    }
+
+    /// ⟨ψ|O|ψ⟩ over the DENSE statevector, summing every basis PAIR.
+    ///
+    /// The independent second implementation: a different algorithm (enumerate
+    /// `4^n` basis pairs and factor the operator per site) reaching the number
+    /// the environment sweep reaches. `sv` comes from `to_statevector`, which is
+    /// already normalized, so this returns the normalized expectation.
+    fn dense_product_expectation(sv: &[Complex64], n: usize, ops: &[[Complex64; 4]]) -> f64 {
+        let dim = 1usize << n;
+        let mut acc = Complex64::new(0.0, 0.0);
+        for b in 0..dim {
+            for bp in 0..dim {
+                let mut m = Complex64::new(1.0, 0.0);
+                for q in 0..n {
+                    let s = (b >> q) & 1;
+                    let sp = (bp >> q) & 1;
+                    m *= ops[q][sp * 2 + s];
+                }
+                acc += sv[bp].conj() * m * sv[b];
+            }
+        }
+        acc.re
+    }
+
+    /// Random circuits at a range of bond caps. The starved ones are the point:
+    /// truncation is what leaves the chain non-canonical, and a canonical-form
+    /// assumption in the contraction would survive every exact case and fail
+    /// only here.
+    fn corpus(n: usize) -> Vec<(String, Mps)> {
+        let mut out = Vec::new();
+        for (ci, chi) in [1usize, 2, 4, 32].into_iter().enumerate() {
+            for depth in [1usize, 3, 6] {
+                let mut rng = Xs(0x2026_0827 + (ci as u64) * 7 + depth as u64);
+                let mut mps = Mps::zero_state(n, chi);
+                for _ in 0..depth {
+                    for q in 0..n {
+                        let g = u3(
+                            rng.f() * std::f64::consts::PI,
+                            rng.f() * std::f64::consts::TAU,
+                            rng.f() * std::f64::consts::TAU,
+                        );
+                        mps.apply_1q(q, &g);
+                    }
+                    for q in 0..n - 1 {
+                        mps.apply_2q(q, &cx_gate());
+                    }
+                }
+                out.push((format!("chi={chi} depth={depth}"), mps));
+            }
+        }
+        out
+    }
+
+    /// THE load-bearing test for 3b.1: the tensor contraction and the dense
+    /// route agree, on every state in the corpus and every single-site Pauli,
+    /// plus a two-site and a full-width string.
+    #[test]
+    fn the_tensor_contraction_matches_the_dense_operator_on_every_corpus_state() {
+        const N: usize = 5;
+        let paulis = pauli_ops();
+        let mut checked = 0usize;
+        let mut truncated_states = 0usize;
+        for (label, mps) in corpus(N) {
+            let sv = mps.to_statevector();
+            if mps.discarded_weight > 1e-12 {
+                truncated_states += 1;
+            }
+            // Every single-site placement of every Pauli.
+            for (pname, pm) in &paulis {
+                for q in 0..N {
+                    let mut ops = vec![paulis[0].1; N];
+                    ops[q] = *pm;
+                    let got = mps.expectation_product(&ops);
+                    let want = dense_product_expectation(&sv, N, &ops);
+                    assert!(
+                        (got - want).abs() < 1e-9,
+                        "{label}: {pname}{q} contraction {got} vs dense {want}"
+                    );
+                    checked += 1;
+                }
+            }
+            // A two-site string (adjacent and distant) and a full-width one —
+            // the odd-Y count varies across these, which is what exercises the
+            // Y phase convention rather than assuming it.
+            let combos: Vec<Vec<usize>> = vec![
+                vec![1, 2, 0, 0, 0],
+                vec![2, 0, 0, 3, 0],
+                vec![1, 2, 3, 2, 1],
+                vec![2, 2, 2, 0, 0],
+            ];
+            for combo in combos {
+                let ops: Vec<[Complex64; 4]> = combo.iter().map(|&i| paulis[i].1).collect();
+                let got = mps.expectation_product(&ops);
+                let want = dense_product_expectation(&sv, N, &ops);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "{label}: string {combo:?} contraction {got} vs dense {want}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 200,
+            "corpus too thin to mean anything: {checked}"
+        );
+        assert!(
+            truncated_states >= 3,
+            "the corpus must contain genuinely TRUNCATED states or it never \
+             exercises the non-canonical gauge — got {truncated_states}"
+        );
+    }
+
+    /// Pins the claim `expectation_product` relies on: contracting the identity
+    /// is the state norm, so the normalization can be taken from the same sweep
+    /// instead of from `norm_sqr`'s all-environments-live route.
+    #[test]
+    fn the_identity_contraction_is_the_state_norm() {
+        for (label, mps) in corpus(5) {
+            let ident = [
+                Complex64::new(1.0, 0.0),
+                Complex64::new(0.0, 0.0),
+                Complex64::new(0.0, 0.0),
+                Complex64::new(1.0, 0.0),
+            ];
+            let via_sweep = mps.contract_product_operator(&vec![ident; mps.n]).re;
+            let via_envs = mps.norm_sqr();
+            assert!(
+                (via_sweep - via_envs).abs() < 1e-12 * via_envs.abs().max(1.0),
+                "{label}: identity sweep {via_sweep} vs norm_sqr {via_envs}"
+            );
+        }
+    }
+
+    /// The doc on `contract_product_operator` says identity sites cannot be
+    /// skipped because this MPS is not canonical. That is a claim, so it is
+    /// asserted rather than trusted: the canonical shortcut — contract site `q`
+    /// alone and treat both chains as the identity — is computed here and shown
+    /// to DISAGREE. Without this test the caveat is folklore, and the next
+    /// person to want a faster path deletes it.
+    #[test]
+    fn skipping_identity_sites_would_be_wrong_on_this_non_canonical_mps() {
+        const N: usize = 5;
+        let z_op = pauli_ops()[3].1;
+        let ident = pauli_ops()[0].1;
+        let mut disagreements = 0usize;
+        let mut compared = 0usize;
+        for (_label, mps) in corpus(N) {
+            for q in 0..N {
+                let mut ops = vec![ident; N];
+                ops[q] = z_op;
+                let truth = mps.expectation_product(&ops);
+
+                // The shortcut: site q's local reduced expectation, assuming
+                // the chains either side contract to the identity.
+                let t = &mps.tensors[q];
+                let (mut num, mut den) = (0.0f64, 0.0f64);
+                for l in 0..t.bond_left {
+                    for r in 0..t.bond_right {
+                        for s in 0..2 {
+                            let a = t.get(l, s, r);
+                            let w = a.norm_sqr();
+                            den += w;
+                            num += if s == 1 { -w } else { w };
+                        }
+                    }
+                }
+                let shortcut = if den > 1e-300 { num / den } else { 0.0 };
+                compared += 1;
+                if (truth - shortcut).abs() > 1e-6 {
+                    disagreements += 1;
+                }
+            }
+        }
+        assert!(
+            disagreements > 0,
+            "the canonical shortcut agreed on all {compared} cases, which would \
+             mean the gauge warning on `contract_product_operator` is wrong — \
+             check whether the MPS became canonical before relaxing the doc"
+        );
+    }
 
     #[test]
     fn test_zero_state() {

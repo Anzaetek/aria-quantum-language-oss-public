@@ -1,8 +1,56 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # PLAN — CPU statevector performance (CR B3), under a thread-count-invariance contract
 
-**Status: S0 measured, S1 implemented (2026-08-15). S2–S5 open.** Every number
-in §1.5 was measured on this box; targets elsewhere are labelled as targets.
+**Status: S0 measured, S1 implemented (2026-08-15), S2 completed and S3 gated
+2026-08-18. S4–S5 open.** Every number in §1.5 was measured on this
+box; targets elsewhere are labelled as targets.
+
+> **S2 status corrected 2026-08-18 by reading the code rather than this line.**
+> `apply_1q`, `apply_2q`, `apply_cx` and `apply_diagonal_1q` were already
+> parallel; `apply_ccx` and `apply_cswap` were the ONLY two gate kernels still
+> serial — the two widest ones, and the ones that dominate the Toffoli-heavy
+> circuits the incoming CR reported as timing out. Both are now parallel.
+>
+> **No speedup figure is claimed, deliberately.** This box is an M5 Max, which
+> `PLAN-PERF-BASELINES.md` rules out as a baseline; the numbers belong on an M4
+> or an RTX 6000 Pro. What IS claimed is the correctness contract, which is
+> machine-independent.
+>
+> **Two corrections to this document, found while implementing S2:**
+>
+> 1. §2 says "**Safety:** no `unsafe`. Every split below is `split_at_mut` +
+>    rayon zips". That is already false of shipped code: `apply_cx` uses
+>    `std::ptr::swap` under an injectivity argument, and `apply_ccx`/`apply_cswap`
+>    now follow the same pattern for the same reason — rayon cannot hand out two
+>    arbitrary `&mut` elements without help, and for a permutation the
+>    disjointness argument is exact rather than probabilistic.
+> 2. §2's invariance contract is **necessary and not sufficient**, which the
+>    document does not say. Bit-identity across `T ∈ {1,2,12}` is a CONSISTENCY
+>    property: every thread count runs the same code, so a deterministic error
+>    is invisible to it. Demonstrated by mutation — a `ccx` swapping the wrong
+>    partner in the parallel branch left the entire `thread_count_invariance`
+>    suite green, including the norm check, because a permutation preserves norm
+>    exactly. Correctness needs an independent reference, which is what
+>    `group_walk_equivalence::the_parallel_branch_matches_the_scan_too` now
+>    provides ABOVE the threshold; the pre-existing oracles all ran at `n ≤ 7`,
+>    below it, so they only ever exercised the serial branch.
+>
+> **S3 was implemented but never GATED.** §5 names its gate as "same seed ⇒ same
+> counts"; the sorted-draw sampler shipped without one. `sampler_equivalence`
+> supplies it retroactively, keeping the two-vector sampler verbatim and
+> comparing over 64 (n, shots, seed) combinations plus a shortfall state.
+>
+> The shortfall state is the point: a NORMALISED fixture cannot reach the residue
+> loop at all — `acc` climbs to ~1.0 and every draw in `[0,1)` is consumed — so
+> deleting that loop left the equivalence test green. Measured, then fixed.
+>
+> The `<=` boundary §4 calls out is deliberately NOT tested, and the test file
+> says so with the arithmetic: `<` and `<=` differ only when a draw equals a
+> cumulative sum exactly, ~7e-12 across the module. Unobservable by construction
+> rather than untested by omission. Claiming coverage of a boundary with no
+> behavioural consequence would be worse than recording that it is unreachable —
+> and it stops being unreachable the moment the sampler takes caller-supplied
+> draws.
 
 Incoming request: `fixes/rexxxx-2/REQUEST.md` §2 — 24 qubits, 1000 shots, aria
 statevector **1.36 s** vs qiskit-aer **0.20 s** (6.7×); `qft_28` **> 300 s
@@ -369,7 +417,7 @@ running and not running on a 24 GB box with anything else open.
 | **S1** | `apply_2q` / `apply_ccx` / `apply_cswap` index arithmetic (§3.2), still single-threaded. | bit-identical final state vs pre-change, on a full-mantissa fixture |
 | **S2** | `apply_1q` / `apply_2q` parallel decomposition (§3.1–3.3) + threshold. | the §2 invariance test at T ∈ {1,2,12}, bit-for-bit |
 | **S3** | Sampler steps A then B (§4). | same seed ⇒ same counts; peak-RSS recorded |
-| **S4** | Re-measure S0's table; write the "what the CPU statevector is good for" sentence CR §2 asks for, into `LIMITATIONS.md`. | the table |
+| **S4** | ~~Re-measure S0's table~~ (BLOCKED: needs an M4 or RTX 6000 Pro, not this box); the `LIMITATIONS.md` guidance CR §2 asks for is **DONE 2026-08-18** — and it existed already and was WRONG in three ways, each pushing a reader the wrong direction. | the table (blocked) / the guidance (done) |
 | **S5** | *Only if a gap remains:* gate fusion. **Changes FP association**, so it is a separate decision, gated on the differential cross-checks, with **no tolerance widening** to make it green. | out of scope of this plan |
 
 Targets (labelled as targets): S2 up to the core count minus memory-bandwidth

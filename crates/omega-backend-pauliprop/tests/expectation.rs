@@ -209,9 +209,18 @@ fn max_freq_truncation_stays_within_budget_and_converges() {
 
     let mut prev_err = f64::INFINITY;
     let mut last_err = f64::INFINITY;
+    let mut loosest_informative = false;
     for max_freq in [1u32, 2, 3, 5, 8, 24] {
-        let engine = PauliPropBackend::new().max_freq(Some(max_freq));
-        let (approx, dropped) = engine.expectation_with_budget(&c, &params, &o).unwrap();
+        // A deliberate sweep, so the informativeness ceiling is lifted — the
+        // tight-cap rows are meant to be crude, and refusing them would pin a
+        // healthy transition. See `truncation_error_curve_is_certified_and_converges`.
+        let engine = PauliPropBackend::new()
+            .max_freq(Some(max_freq))
+            .with_max_dropped_mass(Some(f64::INFINITY));
+        let (approx, cert) = engine
+            .expectation_with_certificate(&c, &params, &o)
+            .expect("the sweep lifts the ceiling, so no row may refuse");
+        let dropped = cert.dropped_mass;
         let err = (approx - exact).abs();
         assert!(
             err <= dropped + 1e-9,
@@ -221,13 +230,27 @@ fn max_freq_truncation_stays_within_budget_and_converges() {
             err <= prev_err + 1e-9,
             "max_freq={max_freq}: error {err} worse than tighter cap's {prev_err}"
         );
+        println!(
+            "  max_freq={max_freq:<3} |err|={err:.3e} dropped={dropped:.4e} \
+             range={:.1} informative={}",
+            cert.observable_range,
+            cert.is_informative()
+        );
         prev_err = err;
         last_err = err;
+        loosest_informative = cert.is_informative();
     }
     // A cap past the deepest path (24 ≥ #rotations on any path) is exact.
     assert!(
         last_err <= 1e-9,
         "loosest max_freq did not converge to exact: err {last_err}"
+    );
+    // And the same fourth assertion as the coefficient sweep: at the loosest
+    // cap — the one that discards least — the budget must actually exclude
+    // something. Here it is exact, so this is the strongest form of it.
+    assert!(
+        loosest_informative,
+        "at max_freq=24 the run is exact, so its budget must be informative"
     );
 }
 
@@ -523,9 +546,18 @@ fn truncation_error_curve_is_certified_and_converges() {
     let mut prev_dropped = f64::INFINITY;
     let mut err_loose = None;
     let mut err_tight = 0.0;
+    let mut tightest: Option<omega_backend_pauliprop::PauliPropCertificate> = None;
     for &thr in &thresholds {
-        let be = PauliPropBackend::with_truncation(thr, None);
-        let (val, dropped) = be.expectation_with_budget(&c, &params, &o).unwrap();
+        // A deliberate cutoff SWEEP is the case the informativeness gate must
+        // not break: the loose rows are the point of the sweep, and refusing
+        // them would pin a healthy transition. So the ceiling is lifted here —
+        // explicitly, which is the whole design of the escape hatch.
+        let be =
+            PauliPropBackend::with_truncation(thr, None).with_max_dropped_mass(Some(f64::INFINITY));
+        let (val, cert) = be
+            .expectation_with_certificate(&c, &params, &o)
+            .expect("the sweep lifts the ceiling, so no row may refuse");
+        let dropped = cert.dropped_mass;
         let err = (val - exact).abs();
         // (1) the true error never exceeds the certified budget.
         assert!(
@@ -537,15 +569,51 @@ fn truncation_error_curve_is_certified_and_converges() {
             dropped < prev_dropped,
             "dropped_mass not monotone at C={thr}: {dropped} >= {prev_dropped}"
         );
+        // Printed for every row, asserted for none of them: the transition from
+        // vacuous to informative is the interesting part and must stay visible
+        // rather than being asserted away.
+        println!(
+            "  C={thr:<8} value={val:+.10} |err|={err:.3e} dropped={dropped:.4e} \
+             range={:.1} informative={}",
+            cert.observable_range,
+            cert.is_informative()
+        );
         prev_dropped = dropped;
         err_loose.get_or_insert(err);
         err_tight = err;
+        tightest = Some(cert);
     }
     // (3) convergence: the tightest threshold beats the loosest and is tiny.
     let err_loose = err_loose.unwrap();
     assert!(
         err_tight < err_loose && err_tight < 1e-3,
         "no convergence: tight {err_tight} vs loose {err_loose}"
+    );
+    // (4) THE ASSERTION THAT WAS MISSING, and the reason this test passed for
+    // months over a backend that returns 0.0 with a straight face at depth: the
+    // bound must be INFORMATIVE, not merely honoured.
+    //
+    // Assertions (1)-(3) are all satisfied by a bound that CANNOT be violated.
+    // At C=1e-1 this very circuit reports dropped_mass = 2.06 on a quantity
+    // confined to [-1, 1] — formally correct, excluding nothing — and (1) waved
+    // it through because 2.06 bounds everything. A peer found the identical
+    // hole in their own Trotter-Ising demo, at the identical number, which is
+    // two independent implementations of the same blind spot.
+    //
+    // On the TIGHTEST cutoff only. Requiring it at every threshold would refuse
+    // the loose end of a legitimate sweep; requiring it at the tight end is the
+    // real invariant — that tightening the cutoff BUYS information. A circuit
+    // where even the tightest setting cannot get under the observable's range
+    // is one where truncation has nothing to offer, and that is what this
+    // catches.
+    let tightest = tightest.expect("the sweep ran");
+    assert!(
+        tightest.is_informative(),
+        "at the tightest cutoff the bound must exclude something: \
+         dropped_mass {:.4e} vs observable range {:.4e}. A bound wider than \
+         the range is consistent with every value the observable can take",
+        tightest.dropped_mass,
+        tightest.observable_range
     );
 }
 

@@ -33,7 +33,8 @@ use omega_core::params::ParameterBinding;
 
 /// GHZ over `n` qubits: `h q[0]`, a CX chain, then measure every qubit.
 fn ghz(n: usize) -> String {
-    let mut s = format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\nh q[0];\n");
+    let mut s =
+        format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\nh q[0];\n");
     for i in 0..n - 1 {
         s.push_str(&format!("cx q[{i}], q[{}];\n", i + 1));
     }
@@ -58,7 +59,13 @@ fn run(backend: &dyn Backend, n: usize) -> omega_core::error::Result<ExecResult>
     // every one of n qubits per shot, which was measured at ~1.1 s/shot at
     // n = 1024. At 200 shots this file took 338 s; the assertions are on the
     // key CONTENTS, not on statistics, so the count buys nothing.
-    let shots = if n > 512 { 4 } else if n > 128 { 20 } else { 200 };
+    let shots = if n > 512 {
+        4
+    } else if n > 128 {
+        20
+    } else {
+        200
+    };
     backend.execute(&ir, &ParameterBinding::default(), &cfg(shots))
 }
 
@@ -78,8 +85,8 @@ fn backends() -> Vec<(&'static str, Box<dyn Backend>)> {
 fn ghz_counts_are_correct_at_every_width() {
     for (name, b) in backends() {
         for n in [63usize, 64, 65, 128, 256, 1024] {
-            let res = run(b.as_ref(), n)
-                .unwrap_or_else(|e| panic!("{name} at {n} qubits must run: {e}"));
+            let res =
+                run(b.as_ref(), n).unwrap_or_else(|e| panic!("{name} at {n} qubits must run: {e}"));
             let ExecResult::Counts(c) = res else {
                 panic!("{name}: expected Counts")
             };
@@ -112,9 +119,11 @@ fn ghz_counts_are_correct_at_every_width() {
             }
             for o in c.keys() {
                 assert_eq!(
-                    o.width() as usize, n,
+                    o.width() as usize,
+                    n,
                     "{name} at {n}: key |{}> is {} bits wide",
-                    o.to_bitstring(), o.width()
+                    o.to_bitstring(),
+                    o.width()
                 );
             }
         }
@@ -131,9 +140,8 @@ fn ghz_counts_are_correct_at_every_width() {
 #[test]
 fn mixed_width_outcomes_differ_above_bit_64() {
     let n = 80usize;
-    let mut src = format!(
-        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\nh q[70];\n"
-    );
+    let mut src =
+        format!("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[{n}];\ncreg c[{n}];\nh q[70];\n");
     for i in 0..n {
         src.push_str(&format!("measure q[{i}] -> c[{i}];\n"));
     }

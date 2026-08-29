@@ -14,6 +14,7 @@ crate-type = ["rlib"]
 omega-core = { path = "../omega-core" }
 num-complex = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]

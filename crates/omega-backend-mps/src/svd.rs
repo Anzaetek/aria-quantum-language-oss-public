@@ -217,70 +217,175 @@ pub fn truncated_svd(matrix: &[Vec<Complex64>], max_rank: usize, threshold: f64)
 /// accumulated rotations are V. U and V are orthonormal *by construction* — the
 /// method never forms A†A and never reconstructs U via Σ⁻¹, which is exactly
 /// what made the previous normal-equations kernel non-unitary on deep circuits.
+/// Raw column base pointer that rayon may share across a round's tasks.
+///
+/// # Safety contract, stated once and load-bearing
+///
+/// Within one tournament ROUND every column index appears in exactly one
+/// pair (the round-robin schedule is a partition), and a task touches only
+/// its own two columns. Disjoint columns of a column-major buffer are
+/// disjoint memory, so the aliasing rules hold for the same reason
+/// `split_at_mut` would — the partition is just not expressible as slice
+/// splits. Rounds are separated by rayon's join barrier, so no task ever
+/// sees a column mid-rotation from another round.
+#[derive(Clone, Copy)]
+struct ColBase(*mut Complex64);
+unsafe impl Send for ColBase {}
+unsafe impl Sync for ColBase {}
+
+/// One-sided (Hestenes) Jacobi, parallel across each round's DISJOINT
+/// column pairs.
+///
+/// # Ordering: round-robin tournament, not the old cyclic (p, q) scan
+///
+/// The rotation set per sweep is identical; only the order changes. That is
+/// what makes rounds parallelisable: the circle-method schedule pairs every
+/// column exactly once per round, pairs touch disjoint columns, and disjoint
+/// rotations commute EXACTLY — so the result is deterministic and
+/// **independent of thread count** (asserted by
+/// `thread_count_does_not_change_the_bits`), though it differs from the old
+/// cyclic order in the last bits, as any FP reordering does. Convergence is
+/// unchanged in kind: one-sided Jacobi under any fixed cyclic-by-rounds
+/// ordering strictly reduces the off-diagonal Gram norm per rotation, and
+/// the sweep-level "nothing rotated" criterion is untouched.
+///
+/// # Storage: column-major internally
+///
+/// The public API stays row-major; internally columns are made contiguous so
+/// a pair's working set is two cache-friendly slices rather than two strided
+/// walks — this is worth more than the parallelism at small χ and is what
+/// makes the per-task unsafe justification a one-liner about disjoint
+/// ranges. Transposes at entry/exit are O(rows·cols), noise against the
+/// O(sweeps·cols²·rows) rotation work.
 fn one_sided_jacobi(
     a: &[Complex64],
     rows: usize,
     cols: usize,
 ) -> (Vec<Complex64>, Vec<f64>, Vec<Complex64>) {
-    let mut b = a.to_vec(); // working copy; its columns get rotated into U
+    use rayon::prelude::*;
+
+    // Column-major working copies: column j of `b` at b[j*rows .. (j+1)*rows],
+    // column j of `v` at v[j*cols .. (j+1)*cols].
+    let mut b = vec![Complex64::new(0.0, 0.0); rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            b[j * rows + i] = a[i * cols + j];
+        }
+    }
     let mut v = vec![Complex64::new(0.0, 0.0); cols * cols];
-    for i in 0..cols {
-        v[i * cols + i] = Complex64::new(1.0, 0.0);
+    for j in 0..cols {
+        v[j * cols + j] = Complex64::new(1.0, 0.0);
     }
 
-    // Cyclic sweeps over every column pair. Converged when a whole sweep rotates
-    // nothing — the correct criterion, unlike the old fixed 100-rotation cap
-    // that could not diagonalise a 128-column matrix. One-sided Jacobi is
-    // GLOBALLY convergent (each rotation strictly reduces the off-diagonal Gram
-    // norm and never increases it), and converges quadratically — empirically
-    // ~6-10 sweeps for matrices this size. 60 is therefore a safety ceiling with
-    // large margin, not a hopeful cap; converged inputs break out early via
-    // `rotated == false`, so the extra headroom is free.
+    // BLOCK-round-robin: the tournament runs over BLOCKS of columns, not
+    // single columns. A first-cut pair-level tournament scaled 1→4 threads
+    // and then went BACKWARDS at 8-16 — measured on hea_31q_L16 (quiet box):
+    // 22.2 s at 4 threads, 27.9 s at 16 with 129 s of SYS time, because a
+    // 512-column matrix has 511 barriers per sweep and a run makes ~3M of
+    // them. Blocks cut the barrier count by ~JACOBI_BLOCK× and fatten each
+    // task from one O(rows) rotation to a block-pair's worth, which is the
+    // difference between paying rayon's join per microsecond of work and per
+    // half-millisecond of it.
+    //
+    // The schedule is a function of `cols` ONLY — never of the thread count —
+    // so results stay deterministic and thread-count-invariant: block pairs
+    // within a round touch disjoint columns, rotations inside a task run in
+    // a fixed serial order, and the block size is a constant. (i, i) entries
+    // are the diagonal round: each block orthogonalises its own interior.
+    const JACOBI_BLOCK: usize = 16;
+    let nblocks = cols.div_ceil(JACOBI_BLOCK);
+    let bm = if nblocks.is_multiple_of(2) {
+        nblocks
+    } else {
+        nblocks + 1
+    };
+    let mut rounds: Vec<Vec<(usize, usize)>> = Vec::new();
+    rounds.push((0..nblocks).map(|i| (i, i)).collect());
+    for r in 0..bm.saturating_sub(1) {
+        let slot = |k: usize| -> usize {
+            if k == 0 {
+                0
+            } else {
+                1 + (r + k - 1) % (bm - 1)
+            }
+        };
+        rounds.push(
+            (0..bm / 2)
+                .filter_map(|i| {
+                    let (x, y) = (slot(i), slot(bm - 1 - i));
+                    if x >= nblocks || y >= nblocks {
+                        return None; // the bye slot
+                    }
+                    Some((x.min(y), x.max(y)))
+                })
+                .collect(),
+        );
+    }
+    let block_range = |i: usize| (i * JACOBI_BLOCK, ((i + 1) * JACOBI_BLOCK).min(cols));
+
+    // Converged when a whole sweep rotates nothing — the correct criterion,
+    // unlike the old fixed 100-rotation cap that could not diagonalise a
+    // 128-column matrix. Quadratic convergence, empirically ~6-10 sweeps; 60
+    // is a safety ceiling with large margin, and converged inputs break out
+    // early.
     let tol = 1e-14;
+    let bp = ColBase(b.as_mut_ptr());
+    let vp = ColBase(v.as_mut_ptr());
+    // Grain gate, still load-bearing: a deep circuit spends MOST of its gates
+    // at small χ while ramping up, and parallelism there is pure overhead —
+    // measured 286 s of SYS time on hea_28q_L16 before the gate existed.
+    // Below the gate the SAME schedule runs sequentially; tasks within a
+    // round are independent, so serial-vs-parallel is bit-identical by
+    // construction (the thread-count test pins 1 thread ≡ 8 threads, which
+    // includes "inline" as a special case).
+    let par = cols >= 128;
     for _sweep in 0..60 {
         let mut rotated = false;
-        for p in 0..cols {
-            for q in (p + 1)..cols {
-                // Gram entries of columns p, q of the working matrix.
-                let (mut app, mut aqq) = (0.0f64, 0.0f64);
-                let mut apq = Complex64::new(0.0, 0.0);
-                for i in 0..rows {
-                    let bip = b[i * cols + p];
-                    let biq = b[i * cols + q];
-                    app += bip.norm_sqr();
-                    aqq += biq.norm_sqr();
-                    apq += bip.conj() * biq;
+        for tasks in &rounds {
+            let one = move |&(bi, bj): &(usize, usize)| {
+                // Bind the WRAPPERS, not their pointer fields: edition-2021
+                // closure capture would otherwise capture the bare `*mut`
+                // (not Send/Sync) instead of the vouched-for ColBase.
+                let (bp, vp) = (bp, vp);
+                let col = |j: usize| {
+                    // SAFETY: see `ColBase` — block pairs within a round are
+                    // a partition of the blocks, so every column this task
+                    // touches belongs to it alone this round.
+                    unsafe {
+                        (
+                            std::slice::from_raw_parts_mut(bp.0.add(j * rows), rows),
+                            std::slice::from_raw_parts_mut(vp.0.add(j * cols), cols),
+                        )
+                    }
+                };
+                let (s0, e0) = block_range(bi);
+                let mut did = false;
+                if bi == bj {
+                    for p in s0..e0 {
+                        for q in (p + 1)..e0 {
+                            let (colp, vcolp) = col(p);
+                            let (colq, vcolq) = col(q);
+                            did |= rotate_pair(colp, colq, vcolp, vcolq, tol);
+                        }
+                    }
+                } else {
+                    let (s1, e1) = block_range(bj);
+                    for p in s0..e0 {
+                        for q in s1..e1 {
+                            let (colp, vcolp) = col(p);
+                            let (colq, vcolq) = col(q);
+                            did |= rotate_pair(colp, colq, vcolp, vcolq, tol);
+                        }
+                    }
                 }
-                let apq_abs = apq.norm();
-                if apq_abs < 1e-300 || apq_abs <= tol * (app * aqq).sqrt() {
-                    continue; // columns already orthogonal
-                }
-                rotated = true;
-                // Real Jacobi angle on the phased 2×2 Hermitian Gram
-                // [[app, apq], [conj(apq), aqq]]; this choice of t zeroes apq.
-                let phase = apq / apq_abs; // e^{iθ}
-                let tau = (aqq - app) / (2.0 * apq_abs);
-                let t = tau.signum() / (tau.abs() + (1.0 + tau * tau).sqrt());
-                let c = 1.0 / (1.0 + t * t).sqrt();
-                let s = c * t;
-                let cs = Complex64::new(c, 0.0);
-                let sp = phase.conj() * s; // conj(phase)·s
-                let sq = phase * s;
-                // col_p' = c·col_p − conj(phase)·s·col_q
-                // col_q' = phase·s·col_p + c·col_q
-                for i in 0..rows {
-                    let bip = b[i * cols + p];
-                    let biq = b[i * cols + q];
-                    b[i * cols + p] = cs * bip - sp * biq;
-                    b[i * cols + q] = sq * bip + cs * biq;
-                }
-                for i in 0..cols {
-                    let vip = v[i * cols + p];
-                    let viq = v[i * cols + q];
-                    v[i * cols + p] = cs * vip - sp * viq;
-                    v[i * cols + q] = sq * vip + cs * viq;
-                }
-            }
+                did
+            };
+            let did = if par {
+                tasks.par_iter().map(one).reduce(|| false, |x, y| x | y)
+            } else {
+                tasks.iter().map(one).fold(false, |x, y| x | y)
+            };
+            rotated |= did;
         }
         if !rotated {
             break;
@@ -289,24 +394,81 @@ fn one_sided_jacobi(
 
     // Column norms are the singular values; normalise columns to form U.
     let mut s = vec![0.0f64; cols];
-    for j in 0..cols {
-        let mut nrm = 0.0f64;
-        for i in 0..rows {
-            nrm += b[i * cols + j].norm_sqr();
-        }
-        s[j] = nrm.sqrt();
-    }
-    let mut u = b;
-    for j in 0..cols {
-        if s[j] > 1e-300 {
-            let inv = 1.0 / s[j];
-            for i in 0..rows {
-                u[i * cols + j] *= inv;
+    for (j, sj) in s.iter_mut().enumerate() {
+        let nrm: f64 = b[j * rows..(j + 1) * rows]
+            .iter()
+            .map(|z| z.norm_sqr())
+            .sum();
+        *sj = nrm.sqrt();
+        if *sj > 1e-300 {
+            let inv = 1.0 / *sj;
+            for z in &mut b[j * rows..(j + 1) * rows] {
+                *z *= inv;
             }
         }
         // A zero column (σ ≈ 0) is left zero; it is truncated by the caller.
     }
-    (u, s, v)
+
+    // Back to the row-major layout the callers consume.
+    let mut u = vec![Complex64::new(0.0, 0.0); rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            u[i * cols + j] = b[j * rows + i];
+        }
+    }
+    let mut v_rm = vec![Complex64::new(0.0, 0.0); cols * cols];
+    for i in 0..cols {
+        for j in 0..cols {
+            v_rm[i * cols + j] = v[j * cols + i];
+        }
+    }
+    (u, s, v_rm)
+}
+
+/// Gram + one plane rotation on a single column pair. The arithmetic is the
+/// old cyclic loop's, verbatim — only the memory layout (contiguous columns)
+/// and the caller's ordering changed.
+fn rotate_pair(
+    colp: &mut [Complex64],
+    colq: &mut [Complex64],
+    vcolp: &mut [Complex64],
+    vcolq: &mut [Complex64],
+    tol: f64,
+) -> bool {
+    let (mut app, mut aqq) = (0.0f64, 0.0f64);
+    let mut apq = Complex64::new(0.0, 0.0);
+    for (bip, biq) in colp.iter().zip(colq.iter()) {
+        app += bip.norm_sqr();
+        aqq += biq.norm_sqr();
+        apq += bip.conj() * biq;
+    }
+    let apq_abs = apq.norm();
+    if apq_abs < 1e-300 || apq_abs <= tol * (app * aqq).sqrt() {
+        return false; // columns already orthogonal
+    }
+    // Real Jacobi angle on the phased 2×2 Hermitian Gram
+    // [[app, apq], [conj(apq), aqq]]; this choice of t zeroes apq.
+    let phase = apq / apq_abs; // e^{iθ}
+    let tau = (aqq - app) / (2.0 * apq_abs);
+    let t = tau.signum() / (tau.abs() + (1.0 + tau * tau).sqrt());
+    let c = 1.0 / (1.0 + t * t).sqrt();
+    let s = c * t;
+    let cs = Complex64::new(c, 0.0);
+    let sp = phase.conj() * s; // conj(phase)·s
+    let sq = phase * s;
+    // col_p' = c·col_p − conj(phase)·s·col_q
+    // col_q' = phase·s·col_p + c·col_q
+    for (bip, biq) in colp.iter_mut().zip(colq.iter_mut()) {
+        let (op, oq) = (*bip, *biq);
+        *bip = cs * op - sp * oq;
+        *biq = sq * op + cs * oq;
+    }
+    for (vip, viq) in vcolp.iter_mut().zip(vcolq.iter_mut()) {
+        let (op, oq) = (*vip, *viq);
+        *vip = cs * op - sp * oq;
+        *viq = sq * op + cs * oq;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -447,6 +609,48 @@ mod tests {
         assert_svd_valid(&seeded_matrix(64, 64, 3), 64, 64, 3);
         assert_svd_valid(&seeded_matrix(40, 12, 4), 40, 12, 4);
         assert_svd_valid(&seeded_matrix(12, 40, 5), 12, 40, 5);
+    }
+
+    /// The parallel-rounds contract: results are a FUNCTION OF THE SCHEDULE,
+    /// never of the thread count. Disjoint-pair rotations touch disjoint
+    /// columns and commute exactly, so 1 thread and 8 threads must produce
+    /// bitwise-identical U, S, Vᵀ — the same machine-independent invariance
+    /// the statevector kernels are held to (PLAN-SV-PERF S2-S5 split).
+    #[test]
+    fn thread_count_does_not_change_the_bits() {
+        // An odd column count too, so the bye slot is exercised.
+        for (m, n, seed) in [(96usize, 64usize, 0xABCDu64), (80, 33, 0x77)] {
+            let a = seeded_matrix(m, n, seed);
+            let run = |threads: usize| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("pool")
+                    .install(|| truncated_svd_flat(&a, m, n, n, n, 1e-30))
+            };
+            let r1 = run(1);
+            let r8 = run(8);
+            assert_eq!(r1.s.len(), r8.s.len(), "{m}x{n}");
+            for (x, y) in r1.s.iter().zip(&r8.s) {
+                assert_eq!(x.to_bits(), y.to_bits(), "sigma differs by thread count");
+            }
+            for (x, y) in r1.u.iter().zip(&r8.u) {
+                assert_eq!(x.re.to_bits(), y.re.to_bits(), "U differs by thread count");
+                assert_eq!(x.im.to_bits(), y.im.to_bits());
+            }
+            for (x, y) in r1.vt.iter().zip(&r8.vt) {
+                assert_eq!(x.re.to_bits(), y.re.to_bits(), "Vt differs by thread count");
+                assert_eq!(x.im.to_bits(), y.im.to_bits());
+            }
+        }
+    }
+
+    /// Convergence at the χ=256 shape the deep-circuit regime actually
+    /// produces (512×512): the tournament ordering must still orthogonalise
+    /// to the same defect bound as the old cyclic scan.
+    #[test]
+    fn jacobi_converges_at_the_chi_256_split_shape() {
+        assert_svd_valid(&seeded_matrix(512, 512, 6), 512, 512, 6);
     }
 
     #[test]

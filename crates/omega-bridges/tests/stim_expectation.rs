@@ -19,7 +19,10 @@ fn runner_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python")
 }
 fn venv(slug: &str) -> PathBuf {
-    runner_dir().join(format!(".venv-{slug}")).join("bin").join("python")
+    runner_dir()
+        .join(format!(".venv-{slug}"))
+        .join("bin")
+        .join("python")
 }
 fn force(slug: &str) {
     std::env::set_var(
@@ -77,8 +80,16 @@ fn stim_reads_pauli_strings_lsb_first() {
     skip_unless!("tsim");
     let qasm = format!("{HDR}qreg q[2];\nx q[0];");
     let v = expectation_qasm2(Backend::Tsim, &qasm, &[obs("ZI"), obs("IZ")]).expect("stim");
-    assert!((v[0] + 1.0).abs() < 1e-12, "\"ZI\" names q0 -> -1, got {}", v[0]);
-    assert!((v[1] - 1.0).abs() < 1e-12, "\"IZ\" names q1 -> +1, got {}", v[1]);
+    assert!(
+        (v[0] + 1.0).abs() < 1e-12,
+        "\"ZI\" names q0 -> -1, got {}",
+        v[0]
+    );
+    assert!(
+        (v[1] - 1.0).abs() < 1e-12,
+        "\"IZ\" names q1 -> +1, got {}",
+        v[1]
+    );
 }
 
 /// Stim and Qiskit agree exactly on Clifford circuits — including `sx`/`sxdg`,
@@ -93,9 +104,14 @@ fn stim_and_qiskit_agree_exactly_on_clifford_circuits() {
         ("qreg q[1];\nh q[0];", &["X", "Y", "Z"]),
         ("qreg q[1];\nsx q[0];", &["X", "Y", "Z"]),
         ("qreg q[1];\nsxdg q[0];", &["X", "Y", "Z"]),
-        ("qreg q[2];\nh q[0];\ncx q[0],q[1];", &["ZZ", "XX", "YY", "ZI", "IZ", "XY"]),
-        ("qreg q[2];\nh q[0];\ns q[0];\ncx q[0],q[1];\nsxdg q[1];",
-         &["ZZ", "XI", "IY", "XY", "YX", "ZX"]),
+        (
+            "qreg q[2];\nh q[0];\ncx q[0],q[1];",
+            &["ZZ", "XX", "YY", "ZI", "IZ", "XY"],
+        ),
+        (
+            "qreg q[2];\nh q[0];\ns q[0];\ncx q[0],q[1];\nsxdg q[1];",
+            &["ZZ", "XI", "IY", "XY", "YX", "ZX"],
+        ),
     ];
     let mut compared = 0;
     let mut worst = 0.0_f64;
@@ -118,7 +134,10 @@ fn stim_and_qiskit_agree_exactly_on_clifford_circuits() {
         }
     }
     eprintln!("stim vs qiskit: {compared} (circuit, observable) pairs, worst |Δ| = {worst:.3e}");
-    assert!(compared >= 18, "only {compared} cells compared — coverage collapsed");
+    assert!(
+        compared >= 18,
+        "only {compared} cells compared — coverage collapsed"
+    );
 }
 
 /// Stim's values really are integers — the property that makes this anchor
@@ -131,8 +150,8 @@ fn stim_and_qiskit_agree_exactly_on_clifford_circuits() {
 fn stim_returns_exact_integers() {
     skip_unless!("tsim");
     let qasm = format!("{HDR}qreg q[2];\nh q[0];\ncx q[0],q[1];");
-    let v = expectation_qasm2(Backend::Tsim, &qasm, &[obs("ZZ"), obs("ZI"), obs("XX")])
-        .expect("stim");
+    let v =
+        expectation_qasm2(Backend::Tsim, &qasm, &[obs("ZZ"), obs("ZI"), obs("XX")]).expect("stim");
     for (i, x) in v.iter().enumerate() {
         assert_eq!(
             *x,

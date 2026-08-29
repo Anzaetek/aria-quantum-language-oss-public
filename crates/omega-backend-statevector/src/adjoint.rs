@@ -115,6 +115,11 @@ pub fn adjoint_gradient(
         .filter(|(_, op)| is_unitary(&op.gate))
         .collect();
 
+    // Refuse before the tape is built. This allocation is `gates * 2^n`, not
+    // `2^n` — a 16-qubit circuit whose state is 1 MB can still ask for 8 GB of
+    // checkpoints — so the statevector guard alone does not cover it.
+    crate::capacity::check_adjoint(circuit.num_qubits, unitary_ops.len(), 1)?;
+
     // --- Forward pass: store all checkpoints ---
     let mut state = vec![Complex64::new(0.0, 0.0); dim];
     state[0] = Complex64::new(1.0, 0.0);
@@ -136,20 +141,37 @@ pub fn adjoint_gradient(
     for (step, (_, op)) in unitary_ops.iter().enumerate().rev() {
         let psi_i = &checkpoints[step]; // state before gate was applied
 
-        // Accumulate gradient for each parametric slot
+        // Accumulate gradient for each parametric slot.
+        //
+        // `apply_gate_derivative` and `inner_product` are hoisted OUT of the
+        // symbol loop. Neither depends on `sym_id` — the derivative is a
+        // property of the (gate, parameter slot) pair, and only the chain
+        // factor varies per symbol — but both used to run once per symbol, so
+        // an expression like `theta + phi` applied a full gate to all `2^n`
+        // amplitudes twice, allocated a `2^n` vector twice, and swept the
+        // inner product twice, to obtain the same `ip` each time.
+        //
+        // Bit-exact: the identical value is computed once instead of k times
+        // and multiplied by each chain factor, which is what the loop was
+        // already doing.
         for (param_idx, param_expr) in op.params.iter().enumerate() {
-            let syms = collect_symbols(param_expr);
-            for sym_id in syms {
+            // Resolve every chain factor first, propagating errors as before,
+            // so a slot whose symbols all vanish costs no gate application.
+            let mut active: Vec<(SymbolId, f64)> = Vec::new();
+            for sym_id in collect_symbols(param_expr) {
                 let chain = params.resolve_derivative(param_expr, sym_id)?;
-                if chain.abs() < 1e-30 {
-                    continue;
+                if chain.abs() >= 1e-30 {
+                    active.push((sym_id, chain));
                 }
+            }
+            if active.is_empty() {
+                continue;
+            }
 
-                let du_psi = apply_gate_derivative(psi_i, n, op, params, param_idx)?;
-                let ip = inner_product(&lambda, &du_psi);
-                let contribution = 2.0 * ip.re * chain;
-
-                *gradients.entry(sym_id).or_insert(0.0) += contribution;
+            let du_psi = apply_gate_derivative(psi_i, n, op, params, param_idx)?;
+            let ip = inner_product(&lambda, &du_psi);
+            for (sym_id, chain) in active {
+                *gradients.entry(sym_id).or_insert(0.0) += 2.0 * ip.re * chain;
             }
         }
 
@@ -168,7 +190,7 @@ pub fn adjoint_gradient(
 }
 
 /// Check if a gate is unitary (differentiable in the adjoint sense).
-fn is_unitary(gate: &GateKind) -> bool {
+pub(crate) fn is_unitary(gate: &GateKind) -> bool {
     !matches!(
         gate,
         GateKind::Measure | GateKind::Barrier | GateKind::Reset
@@ -538,33 +560,19 @@ fn collect_symbols_inner(expr: &ParamExpr, out: &mut Vec<SymbolId>) {
 }
 
 /// CCX (Toffoli) — direct implementation.
+/// CCX and CSwap in the forward sweep.
+///
+/// These were verbatim copies of the `sim.rs` kernels. Two copies of a
+/// permutation is two places for an aliasing guard to be missing, and it was
+/// missing from both — so the copies are gone and the gradient path now walks
+/// exactly the same code the forward path does.
 fn apply_ccx_forward(state: &mut [Complex64], n: usize, c0: usize, c1: usize, target: usize) {
-    let dim = 1usize << n;
-    let mask_c0 = 1usize << c0;
-    let mask_c1 = 1usize << c1;
-    let mask_t = 1usize << target;
-
-    for i in 0..dim {
-        if (i & mask_c0) != 0 && (i & mask_c1) != 0 && (i & mask_t) == 0 {
-            let j = i | mask_t;
-            state.swap(i, j);
-        }
-    }
+    crate::sim::apply_ccx(state, n, c0, c1, target)
 }
 
-/// CSwap (Fredkin) — direct implementation.
+/// CSwap (Fredkin).
 fn apply_cswap_forward(state: &mut [Complex64], n: usize, ctrl: usize, t0: usize, t1: usize) {
-    let dim = 1usize << n;
-    let mask_c = 1usize << ctrl;
-    let mask_t0 = 1usize << t0;
-    let mask_t1 = 1usize << t1;
-
-    for i in 0..dim {
-        if (i & mask_c) != 0 && (i & mask_t0) != 0 && (i & mask_t1) == 0 {
-            let j = (i & !mask_t0) | mask_t1;
-            state.swap(i, j);
-        }
-    }
+    crate::sim::apply_cswap(state, n, ctrl, t0, t1)
 }
 
 #[cfg(test)]
@@ -581,6 +589,74 @@ mod tests {
         Observable {
             terms: vec![(1.0, vec![(0, PauliOp::Z)])],
         }
+    }
+
+    /// **A parameter expression over SEVERAL symbols is differentiated once,
+    /// and correctly.**
+    ///
+    /// This is the case A1 was about. `apply_gate_derivative` and
+    /// `inner_product` do not depend on which symbol is being differentiated —
+    /// only the chain factor does — but both used to run once per symbol, so
+    /// `Ry(theta + phi)` applied a full gate to all `2^n` amplitudes twice and
+    /// allocated a `2^n` vector twice to obtain the same value.
+    ///
+    /// Correctness here is not just "it still runs": `d/dtheta` and `d/dphi` of
+    /// `Ry(theta + phi)` are EQUAL, so a bug that reused one symbol's chain
+    /// factor for both would still produce the right answer. The second case
+    /// uses `2*theta + phi`, whose derivatives differ by exactly the factor 2,
+    /// so a mixed-up chain factor cannot hide.
+    #[test]
+    fn a_multi_symbol_parameter_is_differentiated_once_per_slot() {
+        use omega_core::circuit::ParamExpr;
+
+        // Ry(2*theta + phi) on |0>, observable Z.
+        //   <Z> = cos(2*theta + phi)
+        //   d/dtheta = -2 sin(2*theta + phi),  d/dphi = -sin(2*theta + phi)
+        let (theta, phi) = (0.3_f64, 0.4_f64);
+        let mut circuit = CircuitIR::new(1, CircuitType::GateBased);
+        circuit.symbols.insert(0, "theta".to_string());
+        circuit.symbols.insert(1, "phi".to_string());
+        circuit.add_op(GateOp {
+            gate: GateKind::Ry,
+            qubits: smallvec![Qubit(0)],
+            params: smallvec![ParamExpr::Add(
+                Box::new(ParamExpr::Mul(
+                    Box::new(ParamExpr::Concrete(2.0)),
+                    Box::new(ParamExpr::Symbol(0)),
+                )),
+                Box::new(ParamExpr::Symbol(1)),
+            )],
+            classical_bit: None,
+            condition: None,
+        });
+
+        let mut binding = ParameterBinding::new();
+        binding.bind(0, theta);
+        binding.bind(1, phi);
+
+        let grads = adjoint_gradient(&circuit, &binding, &z_observable()).expect("gradient");
+        let got: std::collections::HashMap<_, _> = grads.into_iter().collect();
+
+        let s = (2.0 * theta + phi).sin();
+        let (want_theta, want_phi) = (-2.0 * s, -s);
+        assert!(
+            (got[&0] - want_theta).abs() < 1e-10,
+            "d/dtheta: got {}, want {want_theta}",
+            got[&0]
+        );
+        assert!(
+            (got[&1] - want_phi).abs() < 1e-10,
+            "d/dphi: got {}, want {want_phi}",
+            got[&1]
+        );
+        // And they must genuinely differ, or the test proves nothing about
+        // the per-symbol chain factor.
+        assert!(
+            (got[&0] - got[&1]).abs() > 1e-6,
+            "the two derivatives must differ (2x), got {} and {}",
+            got[&0],
+            got[&1]
+        );
     }
 
     #[test]

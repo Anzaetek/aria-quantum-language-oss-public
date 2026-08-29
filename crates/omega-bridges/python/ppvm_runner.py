@@ -73,6 +73,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from qasm2_stim import (  # noqa: E402
+    _PPVM_EXPANSIONS,
     GATE_SETS,
     ConversionError,
     UnsupportedGate,
@@ -99,6 +100,24 @@ def main() -> int:
         return 0
 
     mode = req.get("mode") or "execute"
+    if mode == "capabilities":
+        # Capability handshake. Without it, a mismatch between what a caller
+        # wants and what a bridge implements only surfaces as a mid-run error —
+        # after the circuit has been converted and sent — and for noise it did
+        # not surface at all. Answering here lets the caller decide before it
+        # commits to a run.
+        _emit(
+            {
+                "ok": True,
+                "capabilities": {
+                    "backend": "ppvm",
+                    "modes": ["execute", "expectation", "gates"],
+                    "noise_keys": [],
+                    "notes": "no noise model through this path",
+                },
+            }
+        )
+        return 0
     if mode == "gates":
         # Introspection mode: report the QASM2 gate names this bridge
         # can lower. `tests/cross_backend.rs` asks the runner for this
@@ -137,7 +156,7 @@ def main() -> int:
 
     try:
         stim_text, n_qubits, clbit_of_measurement, n_clbits = convert(
-            qasm, GATE_SETS["ppvm"]
+            qasm, GATE_SETS["ppvm"], _PPVM_EXPANSIONS
         )
     except UnsupportedGate as e:
         _err(str(e), kind="ppvm-unsupported-gate")

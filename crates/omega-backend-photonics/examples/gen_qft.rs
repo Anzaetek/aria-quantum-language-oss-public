@@ -16,19 +16,33 @@ fn main() {
     use omega_backend_photonics::decompose::reck_decompose;
     let m = 4usize;
     let norm = 1.0 / (m as f64).sqrt();
-    let u: Vec<Vec<Complex64>> = (0..m).map(|j| (0..m).map(|k| {
-        let a = 2.0 * std::f64::consts::PI * (j*k) as f64 / m as f64;
-        Complex64::new(a.cos()*norm, a.sin()*norm)
-    }).collect()).collect();
+    let u: Vec<Vec<Complex64>> = (0..m)
+        .map(|j| {
+            (0..m)
+                .map(|k| {
+                    let a = 2.0 * std::f64::consts::PI * (j * k) as f64 / m as f64;
+                    Complex64::new(a.cos() * norm, a.sin() * norm)
+                })
+                .collect()
+        })
+        .collect();
     let ops = reck_decompose(&u);
     let back = build_unitary(m, &ops);
-    let d: f64 = u.iter().zip(&back).flat_map(|(a,b)| a.iter().zip(b).map(|(x,y)| (x-y).norm())).fold(0.0, f64::max);
+    let d: f64 = u
+        .iter()
+        .zip(&back)
+        .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).norm()))
+        .fold(0.0, f64::max);
     eprintln!("recomposition max diff = {d:.3e}   ops = {}", ops.len());
     for op in &ops {
         match op {
             PhotonicOp::PhaseShifter { mode, phi } => println!("ps({phi:.15}) q[{mode}];"),
-            PhotonicOp::BeamSplitterRx { mode0, mode1, theta, phi } =>
-                println!("bs_rx({theta:.15}, {phi:.15}) q[{mode0}], q[{mode1}];"),
+            PhotonicOp::BeamSplitterRx {
+                mode0,
+                mode1,
+                theta,
+                phi,
+            } => println!("bs_rx({theta:.15}, {phi:.15}) q[{mode0}], q[{mode1}];"),
         }
     }
 }

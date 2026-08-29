@@ -4,9 +4,123 @@ use omega_core::circuit::*;
 
 use crate::ast::*;
 
-/// Lower a QASM2 AST to CircuitIR.
+/// Which OpenQASM 2.0 dialect to read.
+///
+/// QASM 2.0 has no single answer for `rxx`/`ryy`/`rzz`: none of the three is in
+/// `qelib1.inc`, so whether a *bare* one (no preceding `gate` definition) is
+/// readable depends entirely on the reader. Qiskit ships two readers that
+/// disagree with each other, measured on 2.5.1:
+///
+/// ```text
+///                strict `qasm2.loads`   legacy `from_qasm_str`
+///   bare rxx     reject                 accept
+///   bare rzz     reject                 accept
+///   bare ryy     reject                 reject
+///   with a gate def                 accept (both)
+/// ```
+///
+/// So "align with Qiskit" is under-specified until you say *which* Qiskit. This
+/// enum makes the choice explicit instead of burying it in a match arm. The
+/// default is [`Qasm2Dialect::Legacy`], which reproduces `from_qasm_str` — the
+/// more permissive of the two readers Qiskit actually ships, and the one whose
+/// accept-set is a superset of the strict reader's.
+///
+/// A gate carrying its own `gate name(...) ... { ... }` definition is read in
+/// **every** dialect, because then the file says what the name means and no
+/// reader has to guess. That is why this workspace's emitter writes definitions
+/// (see `GATE_DEFS` in `aria-core`): its output loads under both Qiskit readers
+/// and under all three dialects here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Qasm2Dialect {
+    /// `qiskit.qasm2.loads`: a bare `rxx`/`ryy`/`rzz` is an error. Only names in
+    /// `qelib1.inc`, plus whatever the file defines itself, are readable.
+    Strict,
+    /// `QuantumCircuit.from_qasm_str` (**default**): bare `rxx` and `rzz` are
+    /// accepted, bare `ryy` is not — Qiskit's legacy custom-instruction table
+    /// contains the first two and not the third.
+    #[default]
+    Legacy,
+    /// Accept a bare `rxx`, `ryy` **and** `rzz`. No Qiskit reader does this, so
+    /// a file relying on it is one this workspace can read and other toolchains
+    /// cannot. Opt in deliberately; it is not the default for that reason.
+    Lenient,
+}
+
+impl Qasm2Dialect {
+    /// Is a *bare* (undeclared) `name` readable in this dialect?
+    ///
+    /// Only ever consulted for the three two-qubit rotations; every other
+    /// spelling is resolved by `name_to_gate` as before.
+    fn accepts_bare(self, name: &str) -> bool {
+        match self {
+            Qasm2Dialect::Strict => false,
+            Qasm2Dialect::Legacy => matches!(name, "rxx" | "rzz"),
+            Qasm2Dialect::Lenient => matches!(name, "rxx" | "ryy" | "rzz"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Qasm2Dialect::Strict => "strict",
+            Qasm2Dialect::Legacy => "legacy",
+            Qasm2Dialect::Lenient => "lenient",
+        }
+    }
+}
+
+/// The three spellings whose readability depends on the dialect.
+const DIALECT_GATED: &[&str] = &["rxx", "ryy", "rzz"];
+
+/// Refusal for a bare `rxx`/`ryy`/`rzz` the active dialect does not read.
+///
+/// This used to be the same bare `unknown gate: ryy` a typo produces, which is
+/// actively misleading: the name is not unknown, it is *undefined in this file*
+/// and the reader is following a dialect that requires it to be defined. Say
+/// which dialect, say that Qiskit agrees (so the refusal does not look like a
+/// local quirk), and name the two ways out.
+fn dialect_refusal(name: &str, dialect: Qasm2Dialect) -> String {
+    let qiskit = match name {
+        // The one Qiskit refuses in BOTH readers; worth saying so, because a
+        // user who "fixes" it by switching to Qiskit will hit the same wall.
+        "ryy" => {
+            "no Qiskit reader accepts a bare `ryy` either \
+                  (`from_qasm_str`: \"'ryy' is not defined in this scope\")"
+        }
+        _ => "Qiskit's strict `qasm2.loads` refuses it too",
+    };
+    format!(
+        "`{name}` is not defined in this file, and the `{dialect_name}` QASM2 \
+         dialect does not supply it — {qiskit}. `{name}` is not in qelib1.inc, \
+         so a file that uses it must either (a) carry its own definition, e.g. \
+         `gate {name}(param0) q0,q1 {{ ... }}` before first use — which this \
+         reader inlines and every Qiskit reader accepts — or (b) be read in a \
+         dialect that supplies it{lenient_hint}.",
+        dialect_name = dialect.name(),
+        lenient_hint = if dialect == Qasm2Dialect::Lenient {
+            String::new()
+        } else {
+            format!(
+                " (`lenient` accepts all three bare; `legacy` accepts \
+                 rxx/rzz; you are in `{}`)",
+                dialect.name()
+            )
+        }
+    )
+}
+
+/// Lower a QASM2 AST to CircuitIR, reading the default ([`Qasm2Dialect::Legacy`])
+/// dialect.
 pub fn lower_qasm2(prog: &Qasm2Program) -> Result<CircuitIR, String> {
+    lower_qasm2_with_dialect(prog, Qasm2Dialect::default())
+}
+
+/// Lower a QASM2 AST to CircuitIR in an explicit dialect.
+pub fn lower_qasm2_with_dialect(
+    prog: &Qasm2Program,
+    dialect: Qasm2Dialect,
+) -> Result<CircuitIR, String> {
     let mut ctx = LowerCtx::new(CircuitType::GateBased);
+    ctx.dialect = dialect;
 
     for stmt in &prog.statements {
         ctx.lower_qasm2_stmt(stmt)?;
@@ -28,6 +142,14 @@ pub fn lower_opticqasm(prog: &OpticQasmProgram) -> Result<CircuitIR, String> {
 
 /// Convenience: parse + lower in one step.
 pub fn lower_to_ir(source: &str) -> Result<CircuitIR, String> {
+    lower_to_ir_with_dialect(source, Qasm2Dialect::default())
+}
+
+/// Convenience: parse + lower in one step, in an explicit QASM2 dialect.
+///
+/// The dialect is ignored for OPTICQASM input, which has no equivalent
+/// ambiguity — its gate set is defined by this workspace, not inherited.
+pub fn lower_to_ir_with_dialect(source: &str, dialect: Qasm2Dialect) -> Result<CircuitIR, String> {
     // Skip leading comments and whitespace
     let trimmed = source
         .lines()
@@ -39,12 +161,35 @@ pub fn lower_to_ir(source: &str) -> Result<CircuitIR, String> {
         .trim();
     if trimmed.starts_with("OPENQASM") {
         let ast = crate::qasm2::parse_qasm2(source)?;
-        lower_qasm2(&ast)
+        lower_qasm2_with_dialect(&ast, dialect)
     } else if trimmed.starts_with("OPTICQASM") {
         let ast = crate::opticqasm::parse_opticqasm(source)?;
         lower_opticqasm(&ast)
     } else {
-        Err("unknown circuit format: expected OPENQASM or OPTICQASM header".to_string())
+        // No header. OpenQASM 3 makes the version statement OPTIONAL, and the
+        // specification's own examples overwhelmingly omit it — 20 of the 21
+        // programs in `third_party/openqasm-examples/`. Refusing here rejected
+        // the entire reference corpus *upstream of the grammar*, so relaxing
+        // the pest rule alone would have changed nothing.
+        //
+        // Deliberately NOT a "does this look like QASM?" heuristic. Sniffing
+        // for `include`/`qubit`/`qreg` would be one more predicate to keep in
+        // step with the grammar, and predicates that drift from the code they
+        // describe are a recurring defect here. One path instead: try the QASM
+        // lane, and if it fails, say that a header was absent and what was
+        // assumed — so genuinely unknown input still gets an actionable
+        // message rather than a bare pest position.
+        //
+        // OPTICQASM is unaffected: its grammar requires its header, so a
+        // headerless file was never going to be one.
+        let ast = crate::qasm2::parse_qasm2(source).map_err(|e| {
+            format!(
+                "no `OPENQASM` or `OPTICQASM` header found, so this was read as \
+                 OpenQASM 3 (where the version statement is optional) — and that \
+                 failed: {e}"
+            )
+        })?;
+        lower_qasm2_with_dialect(&ast, dialect)
     }
 }
 
@@ -67,6 +212,8 @@ struct LowerCtx {
     /// OPTICQASM registers declared `pol`. Mode refs into these name a
     /// **spatial** mode, which expands to optical modes `2s` (H) and `2s+1` (V).
     polarized_regs: std::collections::HashSet<String>,
+    /// Which QASM2 reader to imitate for the bare two-qubit rotations.
+    dialect: Qasm2Dialect,
 }
 
 impl LowerCtx {
@@ -83,6 +230,7 @@ impl LowerCtx {
             num_classical_bits: 0,
             ops: Vec::new(),
             gate_defs: HashMap::new(),
+            dialect: Qasm2Dialect::default(),
         }
     }
 
@@ -265,6 +413,19 @@ impl LowerCtx {
             Qasm2Stmt::Measure { qubit, cbit } => {
                 let qubits = self.resolve_qubit(qubit)?;
                 let cbits = self.resolve_cbit(cbit)?;
+                // `zip` stops at the shorter side, so `measure q -> c;` with a
+                // 4-qubit `q` and a 2-bit `c` emitted TWO measurements and said
+                // nothing — two qubits silently unmeasured. OpenQASM requires
+                // equal widths for a register-to-register measure.
+                if qubits.len() != cbits.len() {
+                    return Err(format!(
+                        "`measure` maps {} qubit(s) onto {} classical bit(s); a \
+                         register-to-register measure requires equal widths. Index \
+                         one side, or declare registers of the same size.",
+                        qubits.len(),
+                        cbits.len()
+                    ));
+                }
                 for (q, c) in qubits.into_iter().zip(cbits) {
                     self.ops.push(GateOp {
                         gate: GateKind::Measure,
@@ -292,7 +453,12 @@ impl LowerCtx {
                 });
                 Ok(())
             }
-            Qasm2Stmt::If { creg, value, then } => {
+            Qasm2Stmt::If {
+                creg,
+                bit,
+                value,
+                then,
+            } => {
                 // Emit the inner gate(s) and patch each one with a classical
                 // condition keyed on the creg's LSB. The executor checks
                 // `classical_bits[cbit] != expected`, so this is exact for
@@ -312,18 +478,26 @@ impl LowerCtx {
                 // parse error into a silent drop. That is strictly worse: the
                 // circuit would run without the guarded operation and say so
                 // nowhere.
-                match then.as_ref() {
-                    Qasm2Stmt::GateApp(app) => self.lower_gate_app(app, &HashMap::new(), &[])?,
-                    // Delegates to the same arm the unguarded forms use, so a
-                    // change there cannot make the guarded form diverge.
-                    stmt @ (Qasm2Stmt::Measure { .. } | Qasm2Stmt::Reset(_)) => {
-                        self.lower_qasm2_stmt(stmt)?
-                    }
-                    other => {
-                        return Err(format!(
-                            "`if (...)` may guard a gate application, a measure or a \
-                             reset; got {other:?}"
-                        ))
+                // The body is a list: a braced block may hold several
+                // statements, and a bare statement is a list of one. Every one
+                // of them is patched with the guard below, so a block cannot
+                // end up with only its first statement conditioned.
+                for stmt in then {
+                    match stmt {
+                        Qasm2Stmt::GateApp(app) => {
+                            self.lower_gate_app(app, &HashMap::new(), &[])?
+                        }
+                        // Delegates to the same arm the unguarded forms use, so
+                        // a change there cannot make the guarded form diverge.
+                        stmt @ (Qasm2Stmt::Measure { .. } | Qasm2Stmt::Reset(_)) => {
+                            self.lower_qasm2_stmt(stmt)?
+                        }
+                        other => {
+                            return Err(format!(
+                                "`if (...)` may guard a gate application, a measure or a \
+                                 reset; got {other:?}"
+                            ))
+                        }
                     }
                 }
                 if self.ops.len() == before {
@@ -353,8 +527,25 @@ impl LowerCtx {
                             .to_string(),
                     );
                 }
+                // A single-bit guard (`c[i] == true`) conditions on ONE bit, not
+                // the register: `(start_bit + i, 1, value)`. Reusing the
+                // whole-register tuple would assert that the entire register
+                // equals the value — a different predicate, and precisely the
+                // silent reinterpretation `to_qasm` refuses to perform on the
+                // export side.
+                let (cond_start, cond_width) = match bit {
+                    Some(i) => {
+                        if *i >= size {
+                            return Err(format!(
+                                "bit index {i} is out of range for creg `{creg}` (size {size})"
+                            ));
+                        }
+                        (start_bit + i, 1)
+                    }
+                    None => (start_bit, size),
+                };
                 for op in &mut self.ops[before..] {
-                    op.condition = Some((start_bit, size, *value));
+                    op.condition = Some((cond_start, cond_width, *value));
                 }
                 Ok(())
             }
@@ -436,12 +627,44 @@ impl LowerCtx {
                 qubit_args.push(qs);
             }
 
+            // The argument list must MATCH the definition. Both halves of this
+            // were unchecked: the loop below guarded only `i < qubit_args.len()`,
+            // so extra arguments were dropped without a word, and missing ones
+            // simply never entered the map — the body then failed with
+            // "undefined qubit in gate body", blaming the definition for the
+            // caller's mistake.
+            if qubit_args.len() != def.qubits.len() {
+                return Err(format!(
+                    "`{}` is defined on {} qubit(s) ({}), but was called with {} \
+                     argument(s). A gate call must pass exactly one argument per \
+                     declared qubit.",
+                    app.name,
+                    def.qubits.len(),
+                    def.qubits.join(", "),
+                    qubit_args.len()
+                ));
+            }
+
             // Map gate's qubit names to actual qubits
             let mut qubit_map: HashMap<String, Qubit> = HashMap::new();
             for (i, qname) in def.qubits.iter().enumerate() {
-                if i < qubit_args.len() && !qubit_args[i].is_empty() {
-                    qubit_map.insert(qname.clone(), qubit_args[i][0]);
+                // A bare register argument resolves to ALL its qubits, and this
+                // used to silently take `[0]` and discard the rest: `flip q;`
+                // on a 3-qubit register applied one X. OpenQASM does define
+                // broadcast over a user gate, but implementing it is a separate
+                // increment; discarding is not an option either way.
+                if qubit_args[i].len() != 1 {
+                    return Err(format!(
+                        "argument {} of `{}` is a whole register ({} qubits) where a \
+                         single qubit is expected. Index it (`{}[0]`) — broadcasting a \
+                         user-defined gate over a register is not supported.",
+                        i,
+                        app.name,
+                        qubit_args[i].len(),
+                        qname
+                    ));
                 }
+                qubit_map.insert(qname.clone(), qubit_args[i][0]);
             }
 
             // Expand body
@@ -472,6 +695,21 @@ impl LowerCtx {
                 // `cu3(0.7) a,b;` and `u3(0.7) a;` at top level — three ways for
                 // a malformed QASM2 file to crash the process instead of being
                 // refused.
+                // Same placeholder hazard as the top-level path, and this path
+                // has no decomposition intercept at all — a `gate mine(t) a,b {
+                // rzz(t) a,b; }` body cannot be expanded here. Arity checking
+                // below would catch it (placeholder `CX` takes 0 parameters vs
+                // the 1 supplied), but with a message about parameter counts
+                // that says nothing about the real problem. Refuse explicitly.
+                if DIALECT_GATED.contains(&body_app.name.as_str()) {
+                    return Err(format!(
+                        "gate definition `{}` calls `{}` in its body; this reader \
+                         expands definition bodies from qelib1 primitives only, so \
+                         write the two-qubit rotation out (`cx`, `rz`, `cx`, with \
+                         `h` or `rx(±pi/2)` conjugators) instead of nesting it",
+                        app.name, body_app.name
+                    ));
+                }
                 let gate = name_to_gate(&body_app.name)?;
                 let body_params = widen_cp_params(&body_app.name, body_params)?;
                 let body_qubits: smallvec::SmallVec<[Qubit; 3]> = body_qubits.into_iter().collect();
@@ -506,6 +744,65 @@ impl LowerCtx {
         // `(0,0,λ)` gives `U3(0,−λ,0) = diag(1, e^{−iλ})` — correct.
         let params = widen_cp_params(&app.name, params)?;
 
+        // ----- register broadcast -----
+        //
+        // A bare register argument (`q`, no index) resolves to ALL its qubits.
+        // Flattening those into one operand list, as this used to do, made the
+        // arity check downstream see the FLATTENED count — so `qubit[2] q; cz q;`
+        // arrived as a 2-operand CZ, passed, and silently executed as
+        // `cz q[0], q[1]`. OpenQASM defines no such broadcast: it was a
+        // confident wrong answer, not a refusal.
+        //
+        // What OpenQASM *does* define, and what the official examples use, is a
+        // single-qubit gate over a register: `h q;` is `h q[0]; h q[1]; ...`.
+        // That never worked here either — it hit the arity check as an N-operand
+        // H and was refused.
+        //
+        // So both halves are handled together, deliberately. Fixing only the
+        // refusal would leave every broadcast rejected, including the legal
+        // form, which is its own regression.
+        let widths: Vec<usize> = app
+            .qubits
+            .iter()
+            .map(|qr| self.resolve_qubit(qr).map(|v| v.len()))
+            .collect::<Result<_, _>>()?;
+
+        if widths.iter().any(|w| *w != 1) {
+            let arity = gate_signature(&gate).map(|(_, q)| q);
+            // The one legal case: exactly one argument, a single-qubit gate.
+            if app.qubits.len() == 1 && arity == Some(1) {
+                let QubitRef::Register(reg) = &app.qubits[0] else {
+                    // An indexed ref always resolves to width 1, so reaching
+                    // here would mean `resolve_qubit` changed underneath us.
+                    return Err(format!(
+                        "`{}`: internal — a non-register argument resolved to {} qubits",
+                        app.name, widths[0]
+                    ));
+                };
+                for i in 0..widths[0] {
+                    let one = GateApp {
+                        qubits: vec![QubitRef::Indexed {
+                            reg: reg.clone(),
+                            index: i as u32,
+                        }],
+                        ..app.clone()
+                    };
+                    self.lower_gate_app(&one, local_params, param_values)?;
+                }
+                return Ok(());
+            }
+            return Err(format!(
+                "`{}` cannot be broadcast over a whole register: it acts on {} \
+                 qubit(s) and was given {} argument(s) of width {:?}. Only a \
+                 single-qubit gate broadcasts over one register; index the \
+                 operands explicitly instead.",
+                app.name,
+                arity.map_or("?".to_string(), |a| a.to_string()),
+                app.qubits.len(),
+                widths
+            ));
+        }
+
         // Resolve qubits
         let mut qubits: smallvec::SmallVec<[Qubit; 3]> = smallvec::SmallVec::new();
         for qr in &app.qubits {
@@ -535,20 +832,16 @@ impl LowerCtx {
         // Before this, `aria-core` emitted `rxx`/`rzz` and this parser answered
         // "unknown gate" — a file Qiskit's legacy loader reads and we could not.
         //
-        // `ryy` is deliberately NOT handled. Measured on qiskit 2.5.1: the
-        // strict `qasm2.loads` rejects all of rxx/ryy/rzz/cp, and the LEGACY
-        // `from_qasm_str` accepts rxx/rzz/cp but rejects `ryy` — "'ryy' is not
-        // defined in this scope". So no Qiskit loader reads `ryy`. Teaching this
-        // parser to read it would make the round trip work for us alone while
-        // every other toolchain still could not load the file, which is worse
-        // than the status quo because it would look fixed. What to do about
-        // EMITTING it is a separate decision (see PLAN-EXPORT-INTEGRITY.md).
+        // Which of the three is readable BARE is a dialect choice, not a fact
+        // about QASM — see [`Qasm2Dialect`]. A file that defines the gate itself
+        // never reaches here: `gate_defs` is consulted above, so a declared
+        // `ryy` is inlined from its own body in every dialect.
         //
-        // θ appears EXACTLY ONCE in each decomposition (the `h` conjugators are
-        // constants), so a symbolic angle differentiates correctly: `adjoint.rs`
-        // accumulates per-symbol contributions with `+=` and there is nothing
-        // here to double-count.
-        if matches!(app.name.as_str(), "rxx" | "rzz") {
+        // θ appears EXACTLY ONCE in each decomposition (the `h` and `rx(±π/2)`
+        // conjugators are constants), so a symbolic angle differentiates
+        // correctly: `adjoint.rs` accumulates per-symbol contributions with `+=`
+        // and there is nothing here to double-count.
+        if DIALECT_GATED.contains(&app.name.as_str()) && self.dialect.accepts_bare(&app.name) {
             if params.len() != 1 {
                 return Err(format!(
                     "{} expects 1 parameter, got {}",
@@ -580,10 +873,34 @@ impl LowerCtx {
                     condition: None,
                 });
             };
+            // Basis conjugators, chosen so each lands on exactly Qiskit's
+            // operator `exp(-i θ/2 P⊗P)`:
+            //   rxx  H · (Z⊗Z rotation) · H            (H maps Z -> X)
+            //   ryy  Rx(π/2) · … · Rx(-π/2)            (measured 1.214e-16
+            //        against qiskit's native RYYGate; the `sdg/h` spelling
+            //        differs by a global phase and is NOT used)
+            //   rzz  none — the CX·Rz·CX core is already Z⊗Z
+            let half_pi = ParamExpr::Concrete(std::f64::consts::FRAC_PI_2);
+            let neg_half_pi = ParamExpr::Concrete(-std::f64::consts::FRAC_PI_2);
             for _ in 0..total_pow {
-                if app.name == "rxx" {
-                    push(GateKind::H, std::slice::from_ref(&a), &[]);
-                    push(GateKind::H, std::slice::from_ref(&b), &[]);
+                match app.name.as_str() {
+                    "rxx" => {
+                        push(GateKind::H, std::slice::from_ref(&a), &[]);
+                        push(GateKind::H, std::slice::from_ref(&b), &[]);
+                    }
+                    "ryy" => {
+                        push(
+                            GateKind::Rx,
+                            std::slice::from_ref(&a),
+                            std::slice::from_ref(&half_pi),
+                        );
+                        push(
+                            GateKind::Rx,
+                            std::slice::from_ref(&b),
+                            std::slice::from_ref(&half_pi),
+                        );
+                    }
+                    _ => {}
                 }
                 push(GateKind::CX, &[a, b], &[]);
                 push(
@@ -592,12 +909,35 @@ impl LowerCtx {
                     std::slice::from_ref(&theta),
                 );
                 push(GateKind::CX, &[a, b], &[]);
-                if app.name == "rxx" {
-                    push(GateKind::H, std::slice::from_ref(&a), &[]);
-                    push(GateKind::H, std::slice::from_ref(&b), &[]);
+                match app.name.as_str() {
+                    "rxx" => {
+                        push(GateKind::H, std::slice::from_ref(&a), &[]);
+                        push(GateKind::H, std::slice::from_ref(&b), &[]);
+                    }
+                    "ryy" => {
+                        push(
+                            GateKind::Rx,
+                            std::slice::from_ref(&a),
+                            std::slice::from_ref(&neg_half_pi),
+                        );
+                        push(
+                            GateKind::Rx,
+                            std::slice::from_ref(&b),
+                            std::slice::from_ref(&neg_half_pi),
+                        );
+                    }
+                    _ => {}
                 }
             }
             return Ok(());
+        }
+
+        // Reached only when the dialect refuses the bare spelling. `name_to_gate`
+        // resolved it to a PLACEHOLDER `CX` (so the dialect, not the name table,
+        // gets to decide), and that placeholder must never be pushed — refuse
+        // here, before it can reach `self.ops`.
+        if DIALECT_GATED.contains(&app.name.as_str()) {
+            return Err(dialect_refusal(&app.name, self.dialect));
         }
 
         check_gate_arity(&app.name, &gate, params.len(), qubits.len())?;
@@ -976,7 +1316,10 @@ fn widen_cp_params(
     name: &str,
     params: smallvec::SmallVec<[ParamExpr; 3]>,
 ) -> Result<smallvec::SmallVec<[ParamExpr; 3]>, String> {
-    if !matches!(name, "cp" | "cu1") {
+    // `cphase` is OpenQASM 3's spelling of the same gate — `qft.qasm` writes
+    // `cphase(pi / 2) q[1], q[0];`. Verified operator-identical rather than
+    // assumed: all three resolve to `CU3(0, 0, λ)` = `diag(1, 1, 1, e^{iλ})`.
+    if !matches!(name, "cp" | "cu1" | "cphase") {
         return Ok(params);
     }
     if params.len() != 1 {
@@ -1014,9 +1357,28 @@ fn check_gate_arity(
     n_params: usize,
     n_qubits: usize,
 ) -> Result<(), String> {
+    let Some((wp, wq)) = gate_signature(gate) else {
+        return Ok(());
+    };
+    if n_params != wp {
+        return Err(format!("`{name}` takes {wp} parameter(s), got {n_params}"));
+    }
+    if n_qubits != wq {
+        return Err(format!("`{name}` acts on {wq} qubit(s), got {n_qubits}"));
+    }
+    Ok(())
+}
+
+/// `(params, qubits)` a builtin gate takes, or `None` where the signature is
+/// not knowable here — see [`check_gate_arity`] for which cases and why.
+///
+/// Extracted from `check_gate_arity` so the register-broadcast path can ask the
+/// **same** table how many qubits a gate wants. Two copies of this would be the
+/// hazard `PLAN-WIDE-COUNTS.md` records twice: a predicate that drifts between
+/// the guard and the code the guard is supposed to describe.
+fn gate_signature(gate: &GateKind) -> Option<(usize, usize)> {
     use GateKind::*;
-    // (params, qubits). `None` means "not checked here", with the reason above.
-    let want: Option<(usize, usize)> = match gate {
+    match gate {
         Id | X | Y | Z | H | S | Sdg | T | Tdg | Sx | Sxdg => Some((0, 1)),
         Rx | Ry | Rz | U1 => Some((1, 1)),
         U2 => Some((2, 1)),
@@ -1032,17 +1394,7 @@ fn check_gate_arity(
         // signature, so there is nothing to check against. Named rather than
         // swept into a `_` arm, so a NEW GateKind still fails to compile here.
         Custom(_) => None,
-    };
-    let Some((wp, wq)) = want else {
-        return Ok(());
-    };
-    if n_params != wp {
-        return Err(format!("`{name}` takes {wp} parameter(s), got {n_params}"));
     }
-    if n_qubits != wq {
-        return Err(format!("`{name}` acts on {wq} qubit(s), got {n_qubits}"));
-    }
-    Ok(())
 }
 
 /// Map a gate name string to a GateKind.
@@ -1088,13 +1440,17 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         "crz" => Ok(GateKind::CRz),
         // qelib1's controlled-phase. CP(λ) == CU3(0, 0, λ) exactly; the
         // 1 -> 3 parameter widening happens in `lower_gate_app`.
-        "cu3" | "cp" | "cu1" => Ok(GateKind::CU3),
-        // Placeholder only: `rxx`/`rzz` never reach the single-op push —
-        // `lower_gate_app` intercepts them above and emits a decomposition. The
-        // entry exists so `name_to_gate` does not reject the name first.
-        // `ryy` is absent on purpose: no Qiskit loader reads it (measured), so
-        // reading it here would fix the round trip for us alone.
-        "rxx" | "rzz" => Ok(GateKind::CX),
+        // `cphase` is what the OpenQASM 3 corpus writes (`qft.qasm`); `cp` is
+        // qelib1's name and `cu1` the older one. Same operator — see
+        // `widen_cp_params`, which widens all three from one angle to three.
+        "cu3" | "cp" | "cu1" | "cphase" => Ok(GateKind::CU3),
+        // Placeholder only: these never reach the single-op push —
+        // `lower_gate_app` intercepts them above and emits a decomposition,
+        // but only in a dialect that accepts the bare spelling. The entry
+        // exists so `name_to_gate` does not reject the name before the dialect
+        // has had its say; a bare spelling the dialect refuses is reported by
+        // `unknown_gate_error` instead.
+        "rxx" | "ryy" | "rzz" => Ok(GateKind::CX),
         "ccx" | "toffoli" => Ok(GateKind::CCX),
         "cswap" | "fredkin" => Ok(GateKind::CSwap),
         "measure" => Ok(GateKind::Measure),

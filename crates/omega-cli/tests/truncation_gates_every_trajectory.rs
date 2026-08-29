@@ -50,7 +50,12 @@ fn feed_forward() -> String {
     s
 }
 
-fn run(chi: usize, ceiling: f64, shots: u32, seed: u64) -> (Result<ExecResult, omega_core::error::OmegaError>, f64) {
+fn run(
+    chi: usize,
+    ceiling: f64,
+    shots: u32,
+    seed: u64,
+) -> (Result<ExecResult, omega_core::error::OmegaError>, f64) {
     let ir = omega_parser::lower_to_ir(&feed_forward()).expect("lower");
     let b = MpsBackend::new(chi).with_max_discarded_weight(ceiling);
     let cfg = ExecConfig {
@@ -163,7 +168,8 @@ fn stats_are_reset_per_execute() {
         mid_circuit_mode: MidCircuitMode::Collapse,
     };
     // A run that truncates heavily...
-    b.execute(&ir, &ParameterBinding::default(), &cfg(40, 1)).expect("run 1");
+    b.execute(&ir, &ParameterBinding::default(), &cfg(40, 1))
+        .expect("run 1");
     assert!(b.last_run_stats().discarded_weight > 1.0);
 
     // ...must not colour a subsequent exact one.
@@ -171,7 +177,8 @@ fn stats_are_reset_per_execute() {
         "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\ncreg c[1];\nh q[0];\ncx q[0],q[1];\nmeasure q[0]->c[0];\n",
     )
     .expect("lower");
-    b.execute(&bell, &ParameterBinding::default(), &cfg(10, 1)).expect("run 2");
+    b.execute(&bell, &ParameterBinding::default(), &cfg(10, 1))
+        .expect("run 2");
     assert_eq!(
         b.last_run_stats().discarded_weight,
         0.0,

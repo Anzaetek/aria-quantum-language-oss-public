@@ -479,6 +479,7 @@ dependencies = [
  "num-complex",
  "omega-core",
  "rand",
+ "rayon",
  "smallvec",
 ]
 
@@ -507,6 +508,7 @@ version = "0.1.0"
 dependencies = [
  "num-complex",
  "omega-core",
+ "smallvec",
 ]
 
 [[package]]

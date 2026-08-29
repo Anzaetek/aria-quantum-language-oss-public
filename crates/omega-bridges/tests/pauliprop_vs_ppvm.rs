@@ -85,8 +85,8 @@ fn dense_to_indexed(dense: &str) -> String {
 
 /// Our backend's expectation for one QASM2 body and one dense Pauli string.
 fn ours(body: &str, pauli: &str) -> Result<f64, String> {
-    let ir = omega_parser::lower_to_ir(&format!("{HDR}{body}"))
-        .map_err(|e| format!("lower: {e}"))?;
+    let ir =
+        omega_parser::lower_to_ir(&format!("{HDR}{body}")).map_err(|e| format!("lower: {e}"))?;
     let indexed = dense_to_indexed(pauli);
     let o = Observable::parse(&indexed).map_err(|e| format!("observable {indexed:?}: {e}"))?;
     PauliPropBackend::new()
@@ -105,7 +105,10 @@ const CASES: &[(&str, &[&str])] = &[
     ("qreg q[1];\nh q[0];", &["X", "Y", "Z"]),
     ("qreg q[1];\nrx(0.7) q[0];", &["X", "Y", "Z"]),
     ("qreg q[1];\nry(0.9) q[0];\nrz(0.4) q[0];", &["X", "Y", "Z"]),
-    ("qreg q[2];\nh q[0];\ncx q[0],q[1];", &["ZZ", "XX", "YY", "ZI", "IZ", "XY"]),
+    (
+        "qreg q[2];\nh q[0];\ncx q[0],q[1];",
+        &["ZZ", "XX", "YY", "ZI", "IZ", "XY"],
+    ),
     (
         "qreg q[2];\nry(0.7) q[0];\ncx q[0],q[1];\nrz(1.1) q[1];",
         &["ZZ", "XI", "IY", "XY", "YX", "ZX"],
@@ -192,7 +195,10 @@ fn both_implementations_read_pauli_strings_lsb_first() {
     let body = "qreg q[2];\nx q[0];";
     let qasm = format!("{HDR}{body}");
     let theirs = expectation_qasm2(Backend::Ppvm, &qasm, &[obs("ZI"), obs("IZ")]).expect("ppvm");
-    let mine = [ours(body, "ZI").expect("ours ZI"), ours(body, "IZ").expect("ours IZ")];
+    let mine = [
+        ours(body, "ZI").expect("ours ZI"),
+        ours(body, "IZ").expect("ours IZ"),
+    ];
 
     // `x q[0]` flips qubit 0 only. LSB-first, "ZI" places Z on qubit 0.
     assert!(

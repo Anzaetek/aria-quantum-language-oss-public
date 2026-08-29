@@ -45,7 +45,12 @@ use regex::Regex;
 /// binds it — so a symbolic angle genuinely cannot be written here. That is a
 /// real limitation of the format, and it must be *stated*, never silently
 /// resolved to 0.
-fn num(params: &[super::expr::ParamExpr], i: usize, gate: &str, arity: usize) -> Result<f64, String> {
+fn num(
+    params: &[super::expr::ParamExpr],
+    i: usize,
+    gate: &str,
+    arity: usize,
+) -> Result<f64, String> {
     let p = params.get(i).ok_or_else(|| {
         format!(
             "OPTICQASM `{gate}` needs {arity} parameter(s), got {}",
@@ -241,7 +246,9 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
                     format!("line {line}: expected an `OPTICQASM <version>;` header, got `{stmt}`")
                 })?;
             if version.is_empty() {
-                return Err(format!("line {line}: the OPTICQASM header names no version"));
+                return Err(format!(
+                    "line {line}: the OPTICQASM header names no version"
+                ));
             }
             seen_header = true;
             continue;
@@ -316,9 +323,9 @@ pub fn from_opticqasm(src: &str) -> Result<Circuit, String> {
             let index: usize = m[2]
                 .parse()
                 .map_err(|e| format!("line {line}: bad mode index: {e}"))?;
-            let (size, _pol) = regs.get(reg).ok_or_else(|| {
-                format!("line {line}: undefined photon register `{reg}`")
-            })?;
+            let (size, _pol) = regs
+                .get(reg)
+                .ok_or_else(|| format!("line {line}: undefined photon register `{reg}`"))?;
             if index >= *size {
                 return Err(format!(
                     "line {line}: mode index {index} out of range for `{reg}[{size}]`"
@@ -490,7 +497,6 @@ fn statements(src: &str) -> Vec<(&str, usize)> {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,8 +563,16 @@ mod tests {
                 let (b, a) = (b.try_as_f64().unwrap(), a.try_as_f64().unwrap());
                 assert!((b - a).abs() < 1e-12, "parameter changed: {b} -> {a}");
             }
-            let bq: Vec<_> = before.qubits.iter().map(|q| (&q.register, q.index)).collect();
-            let aq: Vec<_> = after.qubits.iter().map(|q| (&q.register, q.index)).collect();
+            let bq: Vec<_> = before
+                .qubits
+                .iter()
+                .map(|q| (&q.register, q.index))
+                .collect();
+            let aq: Vec<_> = after
+                .qubits
+                .iter()
+                .map(|q| (&q.register, q.index))
+                .collect();
             assert_eq!(bq, aq, "modes changed for {:?}", before.gate.kind);
         }
     }
@@ -612,8 +626,15 @@ mod tests {
         let c = from_opticqasm(src).expect("O4: polarization is readable");
         assert_eq!(c.registers.len(), 1, "register lost:\n{src}");
         assert_eq!(c.instructions.len(), 1, "the pbs was dropped:\n{src}");
-        assert_eq!(c.instructions[0].gate.kind, GateKind::PolarizingBeamSplitter);
-        assert_eq!(c.instructions[0].qubits.len(), 2, "pbs spans two spatial modes");
+        assert_eq!(
+            c.instructions[0].gate.kind,
+            GateKind::PolarizingBeamSplitter
+        );
+        assert_eq!(
+            c.instructions[0].qubits.len(),
+            2,
+            "pbs spans two spatial modes"
+        );
         assert!(
             c.registers[0].polarized,
             "the `pol` marker was dropped — the register would re-emit as \
@@ -622,7 +643,10 @@ mod tests {
         // `size` counts SPATIAL modes on both sides of the boundary; the
         // doubling to optical modes happens in omega-parser's lowering and
         // nowhere else.
-        assert_eq!(c.registers[0].size, 2, "size must stay spatial, not doubled here");
+        assert_eq!(
+            c.registers[0].size, 2,
+            "size must stay spatial, not doubled here"
+        );
     }
 
     /// A polarization gate on a NON-polarized register is refused. Accepting it
@@ -642,7 +666,10 @@ mod tests {
     fn unparseable_line_is_an_error_not_a_skip() {
         let err = from_opticqasm("OPTICQASM 1.0;\nphoton q[2];\nnonsense here\n")
             .expect_err("a line matching nothing must not be skipped");
-        assert!(err.contains("line 3"), "the error must locate the line: {err}");
+        assert!(
+            err.contains("line 3"),
+            "the error must locate the line: {err}"
+        );
     }
 
     /// Arity: `ps(0.5, 0.2)` is a typo, and accepting it drops a parameter.

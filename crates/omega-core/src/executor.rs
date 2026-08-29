@@ -39,6 +39,73 @@ impl Default for ExecConfig {
     }
 }
 
+/// How a backend realises the multi-controlled gates `CCX` and `CSwap`.
+///
+/// **Not a field on [`ExecConfig`], deliberately.** It is a property of how a
+/// backend *realises* a gate, not of what the circuit means — and adding a
+/// field there would have broken ~150 exhaustive struct literals across the
+/// workspace, burying a one-line switch under mechanical churn. Backends that
+/// support it take it at construction; those that do not ignore it.
+///
+/// See `GATE-EXACTNESS.md` §2.3 for what the two cost numerically.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MultiControlMode {
+    /// 15-gate Nielsen-Chuang decomposition. **Default** on both GPU
+    /// statevector backends, which run the same sequence, **each validated
+    /// against CPU f64** (1e-6).
+    ///
+    /// This doc used to promise the two GPUs agree *bit-for-bit* in this
+    /// mode. **Measured 2026-08-20 (rev b9e06b9, Darwin 25.5.0 Metal vs
+    /// Linux 6.17 CUDA): they do not** — every superposition circuit in the
+    /// cross-device corpus differs in its last bits, including one with NO
+    /// multi-control gate at all, while `Exact`-vs-`Exact` is bit-identical
+    /// on basis states. So the divergence is not the decomposition's: it is
+    /// the elementary gate kernels' f32 contraction (Metal compiles shaders
+    /// at runtime with fast-math; CUDA fuses with `fmad`), which no shared
+    /// gate sequence can cancel. Both sides' CPU f64 states were bit-identical
+    /// across the two hosts, which pins the attribution. Protocol and full
+    /// tables: `tools/biteq/RESULTS.md`; the verdict is scoped to those
+    /// OS/compiler pairs.
+    ///
+    /// Each of the 15 gates rounds in f32, and `T`/`Tdg` carry an irrational
+    /// `e^{±iπ/4}`, so this is the single largest per-gate approximation in the
+    /// CUDA backend.
+    #[default]
+    Decompose,
+    /// Direct subspace permutation: `CCX` swaps two amplitudes of an octet,
+    /// `CSwap` two others. **Exact** (a permutation computes nothing) and one
+    /// pass instead of fifteen.
+    ///
+    /// Opt-in because it CHANGES THE NUMBERS — it removes 14 gates' worth of
+    /// f32 rounding, so a caller comparing against previously recorded results
+    /// will see a difference.
+    ///
+    /// Honoured by CUDA and Metal. Cross-GPU agreement now depends on the two
+    /// being set to the SAME mode rather than on both being decomposed: mixing
+    /// `Exact` on one device with `Decompose` on the other is a caller error
+    /// that no longer announces itself as a device difference.
+    Exact,
+}
+
+impl MultiControlMode {
+    /// Parse a CLI/API spelling. `None` for anything unrecognised, so callers
+    /// can refuse rather than silently pick a default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "decompose" | "decomposed" => Some(Self::Decompose),
+            "exact" => Some(Self::Exact),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Decompose => "decompose",
+            Self::Exact => "exact",
+        }
+    }
+}
+
 /// Result of circuit execution.
 #[derive(Clone, Debug)]
 pub enum ExecResult {
@@ -70,11 +137,28 @@ impl ExecResult {
     /// this wrong no longer produces a wrong key, but it does produce a key
     /// rendered at the wrong width, which is the same defect one layer out.
     pub fn counts_from_u64(map: HashMap<u64, u32>, width: u32) -> Self {
+        // NOT `width <= MAX_COUNTS_QUBITS`. That asserted on the width LABEL and
+        // conflated "the register is declared wide" with "the outcome carries
+        // wide information" — the exact conflation `creg_to_u64`'s comment
+        // describes and rejects: "the condition is on the bits that are SET, not
+        // on the register's declared size ... what actually loses information is
+        // a set bit at or above index 64."
+        //
+        // A `u64` key has no bits at or above 64 by construction, so widening it
+        // to, say, 70 is well defined: bits 64..70 are zero. That is exactly
+        // right for `creg c[70]; measure q[0] -> c[0];` — a legal circuit whose
+        // outcome is two significant bits sitting in a 70-bit register.
+        //
+        // Information loss at pack time is already caught where it can be seen:
+        // `creg_to_u64` debug-asserts that no bit at or above 64 is SET. These
+        // two checks are complementary, and the width one was both redundant and
+        // wrong — it refused `creg c[70]` outright once the key width started
+        // following the declaration (matching qiskit) rather than the highest
+        // bit written.
         debug_assert!(
-            width <= MAX_COUNTS_QUBITS as u32,
-            "counts_from_u64 at width {width}: a u64 key cannot carry more than \
-             {MAX_COUNTS_QUBITS} bits, so this map has already lost information. \
-             Build `Outcome`s directly instead."
+            map.keys().all(|k| width >= 64 || *k < (1u64 << width)),
+            "counts_from_u64 at width {width}: a key has a bit set at or above \
+             the stated width, so the width is wrong for this map."
         );
         ExecResult::Counts(
             map.into_iter()
@@ -305,11 +389,44 @@ pub fn counts_keyed_on_creg(circuit: &CircuitIR, collapse: bool) -> bool {
 /// measured circuit is keyed on its creg even in skip mode.
 pub fn counts_outcome_width(circuit: &CircuitIR, by_creg: bool) -> usize {
     if by_creg {
-        measure_pairs(circuit)
+        // The DECLARED register width, matching qiskit. This used to be
+        // `max(written cbit) + 1` — the highest bit actually written — which
+        // diverged from every other toolchain on a partially-written creg:
+        //
+        //   creg c[4]; measure q[0]->c[0]; measure q[1]->c[1];
+        //     ours   |11>    (2 chars)
+        //     qiskit  '0011' (4 chars)
+        //
+        // A key width is not cosmetic for an interchange tool: a consumer
+        // diffing our counts against qiskit's saw every key mismatch, and
+        // `LIMITATIONS.md` documented qiskit's rule rather than ours, so the
+        // prose and the code disagreed with the prose being right.
+        //
+        // Why the narrow rule existed, and why it no longer needs to: it was
+        // protection against `u64`-era defects — `creg_to_u64` asserting on the
+        // declared size, and `condition_satisfied` computing `<< i` past 64.
+        // The `Outcome` migration removed that cliff (keys carry as many words
+        // as the register needs; `counts_width_boundary.rs` pins 1024), so the
+        // workaround outlived its constraint.
+        //
+        // `max(.., written + 1)` is belt-and-braces: lowering already rejects a
+        // cbit index beyond its creg, so `num_classical_bits` should dominate,
+        // and if it ever does not, a key must never be NARROWER than the bits
+        // it carries — that would silently drop them.
+        let declared = circuit.num_classical_bits as usize;
+        let written = measure_pairs(circuit)
             .iter()
             .map(|&(_, c)| c as usize + 1)
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        declared.max(written)
+    } else if circuit.circuit_type == crate::circuit::CircuitType::Photonic {
+        // A photonic shot is a Fock pattern, not a bit pattern: the sampler
+        // packs each mode's OCCUPATION into a nibble, so an M-mode outcome is
+        // 4M bits wide. Returning `num_qubits` here would disagree with what
+        // the photonics backend records, and the server's width `debug_assert`
+        // would fire on every photonic run.
+        4 * circuit.num_qubits as usize
     } else {
         circuit.num_qubits as usize
     }
@@ -395,6 +512,45 @@ pub struct Observable {
 }
 
 impl Observable {
+    /// Reject terms naming a qubit the circuit does not have.
+    ///
+    /// **Call this before handing an observable to any backend.** Nothing else
+    /// validates it: `Observable::parse` reads the index as a bare `u32` and
+    /// never sees the circuit it will be measured against, and the backends
+    /// index straight into their state with it. Confirmed consequences of
+    /// skipping it, on a 4-qubit circuit:
+    ///
+    /// * `omega-backend-pauliprop` — `PauliKey::set_z` indexes `words[w + q/64]`
+    ///   and **panics** ("index out of bounds: the len is 2 but the index is
+    ///   2"); `set_x` is worse, silently writing into the Z half and returning
+    ///   a wrong number.
+    /// * `omega-backend-statevector` — `(i >> q) & 1` with `q = 99` **panics**
+    ///   on the shift.
+    ///
+    /// Over HTTP those land inside a request handler with no
+    /// `CatchPanicLayer`, so an unvalidated observable is remotely triggerable
+    /// by a malformed request body.
+    ///
+    /// Refusing is the only sensible answer: padding the register would invent
+    /// qubits the caller never asked for, and dropping the term would silently
+    /// change the observable.
+    pub fn validate_qubits(&self, num_qubits: u32) -> crate::error::Result<()> {
+        for (_, paulis) in &self.terms {
+            for (q, _) in paulis {
+                if *q >= num_qubits {
+                    return Err(crate::error::OmegaError::Unsupported(format!(
+                        "observable acts on qubit {q}, but the circuit has \
+                         {num_qubits} (valid indices are 0..{}). Pauli terms \
+                         must name qubits that exist in the circuit they are \
+                         measured on.",
+                        num_qubits.saturating_sub(1)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Identity observable (scalar 1).
     pub fn identity() -> Self {
         Self {
@@ -748,6 +904,79 @@ pub type GradientObservableFactory<'a> = Box<dyn FnOnce(&[f64]) -> Observable + 
 /// `None` if the backend doesn't support adjoint AD on this
 /// circuit (matches the contract of `adjoint_gradient`).
 pub type ExpectationsAndGradient = (Vec<f64>, Option<Vec<(SymbolId, f64)>>);
+
+impl Observable {
+    /// Delete every term carrying `X` or `Y` on any qubit in `measured`.
+    ///
+    /// # What this is
+    ///
+    /// The **adjoint of the measurement channel**. Measuring qubit `q` in the
+    /// computational basis and discarding the outcome is
+    ///
+    /// ```text
+    ///   M_q(ρ) = |0⟩⟨0|_q ρ |0⟩⟨0|_q + |1⟩⟨1|_q ρ |1⟩⟨1|_q
+    /// ```
+    ///
+    /// which is self-adjoint under the Hilbert–Schmidt pairing, so
+    ///
+    /// ```text
+    ///   Tr[ M_q(ρ) · O ]  =  Tr[ ρ · M_q(O) ]
+    /// ```
+    ///
+    /// and on the Pauli basis `M_q` deletes `X_q` and `Y_q` while fixing `I` and
+    /// `Z_q`. That is exactly what this does.
+    ///
+    /// # Why it exists — deferred measurement is only valid WITH it
+    ///
+    /// The principle of deferred measurement lets a mid-circuit measurement move
+    /// to the end, turning classical control into quantum control. But it is only
+    /// equivalent **if the measurement is still performed**: deferring
+    /// `h q0; measure q0; if(c==1) x q1` gives the pure Bell state, while the
+    /// truth is the mixture ½|00⟩ + ½|11⟩. Those agree on `⟨Z₀Z₁⟩ = +1` and
+    /// disagree on `⟨X₀X₁⟩` — **0** for the mixture, **+1** for Bell.
+    ///
+    /// So a rewrite that defers without dephasing returns a *wrong answer* for
+    /// any observable with X or Y support on a measured qubit. Applying this to
+    /// the observable recovers the mixture's value for **every** observable, not
+    /// merely diagonal ones.
+    ///
+    /// # Verified before it was written
+    ///
+    /// * **Lean**, `proofs/lean4/QuantumProofs/DeferProbe.lean`:
+    ///   `trace_deph_left_eq_right` proves the adjoint identity, and
+    ///   `deph_X`/`deph_Y`/`deph_Z`/`deph_I` the Pauli action — all axiom-clean
+    ///   on `{propext, Classical.choice, Quot.sound}`.
+    /// * **An independent oracle**, `AerSimulator(method="density_matrix")` on
+    ///   `h q0; measure q0; if(c==1) x q1`: `⟨ZZ⟩ = 1.0`, `⟨XX⟩ = 0.0`,
+    ///   `⟨YY⟩ = 0.0`, against the pure-Bell `1.0 / 1.0 / −1.0`.
+    ///
+    /// Note that Qiskit's `Statevector`/`DensityMatrix` **refuse** a measured
+    /// circuit outright ("Cannot apply instruction with classical bits"), so the
+    /// elide-terminal-measures convention in this repository is ours, not
+    /// theirs, and only the density-matrix simulator can anchor this.
+    ///
+    /// # Coefficients are untouched
+    ///
+    /// A deleted term is deleted, not zeroed: `M_q` maps `X_q ↦ 0`, so the term
+    /// contributes nothing and carrying a `0.0`-weighted term would only invite
+    /// a later reader to wonder whether the weight was computed.
+    pub fn dephase(&self, measured: &[u32]) -> Observable {
+        if measured.is_empty() {
+            return self.clone();
+        }
+        Observable {
+            terms: self
+                .terms
+                .iter()
+                .filter(|(_, ops)| {
+                    !ops.iter()
+                        .any(|(q, p)| measured.contains(q) && matches!(p, PauliOp::X | PauliOp::Y))
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

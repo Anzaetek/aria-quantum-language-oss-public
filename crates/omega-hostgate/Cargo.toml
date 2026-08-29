@@ -1,0 +1,26 @@
+[package]
+name = "omega-hostgate"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Host-wide admission: one resource budget shared by every process on a machine."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Deliberately no libc, no nix, no rustix, no fs2: std has file locking since
+# 1.89 and this workspace pins 1.95, /proc covers Linux, and the one macOS probe
+# forks `ps` exactly as `omega-core::hostmem` already forks `sysctl`.
+
+# `admission` wires this crate into omega's Admission seam. OFF by default so the
+# crate stays a leaf: a node agent, a batch tool or a Python worker's helper
+# binary should not pull the core engine in to ask whether it may allocate.
+[features]
+default = []
+admission = ["dep:omega-core"]
+
+[dependencies.omega-core]
+path = "../omega-core"
+optional = true

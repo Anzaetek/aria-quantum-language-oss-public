@@ -37,7 +37,7 @@ use num_complex::Complex64;
 use omega_backend_statevector::gates;
 use omega_core::circuit::{CircuitIR, GateKind, GateOp, ParamExpr, SymbolId};
 use omega_core::error::{OmegaError, Result as OmegaResult};
-use omega_core::executor::{Observable, PauliOp};
+use omega_core::executor::{MultiControlMode, Observable, PauliOp};
 use omega_core::params::ParameterBinding;
 
 use crate::imp::DeviceHandle;
@@ -48,8 +48,9 @@ pub(crate) fn adjoint_gradient(
     circuit: &CircuitIR,
     params: &ParameterBinding,
     observable: &Observable,
+    multi_control: MultiControlMode,
 ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
-    adjoint_gradient_inner(handle, circuit, params, observable, None)
+    adjoint_gradient_inner(handle, circuit, params, observable, None, multi_control)
 }
 
 /// Variant of [`adjoint_gradient`] that takes a caller-provided
@@ -64,7 +65,17 @@ pub(crate) fn adjoint_gradient_with_forward_state(
     observable: &Observable,
     pre_forward_state: CudaState,
 ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
-    adjoint_gradient_inner(handle, circuit, params, observable, Some(pre_forward_state))
+    // Inherit the forward pass's realisation mode — see the note at the
+    // `phi_state` construction below.
+    let multi_control = pre_forward_state.multi_control;
+    adjoint_gradient_inner(
+        handle,
+        circuit,
+        params,
+        observable,
+        Some(pre_forward_state),
+        multi_control,
+    )
 }
 
 fn adjoint_gradient_inner(
@@ -73,6 +84,7 @@ fn adjoint_gradient_inner(
     params: &ParameterBinding,
     observable: &Observable,
     pre_forward_state: Option<CudaState>,
+    multi_control: MultiControlMode,
 ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
     if circuit.ops.iter().any(|op| !is_unitary(&op.gate)) {
         return Ok(None);
@@ -102,7 +114,13 @@ fn adjoint_gradient_inner(
             let phi_inner = handle
                 .allocate(n)
                 .map_err(|e| OmegaError::Backend(format!("cuda alloc phi: {e}")))?;
-            let mut phi_state = CudaState { inner: phi_inner };
+            // Mode is a property of how gates are realised, so the adjoint must
+            // use the SAME one the forward pass did — defaulting here would
+            // make the gradient disagree with the value under Exact.
+            let mut phi_state = CudaState {
+                inner: phi_inner,
+                multi_control,
+            };
             // `unitary_ops` excludes Reset by construction (the adjoint path
             // refuses non-unitary circuits upstream), so no trajectory RNG.
             crate::apply_ops_fused(
@@ -120,7 +138,10 @@ fn adjoint_gradient_inner(
     let nu_inner = handle
         .allocate(n)
         .map_err(|e| OmegaError::Backend(format!("cuda alloc nu: {e}")))?;
-    let mut nu_state = CudaState { inner: nu_inner };
+    let mut nu_state = CudaState {
+        inner: nu_inner,
+        multi_control,
+    };
     if let Some(diag_terms) = diagonal_pauli_terms(observable) {
         phi_state
             .apply_diagonal_pauli_sum(&mut nu_state, &diag_terms)
@@ -140,7 +161,10 @@ fn adjoint_gradient_inner(
     let temp_inner = handle
         .allocate(n)
         .map_err(|e| OmegaError::Backend(format!("cuda alloc temp: {e}")))?;
-    let mut temp_state = CudaState { inner: temp_inner };
+    let mut temp_state = CudaState {
+        inner: temp_inner,
+        multi_control,
+    };
 
     // Per-(op, sym) inner_product launches stream-async via
     // `inner_product_deferred` — partials memcpy_dtoh queues but the

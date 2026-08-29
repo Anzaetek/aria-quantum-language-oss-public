@@ -33,14 +33,42 @@ fn bin() -> PathBuf {
     p.join("omega-run")
 }
 
+/// The shared QASM fixture, written **exactly once per process** to a
+/// **process-unique** path.
+///
+/// Both of those matter, and neither was true before — this test was flaky at
+/// roughly 1 run in 6:
+///
+/// ```text
+///   a_well_formed_command_line_still_succeeds ... FAILED
+///   Parse error: unknown circuit format: expected OPENQASM or OPTICQASM header
+/// ```
+///
+/// The old version rewrote `temp_dir()/omega_flag_refusal_fixture.qasm` on
+/// every call. All three tests call it, cargo runs them on separate threads,
+/// and `fs::write` truncates before it writes — so one test could hand
+/// `omega-run` a file another test had just emptied. The parse error was the
+/// symptom; the fixture was momentarily zero bytes.
+///
+/// A fixed name in a shared temp dir is also racy ACROSS processes: two
+/// concurrent `cargo test` runs (different target dirs, a second checkout, CI
+/// beside a local run) collide on the same path. The pid in the name removes
+/// that, and `OnceLock` removes the in-process race by making the write happen
+/// once rather than per call.
 fn circuit() -> PathBuf {
-    let p = std::env::temp_dir().join("omega_flag_refusal_fixture.qasm");
-    std::fs::write(
-        &p,
-        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\ncreg c[2];\nh q[0];\ncx q[0], q[1];\n",
-    )
-    .expect("write fixture");
-    p
+    static FIXTURE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let p = std::env::temp_dir()
+                .join(format!("omega_flag_refusal_fixture_{}.qasm", std::process::id()));
+            std::fs::write(
+                &p,
+                "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\ncreg c[2];\nh q[0];\ncx q[0], q[1];\n",
+            )
+            .expect("write fixture");
+            p
+        })
+        .clone()
 }
 
 fn run(extra: &[&str]) -> Output {

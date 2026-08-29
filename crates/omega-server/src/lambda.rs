@@ -244,7 +244,17 @@ pub async fn invoke_lambda(
     // Stage HostState. Pre-register (circuit_id=1, observable_id=1) IFF the
     // caller supplied a QASM / observable; otherwise leave the host empty
     // and let the guest call `omega_register_qasm` / `omega_qaoa_from_qubo`.
-    let mut host = HostState::new();
+    // Inject admission control. This is the ONLY place a governor reaches the
+    // WASM route: the guest's own `omega_register_qasm` /
+    // `omega_qaoa_from_qubo` calls now price through the same ledger the HTTP
+    // routes use, so two large jobs arriving through different doors can no
+    // longer each pass capacity individually and collectively oversubscribe.
+    //
+    // The circuit PRE-registered below deliberately does not go through it: the
+    // governor already priced that one on this request's HTTP path, and charging
+    // it twice would refuse work that was legitimately admitted.
+    let mut host =
+        HostState::new().with_admission(std::sync::Arc::new(crate::worker::GovernorHandle));
     if let Some(src) = qasm_src {
         let circuit = match lower_to_ir(src) {
             Ok(c) => c,

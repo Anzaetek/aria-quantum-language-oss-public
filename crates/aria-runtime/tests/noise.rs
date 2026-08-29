@@ -123,3 +123,82 @@ fn per_qubit_and_asymmetric_parse_round_trips() {
     assert!(parse_noise_model(r#"{"readout_flip":0.02,"readout":0.02}"#).is_err());
     assert!(parse_noise_model(r#"{"reado":0.02}"#).is_err());
 }
+
+/// **A per-pair two-qubit rate must actually reach the sampled distribution.**
+///
+/// The per-pair table (`{"2q": {"0,1": …, "1,2": …, "default": …}}`) was
+/// unit-tested at the level of *rate selection* — `at_gate` returns the right
+/// number for the right pair — and nowhere else. That leaves the interesting
+/// half unproven: whether the selected rate is the one the backend then
+/// applies. A table that parses correctly and is then ignored, or one whose
+/// value is read for the wrong pair, passes every rate-selection test and
+/// changes no answer.
+///
+/// So: two CX gates on disjoint pairs in one circuit, one pair given a heavy
+/// depolarizing rate and the other essentially none. If per-pair selection
+/// reaches the sampler, the two qubits' marginals must come apart. If the
+/// implementation collapsed to a single rate — either one — they could not.
+#[test]
+fn a_per_pair_two_qubit_rate_moves_the_distribution_it_names() {
+    const SRC: &str = r#"
+circuit Pairs() {
+  qreg q[4]
+  creg c[4]
+  apply X on q[0]
+  apply X on q[2]
+  apply CX on q[0], q[1]
+  apply CX on q[2], q[3]
+  measure q[0] -> c[0]
+  measure q[1] -> c[1]
+  measure q[2] -> c[2]
+  measure q[3] -> c[3]
+}
+"#;
+    let circuit = parse_aria(SRC)
+        .expect("parse")
+        .instantiate("Pairs", &[])
+        .expect("instantiate");
+    let binds = HashMap::new();
+    // Pair (0,1) is hammered; pair (2,3) is left almost clean. `default` is
+    // low so an implementation that fell back to it for BOTH pairs would give
+    // two clean marginals and fail.
+    let model = parse_noise_model(r#"{"depolarizing":{"2q":{"0,1":0.5,"2,3":0.0,"default":0.0}}}"#)
+        .expect("per-pair model must parse");
+
+    const SHOTS: u32 = 20000;
+    for sel in [BackendSel::Sim, BackendSel::Mps { chi: 64 }] {
+        let res = run_counts_noisy(&circuit, &binds, SHOTS, Some(7), sel, &model).unwrap();
+        let counts = match &res {
+            ExecResult::Counts(c) => c,
+            other => panic!("expected counts, got {other:?}"),
+        };
+        // Marginal P(bit = 1) for each measured qubit.
+        let marginal = |bit: usize| -> f64 {
+            counts
+                .iter()
+                .filter(|(o, _)| o.bit(bit as u32) == 1)
+                .map(|(_, n)| *n as u64)
+                .sum::<u64>() as f64
+                / SHOTS as f64
+        };
+        // Noiseless truth: q0=1, q1=1 (CX from |1>), q2=1, q3=1.
+        let noisy_pair = marginal(1); // target of the hammered CX
+        let clean_pair = marginal(3); // target of the clean CX
+
+        assert!(
+            clean_pair > 0.98,
+            "{sel:?}: pair (2,3) has rate 0 and must stay ~1.0, got {clean_pair} \
+             — a rate is leaking onto a pair that was not given one"
+        );
+        assert!(
+            noisy_pair < 0.9,
+            "{sel:?}: pair (0,1) has rate 0.5 and must be visibly depolarized, \
+             got {noisy_pair} — the per-pair rate is parsed but never applied"
+        );
+        assert!(
+            clean_pair - noisy_pair > 0.05,
+            "{sel:?}: the two pairs must come apart (clean {clean_pair}, noisy \
+             {noisy_pair}); if they agree, per-pair selection collapsed to one rate"
+        );
+    }
+}

@@ -194,6 +194,12 @@ $ cargo run --release -p aria-cli --features metal -- run examples/aria/bell.ari
 
 ### 9a. CUDA GPU backends agree with CPU (NVIDIA; opt-in `ARIA_CUDA=1`)
 
+> **`omega-server` is in this list as of 2026-08-17 and was not before.** The
+> daemon had no CUDA dependency, so a job submitted over HTTP could not reach
+> the GPU however the box was built — and `cargo test --workspace` still cannot
+> catch a regression in it, because that builds `omega-server` with **default**
+> features. Only the `--features cuda` line below compiles that code.
+
 On a CUDA host (Linux/Windows + an NVIDIA GPU), three GPU paths are numerically
 gated against the CPU. All are optional and fall back to the CPU when the feature
 is off or no device is present, so `./ci.sh` stays green without a GPU; set
@@ -206,6 +212,8 @@ $ cargo test -p omega-backend-pauliprop-cuda --features cuda
 $ cargo test -p aria-runtime --features cuda --test run_examples gpu_cuda_agrees_with_sim_on_qft
 $ cargo test -p aria-runtime --features cuda --test run_examples gpu_mps_cuda_agrees_with_sim
 $ cargo test -p aria-runtime --features cuda --test run_examples rbs
+$ cargo test  -p omega-server --features cuda      # the HTTP daemon's CUDA path
+$ cargo clippy -p omega-server --features cuda --all-targets -- -D warnings
 ```
 
 Checks (each test prints `... ok`):

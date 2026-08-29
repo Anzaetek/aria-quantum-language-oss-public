@@ -69,9 +69,12 @@ use omega_core::circuit::CircuitIR;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 use omega_core::circuit::GateKind;
 use omega_core::circuit::SymbolId;
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+use omega_core::defer_measure::{prepare_for_expectation, prepare_for_expectation_multi};
 use omega_core::error::{OmegaError, Result as OmegaResult};
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 use omega_core::executor::MidCircuitMode;
+use omega_core::executor::MultiControlMode;
 use omega_core::executor::{
     Backend, ExecConfig, ExecResult, ExpectationsAndGradient, GradientObservableFactory, Observable,
 };
@@ -154,20 +157,127 @@ pub struct CudaStatevectorBackend {
     /// are graph-compatible (Z-only obs, supported gate set).
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     train_step_graph_cache: std::sync::Mutex<Option<(u64, backward_graph::TrainStepGraph)>>,
+    /// How CCX/CSwap are realised. See [`MultiControlMode`]; default
+    /// `Decompose`, so behaviour is unchanged unless a caller asks.
+    multi_control: MultiControlMode,
     #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")))]
     _private: (),
 }
+
+// `CudaStatevectorBackend` must be `Send + Sync` for `aria-py` to release the
+// GIL around a simulation: `Python::allow_threads` needs a `Send` closure, which
+// needs the captured `&dyn Backend` to be `Sync`. See
+// `crates/omega-cli/tests/backends_are_send_sync.rs`, which measures this for
+// every backend and names CUDA as the one it cannot check on a non-CUDA host.
+//
+// WRITTEN BLIND — this machine cannot compile the `cuda` feature, so the note in
+// `CUDA_TODO.md` ("Send + Sync audit") is the gate on it, not this comment.
+//
+// # If this does not compile with E0119 "conflicting implementations"
+//
+// DELETE both impls. That error means cudarc's `CudaContext`/`CudaStream`
+// already derive `Send + Sync`, the whole struct qualifies automatically, and
+// nothing here is needed. Auto-traits cannot be hand-implemented for a type that
+// already has them.
+//
+// # Safety
+//
+// Field by field, and the reasoning is about MEMORY safety only:
+//
+// * `ctx: Arc<CudaContext>` — a CUDA context is thread-safe in the driver API;
+//   the primary context is explicitly usable from multiple host threads.
+// * `stream: Arc<CudaStream>` — stream handles are thread-safe to enqueue on;
+//   the driver serialises submissions. See the CONCURRENCY CAVEAT below, which
+//   is a performance property and not a soundness one.
+// * `kernels: KernelLibrary` — loaded modules and function handles, immutable
+//   after load, so shared reads are fine.
+// * `train_step_graph_cache: Mutex<Option<..>>` — already behind a lock, so the
+//   only interior mutability in the struct is synchronised. `Mutex<T>: Sync`
+//   whenever `T: Send`, which is the part the CUDA host had to confirm for
+//   `TrainStepGraph`.
+//
+// # VERIFIED ON A CUDA HOST 2026-08-17 (DGX Spark GB10, CUDA 13.0.88)
+//
+// This block was written BLIND on a machine that could not compile CUDA. It
+// has now been compiled and checked, and the results change what a reader
+// should conclude:
+//
+// 1. **The impls are load-bearing, not redundant.** The handoff predicted they
+//    might fail with E0119 if `cudarc`'s types already derived `Send + Sync`,
+//    in which case they should be deleted. They do NOT: the crate builds
+//    cleanly with them, and removing them fails to compile. Do not delete.
+//
+// 2. **Exactly one field blocks the auto-impl, and it is the one predicted.**
+//    Removing the impls and asserting `Send`/`Sync` directly makes rustc name
+//    it precisely: `*mut CUgraph_st` and `*mut CUgraphExec_st`, raw handles
+//    inside `CudaGraph` → `TrainStepGraph` → the cache. `Arc<CudaContext>`,
+//    `Arc<CudaStream>` and `KernelLibrary` all qualify on their own, so the
+//    reasoning above about them is correct but was never what mattered.
+//
+// 3. **The soundness argument reduces to the Mutex, and the Mutex holds.**
+//    CUDA graph handles are scoped to a CONTEXT, not a thread, so moving them
+//    between threads is fine. The operation the driver does not permit is
+//    launching one `CUgraphExec` concurrently with itself. Every use of the
+//    cache — the `capture` at :1381 AND the `replay_with_y_labels` at :1405 —
+//    happens while the guard from :1373 is still alive, so concurrent replay of
+//    the same graph cannot occur.
+//
+//    That is the whole assertion. If a future change replays a cached graph
+//    outside the guard (e.g. by cloning the handle out, or dropping the guard
+//    early to "reduce contention"), this `unsafe impl` becomes UNSOUND and the
+//    compiler will not say a word. That is the invariant to protect.
+//
+// # CONCURRENCY CAVEAT — read before assuming this buys parallelism
+//
+// All calls share ONE stream. Two host threads running circuits concurrently
+// therefore serialise on the GPU even though the GIL is released: each launch
+// operates on its own `StateBuffer` so results stay correct, but the work does
+// not overlap. Releasing the GIL is necessary for the CPU backends and very
+// likely NOT sufficient for this one. A per-call or per-thread stream would be
+// the actual fix, and it is a separate piece of work.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+unsafe impl Send for CudaStatevectorBackend {}
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+unsafe impl Sync for CudaStatevectorBackend {}
 
 /// Per-circuit statevector held in a `CudaSlice<f32>`. Created by
 /// [`CudaStatevectorBackend::allocate`].
 pub struct CudaState {
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub(crate) inner: imp::StateBuffer,
+    /// Copied from the backend at `allocate`, so `apply_op` can honour it
+    /// without threading `ExecConfig` through every call.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    pub(crate) multi_control: MultiControlMode,
     #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")))]
     _private: (),
 }
 
 impl CudaStatevectorBackend {
+    /// Choose how `CCX`/`CSwap` are realised.
+    ///
+    /// Default is [`MultiControlMode::Decompose`] — unchanged behaviour, and
+    /// bit-for-bit agreement with Metal. [`MultiControlMode::Exact`] applies the
+    /// permutation directly: faster and exact, but it CHANGES THE NUMBERS
+    /// (14 gates' worth of f32 rounding disappear), which is why it is opt-in.
+    pub fn with_multi_control(mut self, mode: MultiControlMode) -> Self {
+        self.multi_control = mode;
+        self
+    }
+
+    /// Per-kernel `(name, registers, local bytes, shared bytes)`, straight from
+    /// the driver.
+    ///
+    /// Exists because a performance claim in `kernels/apply_quad_perm.cu` was
+    /// once written as a register-pressure diagnosis without anyone measuring
+    /// registers. `-Xptxas -v` is unreachable through NVRTC (it emits PTX;
+    /// ptxas runs at module load), but `cuFuncGetAttribute` answers directly.
+    /// Consumed by `tests/kernel_resource_report.rs`.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    pub fn kernel_resource_report(&self) -> Result<Vec<(String, i32, i32, i32)>, CudaError> {
+        self.handle.kernel_resource_report()
+    }
+
     /// Open device 0 + the default stream and NVRTC-compile the
     /// kernel library. On a build that doesn't include the CUDA
     /// runtime, returns `Err(CudaError::Unavailable)` rather than
@@ -177,6 +287,7 @@ impl CudaStatevectorBackend {
         {
             let handle = imp::DeviceHandle::new()?;
             Ok(Self {
+                multi_control: MultiControlMode::default(),
                 handle,
                 train_step_graph_cache: std::sync::Mutex::new(None),
             })
@@ -196,7 +307,10 @@ impl CudaStatevectorBackend {
         #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
         {
             let inner = self.handle.allocate(num_qubits)?;
-            Ok(CudaState { inner })
+            Ok(CudaState {
+                inner,
+                multi_control: self.multi_control,
+            })
         }
         #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")))]
         {
@@ -241,7 +355,10 @@ impl CudaStatevectorBackend {
             .handle
             .allocate(n)
             .map_err(|e| OmegaError::Backend(format!("cuda alloc psi: {e}")))?;
-        let mut psi = CudaState { inner };
+        let mut psi = CudaState {
+            inner,
+            multi_control: self.multi_control,
+        };
         apply_ops_fused(
             &mut psi,
             &circuit.ops,
@@ -286,6 +403,104 @@ impl CudaStatevectorBackend {
     /// indexing assumes 32-bit masks (popcount on u32) so 28 is the
     /// hard ceiling regardless of host VRAM.
     pub const MAX_QUBITS: u32 = 28;
+}
+
+/// Below this `min(qa, qb)`, the specialised quad kernels are a PESSIMISATION
+/// and the dense `apply_2q` path is dispatched instead.
+///
+/// MEASURED, and it was nearly shipped as a regression. The byte saving is not
+/// a property of the gate; it is a property of the low qubit index, because
+/// DRAM/L2 granularity is a 32 B sector = 4 f32 amplitudes. When
+/// `min(qa, qb) < 2` the touched slots are strided *within* every sector, so
+/// the same bytes are fetched as the dense path but through more, worse-shaped
+/// transactions. At 26 qubits, `qa ∈ {0,1}`:
+///
+/// ```text
+/// dense apply_2q      114.15 ms
+/// CX specialised      148.99 ms   <- 1.31x SLOWER
+/// CZ specialised      121.80 ms   <- slower
+/// ```
+///
+/// against 67.40 ms / 39.56 ms for the same kernels at `qa >= 2`. This matters
+/// because it is not an exotic corner: a CX ladder, a GHZ chain and a QFT all
+/// start at `(0, 1)`.
+///
+/// APPLIES TO TWO-SLOT GATES ONLY (CX, SWAP, CRz). A one-slot gate (CZ, CP)
+/// wins at every index and must NOT be gated — measured like-for-like at
+/// `qa ∈ {0,1}`:
+///
+/// ```text
+/// CX   dense 136.74 ms   specialised 148.99 ms   -> dense wins, gate it
+/// CZ   dense 136.35 ms   specialised 121.80 ms   -> specialised wins 1.12x
+/// ```
+///
+/// The asymmetry is the sector arithmetic: at `min < 2` a two-slot gate touches
+/// 2 of every 4 amplitudes — same sectors as dense, but strided within them, so
+/// it fetches the same bytes through worse transactions. A one-slot gate
+/// touches 1 in 4, which still halves the writes and stays ahead.
+///
+/// This nearly went in as a blanket threshold, which would have made CZ 12%
+/// SLOWER at low indices while fixing CX. The trap was comparing the low-index
+/// arm against a dense reference that swept a SPREAD of qubit pairs — the dense
+/// kernel is itself ~19% slower at low indices (136 ms vs 115 ms), so the
+/// like-for-like comparison is the only valid one.
+///
+/// The cfg must MATCH THE USE SITES EXACTLY (all four of them, at the `qc.min(qt)`
+/// and `qa.min(qb)` guards below). They are gated on the full three-part
+/// predicate, not on `feature = "cuda"` alone, because this crate promises that
+/// `cargo build --workspace --features cuda` still compiles on macOS — see
+/// Cargo.toml. Gating this const on the feature alone would leave it dead in
+/// exactly that configuration, which is the one no CI here can check.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+const QUAD_KERNEL_MIN_QUBIT_2SLOT: u32 = 2;
+
+/// The dense matrices the specialised kernels replace, kept for the low-index
+/// fallback above — and, being the previous implementation verbatim, they are
+/// what `tests/quad_perm_bit_identity.rs` compares against.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+mod dense_2q {
+    use num_complex::Complex64;
+    const Z: Complex64 = Complex64::new(0.0, 0.0);
+    const O: Complex64 = Complex64::new(1.0, 0.0);
+
+    #[rustfmt::skip]
+    pub const CX: [Complex64; 16] = [
+        O, Z, Z, Z,
+        Z, Z, Z, O,
+        Z, Z, O, Z,
+        Z, O, Z, Z,
+    ];
+    const PI: Complex64 = Complex64::new(0.0, 1.0);
+    const MI: Complex64 = Complex64::new(0.0, -1.0);
+    #[rustfmt::skip]
+    pub const CY: [Complex64; 16] = [
+        O, Z,  Z, Z,
+        Z, Z,  Z, MI,
+        Z, Z,  O, Z,
+        Z, PI, Z, Z,
+    ];
+    #[rustfmt::skip]
+    pub const SWAP: [Complex64; 16] = [
+        O, Z, Z, Z,
+        Z, Z, O, Z,
+        Z, O, Z, Z,
+        Z, Z, Z, O,
+    ];
+    // No CZ here on purpose: it is a one-slot diagonal, wins at every qubit
+    // index, and therefore never falls back — so a dense copy would be dead
+    // code. The test keeps its own copy to compare against.
+    pub fn crz(theta: f64) -> [Complex64; 16] {
+        let phn = Complex64::from_polar(1.0, -theta / 2.0);
+        let php = Complex64::from_polar(1.0, theta / 2.0);
+        #[rustfmt::skip]
+        let m = [
+            O, Z,   Z, Z,
+            Z, phn, Z, Z,
+            Z, Z,   O, Z,
+            Z, Z,   Z, php,
+        ];
+        m
+    }
 }
 
 impl CudaState {
@@ -524,63 +739,84 @@ impl CudaState {
         self.inner.apply_2q(qa, qb, u)
     }
 
+    /// CX as the permutation it is.
+    ///
+    /// The dense form below is what this used to dispatch, and it is kept in
+    /// the comment because it is the derivation:
+    ///
+    /// ```text
+    ///     o, z, z, z,     row 0 -> v[0]
+    ///     z, z, z, o,     row 1 -> v[3]
+    ///     z, z, o, z,     row 2 -> v[2]
+    ///     z, o, z, z,     row 3 -> v[1]
+    /// ```
+    ///
+    /// Rows 0 and 2 are identity; rows 1 and 3 exchange slots 1 and 3 — the
+    /// half of each quad where the control is 1, which is exactly what "flip
+    /// the target when the control is set" means. So the whole 4x4 matvec (16
+    /// complex multiplies, 12 complex adds, 4 loads, 4 stores per quad) was
+    /// computing a two-element swap.
+    ///
+    /// `apply_quad_swap` does the swap directly: 2 loads, 2 stores, no
+    /// arithmetic. Bit-identical — see `kernels/apply_quad_perm.cu` for the
+    /// signed-zero caveat, which is the only observable difference and goes
+    /// the harmless way.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_cx(&mut self, qc: u32, qt: u32) -> Result<(), CudaError> {
-        let z = Complex64::new(0.0, 0.0);
-        let o = Complex64::new(1.0, 0.0);
-        #[rustfmt::skip]
-        let u = [
-            o, z, z, z,
-            z, z, z, o,
-            z, z, o, z,
-            z, o, z, z,
-        ];
-        self.apply_2q(qc, qt, &u)
+        if qc.min(qt) < QUAD_KERNEL_MIN_QUBIT_2SLOT {
+            return self.apply_2q(qc, qt, &dense_2q::CX);
+        }
+        self.inner.apply_quad_swap(qc, qt, 1, 3)
     }
 
+    /// CY is a permutation WITH phases — the same slot exchange as CX, with
+    /// each arriving amplitude multiplied by ∓i:
+    ///
+    /// ```text
+    ///     out[1] = -i * in[3]        out[3] = +i * in[1]
+    /// ```
+    ///
+    /// **The phase attaches to the destination**, which is worth stating
+    /// because CY is Hermitian and an involution: swapping the two phases still
+    /// satisfies `CY·CY = I` and would only surface against an independent
+    /// implementation. The assignment above is read off the dense matrix this
+    /// replaces (`u[1][3] = -i`, `u[3][1] = +i`).
+    ///
+    /// Exact: every product in `cmul` is `x·0` or `x·(±1)`, so unlike CRz there
+    /// is nothing for FMA contraction to round differently.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_cy(&mut self, qc: u32, qt: u32) -> Result<(), CudaError> {
-        let z = Complex64::new(0.0, 0.0);
-        let o = Complex64::new(1.0, 0.0);
+        if qc.min(qt) < QUAD_KERNEL_MIN_QUBIT_2SLOT {
+            return self.apply_2q(qc, qt, &dense_2q::CY);
+        }
         let pi = Complex64::new(0.0, 1.0);
         let mi = Complex64::new(0.0, -1.0);
-        #[rustfmt::skip]
-        let u = [
-            o, z, z, z,
-            z, z, z, mi,
-            z, z, o, z,
-            z, pi, z, z,
-        ];
-        self.apply_2q(qc, qt, &u)
+        self.inner.apply_quad_swap_phase(qc, qt, 1, mi, 3, pi)
     }
 
+    /// CZ as the diagonal it is — `diag(1, 1, 1, -1)`, so only slot 3 moves.
+    ///
+    /// Note this is NOT caught by `diagonal_factor`'s fusion chain, which
+    /// carries a **1-qubit** factor `(qubit, d0, d1)` only; a 2q diagonal has
+    /// no representation there. Until it does, a CZ ladder is one launch per
+    /// gate either way — but each launch now moves a quarter of the bytes.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_cz(&mut self, qa: u32, qb: u32) -> Result<(), CudaError> {
-        let z = Complex64::new(0.0, 0.0);
-        let o = Complex64::new(1.0, 0.0);
-        let m = Complex64::new(-1.0, 0.0);
-        #[rustfmt::skip]
-        let u = [
-            o, z, z, z,
-            z, o, z, z,
-            z, z, o, z,
-            z, z, z, m,
-        ];
-        self.apply_2q(qa, qb, &u)
+        // NOT index-gated — see `QUAD_KERNEL_MIN_QUBIT_2SLOT`: a one-slot
+        // diagonal beats the dense path at every index, including (0, 1).
+        self.inner
+            .apply_quad_phase(qa, qb, &[(3, Complex64::new(-1.0, 0.0))])
     }
 
+    /// SWAP exchanges slots 1 and 2 — the two amplitudes where the qubits
+    /// disagree. Slots 0 (`|00>`) and 3 (`|11>`) are fixed points, so the
+    /// dense path was loading and storing them to no effect.
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_swap(&mut self, qa: u32, qb: u32) -> Result<(), CudaError> {
-        let z = Complex64::new(0.0, 0.0);
-        let o = Complex64::new(1.0, 0.0);
-        #[rustfmt::skip]
-        let u = [
-            o, z, z, z,
-            z, z, o, z,
-            z, o, z, z,
-            z, z, z, o,
-        ];
-        self.apply_2q(qa, qb, &u)
+        if qa.min(qb) < QUAD_KERNEL_MIN_QUBIT_2SLOT {
+            return self.apply_2q(qa, qb, &dense_2q::SWAP);
+        }
+        self.inner.apply_quad_swap(qa, qb, 1, 2)
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
@@ -693,23 +929,40 @@ impl CudaState {
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    /// **APPROXIMATE — see `GATE-EXACTNESS.md` §2.1.** Unlike CX/SWAP/CZ/CY
+    /// this is NOT bit-identical to the dense path: FMA contraction moves
+    /// between the two, bounded by `4·f32::EPSILON·|amplitude|`.
+    ///
+    /// CRz is `diag(1, e^{-iθ/2}, 1, e^{+iθ/2})` — slots 0 and 2 are identity,
+    /// so the dense path was loading and storing half the state to multiply it
+    /// by one. Two slots move; two do not.
+    ///
+    /// Worth stating because it is the reason this is a diagonal at all: the
+    /// phases sit at slots 1 and 3, i.e. wherever `qc` is 1, which is what
+    /// "controlled" means here — `apply_2q`'s row index is
+    /// `bit_qb*2 + bit_qa` with `qa = qc`.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_crz(&mut self, qc: u32, qt: u32, theta: f64) -> Result<(), CudaError> {
-        let z = Complex64::new(0.0, 0.0);
-        let o = Complex64::new(1.0, 0.0);
+        if qc.min(qt) < QUAD_KERNEL_MIN_QUBIT_2SLOT {
+            return self.apply_2q(qc, qt, &dense_2q::crz(theta));
+        }
         let phn = Complex64::from_polar(1.0, -theta / 2.0);
         let php = Complex64::from_polar(1.0, theta / 2.0);
-        #[rustfmt::skip]
-        let u = [
-            o,   z,   z,   z,
-            z,   phn, z,   z,
-            z,   z,   o,   z,
-            z,   z,   z,   php,
-        ];
-        self.apply_2q(qc, qt, &u)
+        self.inner.apply_quad_phase(qc, qt, &[(1, phn), (3, php)])
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_ccx(&mut self, qc1: u32, qc2: u32, qt: u32) -> Result<(), CudaError> {
+        if self.multi_control == MultiControlMode::Exact {
+            // Both controls set, target flips: slot 3 <-> 7 under
+            // slot = bit_q0 + 2*bit_q1 + 4*bit_q2. One pass, exact.
+            return self.inner.apply_octet_swap(qc1, qc2, qt, 3, 7);
+        }
+        // APPROXIMATE — see `GATE-EXACTNESS.md` §2.3. CCX is a permutation but
+        // is applied as 15 gates, each rounding in f32, and T/Tdg carry an
+        // irrational e^{±iπ/4}. A dedicated subspace kernel would be both
+        // faster and exact; the CPU already has one.
+        //
         // Same Nielsen-Chuang decomposition Metal uses; identical
         // sequence so f32 round-off is bit-equivalent.
         self.apply_h(qt)?;
@@ -732,6 +985,12 @@ impl CudaState {
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
     pub fn apply_cswap(&mut self, qc: u32, qt1: u32, qt2: u32) -> Result<(), CudaError> {
+        if self.multi_control == MultiControlMode::Exact {
+            // Control set and the targets differ: slot 3 <-> 5. Note this does
+            // NOT go through apply_ccx, so it is one pass rather than the
+            // CX.CCX.CX chain.
+            return self.inner.apply_octet_swap(qc, qt1, qt2, 3, 5);
+        }
         self.apply_cx(qt2, qt1)?;
         self.apply_ccx(qc, qt1, qt2)?;
         self.apply_cx(qt2, qt1)?;
@@ -913,6 +1172,12 @@ impl Backend for CudaStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<f64> {
+        // The device sweep skips `Measure`, which is the wrong answer for a
+        // measurement that has consequences. Defer first, so what reaches the GPU
+        // is a circuit with no measurements at all.
+        let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+        let circuit = &deferred;
+        let observable = &observable;
         let n = circuit.num_qubits;
         let mut psi = self.allocate(n)?;
         // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
@@ -955,6 +1220,10 @@ impl Backend for CudaStatevectorBackend {
         if observables.is_empty() {
             return Ok(Vec::new());
         }
+        // See `expectation`: prepare before anything reaches the device.
+        let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+        let circuit = &deferred;
+        let observables = &dephased[..];
 
         let n = circuit.num_qubits;
         let mut psi = self.allocate(n)?;
@@ -987,6 +1256,14 @@ impl Backend for CudaStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        // A gradient must obey the same contract as the expectation it
+        // differentiates, or `expectation_multi_then_gradient` pairs a
+        // mixture-valued prediction with a pure-state gradient in ONE call: the
+        // adjoint sweep skips `Measure`, so a conditioned gate never fires. The
+        // dephased observable is parameter-independent, so this costs nothing.
+        let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+        let circuit = &deferred;
+        let observable = &observable;
         // Circuits with Reset are non-unitary — no adjoint. Decline (Ok(None))
         // so the runtime falls back to parameter-shift, which runs the
         // (now reset-capable) forward `expectation`. Mirrors the CPU backend.
@@ -997,7 +1274,13 @@ impl Backend for CudaStatevectorBackend {
         {
             return Ok(None);
         }
-        adjoint::adjoint_gradient(&self.handle, circuit, params, observable)
+        adjoint::adjoint_gradient(
+            &self.handle,
+            circuit,
+            params,
+            observable,
+            self.multi_control,
+        )
     }
 
     #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")))]
@@ -1018,6 +1301,13 @@ impl Backend for CudaStatevectorBackend {
         observables: &[Observable],
         gradient_observable_factory: GradientObservableFactory<'_>,
     ) -> OmegaResult<ExpectationsAndGradient> {
+        // Prepared FIRST, before the fallbacks below are considered. Deferral
+        // removes every `Measure`, so a feedforward circuit takes the fast fused
+        // path and — the point — the gradient returned belongs to the same
+        // circuit the prediction came from.
+        let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+        let circuit = &deferred;
+        let observables = &dephased[..];
         if circuit
             .ops
             .iter()
@@ -1180,7 +1470,10 @@ impl Backend for CudaStatevectorBackend {
             .handle
             .allocate(n)
             .map_err(|e| OmegaError::Backend(format!("cuda alloc psi: {e}")))?;
-        let mut psi = CudaState { inner };
+        let mut psi = CudaState {
+            inner,
+            multi_control: self.multi_control,
+        };
         apply_ops_fused(
             &mut psi,
             &circuit.ops,
@@ -1389,34 +1682,50 @@ where
             let outcome_one = match reset_rng.as_deref_mut() {
                 Some(rng) => rng.random::<f64>() >= p0,
                 None => {
-                    // Analytic run: only a determined outcome is representable.
+                    // Analytic run: only a determined RESULT is representable.
                     //
-                    // KNOWN DIVERGENCE (recorded 2026-08-05, NOT device-verified
-                    // — this arm cannot be compiled or run on the Mac dev box).
-                    // This refuses whenever the OUTCOME is random; the CPU
-                    // backend (`sim::reset_is_deterministic`) refuses whenever
-                    // the qubit is ENTANGLED, and Metal now matches the CPU.
-                    // They differ on an unentangled superposition:
+                    // Resolved 2026-08-17 on a GB10. This used to refuse
+                    // whenever the OUTCOME was random, while the CPU
+                    // (`sim::reset_is_deterministic*`) and Metal refuse whenever
+                    // the qubit is ENTANGLED. They differ on an unentangled
+                    // superposition:
                     //
                     //   |+> unentangled : purity 1, p0 = 0.5
                     //     CPU/Metal  -> ALLOW (both branches land on |0>(x)rest,
                     //                   so the RESULT is deterministic even
                     //                   though the outcome is not)
-                    //     CUDA       -> REFUSE  <-- false rejection
+                    //     CUDA       -> REFUSED   <-- false rejection
                     //
-                    // Entangled cases are refused by all three, so this is a
-                    // usability/consistency defect (a valid circuit errors out),
-                    // not a wrong-answer defect. The fix is to adopt the purity
-                    // criterion — `omega_backend_statevector::sim::
-                    // reset_is_deterministic_within(&state.read_state()?, n, q,
-                    // 1e-4)` — which needs a dependency on the CPU crate and a
-                    // device readback, and must be verified ON a CUDA box.
-                    // See LIMITATIONS.md and verification/.../Reset.lean (T1).
-                    if p0 > 1e-6 && p0 < 1.0 - 1e-6 {
+                    // Now on the same purity criterion as CPU and Metal.
+                    //
+                    // TOLERANCE. 1e-6, not the 1e-4 the old comment proposed.
+                    // This trades a criterion that was over-strict but never
+                    // WRONG for one that can be wrong, so the bound matters: at
+                    // 1e-4 a purity of 0.9999 is admitted, i.e. a Schmidt weight
+                    // ~5e-5 and an amplitude error ~7e-3 — three to four orders
+                    // outside this project's own gates (5e-7 f32, 1e-9
+                    // cross-check). Measured f32 purity noise on this device is
+                    // ~1e-6, so 1e-4 was ~100x looser than the hardware needs.
+                    // It was inherited from Metal without re-deriving it at
+                    // CUDA's larger MAX_QUBITS.
+                    //
+                    // COST, stated because it is not free: `read_state` pulls
+                    // the whole state to the host (16 B/amp from an 8 B/amp
+                    // device buffer, so peak host memory doubles) and
+                    // `reduced_purity` is a SERIAL host loop over `dim` — per
+                    // Reset op, not once. Analytic mode only, so it is off the
+                    // shot path, but at large n it dominates. See LIMITATIONS.md.
+                    let host = state.read_state().map_err(OmegaError::from)?;
+                    if !omega_backend_statevector::sim::reset_is_deterministic_within(
+                        &host,
+                        state.num_qubits() as usize,
+                        q as usize,
+                        1e-6,
+                    ) {
                         return Err(OmegaError::Unsupported(format!(
                             "cuda: analytic expectation of Reset on qubit {q} is ill-defined — \
-                             the outcome is random (p0 = {p0:.6}), so the reset leaves the \
-                             register in a mixed state that one statevector cannot represent. \
+                             the qubit is entangled with the rest of the register, so the reset \
+                             leaves it in a mixed state that one statevector cannot represent. \
                              Run with shots (each shot is an independent trajectory)."
                         )));
                     }
@@ -1747,21 +2056,37 @@ mod tests {
         let mut state = new_state(1);
         apply_op(&mut state, &op(GateKind::Sx), &params).expect("Sx");
         let v = state.read_state().expect("read");
-        assert!((v[0] - Complex64::new(0.5, 0.5)).norm() < 1e-5, "amp0 = {:?}", v[0]);
-        assert!((v[1] - Complex64::new(0.5, -0.5)).norm() < 1e-5, "amp1 = {:?}", v[1]);
+        assert!(
+            (v[0] - Complex64::new(0.5, 0.5)).norm() < 1e-5,
+            "amp0 = {:?}",
+            v[0]
+        );
+        assert!(
+            (v[1] - Complex64::new(0.5, -0.5)).norm() < 1e-5,
+            "amp1 = {:?}",
+            v[1]
+        );
 
         // √X·√X = X: |0⟩ → |1⟩.
         apply_op(&mut state, &op(GateKind::Sx), &params).expect("Sx^2");
         let v = state.read_state().expect("read");
         assert!(v[0].norm() < 1e-5, "amp0 = {:?}", v[0]);
-        assert!((v[1] - Complex64::new(1.0, 0.0)).norm() < 1e-5, "amp1 = {:?}", v[1]);
+        assert!(
+            (v[1] - Complex64::new(1.0, 0.0)).norm() < 1e-5,
+            "amp1 = {:?}",
+            v[1]
+        );
 
         // √X†·√X = I: a fresh |0⟩ round-trips back to |0⟩.
         let mut state = new_state(1);
         apply_op(&mut state, &op(GateKind::Sx), &params).expect("Sx");
         apply_op(&mut state, &op(GateKind::Sxdg), &params).expect("Sxdg");
         let v = state.read_state().expect("read");
-        assert!((v[0] - Complex64::new(1.0, 0.0)).norm() < 1e-5, "amp0 = {:?}", v[0]);
+        assert!(
+            (v[0] - Complex64::new(1.0, 0.0)).norm() < 1e-5,
+            "amp0 = {:?}",
+            v[0]
+        );
         assert!(v[1].norm() < 1e-5, "amp1 = {:?}", v[1]);
     }
 
@@ -1952,6 +2277,9 @@ mod tests {
             let m = r.counts().clone();
             let mut f = [0.0; 4];
             for (k, v) in m {
+                // `Outcome` is neither `Copy` nor castable — this is a 2-qubit
+                // circuit, so the key always fits a u64.
+                let k = k.as_u64().expect("2-qubit outcome fits in u64");
                 f[(k as usize) & 3] = v as f64 / SHOTS as f64;
             }
             f
@@ -2024,6 +2352,9 @@ mod tests {
                 .clone();
             let mut out = [0u32; 4];
             for (k, v) in m {
+                // See the note in `reset_matches_cpu`: 2 qubits, so the key
+                // fits a u64 and `Outcome` must be read, not cast.
+                let k = k.as_u64().expect("2-qubit outcome fits in u64");
                 out[(k as usize) & 3] += v;
             }
             out
@@ -2592,6 +2923,126 @@ mod tests {
             .map(|(a, b)| (a - b).norm())
             .fold(0.0_f64, f64::max);
         assert!(max2 < 1e-5, "graph replay #2 max diff = {max2:.3e}");
+    }
+
+    /// The CUDA-graph path against the naive one on a circuit containing
+    /// **every 2q gate the backend implements**, not just CX.
+    ///
+    /// `train_step_graph_matches_naive_backward` below is the only graph
+    /// gradient gate, and among 2q gates it contains **CX and nothing else** —
+    /// no CZ, SWAP, CY, CRz or CU3 appears anywhere in this crate's tests. So
+    /// `resolve_deriv_apply_2q_params`, `PlanEntry::Deriv2q` and the unfused
+    /// `DaggerPhi2q` / `DaggerNu2q` arms have been uncovered since they landed.
+    ///
+    /// That gap matters more now than it did: the forward path dispatches
+    /// CX/SWAP/CZ/CY/CRz to specialised kernels while the graph path still
+    /// builds dense 4x4s for all of them, so the two are no longer the same
+    /// code and only this kind of test would notice them diverging.
+    ///
+    /// **CRz is the load-bearing gate here** — it is the only PARAMETERISED 2q
+    /// gate, so it is the one that exercises the derivative pool rather than
+    /// just the forward and dagger ones.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+    #[test]
+    fn train_step_graph_matches_naive_on_every_2q_gate() {
+        use omega_core::circuit::{CircuitType, GateOp, ParamExpr, Qubit};
+        use omega_core::executor::PauliOp;
+
+        let backend = new_backend();
+        let n: u32 = 6;
+        let mut circuit = CircuitIR::new(n, CircuitType::GateBased);
+        for s in 0..4u32 {
+            circuit.symbols.insert(s, format!("theta_{s}"));
+        }
+        let mut push = |gate, qubits: &[u32], params: Vec<ParamExpr>| {
+            circuit.ops.push(GateOp {
+                gate,
+                qubits: qubits.iter().map(|&q| Qubit(q)).collect(),
+                params: params.into(),
+                classical_bit: None,
+                condition: None,
+            });
+        };
+        // Parameterised 1q layer, so there is something to differentiate.
+        for q in 0..4u32 {
+            push(GateKind::Ry, &[q], vec![ParamExpr::Symbol(q)]);
+        }
+        // Every 2q gate the backend implements. Qubit pairs deliberately
+        // straddle QUAD_KERNEL_MIN_QUBIT_2SLOT so both the specialised and the
+        // dense-fallback forward paths are represented.
+        push(GateKind::CX, &[0, 1], vec![]);
+        push(GateKind::CZ, &[2, 3], vec![]);
+        push(GateKind::Swap, &[3, 4], vec![]);
+        push(GateKind::CY, &[2, 4], vec![]);
+        push(GateKind::CX, &[4, 5], vec![]);
+        // The parameterised 2q gate — the derivative pool's only exercise.
+        push(GateKind::CRz, &[1, 2], vec![ParamExpr::Symbol(0)]);
+        push(GateKind::CRz, &[3, 5], vec![ParamExpr::Symbol(1)]);
+
+        let mut params = ParameterBinding::new();
+        for s in 0..4u32 {
+            params.bind(s, 0.13 * (s as f64 + 1.0));
+        }
+
+        // The gradient observable must be the one the FACTORY produces from the
+        // predictions, on both sides. Comparing the fused path against
+        // `adjoint_gradient(&template)` compares two different observables and
+        // fails for every gate — including CX, which the existing test proves
+        // works. (That is how this test was first written, and bisecting it gate
+        // by gate is what showed the mechanism rather than the gates was wrong.)
+        let obs: Vec<Observable> = (0..n)
+            .map(|q| Observable {
+                terms: vec![(1.0, vec![(q, PauliOp::Z)])],
+            })
+            .collect();
+        let targets: Vec<f64> = (0..n).map(|q| 0.1 * q as f64 - 0.2).collect();
+        let mk_factory = || {
+            let targets = targets.clone();
+            let f: omega_core::executor::GradientObservableFactory<'_> =
+                Box::new(move |y_hat: &[f64]| Observable {
+                    terms: y_hat
+                        .iter()
+                        .zip(targets.iter())
+                        .enumerate()
+                        .map(|(q, (h, y))| (2.0 * (h - y), vec![(q as u32, PauliOp::Z)]))
+                        .collect(),
+                });
+            f
+        };
+
+        let preds_ref = backend
+            .expectation_multi(&circuit, &params, &obs)
+            .expect("predictions");
+        let obs_ref = mk_factory()(&preds_ref);
+        let naive = backend
+            .adjoint_gradient(&circuit, &params, &obs_ref)
+            .expect("naive gradient")
+            .expect("has gradient");
+
+        // `expectation_multi_then_gradient` is what actually drives
+        // TrainStepGraph in production (lib.rs), so go through it rather than
+        // reaching for the graph directly — otherwise the test proves the graph
+        // works while production takes a path it never touched.
+        let (_pred, graph_grad) = backend
+            .expectation_multi_then_gradient(&circuit, &params, &obs, mk_factory())
+            .expect("graph gradient");
+        let graph_grad = graph_grad.expect("graph path returned no gradient");
+
+        assert_eq!(
+            graph_grad.len(),
+            naive.len(),
+            "gradient arity changed between the graph and naive paths"
+        );
+        for ((sa, ga), (sb, gb)) in graph_grad.iter().zip(naive.iter()) {
+            assert_eq!(sa, sb, "symbol order differs");
+            assert!(
+                (ga - gb).abs() < 1e-5,
+                "sym {sa}: graph = {ga:.10}, naive = {gb:.10}. The graph path \
+                 builds DENSE 4x4s for CX/CZ/SWAP/CY/CRz while the forward path \
+                 now uses specialised kernels — this is the gate that catches \
+                 them diverging."
+            );
+        }
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]

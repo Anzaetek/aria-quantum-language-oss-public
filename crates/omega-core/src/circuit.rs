@@ -426,3 +426,129 @@ mod tests {
         assert_eq!(c.three_qubit_count(), 2);
     }
 }
+
+/// Is every operation in this circuit a Clifford (or a classical no-op)?
+///
+/// The Clifford group is exactly where the stabilizer backend is both **exact
+/// and cheap** — polynomial in the qubit count rather than exponential — so
+/// this predicate is what lets a dispatcher route a circuit to it instead of a
+/// dense statevector.
+///
+/// # What counts, and one that is easy to miss
+///
+/// `H`, `X`, `Y`, `Z`, `S`, `Sdg`, `CX`, `CY`, `CZ`, `Swap`, plus `Sx`/`Sxdg`.
+/// **The square roots of X are Clifford** — `sx·sx = X` exactly — and they are
+/// routinely left out of these lists because they look like rotations. Omitting
+/// them does not produce a wrong answer, it silently sends a perfectly good
+/// Clifford circuit to an exponential backend, which is the kind of miss that
+/// never shows up as a failure.
+///
+/// `Measure`, `Barrier`, `Reset` and `Id` are admitted as well: none of them is
+/// a unitary outside the group, and the stabilizer formalism represents all of
+/// them exactly.
+///
+/// Rotations are **not** admitted even at Clifford angles. `Rz(π/2)` equals `S`
+/// up to a phase, but recognising that requires trusting a float comparison to
+/// decide whether a circuit is exactly representable, and being wrong there
+/// means a wrong answer rather than a slow one.
+pub fn is_clifford_only(circuit: &CircuitIR) -> bool {
+    circuit.ops.iter().all(|op| {
+        matches!(
+            op.gate,
+            GateKind::H
+                | GateKind::X
+                | GateKind::Y
+                | GateKind::Z
+                | GateKind::S
+                | GateKind::Sdg
+                | GateKind::Sx
+                | GateKind::Sxdg
+                | GateKind::CX
+                | GateKind::CY
+                | GateKind::CZ
+                | GateKind::Swap
+                | GateKind::Measure
+                | GateKind::Barrier
+                | GateKind::Reset
+                | GateKind::Id
+        )
+    })
+}
+
+#[cfg(test)]
+mod clifford_predicate_tests {
+    use super::*;
+    use smallvec::smallvec;
+
+    fn op(gate: GateKind) -> GateOp {
+        GateOp {
+            gate,
+            qubits: smallvec![Qubit(0)],
+            params: smallvec![],
+            classical_bit: None,
+            condition: None,
+        }
+    }
+
+    fn circuit(gates: &[GateKind]) -> CircuitIR {
+        let mut c = CircuitIR::new(2, CircuitType::GateBased);
+        for g in gates {
+            c.add_op(op(g.clone()));
+        }
+        c
+    }
+
+    #[test]
+    fn the_clifford_generators_are_recognised() {
+        assert!(is_clifford_only(&circuit(&[
+            GateKind::H,
+            GateKind::S,
+            GateKind::Sdg,
+            GateKind::CX,
+            GateKind::CZ,
+            GateKind::CY,
+            GateKind::Swap,
+        ])));
+    }
+
+    /// The square roots of X are Clifford (`sx·sx = X`) and are the ones these
+    /// lists usually forget — a miss here silently routes a Clifford circuit
+    /// to an exponential backend rather than producing a wrong answer, so it
+    /// would never surface as a failure.
+    #[test]
+    fn the_square_roots_of_x_are_clifford() {
+        assert!(is_clifford_only(&circuit(&[GateKind::Sx, GateKind::Sxdg])));
+    }
+
+    #[test]
+    fn non_clifford_gates_are_rejected() {
+        for g in [GateKind::T, GateKind::Tdg, GateKind::Rz, GateKind::U3] {
+            assert!(
+                !is_clifford_only(&circuit(&[GateKind::H, g.clone()])),
+                "{g:?} must not be treated as Clifford"
+            );
+        }
+    }
+
+    /// Not admitted even at a Clifford angle: deciding that from a float would
+    /// mean a wrong answer when the comparison is wrong, rather than a slow one.
+    #[test]
+    fn rotations_are_rejected_even_at_clifford_angles() {
+        let mut c = CircuitIR::new(1, CircuitType::GateBased);
+        let mut o = op(GateKind::Rz);
+        o.params = smallvec![ParamExpr::Concrete(std::f64::consts::FRAC_PI_2)];
+        c.add_op(o);
+        assert!(!is_clifford_only(&c));
+    }
+
+    #[test]
+    fn classical_operations_do_not_disqualify_a_circuit() {
+        assert!(is_clifford_only(&circuit(&[
+            GateKind::H,
+            GateKind::Measure,
+            GateKind::Reset,
+            GateKind::Barrier,
+            GateKind::Id,
+        ])));
+    }
+}

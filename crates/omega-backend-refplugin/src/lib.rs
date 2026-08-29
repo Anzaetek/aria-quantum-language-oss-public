@@ -104,7 +104,6 @@ extern "C" fn backend_caps() -> BackendCaps {
         noise: CAPS_NOISE_NONE,
         device: 0,
         native_gates: REFPLUGIN_GATES,
-        opt_in_cpu_fallback: false,
         engine_version,
     }
 }

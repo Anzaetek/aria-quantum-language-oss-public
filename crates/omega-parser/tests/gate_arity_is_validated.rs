@@ -110,7 +110,10 @@ fn cp_inside_a_gate_body_is_widened_like_cp_at_top_level() {
         top.ops[0].params.len(),
         "the two paths must agree — one grammar cannot mean two things"
     );
-    assert_eq!(body.ops[0].gate, top.ops[0].gate, "same gate kind on both paths");
+    assert_eq!(
+        body.ops[0].gate, top.ops[0].gate,
+        "same gate kind on both paths"
+    );
 }
 
 /// A wrong arity inside a gate body is refused too, not just at top level.
@@ -162,20 +165,19 @@ fn the_previously_panicking_inputs_never_produce_an_ir() {
         "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\ncu3(0.7) q[0], q[1];\n",
         "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[1];\nu3(0.7) q[0];\n",
     ] {
-        match omega_parser::lower_to_ir(src) {
+        // `if let`, not `match`: refusing to lower is a PASS here, so the
+        // `Err` arm is genuinely empty rather than an omission.
+        if let Ok(ir) = omega_parser::lower_to_ir(src) {
             // The first case is now VALID (it widens correctly), so it lowers —
             // but it must carry three parameters, not one.
-            Ok(ir) => {
-                for op in &ir.ops {
-                    assert_ne!(
-                        op.params.len(),
-                        1,
-                        "a CU3/U3 carrying one parameter reached the IR; a backend \
-                         will index params[2] and panic:\n{src}"
-                    );
-                }
+            for op in &ir.ops {
+                assert_ne!(
+                    op.params.len(),
+                    1,
+                    "a CU3/U3 carrying one parameter reached the IR; a backend \
+                     will index params[2] and panic:\n{src}"
+                );
             }
-            Err(_) => {}
         }
     }
 }

@@ -114,12 +114,56 @@ _FIXED_3Q = {
 #: XC*/YC* family (`crates/ppvm-stim/src/executor.rs` marks them
 #: `unreachable!("... rejected by validate")`), and has no CCX/CCZ
 #: sugar, so those live in the tsim set only.
+#: Gates ppvm's parser rejects as INSTRUCTIONS but can execute once
+#: expanded into ones it accepts.
+#:
+#: This distinction is the whole point of the table. ppvm's `stim-parser`
+#: rejects `SWAP` / `CCX` / `CCZ` outright — verified by handing the raw
+#: text to `ppvm.StimProgram.parse`, which answers
+#: `unsupported instruction 'SWAP'` — but it accepts `CX`, `H`, `S[T]`
+#: and `S_DAG[T]`, and those compose into all three. So refusing them was
+#: a **lowering** gap on our side, not a capability gap on theirs, and a
+#: refusal that says "this backend cannot do it" would have been wrong.
+#:
+#: Cost, stated because it is not free: the Toffoli expansion carries
+#: seven T-family rotations, and ppvm is a Pauli-propagation engine whose
+#: term count can double at each one. Worse, T sits at θ = π/4 where
+#: `cos θ = sin θ`, so both branches of a split carry equal weight and no
+#: coefficient truncation can prune either. A Toffoli is genuinely
+#: expensive here; the expansion makes it *expressible*, not cheap.
+_PPVM_EXPANSIONS = {
+    # SWAP(a,b) = CX(a,b) CX(b,a) CX(a,b). Clifford, three instructions.
+    "swap": lambda a, b: [f"CX {a} {b}", f"CX {b} {a}", f"CX {a} {b}"],
+    # Standard Clifford+T Toffoli (Nielsen & Chuang fig. 4.9).
+    "ccx": lambda a, b, c: [
+        f"H {c}",
+        f"CX {b} {c}", f"S_DAG[T] {c}",
+        f"CX {a} {c}", f"S[T] {c}",
+        f"CX {b} {c}", f"S_DAG[T] {c}",
+        f"CX {a} {c}", f"S[T] {b}", f"S[T] {c}",
+        f"H {c}",
+        f"CX {a} {b}", f"S[T] {a}", f"S_DAG[T] {b}",
+        f"CX {a} {b}",
+    ],
+    # CCZ = H_c · CCX · H_c, so reuse the Toffoli body without the outer H.
+    "ccz": lambda a, b, c: [
+        f"CX {b} {c}", f"S_DAG[T] {c}",
+        f"CX {a} {c}", f"S[T] {c}",
+        f"CX {b} {c}", f"S_DAG[T] {c}",
+        f"CX {a} {c}", f"S[T] {b}", f"S[T] {c}",
+        f"CX {a} {b}", f"S[T] {a}", f"S_DAG[T] {b}",
+        f"CX {a} {b}",
+    ],
+}
+
 GATE_SETS = {
     "tsim": frozenset(
         set(_FIXED_1Q) | set(_FIXED_2Q) | set(_FIXED_3Q) | set(_PARAM_GATES)
     ),
+    # ppvm reaches the same surface as tsim, via `_PPVM_EXPANSIONS` for the
+    # three its parser will not take directly.
     "ppvm": frozenset(
-        (set(_FIXED_1Q) | set(_FIXED_2Q) | set(_PARAM_GATES)) - {"swap"}
+        set(_FIXED_1Q) | set(_FIXED_2Q) | set(_FIXED_3Q) | set(_PARAM_GATES)
     ),
 }
 
@@ -267,7 +311,7 @@ class _Registers:
         return [offset + i]
 
 
-def convert(qasm: str, gate_set) -> tuple[str, int, list[int], int]:
+def convert(qasm: str, gate_set, expansions=None) -> tuple[str, int, list[int], int]:
     """Lower a QASM2 source to extended-Stim text.
 
     Args:
@@ -285,6 +329,7 @@ def convert(qasm: str, gate_set) -> tuple[str, int, list[int], int]:
         ConversionError: anything the converter cannot parse.
     """
     gate_set = frozenset(gate_set)
+    expansions = expansions or {}
     regs = _Registers()
     lines: list[str] = []
     clbit_of_measurement: list[int] = []
@@ -296,13 +341,28 @@ def convert(qasm: str, gate_set) -> tuple[str, int, list[int], int]:
             continue
         if head in ("gate", "opaque"):
             raise UnsupportedGate(
-                f"user-defined `{head}` declarations are not supported — "
-                "flatten the circuit (e.g. qiskit's transpile to the basis "
-                "gate set) before sending it to this backend"
+                f"user-defined `{head}` declarations are not supported.\n"
+                "  Why: this converter is deliberately a flat, total mapping "
+                "from a fixed QASM2 subset onto Stim instructions — it has no "
+                "macro expander, because inlining user gates correctly means "
+                "re-implementing a compiler, and getting that subtly wrong "
+                "would produce a WRONG answer rather than a refusal.\n"
+                "  What to do: flatten the circuit before sending it, e.g. "
+                "`qiskit.transpile(qc, basis_gates=[...])`, so only primitive "
+                "gate applications reach the bridge."
             )
         if head == "if":
             raise UnsupportedGate(
-                "classically-conditioned `if (...)` statements are not supported"
+                "classically-conditioned `if (...)` is not expressible in this "
+                "backend's dialect.\n"
+                "  Why: tsim and ppvm consume a Stim-derived instruction set. "
+                "Stim has no classical feedforward at all, and neither tag "
+                "extension adds one — there is no instruction that reads a "
+                "measurement result and branches on it, so the circuit cannot "
+                "be represented at any cost.\n"
+                "  What runs it today: the in-process `statevector`, `mps` and "
+                "`pauli` backends all implement mid-circuit measurement with "
+                "feedforward. Use one of those, or remove the conditional."
             )
 
         decl = _DECL.match(stmt)
@@ -345,16 +405,41 @@ def convert(qasm: str, gate_set) -> tuple[str, int, list[int], int]:
         if name not in gate_set:
             if name in _STRUCTURAL:
                 raise ConversionError(f"cannot parse statement {stmt!r}")
+            hint = ""
+            if name in ("crz", "cu1", "cp", "cu3", "crx", "cry"):
+                hint = (
+                    "\n  Why this one specifically: a CONTROLLED rotation "
+                    "cannot be lowered the way this module lowers an "
+                    "uncontrolled one. `u1 = rz` up to a global phase, which is "
+                    "invisible in measurement statistics — but put that phase "
+                    "inside a control and it becomes a relative phase, i.e. "
+                    "observable. Emitting the uncontrolled form anyway would be "
+                    "a silently different circuit, so it is refused instead."
+                )
+            elif name in ("swap", "ccx", "ccz"):
+                hint = (
+                    "\n  Note: this gate IS expressible here by decomposition "
+                    "(swap -> 3 CX; ccx/ccz -> Clifford+T) and should have been "
+                    "expanded before reaching this point — seeing this message "
+                    "for it means the expansion table and the gate set have "
+                    "drifted apart."
+                )
             raise UnsupportedGate(
-                f"gate `{name}` is outside this backend's supported gate set "
-                f"({', '.join(sorted(gate_set))})"
+                f"gate `{name}` is outside this backend's gate set.\n"
+                f"  Accepted here: {', '.join(sorted(gate_set))}."
+                f"{hint}\n"
+                "  What runs it today: the in-process `statevector` and `mps` "
+                "backends accept the full gate set. This bridge exists to "
+                "cross-check against an independent implementation, so it "
+                "refuses anything it cannot represent EXACTLY rather than "
+                "approximating and quietly weakening the comparison."
             )
 
         params = (
             [eval_param(p) for p in _split_params(raw_params)] if raw_params else []
         )
         operand_groups = _targets(regs, raw_targets)
-        lines.extend(_emit_gate(name, params, operand_groups, stmt))
+        lines.extend(_emit_gate(name, params, operand_groups, stmt, expansions))
 
     if regs.n_qubits == 0:
         raise ConversionError("no `qreg` declared")
@@ -397,7 +482,11 @@ def _targets(regs: _Registers, raw: str) -> list[list[int]]:
 
 
 def _emit_gate(
-    name: str, params: list[float], groups: list[list[int]], stmt: str
+    name: str,
+    params: list[float],
+    groups: list[list[int]],
+    stmt: str,
+    expansions: dict | None = None,
 ) -> list[str]:
     """Emit the Stim line(s) for one gate application.
 
@@ -423,6 +512,15 @@ def _emit_gate(
     tuples = [
         tuple(g[0] if len(g) == 1 else g[i] for g in groups) for i in range(width)
     ]
+
+    # A backend-specific expansion wins over the fixed opcode: ppvm's parser
+    # takes `CX` but not `SWAP`, so `swap` must lower to three CX for ppvm
+    # while staying a single `SWAP` for tsim.
+    if expansions and name in expansions:
+        out: list[str] = []
+        for t in tuples:
+            out.extend(expansions[name](*t))
+        return out
 
     if name in _FIXED_1Q:
         return [f"{_FIXED_1Q[name]} " + " ".join(str(t[0]) for t in tuples)]

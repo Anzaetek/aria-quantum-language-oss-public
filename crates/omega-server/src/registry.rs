@@ -435,12 +435,7 @@ impl Registry {
             omega_core::executor::ExecResult::Counts(counts) => {
                 let map: std::collections::HashMap<String, u32> = counts
                     .into_iter()
-                    .map(|(bs, ct)| {
-                        (
-                            bs.to_bitstring(),
-                            ct,
-                        )
-                    })
+                    .map(|(bs, ct)| (bs.to_bitstring(), ct))
                     .collect();
                 Ok(serde_json::json!({ "type": "counts", "counts": map }))
             }

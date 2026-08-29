@@ -203,6 +203,36 @@ def main():
          [VAC, {"op": "squeeze", "r": 0.5},
           {"op": "phase_shift", "phi": 0.9},
           {"op": "displace", "re": 0.6, "im": 0.2}], out)
+    # --- squeeze as an OPERATOR, not a preparation --------------------------
+    # These are the cases the Rust harness used to SKIP and count, because
+    # `squeeze` existed only as a constructor there and so could only ever be
+    # the first thing to touch a mode. They are the reason the operator form was
+    # written, and they are the only rows here that exercise columns n>=1 of the
+    # squeeze matrix — a vacuum input multiplies column 0 and nothing else, so
+    # every `squeezed_r=*` row above passes with the rest of the matrix wrong.
+    # That is not hypothetical: the first draft of `squeeze_fiber` had its
+    # column recurrence off by one, produced zero for every column from 1 up,
+    # and reproduced the squeezed vacuum perfectly.
+    case("coherent_re=0.5_then_squeeze=0.4",
+         [VAC, {"op": "displace", "re": 0.5, "im": 0.0},
+          {"op": "squeeze", "r": 0.4}], out)
+    case("coherent_re=0.7_im=0.3_then_squeeze=0.6",
+         [VAC, {"op": "displace", "re": 0.7, "im": 0.3},
+          {"op": "squeeze", "r": 0.6}], out)
+    case("coherent_re=1.0_phase_then_squeeze=0.3",
+         [VAC, {"op": "displace", "re": 1.0, "im": 0.0},
+          {"op": "phase_shift", "phi": 0.8},
+          {"op": "squeeze", "r": 0.3}], out)
+    # Squeeze on an already-squeezed state: S(a)S(b)|0> = S(a+b) for real
+    # parameters, so piquasso and we must agree on a state whose closed form is
+    # known independently of either implementation.
+    case("squeeze=0.3_then_squeeze=0.25",
+         [VAC, {"op": "squeeze", "r": 0.3}, {"op": "squeeze", "r": 0.25}], out)
+    case("squeeze=0.4_displace_then_squeeze=-0.4",
+         [VAC, {"op": "squeeze", "r": 0.4},
+          {"op": "displace", "re": 0.5, "im": 0.0},
+          {"op": "squeeze", "r": -0.4}], out)
+
     case("coherent_re=1.2_then_phase_then_kerr",
          [VAC, {"op": "displace", "re": 1.2, "im": 0.0},
           {"op": "phase_shift", "phi": 0.55},

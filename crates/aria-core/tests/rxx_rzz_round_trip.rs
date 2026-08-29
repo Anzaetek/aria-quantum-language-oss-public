@@ -78,7 +78,11 @@ fn rxx_matrix(theta: f64) -> [[Complex64; 4]; 4] {
     let mut hh = [[0.0f64; 4]; 4];
     for (i, row) in hh.iter_mut().enumerate() {
         for (j, e) in row.iter_mut().enumerate() {
-            let s0 = if (i >> 1) & 1 & ((j >> 1) & 1) == 1 { -1.0 } else { 1.0 };
+            let s0 = if (i >> 1) & 1 & ((j >> 1) & 1) == 1 {
+                -1.0
+            } else {
+                1.0
+            };
             let s1 = if i & 1 & (j & 1) == 1 { -1.0 } else { 1.0 };
             *e = h * h * s0 * s1;
         }
@@ -124,7 +128,7 @@ fn reference(m: &[[Complex64; 4]; 4]) -> Vec<Complex64> {
     // `h q[0]; t q[0];` on |00>. Qubit 0 is the LOW bit of the index, matching
     // the in-tree convention (`omega-core` keys states by u64 over the register).
     let h = 1.0 / std::f64::consts::SQRT_2;
-    let mut psi = vec![Complex64::new(0.0, 0.0); 4];
+    let mut psi = [Complex64::new(0.0, 0.0); 4];
     psi[0] = Complex64::new(h, 0.0);
     psi[1] = Complex64::from_polar(h, std::f64::consts::FRAC_PI_4);
     let mut out = vec![Complex64::new(0.0, 0.0); 4];
@@ -138,7 +142,10 @@ fn reference(m: &[[Complex64; 4]; 4]) -> Vec<Complex64> {
 
 fn max_diff(a: &[Complex64], b: &[Complex64]) -> f64 {
     assert_eq!(a.len(), b.len(), "state dimension changed");
-    a.iter().zip(b).map(|(x, y)| (x - y).norm()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).norm())
+        .fold(0.0, f64::max)
 }
 
 /// Both sides evaluate the same analytic expressions in f64, so the agreement
@@ -150,7 +157,10 @@ fn rzz_matches_its_defining_matrix() {
     let got = run(&format!("rzz({THETA}) q[0], q[1];"));
     let want = reference(&rzz_matrix(THETA));
     let d = max_diff(&got, &want);
-    assert!(d <= TOL, "rzz({THETA}) differs from exp(-i θ/2 Z⊗Z) by {d:.3e}");
+    assert!(
+        d <= TOL,
+        "rzz({THETA}) differs from exp(-i θ/2 Z⊗Z) by {d:.3e}"
+    );
 }
 
 #[test]
@@ -158,7 +168,10 @@ fn rxx_matches_its_defining_matrix() {
     let got = run(&format!("rxx({THETA}) q[0], q[1];"));
     let want = reference(&rxx_matrix(THETA));
     let d = max_diff(&got, &want);
-    assert!(d <= TOL, "rxx({THETA}) differs from exp(-i θ/2 X⊗X) by {d:.3e}");
+    assert!(
+        d <= TOL,
+        "rxx({THETA}) differs from exp(-i θ/2 X⊗X) by {d:.3e}"
+    );
 }
 
 /// The fixture must be able to tell q0 from q1, or the qubit-order check above
@@ -213,10 +226,17 @@ fn ryy_is_still_refused_because_no_qiskit_loader_reads_it() {
 /// Arity is refused rather than silently truncated.
 #[test]
 fn wrong_arity_is_refused() {
-    let two_params = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\nrzz(0.7, 0.2) q[0], q[1];\n";
-    assert!(omega_parser::lower_to_ir(two_params).is_err(), "rzz takes 1 parameter");
+    let two_params =
+        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\nrzz(0.7, 0.2) q[0], q[1];\n";
+    assert!(
+        omega_parser::lower_to_ir(two_params).is_err(),
+        "rzz takes 1 parameter"
+    );
     let one_qubit = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\nrzz(0.7) q[0];\n";
-    assert!(omega_parser::lower_to_ir(one_qubit).is_err(), "rzz acts on 2 qubits");
+    assert!(
+        omega_parser::lower_to_ir(one_qubit).is_err(),
+        "rzz acts on 2 qubits"
+    );
 }
 
 /// `inv @ rzz(θ) == rzz(−θ)`, and the decomposition must honour the modifier

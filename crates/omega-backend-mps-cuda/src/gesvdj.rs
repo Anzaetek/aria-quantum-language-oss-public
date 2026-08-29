@@ -44,6 +44,7 @@
 //!   3. `ci.sh` gates CUDA behind `ARIA_CUDA=1` — run `ARIA_CUDA=1 ./ci.sh`
 //!      there so `gpu_cuda_agrees_with_sim` / `gpu_mps_cuda_agrees` exercise the
 //!      new field end to end.
+//!
 //! The one-sided-Jacobi CPU rewrite does not touch this file's device kernels,
 //! so only the `discarded_weight` plumbing (2 construction sites) is new here.
 //!
@@ -125,15 +126,62 @@ impl CudaSvdContext {
     /// driver init or cuSOLVER handle create fails — caller falls back
     /// to CPU.
     pub fn new() -> Option<Self> {
-        let ctx = CudaContext::new(0).ok()?;
-        let stream = ctx.default_stream();
-        let handle = DnHandle::new(stream.clone()).ok()?;
-        Some(Self {
-            ctx,
-            stream,
-            handle,
-            cache: RefCell::new(None),
-        })
+        Self::try_new().ok()
+    }
+
+    /// Build the context, converting a **panic during symbol resolution into a
+    /// typed value** (3b.3 R1).
+    ///
+    /// `DnHandle::new` is where `cudarc` resolves the cuSOLVER entry points it
+    /// declares, and on CUDA 13 that `dlsym` fails for `cusolverDnGeqrf` —
+    /// a symbol we never call, absent from the *binding table* rather than
+    /// from our call graph. `cudarc` 0.19 `.expect()`s it, so the process
+    /// aborted before `new()`'s `Option` could say anything.
+    ///
+    /// `catch_unwind` is the right tool and not a workaround: the panic is a
+    /// Rust panic from `.expect()`, not a foreign exception, and the workspace
+    /// does not set `panic = "abort"`. The alternative — probing every symbol
+    /// `cudarc` might resolve, ahead of it — would have to track that crate's
+    /// binding table version by version.
+    ///
+    /// The panic hook is silenced for the duration so a *handled* condition
+    /// does not print a backtrace that reads like a crash.
+    ///
+    /// **Unverified here.** This arm needs a CUDA 13 host; the classification
+    /// it feeds is tested on every platform (see `availability`).
+    pub fn try_new() -> Result<Self, crate::CudaSvdUnavailable> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let attempt = std::panic::catch_unwind(|| {
+            let ctx = CudaContext::new(0).map_err(|e| format!("{e}"))?;
+            let stream = ctx.default_stream();
+            let handle = DnHandle::new(stream.clone()).map_err(|e| format!("{e}"))?;
+            Ok::<_, String>((ctx, stream, handle))
+        });
+        std::panic::set_hook(previous);
+
+        match attempt {
+            Ok(Ok((ctx, stream, handle))) => Ok(Self {
+                ctx,
+                stream,
+                handle,
+                cache: RefCell::new(None),
+            }),
+            // Returned an error rather than panicking: no device, or a driver
+            // that declined. Distinct from a missing symbol and reported so.
+            Ok(Err(_e)) => Err(crate::CudaSvdUnavailable::NoDevice),
+            // Panicked. The payload carries the diagnosis; `classify_panic`
+            // decides whether it is the CUDA 13 shape or something unrelated,
+            // and is deliberately conservative about claiming the former.
+            Err(payload) => {
+                let text = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_else(|| "panicked with a non-string payload".to_string());
+                Err(crate::classify_panic(&text))
+            }
+        }
     }
 
     /// Build (or reuse) the per-shape buffer + workspace cache. After

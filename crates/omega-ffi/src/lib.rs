@@ -73,7 +73,18 @@ pub unsafe extern "C" fn omega_circuit_from_source(
     }
     let rt = &mut *rt;
     let src = if source_len > 0 {
-        let bytes = slice::from_raw_parts(source as *const u8, source_len);
+        // `.cast::<u8>()`, NOT `source as *const u8` and NOT dropping the cast.
+        //
+        // clippy flags the `as` form here as "casting raw pointers to the same
+        // type and constness is unnecessary" — and on THIS host it is: `c_char`
+        // is `u8` on aarch64 Linux. It is `i8` on x86_64 Linux, where the cast
+        // is load-bearing and removing it fails to compile. So the lint is
+        // correct about this machine and wrong about the target this workspace
+        // also has to build for.
+        //
+        // `.cast()` is the portable spelling: identical semantics, no `as`, no
+        // lint, and it stays correct whichever signedness `c_char` has.
+        let bytes = slice::from_raw_parts(source.cast::<u8>(), source_len);
         match std::str::from_utf8(bytes) {
             Ok(s) => s.to_string(),
             Err(_) => return 0,
@@ -183,13 +194,20 @@ pub unsafe extern "C" fn omega_execute(
 
     let mut symbol_ids: Vec<u32> = circuit.symbols.keys().copied().collect();
     symbol_ids.sort();
+    // The header's contract is "one per free symbol". The implementation padded
+    // any shortfall with `0.0` and ignored any excess, so a caller passing the
+    // wrong count silently got a DIFFERENT circuit with no error — the same
+    // silent-substitution class as an exporter writing a symbolic angle as
+    // zero, and worse here because a C caller has no way to notice.
+    //
+    // Refusing is a behaviour change to a published ABI, which is what
+    // `omega_api_version` is for: it moves to 2, and the header documents the
+    // difference so an embedder can detect it rather than discover it.
+    if param_slice.len() != symbol_ids.len() {
+        return ptr::null_mut();
+    }
     for (i, &sym_id) in symbol_ids.iter().enumerate() {
-        let value = if i < param_slice.len() {
-            param_slice[i]
-        } else {
-            0.0
-        };
-        binding.bind(sym_id, value);
+        binding.bind(sym_id, param_slice[i]);
     }
 
     let config = ExecConfig {
@@ -393,8 +411,108 @@ pub unsafe extern "C" fn omega_result_free(result: *mut OmegaResult) {
     }
 }
 
+/// Compute `<psi|O|psi>` for an observable given as a string.
+///
+/// The entry point a variational embedder cannot work without: the whole
+/// remote/QML path returns scalars and there was no way to ask for one, so an
+/// embedder had to sample counts and reconstruct the expectation itself — at a
+/// statistical cost, and with a different answer.
+///
+/// - `observable`: null-terminated Pauli string, e.g. `"Z0 Z1"` or
+///   `"0.5*X0 + Z1"`. Spaces are ignored.
+/// - `params` / `num_params`: one value per free symbol, exactly (see
+///   [`omega_api_version`] version 2).
+/// - `out`: receives the value **only on success**.
+///
+/// Returns `0` on success and non-zero on failure.
+///
+/// # Why a status code rather than the value
+///
+/// A scalar has no null to signal failure, and a NaN sentinel would be a trap:
+/// a caller that forgets to check would propagate it silently, and NaN
+/// compares false against everything including itself. So the value goes to an
+/// out-parameter which is **left untouched on error** — a caller that ignores
+/// the status code reads its own initial value rather than a stale or partial
+/// answer.
+///
+/// # Safety
+///
+/// `rt` must be a live runtime from [`omega_runtime_new`]; `observable` must be
+/// a valid null-terminated C string; `params` must point to `num_params`
+/// readable `f64`s; `out` must be a writable `f64`.
+#[no_mangle]
+pub unsafe extern "C" fn omega_expectation(
+    rt: *const OmegaRuntime,
+    circuit_id: u32,
+    params: *const f64,
+    num_params: u32,
+    observable: *const c_char,
+    out: *mut f64,
+) -> i32 {
+    if rt.is_null() || observable.is_null() || out.is_null() {
+        return -1;
+    }
+    let rt = &*rt;
+    let Some(circuit) = rt.circuits.get(&circuit_id) else {
+        return -2;
+    };
+    let Ok(obs_str) = CStr::from_ptr(observable).to_str() else {
+        return -3;
+    };
+    let Ok(obs) = omega_core::executor::Observable::parse(obs_str) else {
+        return -4;
+    };
+
+    let param_slice = if !params.is_null() && num_params > 0 {
+        slice::from_raw_parts(params, num_params as usize)
+    } else {
+        &[]
+    };
+    let mut symbol_ids: Vec<u32> = circuit.symbols.keys().copied().collect();
+    symbol_ids.sort();
+    // Same exact-count rule as `omega_execute`. Two entry points binding
+    // parameters by two different rules is the divergence this repository keeps
+    // finding; the check is duplicated in code but not in policy.
+    if param_slice.len() != symbol_ids.len() {
+        return -5;
+    }
+    let mut binding = ParameterBinding::new();
+    for (i, &sym_id) in symbol_ids.iter().enumerate() {
+        binding.bind(sym_id, param_slice[i]);
+    }
+
+    // Photonic circuits have no Pauli observable, so refuse rather than
+    // answering with a gate-model number for a mode-model circuit.
+    if circuit.circuit_type == CircuitType::Photonic {
+        return -6;
+    }
+
+    match StatevectorBackend::new().expectation(circuit, &binding, &obs) {
+        Ok(v) => {
+            *out = v;
+            0
+        }
+        Err(_) => -7,
+    }
+}
+
 /// Get the API version.
+///
+/// # Compatibility contract
+///
+/// A single integer, incremented whenever an existing entry point changes
+/// behaviour or signature. Adding a *new* function does not bump it — an
+/// embedder that does not call the new function is unaffected.
+///
+/// An embedder should refuse a library whose version it does not recognise
+/// **before** calling anything else, rather than discovering the mismatch
+/// inside. Same discipline as the plugin ABI's `omega_backend_abi_version`.
+///
+/// | version | change |
+/// |---|---|
+/// | 1 | initial surface |
+/// | 2 | `omega_execute` REFUSES a parameter count that does not match the circuit's free-symbol count. Version 1 padded a short array with `0.0` and ignored extras, which silently executed a different circuit. Callers that relied on the padding must now pass one value per symbol — query `omega_circuit_num_params` for the count. |
 #[no_mangle]
 pub extern "C" fn omega_api_version() -> u32 {
-    1
+    2
 }

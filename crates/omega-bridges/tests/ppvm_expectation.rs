@@ -26,7 +26,10 @@ fn runner_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python")
 }
 fn venv(slug: &str) -> PathBuf {
-    runner_dir().join(format!(".venv-{slug}")).join("bin").join("python")
+    runner_dir()
+        .join(format!(".venv-{slug}"))
+        .join("bin")
+        .join("python")
 }
 fn force(slug: &str) {
     std::env::set_var(
@@ -57,8 +60,14 @@ fn both_anchors_read_pauli_strings_the_same_way() {
     let qasm = format!("{HDR}qreg q[2];\nx q[0];");
     let q = expectation_qasm2(Backend::Qiskit, &qasm, &[obs("ZI"), obs("IZ")]).expect("qiskit");
     let p = expectation_qasm2(Backend::Ppvm, &qasm, &[obs("ZI"), obs("IZ")]).expect("ppvm");
-    assert!((q[0] + 1.0).abs() < 1e-12 && (q[1] - 1.0).abs() < 1e-12, "qiskit: {q:?}");
-    assert!((p[0] + 1.0).abs() < 1e-12 && (p[1] - 1.0).abs() < 1e-12, "ppvm: {p:?}");
+    assert!(
+        (q[0] + 1.0).abs() < 1e-12 && (q[1] - 1.0).abs() < 1e-12,
+        "qiskit: {q:?}"
+    );
+    assert!(
+        (p[0] + 1.0).abs() < 1e-12 && (p[1] - 1.0).abs() < 1e-12,
+        "ppvm: {p:?}"
+    );
 }
 
 /// **Heisenberg-order pin.** ppvm must apply gates in REVERSE circuit order.
@@ -78,7 +87,12 @@ fn ppvm_applies_gates_in_heisenberg_order() {
         p[0]
     );
     let q = expectation_qasm2(Backend::Qiskit, &qasm, &[obs("X")]).expect("qiskit");
-    assert!((p[0] - q[0]).abs() < 1e-9, "ppvm {} vs qiskit {}", p[0], q[0]);
+    assert!(
+        (p[0] - q[0]).abs() < 1e-9,
+        "ppvm {} vs qiskit {}",
+        p[0],
+        q[0]
+    );
 }
 
 /// The two anchors agree across a spread of circuits and observables.
@@ -92,9 +106,14 @@ fn ppvm_and_qiskit_agree_on_the_corpus_shapes() {
         ("qreg q[1];\nh q[0];", &["X", "Y", "Z"]),
         ("qreg q[1];\nsx q[0];", &["X", "Y", "Z"]),
         ("qreg q[1];\nsx q[0];\nsxdg q[0];", &["Z"]),
-        ("qreg q[2];\nh q[0];\ncx q[0],q[1];", &["ZZ", "XX", "YY", "ZI", "IZ", "XY"]),
-        ("qreg q[2];\nry(0.7) q[0];\ncx q[0],q[1];\nrz(1.1) q[1];",
-         &["ZZ", "XI", "IY", "XY", "YX", "ZX"]),
+        (
+            "qreg q[2];\nh q[0];\ncx q[0],q[1];",
+            &["ZZ", "XX", "YY", "ZI", "IZ", "XY"],
+        ),
+        (
+            "qreg q[2];\nry(0.7) q[0];\ncx q[0],q[1];\nrz(1.1) q[1];",
+            &["ZZ", "XI", "IY", "XY", "YX", "ZX"],
+        ),
     ];
     let mut compared = 0;
     let mut worst = 0.0_f64;
@@ -123,7 +142,10 @@ fn ppvm_and_qiskit_agree_on_the_corpus_shapes() {
     // Report the qualifying count: a differential check that silently compared
     // three cells reads like coverage (Part K4 trap 5).
     eprintln!("ppvm vs qiskit: {compared} (circuit, observable) pairs, worst |Δ| = {worst:.3e}");
-    assert!(compared >= 15, "only {compared} cells compared — coverage collapsed");
+    assert!(
+        compared >= 15,
+        "only {compared} cells compared — coverage collapsed"
+    );
 }
 
 /// Non-unitary constructs are refused by both, with the same taxonomy.

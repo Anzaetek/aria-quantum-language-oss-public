@@ -24,7 +24,9 @@
 //! [`BridgeError::Unavailable`], never a hard error.
 
 #[cfg(feature = "bridge-tsim")]
-use crate::runner::{invoke_runner, run_subprocess, ParseAs, ParsedResponse, RunnerRequest, RunnerSpec};
+use crate::runner::{
+    invoke_runner, run_subprocess, ParseAs, ParsedResponse, RunnerRequest, RunnerSpec,
+};
 use crate::{Backend, BridgeError, Counts, NoiseConfig};
 
 #[cfg(not(feature = "bridge-tsim"))]
@@ -81,7 +83,11 @@ pub fn expectation(
             if v.len() != observables.len() {
                 return Err(BridgeError::Backend(
                     Backend::Tsim,
-                    format!("returned {} values for {} observables", v.len(), observables.len()),
+                    format!(
+                        "returned {} values for {} observables",
+                        v.len(),
+                        observables.len()
+                    ),
                 ));
             }
             Ok(v)

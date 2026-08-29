@@ -22,6 +22,16 @@ if [ ! -f "${runner}" ]; then
 fi
 
 py="${OMEGA_BRIDGE_PPVM_PYTHON:-${self_dir}/.venv-ppvm/bin/python}"
+# Repo-root fallback. `ci.sh` keeps its venv at the repository root and
+# documents ARIA_QISKIT_PY for it, while this wrapper only ever looked
+# beside itself — so a host with a perfectly good venv in the location
+# ci.sh itself uses fell through to a bare `python3` without the
+# package, and the caller reported "not installed". That reads as an
+# absent dependency rather than a path mismatch, and the cross-check
+# lanes SKIP on it, so the failure mode was a green run with no anchor.
+if [ ! -x "${py}" ] && [ -x "${self_dir}/../../../.venv-ppvm/bin/python" ]; then
+  py="${self_dir}/../../../.venv-ppvm/bin/python"
+fi
 if [ ! -x "${py}" ]; then
   if command -v python3 >/dev/null 2>&1; then
     py=python3

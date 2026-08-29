@@ -37,6 +37,109 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runner_io import emit as _emit, err as _err  # noqa: E402
 
 
+
+def _unique_param_converter(QiskitConverter):
+    """A `QiskitConverter` whose generic-gate factories mint UNIQUE parameter names.
+
+    WORKAROUND for an upstream limitation, not a defect on either side.
+
+    perceval-interop builds every 1-qubit gate NOT in Perceval's catalog
+    (`u2`, `u3`, `sx`, `sxdg`, ...) from one shared template,
+    `catalog["generic 2 mode circuit"]`, whose Perceval `Parameter`s are always
+    named `theta`, `phi_tl`, `phi_bl`, `phi_tr`. It then calls `optimize()`,
+    which assigns values through `Parameter.set_value()` — and that sets
+    `_value` while LEAVING `_symbol` set. Since `Parameter.fixed` is literally
+    `self._symbol is None`, those parameters never count as fixed, so
+    `Experiment._validate_new_parameters` rejects the SECOND such gate with
+    "The experiment already owns a parameter named theta".
+
+    So *any two* non-catalog 1-qubit gates in one circuit collide, always on
+    `theta`. Bisected on `02_single_qubit_rotations.qasm`: ry, rz, rx, u2, u1
+    and h all convert, and adding the 7th op (u3) trips it.
+
+    The names are internal to the template and the optimizer never reads them,
+    so uniquifying per invocation sidesteps the collision without touching the
+    physics. All FOUR factories are overridden, not just the generic one: a
+    diagonal gate such as `u1` takes the phase-circuit branch and would
+    otherwise collide next on `phi2`. The base class documents these as
+    override points ("Users could override them", `abstract_converter.py`).
+    """
+    import itertools
+
+    import perceval.components.unitary_components as comp
+    from perceval import Circuit, P
+
+    conv = QiskitConverter()
+    counter = itertools.count()
+
+    def generic_2mode():
+        k = next(counter)
+        return Circuit(2, name="U2") // (
+            0,
+            comp.BS.H(
+                theta=P(f"theta_g{k}"),
+                phi_tl=P(f"phi_tl_g{k}"),
+                phi_bl=P(f"phi_bl_g{k}"),
+                phi_tr=P(f"phi_tr_g{k}"),
+            ),
+        )
+
+    def lower_phase():
+        k = next(counter)
+        return Circuit(2) // (0, comp.PS(P(f"phi2_g{k}")))
+
+    def upper_phase():
+        k = next(counter)
+        return Circuit(2) // (1, comp.PS(P(f"phi1_g{k}")))
+
+    def two_phase():
+        k = next(counter)
+        return (
+            Circuit(2) // (0, comp.PS(P(f"phi1_g{k}"))) // (1, comp.PS(P(f"phi2_g{k}")))
+        )
+
+    conv.create_generic_2mode_circuit = generic_2mode
+    conv.create_lower_phase_circuit = lower_phase
+    conv.create_upper_phase_circuit = upper_phase
+    conv.create_2phase_circuit = two_phase
+    return conv
+
+
+_MEASURE_RE = re.compile(
+    r"\bmeasure\s+(\w+)\s*\[\s*(\d+)\s*\]\s*->\s*(\w+)\s*\[\s*(\d+)\s*\]"
+)
+_CREG_RE = re.compile(r"\bcreg\s+(\w+)\s*\[\s*(\d+)\s*\]")
+_QREG_RE = re.compile(r"\bqreg\s+(\w+)\s*\[\s*(\d+)\s*\]")
+
+
+def _measurement_map(qasm: str):
+    """(total classical bits, {clbit index -> qubit index}) for this program.
+
+    Perceval samples the WHOLE dual-rail register, but a QASM2 program reports
+    the CLASSICAL register — and those differ the moment a circuit measures
+    only some of its qubits. `08_partial_measure.qasm` measures q0,q1 into
+    `creg c[2]` while q2 sits in superposition: qiskit returns 2-bit keys
+    `{00, 11}`, and this runner was returning 3-bit keys with the unmeasured
+    qubit's coin flip in them — L2 = 0.866 against a gate of 9.4e-2.
+
+    That disagreement was invisible while `curated_fixtures()` capped the arm
+    at the first five fixtures. Returning `(0, {})` for an unmeasured circuit
+    keeps the existing measure-all behaviour, which the other runners also use.
+    """
+    qubit_base, total_q = {}, 0
+    for name, size in _QREG_RE.findall(qasm):
+        qubit_base[name] = total_q
+        total_q += int(size)
+    clbit_base, total_c = {}, 0
+    for name, size in _CREG_RE.findall(qasm):
+        clbit_base[name] = total_c
+        total_c += int(size)
+    mapping = {}
+    for qreg, qidx, creg, cidx in _MEASURE_RE.findall(qasm):
+        if qreg in qubit_base and creg in clbit_base:
+            mapping[clbit_base[creg] + int(cidx)] = qubit_base[qreg] + int(qidx)
+    return (total_c, mapping) if mapping else (0, {})
+
 def main() -> int:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -48,6 +151,23 @@ def main() -> int:
         _err(f"bad JSON request: {e}", kind="bad-request")
         return 0
 
+    if (req.get("mode") or "execute") == "capabilities":
+        # Capability handshake — see the note in tsim_runner.py. This runner
+        # has no `mode` dispatch of its own (it only executes), so the check
+        # sits ahead of request validation rather than beside sibling modes.
+        _emit(
+            {
+                "ok": True,
+                "capabilities": {
+                    "backend": "perceval",
+                    "modes": ["execute"],
+                    "noise_keys": [],
+                    "notes": "photonic; no noise model",
+                },
+            }
+        )
+        return 0
+
     qasm = req.get("qasm")
     shots = req.get("shots")
     if not isinstance(qasm, str) or not qasm.strip():
@@ -55,6 +175,20 @@ def main() -> int:
         return 0
     if not isinstance(shots, int) or shots <= 0:
         _err("`shots` must be a positive integer", kind="bad-request")
+        return 0
+
+    # This bridge consumes no noise model. It used to IGNORE `noise` entirely
+    # and return a noiseless distribution, which the caller reads as noisy —
+    # the same silent-drop defect `--noise` was fixed for in-tree. Refuse
+    # loudly instead, matching the tsim/ppvm runners.
+    noise = req.get("noise")
+    if noise:
+        _err(
+            f"the perceval bridge does not implement a noise model "
+            f"(request carried noise={noise!r}); rerun without `noise`, or use "
+            "the qiskit bridge, or an in-process backend",
+            kind="perceval-noise-not-supported",
+        )
         return 0
 
     # Header detection: OPTICQASM uses its own header line. Anything
@@ -167,8 +301,16 @@ def _run_qasm2(qasm: str, shots: int) -> int:
         # `Processor.__init__`, which asserts `isinstance(backend, ABackend)`
         # and dies with "'backend' must be an ABackend (got ...Catalog)".
         # SLOS is Perceval's default strong-simulation backend.
-        processor = QiskitConverter().convert(
-            qiskit_circuit, use_postselection=True
+        # `use_postselection=False` => heralded CNOTs throughout.
+        #
+        # With post-selection on, several post-processed CNOTs' conditions
+        # annihilate each other and the sampler is handed a distribution with
+        # ZERO bins, which surfaces as `Unable to normalize an empty
+        # distribution` — measured on `06_qft_3.qasm`, which has three of them.
+        # Heralded CNOTs cost more modes but always leave a normalisable
+        # distribution; the same fixture then agrees with Qiskit to 8.9e-16.
+        processor = _unique_param_converter(QiskitConverter).convert(
+            qiskit_circuit, use_postselection=False
         )
         sampler = pcvl.algorithm.Sampler(processor)
         sample_result = sampler.samples(shots)
@@ -193,16 +335,50 @@ def _run_qasm2(qasm: str, shots: int) -> int:
                 kind="perceval-not-supported",
             )
             return 0
+        # Capability limits must be typed refusals, not hard errors. These
+        # escaped as kind="execute", which the cross-backend harness treats as
+        # a genuine failure and PANICS on — so a gate perceval simply does not
+        # implement read as a broken bridge rather than an honest "cannot
+        # express". Measured on the corpus: CY and CRZ raise UnknownGateError,
+        # and 3-qubit gates raise NotImplementedError, all from
+        # perceval_interop's converter.
+        emsg = str(e)
+        ename = type(e).__name__
+        if ename in ("UnknownGateError", "NotImplementedError"):
+            _err(
+                f"perceval cannot express this circuit: {emsg}\n"
+                "  Why: perceval-interop's QiskitConverter implements a fixed "
+                "set of gates — CNOT/CZ/SWAP among two-qubit gates, plus any "
+                "one-qubit unitary via a generic 2-mode circuit. Controlled "
+                "rotations (CRZ, CY) and 3-qubit gates (CCX, CSWAP) are not in "
+                "it, so there is no dual-rail circuit to build.\n"
+                "  What runs it today: the in-process `statevector` and `mps` "
+                "backends accept the full gate set.",
+                kind="perceval-not-supported",
+            )
+            return 0
         _err(
-            f"Perceval execute: {e}\n{traceback.format_exc()}",
+            f"perceval failed while executing the circuit: {emsg}\n"
+            "  This is an execution failure, not a capability limit — the "
+            "conversion succeeded and the simulator then raised. Full "
+            "traceback follows for upstream reporting.\n"
+            f"{traceback.format_exc()}",
             kind="execute",
         )
         return 0
 
     counts: dict[str, int] = {}
     n_qubits = qiskit_circuit.num_qubits
+    n_clbits, meas_map = _measurement_map(qasm)
     for sample in sample_result.get("results", []):
         bits = _basis_state_to_bits(sample, n_qubits)
+        if n_clbits:
+            # Project the qubit register onto the CLASSICAL register: bit i is
+            # whatever qubit was measured into clbit i, and an unmeasured clbit
+            # stays 0 — the same convention every other runner uses.
+            bits = "".join(
+                bits[meas_map[i]] if i in meas_map else "0" for i in range(n_clbits)
+            )
         counts[bits] = counts.get(bits, 0) + 1
 
     _emit({"ok": True, "counts": counts})

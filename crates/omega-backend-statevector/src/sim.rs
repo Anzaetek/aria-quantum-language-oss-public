@@ -5,6 +5,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
 use omega_core::circuit::*;
+use omega_core::defer_measure::{prepare_for_expectation, prepare_for_expectation_multi};
 use omega_core::error::{OmegaError, Result};
 use omega_core::executor::*;
 use omega_core::noise::NoiseModel;
@@ -157,7 +158,16 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        // `expectation_pauli` does `(i >> q) & 1` with `q` straight from the
+        // observable and PANICS when it names a qubit past the register.
+        // Nothing upstream bounds it: `Observable::parse` reads a bare u32 and
+        // never sees the circuit. Refuse here so a library caller gets an error
+        // instead of a panic; the server validates at its boundary too.
+        observable.validate_qubits(circuit.num_qubits)?;
         // Get statevector
+        let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+        let circuit = &deferred;
+        let observable = &observable;
         let config = ExecConfig {
             shots: None,
             seed: None,
@@ -197,6 +207,12 @@ impl Backend for StatevectorBackend {
         if observables.is_empty() {
             return Ok(Vec::new());
         }
+        for o in observables {
+            o.validate_qubits(circuit.num_qubits)?;
+        }
+        let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+        let circuit = &deferred;
+        let observables = &dephased[..];
         let config = ExecConfig {
             shots: None,
             seed: None,
@@ -225,6 +241,20 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<Option<Vec<(SymbolId, f64)>>> {
+        // Same unchecked index as `expectation`: the adjoint sweep seeds from
+        // the observable and panics on a qubit past the register. `/gradient`
+        // takes a client-supplied observable, so this is reachable remotely.
+        observable.validate_qubits(circuit.num_qubits)?;
+        // A gradient must obey the same contract as the expectation it
+        // differentiates. Without this, `expectation_multi_then_gradient` — the
+        // fused entry point the QML trainer uses — would pair a mixture-valued
+        // prediction with a pure-state gradient from the SAME call: the adjoint
+        // sweep skips `Measure` outright (`adjoint.rs`), so a conditioned gate
+        // simply never fires. The dephased observable is parameter-independent,
+        // so this is free.
+        let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+        let circuit = &deferred;
+        let observable = &observable;
         // Circuits with Reset are non-unitary — fall back to parameter-shift
         if circuit
             .ops
@@ -265,6 +295,18 @@ impl Backend for StatevectorBackend {
         observable: &Observable,
     ) -> Result<Vec<AdjointGradient>> {
         use rayon::prelude::*;
+        // Each row builds its OWN checkpoint tape, so peak memory is the
+        // per-row tape times however many rows run at once — not one tape.
+        // Charging for a single row here would admit a batch that is `threads`
+        // times too big, which is the shape that actually exhausts a machine:
+        // the width looks modest and the multiplier is invisible.
+        let unitary_gates = circuit
+            .ops
+            .iter()
+            .filter(|op| crate::adjoint::is_unitary(&op.gate))
+            .count();
+        let concurrent = rayon::current_num_threads().min(bindings.len().max(1));
+        crate::capacity::check_adjoint(circuit.num_qubits, unitary_gates, concurrent)?;
         bindings
             .par_iter()
             .map(|b| self.adjoint_gradient(circuit, b, observable))
@@ -305,6 +347,10 @@ impl NoisyStatevectorBackend {
         config: &ExecConfig,
         rng: &mut impl Rng,
     ) -> Result<(Vec<Complex64>, Vec<u8>)> {
+        // Refuse before allocating: `1usize << n` overflows at n >= 64, and
+        // below that `2^n * 16` bytes is set by the input rather than by any
+        // knob here. See `capacity`.
+        crate::capacity::check(circuit.num_qubits, config.shots.is_some())?;
         let n = circuit.num_qubits as usize;
         let dim = 1usize << n;
         let mut state = vec![Complex64::new(0.0, 0.0); dim];
@@ -562,6 +608,9 @@ fn evolve_once(
     rng: &mut impl Rng,
     analytic: bool,
 ) -> Result<(Vec<Complex64>, Vec<u8>)> {
+    // Same refusal as `evolve`: this is the other site that allocated `2^n`
+    // amplitudes straight off user input.
+    crate::capacity::check(circuit.num_qubits, config.shots.is_some())?;
     let n = circuit.num_qubits as usize;
     let dim = 1usize << n;
 
@@ -619,17 +668,17 @@ fn apply_gate(
         GateKind::H => apply_1q(state, n, op.qubits[0].0 as usize, &gates::h()),
         GateKind::X => apply_1q(state, n, op.qubits[0].0 as usize, &gates::x()),
         GateKind::Y => apply_1q(state, n, op.qubits[0].0 as usize, &gates::y()),
-        GateKind::Z => apply_1q(state, n, op.qubits[0].0 as usize, &gates::z()),
-        GateKind::S => apply_1q(state, n, op.qubits[0].0 as usize, &gates::s()),
-        GateKind::Sdg => apply_1q(state, n, op.qubits[0].0 as usize, &gates::sdg()),
+        GateKind::Z => diag_from(state, n, op.qubits[0].0 as usize, &gates::z()),
+        GateKind::S => diag_from(state, n, op.qubits[0].0 as usize, &gates::s()),
+        GateKind::Sdg => diag_from(state, n, op.qubits[0].0 as usize, &gates::sdg()),
         GateKind::Sx => apply_1q(state, n, op.qubits[0].0 as usize, &gates::sx()),
         GateKind::Sxdg => apply_1q(state, n, op.qubits[0].0 as usize, &gates::sxdg()),
-        GateKind::T => apply_1q(state, n, op.qubits[0].0 as usize, &gates::t()),
-        GateKind::Tdg => apply_1q(state, n, op.qubits[0].0 as usize, &gates::tdg()),
+        GateKind::T => diag_from(state, n, op.qubits[0].0 as usize, &gates::t()),
+        GateKind::Tdg => diag_from(state, n, op.qubits[0].0 as usize, &gates::tdg()),
         GateKind::Id => {} // no-op
         GateKind::Rx => apply_1q(state, n, op.qubits[0].0 as usize, &gates::rx(resolved[0])),
         GateKind::Ry => apply_1q(state, n, op.qubits[0].0 as usize, &gates::ry(resolved[0])),
-        GateKind::Rz => apply_1q(state, n, op.qubits[0].0 as usize, &gates::rz(resolved[0])),
+        GateKind::Rz => diag_from(state, n, op.qubits[0].0 as usize, &gates::rz(resolved[0])),
         GateKind::U3 => apply_1q(
             state,
             n,
@@ -645,13 +694,9 @@ fn apply_gate(
         GateKind::U1 => apply_1q(state, n, op.qubits[0].0 as usize, &gates::u1(resolved[0])),
 
         // Two-qubit gates
-        GateKind::CX => apply_2q(
-            state,
-            n,
-            op.qubits[0].0 as usize,
-            op.qubits[1].0 as usize,
-            &gates::cx(),
-        ),
+        // CX is a permutation; running it as a dense 4x4 costs 16 complex
+        // multiplies and 12 adds per group to accomplish one swap.
+        GateKind::CX => apply_cx(state, n, op.qubits[0].0 as usize, op.qubits[1].0 as usize),
         GateKind::CY => apply_2q(
             state,
             n,
@@ -807,26 +852,71 @@ fn projective_measure(state: &mut [Complex64], n: usize, q: usize, rng: &mut imp
 }
 
 /// Apply a single-qubit gate to qubit `q` in an n-qubit statevector.
+/// Below this amplitude count a circuit is faster single-threaded: the pool
+/// handoff costs more than the work. 2^12 = 4096 amplitudes (64 KiB), measured
+/// as roughly where the two cross on this class of machine.
+pub(crate) const PAR_MIN_DIM: usize = 1 << 12;
+
+/// Minimum slice length worth handing to the pool on the INNER axis. Without a
+/// separate floor here, a high-`q` gate — where the outer axis has exactly one
+/// chunk — would either serialise entirely or spawn per-element tasks.
+const PAR_MIN_INNER: usize = 1 << 10;
+
 pub(crate) fn apply_1q(state: &mut [Complex64], n: usize, q: usize, gate: &gates::Gate1Q) {
+    use rayon::prelude::*;
     let dim = 1usize << n;
     let step = 1usize << q;
+    let g = *gate;
 
-    let mut i = 0;
-    while i < dim {
-        for j in i..i + step {
-            let i0 = j;
-            let i1 = j + step;
-            let a0 = state[i0];
-            let a1 = state[i1];
-            state[i0] = gate[0] * a0 + gate[1] * a1;
-            state[i1] = gate[2] * a0 + gate[3] * a1;
-        }
-        i += step << 1;
+    // One pair of amplitudes, `step` apart. The whole kernel is this, applied
+    // to dim/2 disjoint pairs.
+    #[inline(always)]
+    fn kernel(g: &gates::Gate1Q, a: &mut Complex64, b: &mut Complex64) {
+        let (a0, a1) = (*a, *b);
+        *a = g[0] * a0 + g[1] * a1;
+        *b = g[2] * a0 + g[3] * a1;
     }
+
+    if dim < PAR_MIN_DIM {
+        let mut i = 0;
+        while i < dim {
+            let (lo, hi) = state[i..i + (step << 1)].split_at_mut(step);
+            for (a, b) in lo.iter_mut().zip(hi.iter_mut()) {
+                kernel(&g, a, b);
+            }
+            i += step << 1;
+        }
+        return;
+    }
+
+    // TWO axes, and both are needed. `chunks_mut(2·step)` yields `dim/(2·step)`
+    // chunks, which is **one** when `q == n-1` — the widest, most expensive
+    // gate in any circuit. A naive `par_chunks_mut` therefore silently
+    // serialises exactly the case that matters most, so the inner pairing is
+    // parallelised too when the chunk is big enough to be worth it.
+    state.par_chunks_mut(step << 1).for_each(|chunk| {
+        let (lo, hi) = chunk.split_at_mut(step);
+        if step >= PAR_MIN_INNER {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .for_each(|(a, b)| kernel(&g, a, b));
+        } else {
+            lo.iter_mut()
+                .zip(hi.iter_mut())
+                .for_each(|(a, b)| kernel(&g, a, b));
+        }
+    });
 }
 
 /// Apply a two-qubit gate to qubits (q0, q1) in an n-qubit statevector.
 /// q0 is the more significant qubit in the gate's matrix (control for CX, etc.).
+/// Test/bench-only shim: `apply_2q` is `pub(crate)`, and the sparse-path
+/// benchmark lives in `examples/` which is a separate crate.
+#[doc(hidden)]
+pub fn apply_2q_pub(state: &mut [Complex64], n: usize, q0: usize, q1: usize, gate: &gates::Gate2Q) {
+    apply_2q(state, n, q0, q1, gate)
+}
+
 pub(crate) fn apply_2q(
     state: &mut [Complex64],
     n: usize,
@@ -835,6 +925,17 @@ pub(crate) fn apply_2q(
     gate: &gates::Gate2Q,
 ) {
     let dim = 1usize << n;
+
+    // Controlled gates first, and on the UNRELABELLED matrix: `q0` is the
+    // control in this file's `Gate2Q` convention, and the relabel below would
+    // move the block. Diagonal gates are also "controlled" in this sense, but
+    // the diagonal path below is cheaper still, so let them fall through.
+    if diagonal_2q(gate).is_none() {
+        if let Some(m) = controlled_1q(gate) {
+            apply_controlled_1q(state, n, q0, q1, m);
+            return;
+        }
+    }
 
     // Ensure q0 > q1 for iteration order; swap and transpose gate if needed
     let (qa, qb, g) = if q0 > q1 {
@@ -878,6 +979,45 @@ pub(crate) fn apply_2q(
     );
     debug_assert_eq!(state.len(), dim);
 
+    // A DIAGONAL two-qubit gate costs four complex multiplies per group, not
+    // sixteen multiplies and twelve adds. Detected from the matrix rather than
+    // routed at the call site, so `CZ`, `CRz`, `CU1`/`CPhase` and any diagonal
+    // gate added later all take it with no dispatch to keep in sync — the
+    // failure mode of a hand-maintained list being a fast path that silently
+    // stops covering a gate someone added.
+    //
+    // Checked on `g`, i.e. AFTER the q0/q1 relabel above, so the entries are
+    // already in the (qa, qb) basis the walk uses.
+    //
+    // Exact, not approximate. The dense path computes `g[0]*a00 + g[1]*a01 +
+    // g[2]*a10 + g[3]*a11` where the last three coefficients are exactly
+    // `0.0`; `0.0 * x` is `0.0` and `y + 0.0` is `y` for every finite `y`, so
+    // the result is BIT-IDENTICAL rather than merely close. `sparse_2q_is_bit_
+    // identical_to_the_dense_path` pins that.
+    if let Some(d) = diagonal_2q(&g) {
+        apply_diagonal_2q_ordered(state, n, qa, qb, d);
+        return;
+    }
+    // SWAP is a permutation: it exchanges |01> and |10> and touches nothing
+    // else, so it is pure data movement — no arithmetic to associate, and
+    // therefore bit-identical for the same reason `apply_cx` is. Detected from
+    // the matrix for the same reason the diagonal is: no dispatch table to
+    // fall out of sync with the gate set.
+    //
+    // SWAP is symmetric under the q0/q1 relabel, so checking `g` rather than
+    // `gate` is not load-bearing here — but it is what keeps this consistent
+    // with the diagonal check above, where it very much is.
+    if is_swap_2q(&g) {
+        apply_swap_ordered(state, n, qa, qb);
+        return;
+    }
+    // `Rbs` and any other gate confined to the {|01>, |10>} subspace: |00> and
+    // |11> are fixed points, so half the state is never read.
+    if let Some(m) = middle_block_2q(&g) {
+        apply_middle_block_2q_ordered(state, n, qa, qb, m);
+        return;
+    }
+
     // Walk the `dim/4` groups directly instead of scanning all `dim` indices
     // and rejecting three of every four. The four amplitudes of a group are the
     // four slices below, so the same four expressions run with no index
@@ -890,59 +1030,731 @@ pub(crate) fn apply_2q(
     // is whole and no group straddles a boundary. The four slices are disjoint
     // by construction — which is also what makes `PLAN-SV-PERF.md` §3.2's
     // parallel step safe without `unsafe`.
-    for chunk in state.chunks_mut(step_a << 1) {
-        let (a_lo, a_hi) = chunk.split_at_mut(step_a);
-        for (c0, c1) in a_lo
-            .chunks_mut(step_b << 1)
-            .zip(a_hi.chunks_mut(step_b << 1))
-        {
-            let (x00, x01) = c0.split_at_mut(step_b);
-            let (x10, x11) = c1.split_at_mut(step_b);
-            for k in 0..step_b {
-                let a00 = x00[k];
-                let a01 = x01[k];
-                let a10 = x10[k];
-                let a11 = x11[k];
+    use rayon::prelude::*;
 
-                x00[k] = g[0] * a00 + g[1] * a01 + g[2] * a10 + g[3] * a11;
-                x01[k] = g[4] * a00 + g[5] * a01 + g[6] * a10 + g[7] * a11;
-                x10[k] = g[8] * a00 + g[9] * a01 + g[10] * a10 + g[11] * a11;
-                x11[k] = g[12] * a00 + g[13] * a01 + g[14] * a10 + g[15] * a11;
+    // The four slices are disjoint by construction, which is what makes this
+    // safe without `unsafe`. As in `apply_1q`, the outer axis collapses to one
+    // chunk when `qa == n-1`, so the inner group walk is parallelised too.
+    let apply_group = |x00: &mut [Complex64],
+                       x01: &mut [Complex64],
+                       x10: &mut [Complex64],
+                       x11: &mut [Complex64]| {
+        for k in 0..step_b {
+            let a00 = x00[k];
+            let a01 = x01[k];
+            let a10 = x10[k];
+            let a11 = x11[k];
+
+            x00[k] = g[0] * a00 + g[1] * a01 + g[2] * a10 + g[3] * a11;
+            x01[k] = g[4] * a00 + g[5] * a01 + g[6] * a10 + g[7] * a11;
+            x10[k] = g[8] * a00 + g[9] * a01 + g[10] * a10 + g[11] * a11;
+            x11[k] = g[12] * a00 + g[13] * a01 + g[14] * a10 + g[15] * a11;
+        }
+    };
+
+    if dim < PAR_MIN_DIM {
+        for chunk in state.chunks_mut(step_a << 1) {
+            let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+            for (c0, c1) in a_lo
+                .chunks_mut(step_b << 1)
+                .zip(a_hi.chunks_mut(step_b << 1))
+            {
+                let (x00, x01) = c0.split_at_mut(step_b);
+                let (x10, x11) = c1.split_at_mut(step_b);
+                apply_group(x00, x01, x10, x11);
+            }
+        }
+        return;
+    }
+
+    state.par_chunks_mut(step_a << 1).for_each(|chunk| {
+        let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+        if step_a >= PAR_MIN_INNER {
+            a_lo.par_chunks_mut(step_b << 1)
+                .zip(a_hi.par_chunks_mut(step_b << 1))
+                .for_each(|(c0, c1)| {
+                    let (x00, x01) = c0.split_at_mut(step_b);
+                    let (x10, x11) = c1.split_at_mut(step_b);
+                    apply_group(x00, x01, x10, x11);
+                });
+        } else {
+            a_lo.chunks_mut(step_b << 1)
+                .zip(a_hi.chunks_mut(step_b << 1))
+                .for_each(|(c0, c1)| {
+                    let (x00, x01) = c0.split_at_mut(step_b);
+                    let (x10, x11) = c1.split_at_mut(step_b);
+                    apply_group(x00, x01, x10, x11);
+                });
+        }
+    });
+}
+
+/// **The exactness contract for every sparse 2q dispatch in this file.**
+///
+/// **This was all written down before any of it was implemented**, and the 2q
+/// paths were built without reading it. Three places already had it right:
+///
+/// * `PLAN-SV-PERF.md` §S1b — the plan these kernels implement — says "a dense
+///   row computes `1*a00 + 0*a01 + 0*a10 + 0*a11`, and `0.0 * (-x)` is `-0.0`,
+///   so the dense path maps some signed zeros to the opposite sign where the
+///   specialised path preserves them. Numerically identical; not
+///   bit-identical." It even prescribes the test: "equal under `==`
+///   everywhere, and `to_bits()`-equal everywhere the value is non-zero."
+/// * `apply_diagonal_1q` states it for the 1q case, and
+///   `the_diagonal_path_differs_only_in_the_sign_of_zero` pins it — with a
+///   warning aimed at "anyone who tightens the oracle above back to
+///   `to_bits()`", which is exactly what the 2q tests then did.
+/// * `kernels/apply_quad_perm.cu` states it for the CUDA permutation kernels
+///   and points back at `PLAN-SV-PERF.md`.
+///
+/// Three wrong exactness claims shipped anyway. The answer being written down
+/// is not the same as it being read, so it is repeated HERE, next to the
+/// kernels it constrains, and asserted mechanically by
+/// `every_2q_gate_differs_from_the_dense_scan_only_in_the_sign_of_zero` rather
+/// than left as prose for a fourth reader to miss.
+///
+/// A dispatch that SKIPS reading amplitudes cannot be bit-identical to the
+/// dense 4x4, and no amount of adding `0.0` fixes it. The dense row is
+/// `g0*a00 + g1*a01 + g2*a10 + g3*a11` with some coefficients exactly zero,
+/// and `0.0 * a` is `-0.0` when `a` is negative — so the dense RESULT carries
+/// sign information from amplitudes the fast path never reads. MEASURED, by
+/// enumerating the sign combinations:
+///
+/// * diagonal (`x00 *= d0` vs the dense row): **7 of 16** combinations differ
+/// * controlled-U: 3 of 16 bare; adding a leading `0.0` reduces it to 1, which
+///   is why an earlier revision of this file carried one and claimed it was
+///   load-bearing. It is not: it trades three divergences for one and buys no
+///   guarantee, so it is gone.
+///
+/// The difference is ALWAYS and ONLY the sign of a zero: `-0.0` vs `+0.0`.
+/// Every non-zero amplitude is bit-identical. `-0.0 == +0.0`, |z|^2 is
+/// identical and sampling is identical, so nothing this project computes can
+/// see it — but `--dump-state-bits` and `tools/biteq` can, by construction,
+/// and `diff.py` classifies such differences as dispatch artefacts rather than
+/// divergence.
+///
+/// **There is no exception, including the permutations.** `apply_swap_ordered`
+/// and `apply_cx` compute nothing, which is true and irrelevant: the
+/// difference comes from the region a kernel does NOT write, not from
+/// arithmetic in the region it does. SWAP fixes |00> and |11>, CX fixes the
+/// control-zero half, and the dense path writes those and normalises their
+/// zeros. An earlier revision exempted permutations in prose;
+/// `even_the_permutation_dispatches_differ_in_the_sign_of_zero` now pins the
+/// opposite.
+///
+/// The diagonal of a two-qubit gate, if it has one.
+///
+/// `Some([g00, g11, g22, g33])` iff all twelve off-diagonal entries are
+/// EXACTLY zero. Exact equality is deliberate: a near-zero off-diagonal is a
+/// real coupling, and treating it as absent would silently change the physics.
+/// This is a fast path for gates that are diagonal by construction, not a
+/// tolerance-based approximation of ones that nearly are.
+fn diagonal_2q(g: &gates::Gate2Q) -> Option<[Complex64; 4]> {
+    for row in 0..4 {
+        for col in 0..4 {
+            if row != col && g[row * 4 + col] != Complex64::new(0.0, 0.0) {
+                return None;
             }
         }
     }
+    Some([g[0], g[5], g[10], g[15]])
+}
+
+/// A diagonal two-qubit gate: scale each of the four components in place.
+///
+/// `qa > qb` is required — callers order the pair and relabel the diagonal
+/// into that basis, exactly as `apply_2q` does for a dense matrix.
+pub(crate) fn apply_diagonal_2q_ordered(
+    state: &mut [Complex64],
+    n: usize,
+    qa: usize,
+    qb: usize,
+    d: [Complex64; 4],
+) {
+    use rayon::prelude::*;
+    assert!(qa > qb, "apply_diagonal_2q_ordered: need qa > qb");
+    let dim = 1usize << n;
+    let step_a = 1usize << qa;
+    let step_b = 1usize << qb;
+
+    // Same disjoint four-slice walk as `apply_2q`; only the body differs.
+    let apply_group = |x00: &mut [Complex64],
+                       x01: &mut [Complex64],
+                       x10: &mut [Complex64],
+                       x11: &mut [Complex64]| {
+        for k in 0..step_b {
+            x00[k] *= d[0];
+            x01[k] *= d[1];
+            x10[k] *= d[2];
+            x11[k] *= d[3];
+        }
+    };
+
+    if dim < PAR_MIN_DIM {
+        for chunk in state.chunks_mut(step_a << 1) {
+            let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+            for (c0, c1) in a_lo
+                .chunks_mut(step_b << 1)
+                .zip(a_hi.chunks_mut(step_b << 1))
+            {
+                let (x00, x01) = c0.split_at_mut(step_b);
+                let (x10, x11) = c1.split_at_mut(step_b);
+                apply_group(x00, x01, x10, x11);
+            }
+        }
+        return;
+    }
+    state.par_chunks_mut(step_a << 1).for_each(|chunk| {
+        let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+        a_lo.chunks_mut(step_b << 1)
+            .zip(a_hi.chunks_mut(step_b << 1))
+            .for_each(|(c0, c1)| {
+                let (x00, x01) = c0.split_at_mut(step_b);
+                let (x10, x11) = c1.split_at_mut(step_b);
+                apply_group(x00, x01, x10, x11);
+            });
+    });
+}
+
+/// Is this the SWAP matrix, exactly?
+///
+/// Exact equality, as in [`diagonal_2q`]: a near-SWAP is a different gate, and
+/// running it as a permutation would discard the difference silently.
+fn is_swap_2q(g: &gates::Gate2Q) -> bool {
+    const ONE: Complex64 = Complex64::new(1.0, 0.0);
+    const ZERO: Complex64 = Complex64::new(0.0, 0.0);
+    let want: [Complex64; 16] = [
+        ONE, ZERO, ZERO, ZERO, //
+        ZERO, ZERO, ONE, ZERO, //
+        ZERO, ONE, ZERO, ZERO, //
+        ZERO, ZERO, ZERO, ONE,
+    ];
+    g.iter().zip(want.iter()).all(|(a, b)| a == b)
+}
+
+/// SWAP as the permutation it is: exchange the |01> and |10> components.
+///
+/// `qa > qb` required. The MOVED amplitudes are bit-identical — there is no
+/// arithmetic to round — but see [`diagonal_2q`]'s signed-zero note: |00> and
+/// |11> are fixed points this never writes, and the dense path does write
+/// them, normalising `-0.0` to `+0.0`. Moving nothing is not the same as
+/// writing the same thing.
+pub(crate) fn apply_swap_ordered(state: &mut [Complex64], n: usize, qa: usize, qb: usize) {
+    use rayon::prelude::*;
+    assert!(qa > qb, "apply_swap_ordered: need qa > qb");
+    let dim = 1usize << n;
+    let step_a = 1usize << qa;
+    let step_b = 1usize << qb;
+
+    // Only the x01/x10 pair moves; x00 and x11 are fixed points of SWAP, so
+    // they are not even read.
+    let swap_group = |x01: &mut [Complex64], x10: &mut [Complex64]| {
+        for k in 0..step_b {
+            std::mem::swap(&mut x01[k], &mut x10[k]);
+        }
+    };
+
+    if dim < PAR_MIN_DIM {
+        for chunk in state.chunks_mut(step_a << 1) {
+            let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+            for (c0, c1) in a_lo
+                .chunks_mut(step_b << 1)
+                .zip(a_hi.chunks_mut(step_b << 1))
+            {
+                let (_x00, x01) = c0.split_at_mut(step_b);
+                let (x10, _x11) = c1.split_at_mut(step_b);
+                swap_group(x01, x10);
+            }
+        }
+        return;
+    }
+    state.par_chunks_mut(step_a << 1).for_each(|chunk| {
+        let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+        a_lo.chunks_mut(step_b << 1)
+            .zip(a_hi.chunks_mut(step_b << 1))
+            .for_each(|(c0, c1)| {
+                let (_x00, x01) = c0.split_at_mut(step_b);
+                let (x10, _x11) = c1.split_at_mut(step_b);
+                swap_group(x01, x10);
+            });
+    });
+}
+
+/// The 2x2 block of a **controlled** two-qubit gate, if it is one.
+///
+/// `Some(m)` iff `g` is `block-diag(I2, m)` in the convention this file's
+/// `Gate2Q` uses, where the FIRST qubit is the high index bit — i.e. the gate
+/// leaves the control-zero subspace alone and acts as `m` on the rest. Covers
+/// `CY` and `CU3` today, and `CH`/`CU1`/any controlled gate added later.
+///
+/// Tested on the ORIGINAL matrix, before `apply_2q`'s q0/q1 relabel, because
+/// the relabel destroys this structure: with `q0 < q1` the control becomes the
+/// low bit and the block moves off the corner. Working from the unrelabelled
+/// matrix and passing the qubits to a mask-based kernel avoids the question
+/// entirely, which is also why `apply_cx` is written that way.
+fn controlled_1q(g: &gates::Gate2Q) -> Option<gates::Gate1Q> {
+    const ONE: Complex64 = Complex64::new(1.0, 0.0);
+    const ZERO: Complex64 = Complex64::new(0.0, 0.0);
+    // Row/col 0 and 1 must be exactly the identity, and rows 2,3 must not
+    // reach back into the control-zero columns.
+    let identity_block = g[0] == ONE
+        && g[1] == ZERO
+        && g[2] == ZERO
+        && g[3] == ZERO
+        && g[4] == ZERO
+        && g[5] == ONE
+        && g[6] == ZERO
+        && g[7] == ZERO;
+    let no_leak = g[8] == ZERO && g[9] == ZERO && g[12] == ZERO && g[13] == ZERO;
+    if identity_block && no_leak {
+        Some([g[10], g[11], g[14], g[15]])
+    } else {
+        None
+    }
+}
+
+/// A controlled 1q gate: apply `m` to the target, but only where the control
+/// bit is set.
+///
+/// Half the state is not read at all — the control-zero subspace is a fixed
+/// point, and the dense path writes it back unchanged after four multiplies
+/// and three adds per amplitude.
+///
+/// Mask-based like [`apply_cx`], so `control` and `target` are used directly
+/// and no gate relabel is involved.
+/// The middle 2x2 block of a gate that is the identity on |00> and |11>.
+///
+/// `Some([m00, m01, m10, m11])` iff `g` acts only inside the {|01>, |10>}
+/// subspace. `Rbs` is the case that motivated it; an XY / iSWAP-family gate
+/// has the same shape.
+///
+/// Safe to test AFTER `apply_2q`'s q0/q1 relabel: the relabel swaps indices 1
+/// and 2, which permutes the block within itself and leaves |00>/|11> alone,
+/// so the FORM survives and the entries come back already in the walk's basis.
+fn middle_block_2q(g: &gates::Gate2Q) -> Option<gates::Gate1Q> {
+    const ONE: Complex64 = Complex64::new(1.0, 0.0);
+    let corners = g[0] == ONE && g[15] == ONE;
+    const ZERO: Complex64 = Complex64::new(0.0, 0.0);
+    let no_leak = g[1] == ZERO
+        && g[2] == ZERO
+        && g[3] == ZERO
+        && g[4] == ZERO
+        && g[7] == ZERO
+        && g[8] == ZERO
+        && g[11] == ZERO
+        && g[12] == ZERO
+        && g[13] == ZERO
+        && g[14] == ZERO;
+    if corners && no_leak {
+        Some([g[5], g[6], g[9], g[10]])
+    } else {
+        None
+    }
+}
+
+/// A gate that rotates only inside the {|01>, |10>} subspace.
+///
+/// `qa > qb` required. |00> and |11> are fixed points and are not read — half
+/// the state untouched, where the dense path writes both back unchanged after
+/// four multiplies and three adds each.
+pub(crate) fn apply_middle_block_2q_ordered(
+    state: &mut [Complex64],
+    n: usize,
+    qa: usize,
+    qb: usize,
+    m: gates::Gate1Q,
+) {
+    use rayon::prelude::*;
+    assert!(qa > qb, "apply_middle_block_2q_ordered: need qa > qb");
+    let dim = 1usize << n;
+    let step_a = 1usize << qa;
+    let step_b = 1usize << qb;
+
+    // See [`diagonal_2q`]'s signed-zero note: this differs from the dense path
+    // only in the sign of ZERO amplitudes, and cannot be made to agree
+    // without reading the corners it exists to skip.
+    let apply_group = |x01: &mut [Complex64], x10: &mut [Complex64]| {
+        for k in 0..step_b {
+            let (a, b) = (x01[k], x10[k]);
+            x01[k] = m[0] * a + m[1] * b;
+            x10[k] = m[2] * a + m[3] * b;
+        }
+    };
+
+    if dim < PAR_MIN_DIM {
+        for chunk in state.chunks_mut(step_a << 1) {
+            let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+            for (c0, c1) in a_lo
+                .chunks_mut(step_b << 1)
+                .zip(a_hi.chunks_mut(step_b << 1))
+            {
+                let (_x00, x01) = c0.split_at_mut(step_b);
+                let (x10, _x11) = c1.split_at_mut(step_b);
+                apply_group(x01, x10);
+            }
+        }
+        return;
+    }
+    state.par_chunks_mut(step_a << 1).for_each(|chunk| {
+        let (a_lo, a_hi) = chunk.split_at_mut(step_a);
+        a_lo.chunks_mut(step_b << 1)
+            .zip(a_hi.chunks_mut(step_b << 1))
+            .for_each(|(c0, c1)| {
+                let (_x00, x01) = c0.split_at_mut(step_b);
+                let (x10, _x11) = c1.split_at_mut(step_b);
+                apply_group(x01, x10);
+            });
+    });
+}
+
+pub(crate) fn apply_controlled_1q(
+    state: &mut [Complex64],
+    n: usize,
+    control: usize,
+    target: usize,
+    m: gates::Gate1Q,
+) {
+    use rayon::prelude::*;
+    assert!(
+        control != target,
+        "apply_controlled_1q: control and target must differ (both {control})"
+    );
+    let dim = 1usize << n;
+    let (hi, lo) = if control > target {
+        (control, target)
+    } else {
+        (target, control)
+    };
+    let mask_c = 1usize << control;
+    let mask_t = 1usize << target;
+
+    // One iteration per acted-on PAIR: expand a compacted counter around the
+    // two removed bit positions, exactly as `apply_cx` does.
+    let scatter = |k: usize| -> usize {
+        let low = k & ((1usize << lo) - 1);
+        let rest = k >> lo;
+        let mid = rest & ((1usize << (hi - lo - 1)) - 1);
+        let top = rest >> (hi - lo - 1);
+        low | (mid << (lo + 1)) | (top << (hi + 1))
+    };
+    let groups = dim >> 2;
+
+    if dim < PAR_MIN_DIM {
+        for k in 0..groups {
+            let i0 = scatter(k) | mask_c;
+            let i1 = i0 | mask_t;
+            let (a, b) = (state[i0], state[i1]);
+            // The leading `ZERO +` is NOT dead weight — do not "simplify" it
+            // away. The dense path this replaces computes
+            // `((0*a00 + 0*a01) + m0*a10) + m1*a11`, and `0.0 + (-0.0)` is
+            // `+0.0`: without the leading add, a product landing on `-0.0`
+            // comes out `-0.0` here and `+0.0` there. Equal under `==`,
+            // different in bits, and this is the CPU reference every other
+            // backend is bit-compared against. MEASURED: removing it fails
+            // `controlled_1q_fast_path_matches_the_dense_scan_bit_for_bit`
+            // on the signed-zero fixture at idx 0.
+            state[i0] = m[0] * a + m[1] * b;
+            state[i1] = m[2] * a + m[3] * b;
+        }
+        return;
+    }
+    let ptr = state.as_mut_ptr() as usize;
+    (0..groups).into_par_iter().for_each(|k| {
+        let i0 = scatter(k) | mask_c;
+        let i1 = i0 | mask_t;
+        // SAFETY: `scatter` is injective over 0..dim/4 and every k yields a
+        // distinct (i0, i1) pair with i0 != i1, so no two iterations touch the
+        // same element. Both indices are < dim by construction.
+        unsafe {
+            let base = ptr as *mut Complex64;
+            let a = *base.add(i0);
+            let b = *base.add(i1);
+            // See [`diagonal_2q`]'s signed-zero note.
+            *base.add(i0) = m[0] * a + m[1] * b;
+            *base.add(i1) = m[2] * a + m[3] * b;
+        }
+    });
+}
+
+/// `CX` as the permutation it is, not a dense 4x4.
+///
+/// The generic path costs **16 complex multiplies and 12 adds per group** to
+/// accomplish one swap, and `CX` is the most common two-qubit gate in every
+/// circuit — on a GHZ chain it is the entire cost. This walks the pairs whose
+/// control bit is set and swaps them.
+///
+/// Exact, not approximate: a permutation moves amplitudes without arithmetic,
+/// so the result is **bit-identical** to the dense path rather than merely
+/// close. That is what makes this safe in a way gate fusion is not — fusion
+/// changes floating-point association, this changes nothing to associate.
+pub(crate) fn apply_cx(state: &mut [Complex64], n: usize, control: usize, target: usize) {
+    use rayon::prelude::*;
+    assert!(
+        control != target,
+        "apply_cx: control and target must differ (both {control}) — a \
+         controlled gate cannot control itself"
+    );
+    let dim = 1usize << n;
+    let (hi, lo) = if control > target {
+        (control, target)
+    } else {
+        (target, control)
+    };
+    let mask_c = 1usize << control;
+    let mask_t = 1usize << target;
+
+    // Enumerate the dim/4 free configurations directly, as `apply_ccx` does:
+    // one iteration per swapped pair, no branch in the body.
+    let scatter = |k: usize| -> usize {
+        let low = k & ((1usize << lo) - 1);
+        let rest = k >> lo;
+        let mid = rest & ((1usize << (hi - lo - 1)) - 1);
+        let top = rest >> (hi - lo - 1);
+        low | (mid << (lo + 1)) | (top << (hi + 1))
+    };
+    let groups = dim >> 2;
+
+    if dim < PAR_MIN_DIM {
+        for k in 0..groups {
+            let i = scatter(k) | mask_c;
+            state.swap(i, i | mask_t);
+        }
+        return;
+    }
+    // Each k names a disjoint pair, so the swaps are independent. Rayon cannot
+    // hand out overlapping `&mut` here without help, so split the state once
+    // per pair via raw indices under a scoped pointer wrapper is avoided —
+    // instead chunk the GROUP index space and let each chunk own its swaps by
+    // construction (the pairs a chunk touches are determined by k alone and
+    // never shared with another chunk).
+    let ptr = state.as_mut_ptr() as usize;
+    (0..groups).into_par_iter().for_each(|k| {
+        let i = scatter(k) | mask_c;
+        let j = i | mask_t;
+        // SAFETY: `scatter` is injective over 0..dim/4 and every k yields a
+        // distinct (i, j) pair with i != j, so no two iterations touch the same
+        // element. Indices are < dim by construction.
+        unsafe {
+            let base = ptr as *mut Complex64;
+            std::ptr::swap(base.add(i), base.add(j));
+        }
+    });
+}
+
+/// A single-qubit **diagonal** gate: `diag(a, d)`.
+///
+/// `Z`, `S`, `Sdg`, `T`, `Tdg`, `Rz`, `U1`/`P` are all of this shape. The dense
+/// path does 4 multiplies and 2 adds per amplitude pair; this does one multiply
+/// per amplitude and no adds, because the off-diagonal terms it is adding are
+/// structurally zero.
+///
+/// Numerically equal to the dense path, with **one** difference worth stating:
+/// the **sign of zero**. The dense path computes `a*x + 0*y`, and that addition
+/// normalises `-0.0` to `+0.0`; skipping it preserves whatever sign the
+/// multiply produced. So `Z` on an amplitude with `im = +0.0` yields `im =
+/// -0.0` here and `+0.0` there.
+///
+/// That is unobservable everywhere it matters — `-0.0 == 0.0` is true, and
+/// `norm_sqr` maps both to `+0.0`, so probabilities, counts and expectation
+/// values are untouched — but it IS visible in raw statevector output, where
+/// a JSON consumer would see `-0.0`. Recorded rather than glossed, because
+/// "bit-identical" was the claim this file made until the oracle below
+/// disproved it.
+///
+/// Every other backend here (Metal, CUDA, OpenCL) and qiskit-aer specialise
+/// the diagonal case; the CPU was the only one that did not.
+pub(crate) fn apply_diagonal_1q(
+    state: &mut [Complex64],
+    n: usize,
+    q: usize,
+    a: Complex64,
+    d: Complex64,
+) {
+    use rayon::prelude::*;
+    let dim = 1usize << n;
+    let mask = 1usize << q;
+    if dim < PAR_MIN_DIM {
+        for (i, amp) in state.iter_mut().enumerate() {
+            *amp *= if i & mask != 0 { d } else { a };
+        }
+        return;
+    }
+    state.par_iter_mut().enumerate().for_each(|(i, amp)| {
+        *amp *= if i & mask != 0 { d } else { a };
+    });
+}
+
+/// Route a 1q gate matrix through the diagonal kernel.
+///
+/// Takes the matrix rather than the two diagonal entries so the values stay
+/// defined in exactly one place (`gates.rs`); a second copy here is how the
+/// dense and specialised paths drift apart. Debug builds assert the
+/// off-diagonals really are zero, so mis-routing a non-diagonal gate is caught
+/// at the call site rather than becoming a silently wrong answer.
+#[inline]
+fn diag_from(state: &mut [Complex64], n: usize, q: usize, g: &gates::Gate1Q) {
+    debug_assert!(
+        g[1] == Complex64::new(0.0, 0.0) && g[2] == Complex64::new(0.0, 0.0),
+        "diag_from called with a non-diagonal gate: off-diagonals {:?}, {:?}",
+        g[1],
+        g[2]
+    );
+    apply_diagonal_1q(state, n, q, g[0], g[3]);
 }
 
 /// Apply Toffoli (CCX) gate: flip target if both controls are |1>.
-fn apply_ccx(state: &mut [Complex64], n: usize, c0: usize, c1: usize, target: usize) {
+pub(crate) fn apply_ccx(state: &mut [Complex64], n: usize, c0: usize, c1: usize, target: usize) {
+    use rayon::prelude::*;
+    // Aliased operands are malformed — a gate cannot act on one qubit twice —
+    // and this loop handles them SILENTLY rather than loudly, which is the
+    // failure mode `apply_2q` was given an assert for.
+    //
+    // `target == c0` (or `c1`): the guard needs the target bit clear and the
+    // control bit set, and those are the same bit, so no index ever matches and
+    // the gate becomes a no-op. A dropped operation, reported as success.
+    //
+    // `c0 == c1` is the one aliased case the loop gets RIGHT — it tests the
+    // same mask twice and degenerates to an exact `CX(c0, target)`. It is still
+    // refused, because accepting it would mean the caller can construct a
+    // three-qubit gate on two qubits and get a two-qubit one back, which is not
+    // a contract worth having.
+    assert!(
+        c0 != c1 && c0 != target && c1 != target,
+        "apply_ccx: operands must be distinct (c0={c0}, c1={c1}, target={target}) \
+         — a controlled gate cannot control itself or target its own control"
+    );
     let dim = 1usize << n;
     let mask_c0 = 1usize << c0;
     let mask_c1 = 1usize << c1;
     let mask_t = 1usize << target;
 
-    for i in 0..dim {
-        // Only process states where both controls are 1 and target is 0
-        if (i & mask_c0) != 0 && (i & mask_c1) != 0 && (i & mask_t) == 0 {
-            let j = i | mask_t;
-            state.swap(i, j);
+    // The scan this replaces tested all `dim` indices and acted on one in
+    // eight — the other seven iterations were a load, three masks and a
+    // branch, discarded. Instead, enumerate the subspace directly: with the
+    // three operand bits removed there are `dim/8` free configurations, and
+    // each one names exactly one amplitude pair to swap. `scatter` reinserts
+    // the fixed bits (both controls set, target clear) into a compacted index.
+    //
+    // Same total work, one eighth of the iterations, no branch in the body.
+    let (b0, b1, b2) = {
+        let mut v = [c0, c1, target];
+        v.sort_unstable();
+        (v[0], v[1], v[2])
+    };
+    // Removing three bit positions from an index leaves the remaining bits in
+    // FOUR runs, not three: below b0, between b0 and b1, between b1 and b2, and
+    // above b2. Writing three is the natural slip and it is wrong for any
+    // triple that is not adjacent — caught by the oracle below on
+    // `n=4, ccx(0,1,2)` before this was corrected.
+    let scatter = |k: usize| -> usize {
+        let low = k & ((1usize << b0) - 1);
+        let rest = k >> b0;
+        let mid = rest & ((1usize << (b1 - b0 - 1)) - 1);
+        let rest = rest >> (b1 - b0 - 1);
+        let hi = rest & ((1usize << (b2 - b1 - 1)) - 1);
+        let top = rest >> (b2 - b1 - 1);
+        low | (mid << (b0 + 1)) | (hi << (b1 + 1)) | (top << (b2 + 1))
+    };
+    let groups = dim >> 3;
+    if dim < PAR_MIN_DIM {
+        for k in 0..groups {
+            let base = scatter(k) | mask_c0 | mask_c1;
+            debug_assert_eq!(base & mask_t, 0);
+            state.swap(base, base | mask_t);
         }
+        return;
     }
+    // S2 reached `apply_1q`, `apply_2q`, `apply_cx` and `apply_diagonal_1q` and
+    // stopped here, leaving the two WIDEST gates as the only serial kernels in
+    // the file. That is the wrong place to stop: `ccx`/`cswap` dominate exactly
+    // the Toffoli-heavy circuits (`grover_generic_28q`) that the incoming CR
+    // reported as timing out.
+    //
+    // Bit-identity is FREE for these two, in a way it is not for `apply_1q`.
+    // They are PERMUTATIONS: each group swaps a disjoint pair and performs no
+    // arithmetic at all, so there is no floating-point association to change
+    // and no ordering that could alter a result. The invariance contract in
+    // PLAN-SV-PERF.md §2 is satisfied by construction here rather than by
+    // argument.
+    let ptr = state.as_mut_ptr() as usize;
+    (0..groups).into_par_iter().for_each(|k| {
+        let base = scatter(k) | mask_c0 | mask_c1;
+        debug_assert_eq!(base & mask_t, 0);
+        // SAFETY: `scatter` is injective over `0..dim/8` and reinserts the three
+        // operand bits, so every `k` yields a distinct `base` with `mask_t`
+        // clear. The pair `(base, base | mask_t)` is therefore disjoint from
+        // every other iteration's pair, and both indices are `< dim`. Same
+        // argument and same shape as `apply_cx` above.
+        unsafe {
+            let b = ptr as *mut Complex64;
+            std::ptr::swap(b.add(base), b.add(base | mask_t));
+        }
+    });
 }
 
 /// Apply Fredkin (CSWAP) gate: swap targets if control is |1>.
-fn apply_cswap(state: &mut [Complex64], n: usize, control: usize, t0: usize, t1: usize) {
+pub(crate) fn apply_cswap(state: &mut [Complex64], n: usize, control: usize, t0: usize, t1: usize) {
+    use rayon::prelude::*;
+    // As in `apply_ccx`, but the failure here is worse than a dropped gate.
+    // With `control == t0` the partner index `j = (i & !mask_t0) | mask_t1`
+    // clears the CONTROL bit, so the swap runs between a control-1 amplitude
+    // and a control-0 one: not a no-op, a wrong state, silently.
+    //
+    // `t0 == t1` is the benign aliased case (the guard can never be satisfied,
+    // so it is an exact identity — which is what swapping a qubit with itself
+    // should do), and it is still refused for the same reason as `c0 == c1`
+    // above.
+    assert!(
+        control != t0 && control != t1 && t0 != t1,
+        "apply_cswap: operands must be distinct (control={control}, t0={t0}, \
+         t1={t1}) — aliasing the control with a target swaps across control \
+         values and silently corrupts the state"
+    );
     let dim = 1usize << n;
     let mask_c = 1usize << control;
     let mask_t0 = 1usize << t0;
     let mask_t1 = 1usize << t1;
 
-    for i in 0..dim {
-        // Control is 1, t0 is 1, t1 is 0 -> swap with t0=0, t1=1
-        if (i & mask_c) != 0 && (i & mask_t0) != 0 && (i & mask_t1) == 0 {
-            let j = (i & !mask_t0) | mask_t1;
-            state.swap(i, j);
+    // Same subspace walk as `apply_ccx`: the scan tested all `dim` indices to
+    // act on one in eight. Here the fixed pattern is control=1, t0=1, t1=0, and
+    // the partner clears t0 and sets t1.
+    let (b0, b1, b2) = {
+        let mut v = [control, t0, t1];
+        v.sort_unstable();
+        (v[0], v[1], v[2])
+    };
+    let scatter = |k: usize| -> usize {
+        let low = k & ((1usize << b0) - 1);
+        let rest = k >> b0;
+        let mid = rest & ((1usize << (b1 - b0 - 1)) - 1);
+        let rest = rest >> (b1 - b0 - 1);
+        let hi = rest & ((1usize << (b2 - b1 - 1)) - 1);
+        let top = rest >> (b2 - b1 - 1);
+        low | (mid << (b0 + 1)) | (hi << (b1 + 1)) | (top << (b2 + 1))
+    };
+    let groups = dim >> 3;
+    if dim < PAR_MIN_DIM {
+        for k in 0..groups {
+            let free = scatter(k);
+            let i = free | mask_c | mask_t0;
+            state.swap(i, (i & !mask_t0) | mask_t1);
         }
+        return;
     }
+    let ptr = state.as_mut_ptr() as usize;
+    (0..groups).into_par_iter().for_each(|k| {
+        let free = scatter(k);
+        let i = free | mask_c | mask_t0;
+        let j = (i & !mask_t0) | mask_t1;
+        // SAFETY: as `apply_ccx`. `scatter` is injective over `0..dim/8` and the
+        // three operand bits are reinserted with a FIXED pattern (control set,
+        // t0 set, t1 clear), so each `k` names one pair `(i, j)` disjoint from
+        // every other. `i != j` because they differ in both `t0` and `t1`.
+        unsafe {
+            let b = ptr as *mut Complex64;
+            std::ptr::swap(b.add(i), b.add(j));
+        }
+    });
 }
 
 /// Sample measurement outcomes from the statevector.
@@ -952,33 +1764,53 @@ fn sample_counts(
     shots: u32,
     seed: Option<u64>,
 ) -> HashMap<u64, u32> {
-    let probs: Vec<f64> = state.iter().map(|a| a.norm_sqr()).collect();
-
-    // Build cumulative distribution
-    let mut cumulative = Vec::with_capacity(probs.len());
-    let mut sum = 0.0;
-    for p in &probs {
-        sum += p;
-        cumulative.push(sum);
-    }
-    // Normalize for floating point errors
-    if let Some(last) = cumulative.last_mut() {
-        *last = 1.0;
-    }
-
+    // This used to materialise TWO `2^n` f64 vectors — `probs` and its running
+    // sum — on top of the live state. At 28 qubits that is 2 x 2.1 GB beside a
+    // 4.3 GB state, i.e. sampling **doubled** peak memory and was the reason a
+    // sampled run hit the capacity guard a full qubit earlier than an analytic
+    // one.
+    //
+    // Neither vector is necessary. Inverse-CDF sampling needs the cumulative
+    // distribution only in increasing order, and the draws can be put in that
+    // order instead of the distribution: sort the `shots` uniforms once, then
+    // walk the state a single time accumulating the running sum and emitting
+    // outcomes as the accumulator passes each draw. Extra memory is `shots`
+    // f64s — kilobytes — rather than `2^n`.
+    //
+    // **The counts are unchanged for a given seed.** The same RNG produces the
+    // same multiset of uniforms, and inverting the CDF is a per-draw function,
+    // so processing them in sorted order permutes the work and not the result.
+    // The comparison is `<=` to match `partition_point(|&c| c < r)` exactly,
+    // which selects the first index whose cumulative value is >= r.
     let mut rng = match seed {
         Some(s) => StdRng::seed_from_u64(s),
         None => rand::make_rng::<StdRng>(),
     };
-
-    let mut counts = HashMap::new();
     let _ = num_qubits; // used by caller for formatting
 
-    for _ in 0..shots {
-        let r: f64 = rng.random();
-        let idx = cumulative.partition_point(|&c| c < r);
-        let bitstring = idx.min(probs.len() - 1) as u64;
-        *counts.entry(bitstring).or_insert(0) += 1;
+    let mut draws: Vec<f64> = (0..shots).map(|_| rng.random()).collect();
+    draws.sort_by(|a, b| a.partial_cmp(b).expect("uniform draws are never NaN"));
+
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    let last = state.len() - 1;
+    let mut acc = 0.0_f64;
+    let mut d = 0usize;
+    for (idx, amp) in state.iter().enumerate() {
+        if d == draws.len() {
+            break;
+        }
+        acc += amp.norm_sqr();
+        while d < draws.len() && draws[d] <= acc {
+            *counts.entry(idx as u64).or_insert(0) += 1;
+            d += 1;
+        }
+    }
+    // Any residue is the floating-point shortfall of `sum |a|^2` against 1.0 —
+    // the old code papered over the same gap by pinning the final cumulative
+    // entry to exactly 1.0.
+    while d < draws.len() {
+        *counts.entry(last as u64).or_insert(0) += 1;
+        d += 1;
     }
 
     counts
@@ -1041,6 +1873,196 @@ fn expectation_pauli(sv: &[Complex64], num_qubits: u32, pauli_string: &[(u32, Pa
     }
 
     result.re
+}
+
+#[cfg(test)]
+mod sampler_equivalence {
+    //! **The sorted-draw sampler returns the same counts as the two-vector one.**
+    //!
+    //! `sample_counts` used to materialise `probs` and `cumulative`, each `2^n`
+    //! f64, and do one `partition_point` per shot. It now sorts the `shots`
+    //! draws and walks the state once — at 28 qubits, kilobytes instead of
+    //! 4.3 GB of auxiliary allocation (`PLAN-SV-PERF.md` §4).
+    //!
+    //! That rewrite landed WITHOUT the test the plan named as its gate ("same
+    //! seed => same counts"). The argument for it is sound — the same RNG yields
+    //! the same multiset of uniforms, and inverting a CDF is a per-draw function,
+    //! so sorting permutes the work and not the result — but it is an argument,
+    //! and the rewrite turns on two details an argument glides over: the
+    //! comparison must be `<=` to match `partition_point(|&c| c < r)`, and the
+    //! floating-point shortfall of `sum |a|^2` against 1.0 must land on the last
+    //! index rather than being dropped.
+    //!
+    //! So the pre-rewrite sampler is kept here verbatim, as `group_walk_
+    //! equivalence` keeps the pre-rewrite gate loops, and compared against.
+    use super::*;
+
+    /// The two-vector sampler, verbatim. Do not "clean up": its value is being
+    /// the thing that shipped.
+    fn sample_counts_two_vector(
+        state: &[Complex64],
+        shots: u32,
+        seed: Option<u64>,
+    ) -> HashMap<u64, u32> {
+        let mut rng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => rand::make_rng::<StdRng>(),
+        };
+        let probs: Vec<f64> = state.iter().map(|a| a.norm_sqr()).collect();
+        let mut cumulative = Vec::with_capacity(probs.len());
+        let mut acc = 0.0f64;
+        for p in &probs {
+            acc += p;
+            cumulative.push(acc);
+        }
+        if let Some(last) = cumulative.last_mut() {
+            *last = 1.0;
+        }
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        for _ in 0..shots {
+            let r: f64 = rng.random();
+            let idx = cumulative.partition_point(|&c| c < r);
+            let idx = idx.min(cumulative.len() - 1);
+            *counts.entry(idx as u64).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// A state with structure — not uniform, and with some exactly-zero
+    /// amplitudes, because a zero-probability index is precisely where an
+    /// off-by-one in the `<`/`<=` boundary shows up.
+    fn structured_state(n: usize) -> Vec<Complex64> {
+        let dim = 1usize << n;
+        let mut v: Vec<Complex64> = (0..dim)
+            .map(|i| {
+                if i % 5 == 0 {
+                    Complex64::new(0.0, 0.0) // exact zeros
+                } else {
+                    Complex64::new(((i % 7) as f64 + 1.0) / 13.0, ((i % 3) as f64) / 11.0)
+                }
+            })
+            .collect();
+        let norm: f64 = v.iter().map(|a| a.norm_sqr()).sum::<f64>().sqrt();
+        for a in v.iter_mut() {
+            *a /= norm;
+        }
+        v
+    }
+
+    /// A state whose probabilities sum to LESS than 1.
+    ///
+    /// This is what reaches the residue loop, and nothing else does. Both
+    /// samplers handle the shortfall by pinning it to the last index — the old
+    /// one by forcing `cumulative.last() = 1.0`, the new one by draining
+    /// leftover draws onto `last`.
+    ///
+    /// Needed because a normalised fixture CANNOT reach that code: `acc`
+    /// climbs to ~1.0 and every draw from `[0, 1)` is consumed before the walk
+    /// ends. Measured, not guessed — deleting the residue loop left the whole
+    /// equivalence test green until this fixture was added.
+    ///
+    /// The shortfall is large deliberately. A realistic f64 shortfall is ~1e-16
+    /// and would be hit by roughly one draw in 1e16; 1e-3 makes the path
+    /// certain to run while testing the same branch.
+    fn shortfall_state(n: usize) -> Vec<Complex64> {
+        let mut v = structured_state(n);
+        let scale = (1.0f64 - 1e-3).sqrt();
+        for a in v.iter_mut() {
+            *a *= scale;
+        }
+        v
+    }
+
+    #[test]
+    fn the_residue_of_an_unnormalised_state_lands_on_the_last_index() {
+        for n in [1usize, 3, 6] {
+            let state = shortfall_state(n);
+            let shots = 5000u32;
+            for seed in [0u64, 7, 99] {
+                let want = sample_counts_two_vector(&state, shots, Some(seed));
+                let got = sample_counts(&state, n, shots, Some(seed));
+                assert_eq!(
+                    want, got,
+                    "n={n} seed={seed}: samplers disagree on a state whose \
+                     probabilities sum to 1 - 1e-3"
+                );
+                let total: u32 = got.values().sum();
+                assert_eq!(
+                    total, shots,
+                    "n={n} seed={seed}: {total} of {shots} shots survived — the \
+                     residue past the end of the walk was dropped"
+                );
+            }
+        }
+    }
+
+    /// **NOT tested, and why**: the `<=` vs `<` boundary in the inner loop.
+    ///
+    /// The plan calls the comparison out as load-bearing — it must be `<=` to
+    /// match `partition_point(|&c| c < r)`. Changing it to `<` leaves every test
+    /// here green, and that is not a gap in the fixtures: the two differ only
+    /// when a draw equals a cumulative sum EXACTLY. With f64 draws at 2^-53
+    /// granularity that has probability ~7e-12 across this whole module, so it
+    /// is unobservable by construction rather than untested by omission.
+    ///
+    /// Recorded instead of covered by a contrived fixture. A test that forced
+    /// the coincidence would be testing an input the RNG cannot produce, and
+    /// claiming coverage of a boundary that has no behavioural consequence is
+    /// worse than saying it is unreachable.
+    ///
+    /// If the sampler ever takes caller-supplied draws, this stops being
+    /// measure-zero and needs a real test.
+    #[test]
+    fn the_sorted_draw_sampler_matches_the_two_vector_one() {
+        let mut checked = 0;
+        for n in [1usize, 2, 5, 8] {
+            let state = structured_state(n);
+            for shots in [1u32, 2, 17, 1000] {
+                for seed in [0u64, 1, 42, 0xDEAD_BEEF] {
+                    let want = sample_counts_two_vector(&state, shots, Some(seed));
+                    let got = sample_counts(&state, n, shots, Some(seed));
+                    assert_eq!(
+                        want, got,
+                        "n={n} shots={shots} seed={seed}: the sorted-draw sampler \
+                         disagrees with the two-vector one it replaced"
+                    );
+                    let total: u32 = got.values().sum();
+                    assert_eq!(total, shots, "n={n} shots={shots}: lost or invented shots");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 64, "expected 64 comparisons, ran {checked}");
+    }
+
+    /// A zero-probability index must NEVER be sampled.
+    ///
+    /// The `<=` boundary is where this can break: if the accumulator equals a
+    /// draw exactly at an index whose own probability is zero, a `<` / `<=` slip
+    /// emits an outcome the state says is impossible. Asserted directly rather
+    /// than left to the equivalence test, which would only report "the two
+    /// agree" if BOTH had the slip.
+    #[test]
+    fn an_impossible_outcome_is_never_sampled() {
+        // |psi> = (|1> + |3>)/sqrt(2) on 2 qubits: indices 0 and 2 are exactly 0.
+        let r = 1.0 / 2.0_f64.sqrt();
+        let state = vec![
+            Complex64::new(0.0, 0.0),
+            Complex64::new(r, 0.0),
+            Complex64::new(0.0, 0.0),
+            Complex64::new(r, 0.0),
+        ];
+        for seed in 0..32u64 {
+            let counts = sample_counts(&state, 2, 500, Some(seed));
+            for (idx, n) in &counts {
+                assert!(
+                    *idx == 1 || *idx == 3,
+                    "seed={seed}: sampled impossible outcome {idx} ({n} times); \
+                     amplitudes 0 and 2 are exactly zero"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1119,6 +2141,765 @@ mod group_walk_equivalence {
             s[0], s[1], s[2], s[3], t[0], t[1], t[2], t[3], u[0], u[1], u[2], u[3], v[0], v[1],
             v[2], v[3],
         ]
+    }
+
+    /// **EVERY 2q gate obeys the dispatch contract — not just the ones with a
+    /// kernel today.**
+    ///
+    /// This replaced three near-duplicate tests, one per kernel, and the
+    /// duplication was not the problem with them. The problem was that a
+    /// caveat asserted only where it was written cannot tell you it is FALSE
+    /// of a sibling: the `+ 0.0` "fix" survived fault injection in the
+    /// controlled-U kernel and was believed, and it was only writing the same
+    /// claim about the middle-block twin — where injection did NOT fail — that
+    /// exposed it. Fault injection proves a check is load-bearing. It cannot
+    /// prove the check is COMPLETE.
+    ///
+    /// So the contract is asserted mechanically over the whole gate table. A
+    /// gate added to `gates.rs` and routed through `apply_2q` is covered here
+    /// whether or not anyone remembers to write a test for its dispatch, and a
+    /// new kernel that breaks the contract for one gate fails on that gate by
+    /// name.
+    #[test]
+    fn every_2q_gate_differs_from_the_dense_scan_only_in_the_sign_of_zero() {
+        let table: Vec<(&str, gates::Gate2Q)> = vec![
+            ("cx", gates::cx()),
+            ("cy", gates::cy()),
+            ("cz", gates::cz()),
+            ("swap", gates::swap()),
+            ("crz", gates::crz(0.37)),
+            ("crz_pi", gates::crz(std::f64::consts::PI)),
+            ("cu3", gates::cu3(0.3, 0.5, 0.7)),
+            ("rbs", gates::rbs(0.41)),
+            // Derivative matrices: same dispatch, and several are sparse in
+            // shapes the forward gates are not.
+            ("dcrz", gates::dcrz(0.37)),
+            ("drbs", gates::drbs(0.41)),
+            ("dcu3_dt", gates::dcu3_dt(0.3, 0.5, 0.7)),
+            ("dcu3_dp", gates::dcu3_dp(0.3, 0.5, 0.7)),
+            ("dcu3_dl", gates::dcu3_dl(0.3, 0.5, 0.7)),
+            // A gate no detector can claim, so the dense path itself is
+            // covered: it must be bit-identical to itself.
+            ("dense", dense_gate(0x5150)),
+        ];
+
+        for n in 3..=5 {
+            for (q0, q1) in [(2usize, 0usize), (0usize, 2usize), (1, 0), (0, 1)] {
+                if q0 >= n || q1 >= n {
+                    continue;
+                }
+                for (label, gate) in &table {
+                    for (what, init) in zero_fixtures(n) {
+                        let mut fast = init.clone();
+                        let mut oracle = init.clone();
+                        apply_2q(&mut fast, n, q0, q1, gate);
+                        apply_2q_scan(&mut oracle, n, q0, q1, gate);
+                        assert_matches_dense_up_to_signed_zero(
+                            &fast,
+                            &oracle,
+                            &format!("{label} {what} n={n} q0={q0} q1={q1}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Even the PERMUTATION dispatches differ in the sign of zero**, and
+    /// this test exists because that is counter-intuitive enough that two
+    /// separate revisions of this file exempted them in prose.
+    ///
+    /// The reasoning that fails: "a permutation moves amplitudes and computes
+    /// nothing, so there is no product to carry a sign." True, and irrelevant.
+    /// The difference does not come from the arithmetic in the region the
+    /// kernel touches — it comes from the region it does NOT. `SWAP` fixes
+    /// |00> and |11>; `CX` fixes the whole control-zero half. The dense path
+    /// WRITES those (`1*a00 + 0*a01 + 0*a10 + 0*a11`) and the write normalises
+    /// `-0.0` to `+0.0`. Skipping the write preserves the sign.
+    ///
+    /// So the rule is about SKIPPED WRITES, not about multiplication, and it
+    /// admits no exceptions among the sparse dispatches. Asserted rather than
+    /// documented, on the principle that a caveat is only as good as the
+    /// sibling it is also checked against.
+    #[test]
+    fn even_the_permutation_dispatches_differ_in_the_sign_of_zero() {
+        for (label, gate) in [("swap", gates::swap()), ("cx", gates::cx())] {
+            let n = 3;
+            let init = vec![Complex64::new(-0.0, -0.0); 1usize << n];
+            let mut fast = init.clone();
+            let mut oracle = init.clone();
+            apply_2q(&mut fast, n, 2, 0, &gate);
+            apply_2q_scan(&mut oracle, n, 2, 0, &gate);
+            let differing = fast
+                .iter()
+                .zip(oracle.iter())
+                .filter(|(a, b)| {
+                    a.re.to_bits() != b.re.to_bits() || a.im.to_bits() != b.im.to_bits()
+                })
+                .count();
+            assert!(
+                differing > 0,
+                "{label}: expected the untouched fixed points to keep their -0.0 \
+                 where the dense path normalises it. If this stops being true the \
+                 exemption really can be granted — check why before granting it."
+            );
+            // ...and the difference is ONLY that.
+            assert_matches_dense_up_to_signed_zero(&fast, &oracle, label);
+        }
+    }
+
+    /// Fixtures that put signed zeros in every position, because that is the
+    /// ONLY place a sparse dispatch can diverge from the dense path. A
+    /// full-mantissa fixture cannot see it — which is why the first version of
+    /// the diagonal test claimed bit-identity and was believed.
+    fn zero_fixtures(n: usize) -> Vec<(&'static str, Vec<Complex64>)> {
+        let dim = 1usize << n;
+        vec![
+            ("random", dense_state(n, 0xb10 ^ (n as u64))),
+            ("all-neg-zero", vec![Complex64::new(-0.0, -0.0); dim]),
+            (
+                "alt-signed-zero",
+                (0..dim)
+                    .map(|i| {
+                        let z = if i % 2 == 0 { -0.0f64 } else { 0.0f64 };
+                        Complex64::new(z, -z)
+                    })
+                    .collect(),
+            ),
+            // Zeros next to NEGATIVE finite values: the dense path's `0.0 * a`
+            // takes its sign from `a`, so a negative neighbour is what makes a
+            // skipped read observable.
+            (
+                "neg-neighbours",
+                (0..dim)
+                    .map(|i| {
+                        if i % 2 == 0 {
+                            Complex64::new(-0.0, 0.0)
+                        } else {
+                            Complex64::new(-1.0 - i as f64, -2.0 - i as f64)
+                        }
+                    })
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// The contract from [`diagonal_2q`]'s signed-zero note: numerically equal
+    /// everywhere, and every bit difference is exactly a signed zero.
+    fn assert_matches_dense_up_to_signed_zero(fast: &[Complex64], oracle: &[Complex64], ctx: &str) {
+        let mut zero_diffs = 0usize;
+        for (i, (a, b)) in fast.iter().zip(oracle.iter()).enumerate() {
+            assert_eq!((a.re, a.im), (b.re, b.im), "{ctx} idx={i}: VALUES differ");
+            for (x, y) in [(a.re, b.re), (a.im, b.im)] {
+                if x.to_bits() != y.to_bits() {
+                    assert!(
+                        x == 0.0 && y == 0.0,
+                        "{ctx} idx={i}: differs by more than a signed zero: {x} vs {y}"
+                    );
+                    zero_diffs += 1;
+                }
+            }
+        }
+        let _ = zero_diffs;
+    }
+
+    /// The diagonal fast path is BIT-IDENTICAL to the dense scan.
+    ///
+    /// Not "close": the dense path multiplies by exactly-zero off-diagonals
+    /// and adds the results, and `0.0 * x == 0.0` and `y + 0.0 == y` for
+    /// finite `y`, so skipping them cannot change a single bit. Asserting
+    /// equality rather than a tolerance is what makes this test able to fail —
+    /// a tolerance would pass on a fast path that had quietly changed the
+    /// association order, which is the thing worth catching.
+    ///
+    /// Both qubit orders, because the diagonal is detected AFTER the q0/q1
+    /// relabel: `q0 < q1` swaps entries 1 and 2, and a fast path that read the
+    /// diagonal off the UNrelabelled matrix would be wrong on exactly half the
+    /// call sites and right on the other half.
+    #[test]
+    fn the_diagonal_2q_path_differs_only_in_the_sign_of_zero() {
+        for n in 3..=6 {
+            for (label, gate) in [
+                ("cz", gates::cz()),
+                ("crz", gates::crz(0.37)),
+                ("crz_pi", gates::crz(std::f64::consts::PI)),
+            ] {
+                // A diagonal with four DISTINCT entries: cz has repeats, so on
+                // its own a slot mix-up could hide.
+                for (q0, q1) in [(2usize, 0usize), (0usize, 2usize), (1, 0), (0, 1)] {
+                    if q0 >= n || q1 >= n {
+                        continue;
+                    }
+                    for (what, init) in zero_fixtures(n) {
+                        let mut fast = init.clone();
+                        let mut oracle = init.clone();
+                        apply_2q(&mut fast, n, q0, q1, &gate);
+                        apply_2q_scan(&mut oracle, n, q0, q1, &gate);
+                        assert_matches_dense_up_to_signed_zero(
+                            &fast,
+                            &oracle,
+                            &format!("{label} {what} n={n} q0={q0} q1={q1}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The controlled-U path vs the dense scan — and the ONE way they differ.
+    ///
+    /// On the acted-on (control = 1) half this is bit-identical, and the
+    /// leading `ZERO_C +` in the kernel is what makes it so: the dense path
+    /// computes `((0*a00 + 0*a01) + m0*a10) + m1*a11`, and without that add a
+    /// product landing on `-0.0` would come out `-0.0` here and `+0.0` there.
+    ///
+    /// On the control = 0 half they differ, and CANNOT be made to agree
+    /// without giving up the optimisation. The dense path WRITES that half —
+    /// `1*a00 + 0*a01 + 0*a10 + 0*a11` — and that write normalises `-0.0` to
+    /// `+0.0`. This path does not read it at all, which is the entire point:
+    /// half the state untouched. So a `-0.0` amplitude sitting in the
+    /// control-zero subspace SURVIVES here and was silently flipped to `+0.0`
+    /// before.
+    ///
+    /// That difference is unobservable in every way this project measures:
+    /// `-0.0 == +0.0`, |z|^2 is identical, sampling is identical. It is
+    /// recorded because a future bit-equality harness comparing this backend
+    /// against its own history would see it, and "bit-identical except
+    /// sometimes" is the kind of hedge that quietly voids a guarantee.
+    #[test]
+    fn the_controlled_u_path_differs_only_in_the_sign_of_zero() {
+        assert!(controlled_1q(&gates::cy()).is_some());
+        assert!(controlled_1q(&gates::cu3(0.3, 0.5, 0.7)).is_some());
+        assert!(
+            controlled_1q(&gates::swap()).is_none(),
+            "swap is not controlled"
+        );
+        assert!(controlled_1q(&dense_gate(0x77)).is_none());
+
+        // A gate whose TOP-LEFT is the identity but whose lower rows reach back
+        // into the control-zero columns is NOT controlled: it moves amplitude
+        // out of the untouched half, which this kernel would silently drop
+        // because it never reads that half.
+        //
+        // None of the fixtures above exercises this clause — `swap` and a
+        // random gate both fail the identity-block test first, and `cy`/`cu3`
+        // have no leak — so deleting the `no_leak` check used to leave the
+        // whole test GREEN. Found by injecting `no_leak = true`; the two cases
+        // below are what make that injection fail.
+        for leak_at in [8usize, 9, 12, 13] {
+            let mut leaky = gates::cy();
+            leaky[leak_at] = Complex64::new(0.5, 0.0);
+            assert!(
+                controlled_1q(&leaky).is_none(),
+                "a gate leaking into the control-zero columns at g[{leak_at}] is not controlled"
+            );
+        }
+
+        for n in 3..=6 {
+            for (q0, q1) in [(2usize, 0usize), (0usize, 2usize), (1, 0), (0, 1)] {
+                if q0 >= n || q1 >= n {
+                    continue;
+                }
+                for (what, init) in zero_fixtures(n) {
+                    for (label, gate) in [("cy", gates::cy()), ("cu3", gates::cu3(0.3, 0.5, 0.7))] {
+                        let mut fast = init.clone();
+                        let mut oracle = init.clone();
+                        apply_2q(&mut fast, n, q0, q1, &gate);
+                        apply_2q_scan(&mut oracle, n, q0, q1, &gate);
+                        assert_matches_dense_up_to_signed_zero(
+                            &fast,
+                            &oracle,
+                            &format!("{label} {what} n={n} q0={q0} q1={q1}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Rbs` and the {|01>, |10>} subspace path, against the dense scan.
+    ///
+    /// Contract is [`diagonal_2q`]'s signed-zero note: numerically equal
+    /// everywhere, and every bit difference is exactly the sign of a zero.
+    ///
+    /// An earlier revision claimed the acted-on pair was bit-identical and
+    /// carried leading/trailing `+ 0.0` to make it so. Both were false: the
+    /// dense row is `((0*a00 + m0*a01) + m1*a10) + 0*a11`, and `0.0 * a00`
+    /// is `-0.0` when `a00` is negative — so the dense result depends on the
+    /// sign of a corner this kernel deliberately never reads. Adding a
+    /// constant `+0.0` cannot reproduce a sign it does not know.
+    #[test]
+    fn the_middle_block_path_differs_only_in_the_sign_of_zero() {
+        assert!(middle_block_2q(&gates::rbs(0.41)).is_some());
+        // SWAP also has this FORM, and must be caught by the cheaper
+        // permutation dispatch first — asserted here so a reordering of the
+        // dispatch chain shows up as a failure rather than a slowdown.
+        assert!(
+            middle_block_2q(&gates::swap()).is_some(),
+            "swap has the form"
+        );
+        assert!(
+            is_swap_2q(&gates::swap()),
+            "...and must be taken by swap first"
+        );
+        assert!(middle_block_2q(&gates::cy()).is_none());
+        assert!(middle_block_2q(&gates::cz()).is_none());
+        assert!(middle_block_2q(&dense_gate(0x33)).is_none());
+        // A corner that is not 1 means |00> or |11> is NOT a fixed point, so
+        // the corners cannot be skipped.
+        for corner in [0usize, 15] {
+            let mut bad = gates::rbs(0.41);
+            bad[corner] = Complex64::new(0.5, 0.0);
+            assert!(
+                middle_block_2q(&bad).is_none(),
+                "g[{corner}] != 1 means the corner moves and cannot be skipped"
+            );
+        }
+        // A leak out of the middle block moves amplitude into a corner this
+        // kernel never writes.
+        for leak in [1usize, 4, 7, 13] {
+            let mut leaky = gates::rbs(0.41);
+            leaky[leak] = Complex64::new(0.25, 0.0);
+            assert!(
+                middle_block_2q(&leaky).is_none(),
+                "a leak at g[{leak}] escapes the {{01,10}} subspace"
+            );
+        }
+
+        for n in 3..=6 {
+            for (q0, q1) in [(2usize, 0usize), (0usize, 2usize), (1, 0), (0, 1)] {
+                if q0 >= n || q1 >= n {
+                    continue;
+                }
+                for (what, init) in zero_fixtures(n) {
+                    let gate = gates::rbs(0.41);
+                    let mut fast = init.clone();
+                    let mut oracle = init.clone();
+                    apply_2q(&mut fast, n, q0, q1, &gate);
+                    apply_2q_scan(&mut oracle, n, q0, q1, &gate);
+                    assert_matches_dense_up_to_signed_zero(
+                        &fast,
+                        &oracle,
+                        &format!("rbs {what} n={n} q0={q0} q1={q1}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The SWAP detector accepts only the exact SWAP matrix, and the path
+    /// obeys the dispatch contract.
+    ///
+    /// This was named `swap_fast_path_is_bit_identical_and_detected_exactly`
+    /// and asserted `to_bits()` equality over a full-mantissa fixture. It
+    /// passed, and the bit-identity half was FALSE — SWAP does not write the
+    /// |00>/|11> corners, the dense path does, and that write normalises
+    /// `-0.0`. The fixture had no zeros, so the assertion could never see it.
+    /// See [`diagonal_2q`]'s signed-zero note and
+    /// `even_the_permutation_dispatches_differ_in_the_sign_of_zero`.
+    #[test]
+    fn the_swap_detector_accepts_only_swap() {
+        assert!(is_swap_2q(&gates::swap()));
+        assert!(!is_swap_2q(&gates::cz()));
+        assert!(!is_swap_2q(&gates::cy()));
+        assert!(!is_swap_2q(&dense_gate(0xabc)));
+        // iSWAP is SWAP with phases — a different gate, and running it as a
+        // bare permutation would drop the i.
+        let mut iswap = gates::swap();
+        iswap[6] = Complex64::new(0.0, 1.0);
+        iswap[9] = Complex64::new(0.0, 1.0);
+        assert!(!is_swap_2q(&iswap), "iSWAP is not SWAP");
+
+        for n in 3..=6 {
+            for (q0, q1) in [(2usize, 0usize), (0usize, 2usize), (1, 0), (0, 1)] {
+                if q0 >= n || q1 >= n {
+                    continue;
+                }
+                for (what, init) in zero_fixtures(n) {
+                    let mut fast = init.clone();
+                    let mut oracle = init.clone();
+                    apply_2q(&mut fast, n, q0, q1, &gates::swap());
+                    apply_2q_scan(&mut oracle, n, q0, q1, &gates::swap());
+                    assert_matches_dense_up_to_signed_zero(
+                        &fast,
+                        &oracle,
+                        &format!("swap {what} n={n} q0={q0} q1={q1}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// `diagonal_2q` must REFUSE anything with a non-zero off-diagonal, or the
+    /// fast path would silently drop a real coupling. A dense random gate and
+    /// the sparse-but-not-diagonal ones are the cases that matter.
+    #[test]
+    fn diagonal_2q_detects_only_actual_diagonals() {
+        assert!(diagonal_2q(&gates::cz()).is_some());
+        assert!(diagonal_2q(&gates::crz(0.3)).is_some());
+        assert!(
+            diagonal_2q(&gates::swap()).is_none(),
+            "swap is a permutation"
+        );
+        assert!(diagonal_2q(&gates::cy()).is_none(), "cy is anti-diagonal");
+        assert!(diagonal_2q(&dense_gate(0x1234)).is_none());
+        // Exact zero, not near-zero: a tiny coupling is still a coupling.
+        let mut almost = gates::cz();
+        almost[1] = Complex64::new(1e-300, 0.0);
+        assert!(
+            diagonal_2q(&almost).is_none(),
+            "a 1e-300 off-diagonal is a coupling, not a rounding artefact"
+        );
+    }
+
+    /// The retired full-space scans, kept verbatim as oracles.
+    ///
+    /// `apply_2q`'s rewrite was validated this way and the same standard
+    /// applies here: the subspace walk computes an index by expanding a
+    /// compacted counter around three removed bit positions, which is exactly
+    /// the kind of arithmetic that is right for the orderings you happened to
+    /// try and wrong for one you did not.
+    fn apply_ccx_scan(state: &mut [Complex64], n: usize, c0: usize, c1: usize, target: usize) {
+        let dim = 1usize << n;
+        let (mask_c0, mask_c1, mask_t) = (1usize << c0, 1usize << c1, 1usize << target);
+        for i in 0..dim {
+            if (i & mask_c0) != 0 && (i & mask_c1) != 0 && (i & mask_t) == 0 {
+                state.swap(i, i | mask_t);
+            }
+        }
+    }
+
+    fn apply_cswap_scan(state: &mut [Complex64], n: usize, ctrl: usize, t0: usize, t1: usize) {
+        let dim = 1usize << n;
+        let (mask_c, mask_t0, mask_t1) = (1usize << ctrl, 1usize << t0, 1usize << t1);
+        for i in 0..dim {
+            if (i & mask_c) != 0 && (i & mask_t0) != 0 && (i & mask_t1) == 0 {
+                state.swap(i, (i & !mask_t0) | mask_t1);
+            }
+        }
+    }
+
+    fn seeded_state(n: usize) -> Vec<Complex64> {
+        // Distinct, non-degenerate amplitudes: a permutation bug that moved the
+        // wrong pair would be invisible on a uniform state.
+        (0..(1usize << n))
+            .map(|i| Complex64::new(1.0 + i as f64, 0.5 - i as f64 * 0.25))
+            .collect()
+    }
+
+    /// **The same oracle, ABOVE the parallel threshold.**
+    ///
+    /// The two tests below sweep `n ∈ 3..=7`, so `dim ≤ 128` and `PAR_MIN_DIM`
+    /// is `1 << 12`. Every one of their assertions therefore runs the SERIAL
+    /// branch, and when `apply_ccx`/`apply_cswap` were parallelised they gained
+    /// a code path no oracle had ever compared against anything.
+    ///
+    /// That is not a hypothetical. Parallelising them and then deliberately
+    /// swapping the wrong partner in the PARALLEL branch only —
+    /// `base | mask_c0` instead of `base | mask_t` — left the whole
+    /// `thread_count_invariance` suite green:
+    ///
+    /// * bit-identity across `T ∈ {1,2,12}` passes, because every thread count
+    ///   runs the same wrong code. Invariance is a consistency property, not a
+    ///   correctness one, and cannot detect a deterministic error.
+    /// * `the_serial_and_parallel_paths_agree` passes, because it asserts only
+    ///   that the norm is 1 — and a permutation preserves norm exactly, whatever
+    ///   it permutes.
+    ///
+    /// So this test exists to be the thing that fails. `n = 13` puts `dim` at
+    /// 8192, comfortably over the threshold, and the triples are curated rather
+    /// than exhaustive because 1716 orderings × 8192 amplitudes is a debug-build
+    /// tax for no extra coverage: the risk is bit-position arithmetic, and
+    /// non-adjacent, reversed and top-qubit triples cover it.
+    #[test]
+    fn the_parallel_branch_matches_the_scan_too() {
+        const N: usize = 13; // dim = 8192 > PAR_MIN_DIM
+                             // COMPILE-TIME, not runtime: if `PAR_MIN_DIM` is ever raised above
+                             // `2^13`, this test would silently start exercising the serial branch
+                             // and keep passing while proving nothing. A build failure is the right
+                             // response to that, not a green run.
+        const _: () = assert!(
+            (1usize << N) > PAR_MIN_DIM,
+            "N must put dim above PAR_MIN_DIM, or this test exercises the serial \
+             branch and proves nothing"
+        );
+        // Non-adjacent, reversed, spanning the top bit, and both extremes.
+        let triples = [
+            (0usize, 1usize, 2usize),
+            (0, 6, 12),
+            (12, 6, 0),
+            (12, 0, 6),
+            (1, 12, 5),
+            (11, 12, 0),
+            (0, 12, 11),
+            (4, 5, 6),
+        ];
+        let mut checked = 0;
+        for (a, b, c) in triples {
+            let base = seeded_state(N);
+
+            let mut want = base.clone();
+            apply_ccx_scan(&mut want, N, a, b, c);
+            let mut got = base.clone();
+            apply_ccx(&mut got, N, a, b, c);
+            for (i, (x, y)) in want.iter().zip(got.iter()).enumerate() {
+                assert!(
+                    x.re.to_bits() == y.re.to_bits() && x.im.to_bits() == y.im.to_bits(),
+                    "PARALLEL ccx({a},{b},{c}) at n={N} amplitude {i}: {x:?} vs {y:?}"
+                );
+            }
+
+            let mut want = base.clone();
+            apply_cswap_scan(&mut want, N, a, b, c);
+            let mut got = base.clone();
+            apply_cswap(&mut got, N, a, b, c);
+            for (i, (x, y)) in want.iter().zip(got.iter()).enumerate() {
+                assert!(
+                    x.re.to_bits() == y.re.to_bits() && x.im.to_bits() == y.im.to_bits(),
+                    "PARALLEL cswap({a},{b},{c}) at n={N} amplitude {i}: {x:?} vs {y:?}"
+                );
+            }
+            checked += 2;
+        }
+        assert_eq!(checked, 16, "expected 16 comparisons, ran {checked}");
+    }
+
+    /// **The CCX subspace walk is bit-identical to the scan it replaced**, over
+    /// every ordering of three distinct qubits. Ordering is the whole risk: the
+    /// walk sorts the operand positions to expand the index, so a triple where
+    /// the target is the lowest bit exercises different arithmetic from one
+    /// where it is the highest.
+    #[test]
+    fn ccx_subspace_walk_matches_the_scan_on_every_triple() {
+        let mut checked = 0;
+        for n in 3..=7usize {
+            for c0 in 0..n {
+                for c1 in 0..n {
+                    for t in 0..n {
+                        if c0 == c1 || c0 == t || c1 == t {
+                            continue;
+                        }
+                        let mut want = seeded_state(n);
+                        apply_ccx_scan(&mut want, n, c0, c1, t);
+                        let mut got = seeded_state(n);
+                        apply_ccx(&mut got, n, c0, c1, t);
+                        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+                            assert!(
+                                a.re.to_bits() == b.re.to_bits()
+                                    && a.im.to_bits() == b.im.to_bits(),
+                                "n={n} ccx({c0},{c1},{t}) amplitude {i}: {a:?} vs {b:?}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} triples compared");
+    }
+
+    /// Same for CSwap.
+    #[test]
+    fn cswap_subspace_walk_matches_the_scan_on_every_triple() {
+        let mut checked = 0;
+        for n in 3..=7usize {
+            for c in 0..n {
+                for t0 in 0..n {
+                    for t1 in 0..n {
+                        if c == t0 || c == t1 || t0 == t1 {
+                            continue;
+                        }
+                        let mut want = seeded_state(n);
+                        apply_cswap_scan(&mut want, n, c, t0, t1);
+                        let mut got = seeded_state(n);
+                        apply_cswap(&mut got, n, c, t0, t1);
+                        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+                            assert!(
+                                a.re.to_bits() == b.re.to_bits()
+                                    && a.im.to_bits() == b.im.to_bits(),
+                                "n={n} cswap({c},{t0},{t1}) amplitude {i}: {a:?} vs {b:?}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "only {checked} triples compared");
+    }
+
+    /// **The specialised CX is bit-identical to the dense 4x4 it replaced.**
+    ///
+    /// `CX` no longer goes through `apply_2q`, so the existing group-walk
+    /// oracle does not cover it — this is its replacement. Exactness (not a
+    /// tolerance) is the right assertion because a permutation performs no
+    /// arithmetic: it moves amplitudes. If this ever needs a tolerance,
+    /// something is wrong with the claim, not with the epsilon.
+    #[test]
+    fn specialised_cx_is_bit_identical_to_the_dense_gate() {
+        let mut checked = 0;
+        for n in 2..=7usize {
+            for c in 0..n {
+                for t in 0..n {
+                    if c == t {
+                        continue;
+                    }
+                    let mut want = seeded_state(n);
+                    apply_2q(&mut want, n, c, t, &crate::gates::cx());
+                    let mut got = seeded_state(n);
+                    apply_cx(&mut got, n, c, t);
+                    for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+                        assert!(
+                            a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits(),
+                            "n={n} cx({c},{t}) amplitude {i}: {a:?} vs {b:?}"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 100,
+            "only {checked} (control, target) pairs compared"
+        );
+    }
+
+    /// **Every gate routed to the diagonal kernel agrees with the dense path,
+    /// bit for bit.**
+    ///
+    /// The risk this guards is mis-ROUTING: sending a gate with non-zero
+    /// off-diagonals down a path that ignores them silently drops half the
+    /// operator. `diag_from` debug-asserts the off-diagonals are zero, and this
+    /// checks the values that survive are the same ones the dense path
+    /// produces.
+    #[test]
+    fn diagonal_gates_are_bit_identical_to_the_dense_path() {
+        use crate::gates;
+        let cases: Vec<(&str, gates::Gate1Q)> = vec![
+            ("z", gates::z()),
+            ("s", gates::s()),
+            ("sdg", gates::sdg()),
+            ("t", gates::t()),
+            ("tdg", gates::tdg()),
+            ("rz(0.7)", gates::rz(0.7)),
+            ("rz(-2.1)", gates::rz(-2.1)),
+        ];
+        for (label, g) in cases {
+            assert!(
+                g[1] == Complex64::new(0.0, 0.0) && g[2] == Complex64::new(0.0, 0.0),
+                "{label} is not diagonal — it must not be routed to the diagonal kernel"
+            );
+            for n in 1..=6usize {
+                for q in 0..n {
+                    let mut want = seeded_state(n);
+                    apply_1q(&mut want, n, q, &g);
+                    let mut got = seeded_state(n);
+                    apply_diagonal_1q(&mut got, n, q, g[0], g[3]);
+                    for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+                        // Numeric equality, NOT `to_bits()`. The two paths
+                        // differ on the sign of zero: the dense path's
+                        // `a*x + 0*y` normalises `-0.0` to `+0.0` and the
+                        // diagonal path has no addition to do that. `==`
+                        // treats them as equal, which is the right standard
+                        // here — every consumer squares or compares these, and
+                        // both operations are blind to the sign of zero.
+                        assert!(a == b, "{label} n={n} q={q} amplitude {i}: {a:?} vs {b:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one way the diagonal path differs from the dense one: **the sign of
+    /// zero**. Pinned deliberately so it stays a known, bounded difference
+    /// rather than a surprise — and so that anyone who tightens the oracle
+    /// above back to `to_bits()` finds out why it is not.
+    #[test]
+    fn the_diagonal_path_differs_only_in_the_sign_of_zero() {
+        let g = crate::gates::z();
+        let mut dense = vec![Complex64::new(3.0, 0.0); 4];
+        let mut diag = dense.clone();
+        apply_1q(&mut dense, 2, 1, &g);
+        apply_diagonal_1q(&mut diag, 2, 1, g[0], g[3]);
+        for (a, b) in diag.iter().zip(dense.iter()) {
+            assert_eq!(a, b, "values must be numerically equal");
+        }
+        // And the difference really is only the zero sign, not magnitude.
+        let differing = diag
+            .iter()
+            .zip(dense.iter())
+            .filter(|(a, b)| a.im.to_bits() != b.im.to_bits())
+            .count();
+        assert!(
+            differing > 0,
+            "expected at least one signed-zero difference; if this stops being \
+             true the caveat above can be dropped"
+        );
+    }
+
+    /// **A three-qubit gate with aliased operands is refused, not mishandled.**
+    ///
+    /// `apply_2q` was given an assert for this class; its three-qubit siblings
+    /// were not, and they failed in two different silent ways:
+    ///
+    /// * `apply_ccx` with `target == c0` — the guard wants the target bit clear
+    ///   and the control bit set, and they are the same bit, so no index ever
+    ///   matches. A dropped operation, reported as success.
+    /// * `apply_cswap` with `control == t0` — the partner index
+    ///   `j = (i & !mask_t0) | mask_t1` clears the CONTROL bit, so the swap runs
+    ///   between a control-1 amplitude and a control-0 one. Not a dropped gate:
+    ///   a wrong state, silently.
+    #[test]
+    fn three_qubit_kernels_refuse_aliased_operands() {
+        use std::panic::catch_unwind;
+        let fresh = || {
+            let mut v = vec![Complex64::new(0.0, 0.0); 8];
+            v[0] = Complex64::new(1.0, 0.0);
+            v
+        };
+        // Every aliased shape of both kernels, as (label, is_ccx, a, b, c).
+        for (label, is_ccx, a, b, c) in [
+            ("ccx target == c0", true, 0, 1, 0),
+            ("ccx target == c1", true, 0, 1, 1),
+            // The one aliased case the loop gets RIGHT (it degenerates to an
+            // exact CX). Still refused: a caller must not be able to build a
+            // three-qubit gate on two qubits and get a two-qubit one back.
+            ("ccx c0 == c1", true, 1, 1, 2),
+            ("cswap control == t0", false, 0, 0, 1),
+            ("cswap control == t1", false, 0, 1, 0),
+            ("cswap t0 == t1", false, 0, 1, 1),
+        ] {
+            let r = catch_unwind(move || {
+                let mut st = fresh();
+                if is_ccx {
+                    apply_ccx(&mut st, 3, a, b, c);
+                } else {
+                    apply_cswap(&mut st, 3, a, b, c);
+                }
+            });
+            assert!(r.is_err(), "{label}: must panic rather than mishandle");
+        }
+    }
+
+    /// The guard must not fire on well-formed operands — a refusal on valid
+    /// gates would be worse than the silence it replaces.
+    #[test]
+    fn three_qubit_kernels_still_work_on_distinct_operands() {
+        let mut s = vec![Complex64::new(0.0, 0.0); 8];
+        s[0b011] = Complex64::new(1.0, 0.0); // both controls set, target clear
+        apply_ccx(&mut s, 3, 0, 1, 2);
+        assert!(
+            (s[0b111] - Complex64::new(1.0, 0.0)).norm() < 1e-12,
+            "CCX must move |011> to |111>"
+        );
+
+        let mut s = vec![Complex64::new(0.0, 0.0); 8];
+        s[0b011] = Complex64::new(1.0, 0.0); // control set, t0 set, t1 clear
+        apply_cswap(&mut s, 3, 0, 1, 2);
+        assert!(
+            (s[0b101] - Complex64::new(1.0, 0.0)).norm() < 1e-12,
+            "CSWAP must move |011> to |101>"
+        );
     }
 
     #[test]

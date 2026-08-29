@@ -51,9 +51,12 @@ use omega_core::circuit::CircuitIR;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use omega_core::circuit::GateKind;
 use omega_core::circuit::SymbolId;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+use omega_core::defer_measure::{prepare_for_expectation, prepare_for_expectation_multi};
 use omega_core::error::{OmegaError, Result as OmegaResult};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use omega_core::executor::MidCircuitMode;
+use omega_core::executor::MultiControlMode;
 use omega_core::executor::{
     Backend, ExecConfig, ExecResult, ExpectationsAndGradient, GradientObservableFactory, Observable,
 };
@@ -135,6 +138,12 @@ impl From<MetalError> for OmegaError {
 pub struct MetalStatevectorBackend {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     handle: imp::DeviceHandle,
+    /// How CCX/CSwap are realised. See [`MultiControlMode`]; default
+    /// `Decompose`, so behaviour is unchanged unless a caller asks. Mirrors the
+    /// CUDA backend field of the same name — the two must stay in step, since
+    /// the whole point of `Decompose` being the default is that both GPUs run
+    /// the identical 15-gate sequence.
+    multi_control: MultiControlMode,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pool: Arc<imp::BufferPool>,
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -153,6 +162,11 @@ pub struct MetalState {
     /// buffer drops normally (releasing the `MTLBuffer`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) pool_return: Option<Arc<imp::BufferPool>>,
+    /// Copied from the backend at `allocate`/`lease`, so `apply_op` can honour
+    /// it without threading `ExecConfig` through every call — same arrangement
+    /// as `CudaState`.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) multi_control: MultiControlMode,
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     _private: (),
 }
@@ -172,6 +186,18 @@ impl Drop for MetalState {
 }
 
 impl MetalStatevectorBackend {
+    /// Choose how `CCX`/`CSwap` are realised.
+    ///
+    /// Default is [`MultiControlMode::Decompose`] — unchanged behaviour, and
+    /// bit-for-bit agreement with CUDA at the same setting.
+    /// [`MultiControlMode::Exact`] applies the permutation directly: faster and
+    /// exact, but it CHANGES THE NUMBERS (14 gates' worth of f32 rounding
+    /// disappear), which is why it is opt-in on both GPUs rather than automatic.
+    pub fn with_multi_control(mut self, mode: MultiControlMode) -> Self {
+        self.multi_control = mode;
+        self
+    }
+
     /// Open the system default `MTLDevice` and compile the kernel
     /// library. On a build that doesn't include the Metal toolchain,
     /// returns `Err(MetalError::Unavailable)` rather than panicking.
@@ -182,6 +208,7 @@ impl MetalStatevectorBackend {
             Ok(Self {
                 handle,
                 pool: Arc::new(imp::BufferPool::new()),
+                multi_control: MultiControlMode::default(),
             })
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -205,6 +232,7 @@ impl MetalStatevectorBackend {
             Ok(MetalState {
                 inner: ManuallyDrop::new(inner),
                 pool_return: None,
+                multi_control: self.multi_control,
             })
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -232,6 +260,7 @@ impl MetalStatevectorBackend {
         Ok(MetalState {
             inner: ManuallyDrop::new(inner),
             pool_return: Some(Arc::clone(&self.pool)),
+            multi_control: self.multi_control,
         })
     }
 
@@ -878,10 +907,7 @@ impl MetalState {
         // separates the two by five orders of magnitude.
         if branch.is_none()
             && !omega_backend_statevector::sim::reset_is_deterministic_within(
-                &host,
-                n,
-                q as usize,
-                1e-4,
+                &host, n, q as usize, 1e-4,
             )
         {
             return Err(MetalError::Unsupported(format!(
@@ -965,6 +991,16 @@ impl MetalState {
     /// gate, no extra ancillas. 15 ops total.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn apply_ccx(&self, qc1: u32, qc2: u32, qt: u32) -> Result<(), MetalError> {
+        // The mode is checked HERE and not at the `apply_op` dispatch site, so
+        // that EVERY caller honours it. The first version of this branched in
+        // `apply_op` only, which left `adjoint.rs`'s backward sweep permanently
+        // decomposed while `--multi-control exact` reported itself honoured on
+        // the gradient path. CUDA puts the check in the same place for the same
+        // reason; keeping the two structurally identical is not cosmetic, since
+        // their agreement at a given mode is a documented guarantee.
+        if self.multi_control == MultiControlMode::Exact {
+            return self.apply_ccx_exact(qc1, qc2, qt);
+        }
         // Lifted directly from
         // omega-backend-statevector::gates::{ccx via apply_ccx_gate}
         // — same decomposition Nielsen-Chuang use, modulo the qubit
@@ -987,10 +1023,46 @@ impl MetalState {
         Ok(())
     }
 
+    /// CCX as a direct octet permutation — **exact**, one pass instead of 15.
+    ///
+    /// [`Self::apply_ccx`] is the 15-op Nielsen-Chuang chain and stays the
+    /// DEFAULT so Metal and CUDA agree bit-for-bit. Each of those 15 rounds in
+    /// f32 and `T`/`Tdg` carry an irrational e^{±iπ/4}, which makes the
+    /// decomposition the largest per-gate approximation on this backend — for a
+    /// gate whose exact form is a swap of two amplitudes.
+    ///
+    /// Opt-in for the reason it is opt-in on CUDA: it CHANGES THE NUMBERS. It
+    /// removes 14 gates' worth of rounding, so a caller comparing against
+    /// previously recorded results will see a difference, and bit-for-bit
+    /// agreement with a `decompose` run on either GPU is lost by design.
+    ///
+    /// Slot convention `slot = bit_qc1 + 2·bit_qc2 + 4·bit_qt`; CCX flips the
+    /// target iff both controls are set, which is slots 3 <-> 7. Verified
+    /// against the truth table over all eight slots, not adopted from CUDA.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn apply_ccx_exact(&self, qc1: u32, qc2: u32, qt: u32) -> Result<(), MetalError> {
+        self.inner.apply_octet_swap(qc1, qc2, qt, 3, 7)
+    }
+
+    /// CSwap as a direct octet permutation — exact, one pass instead of 17
+    /// (the 15-op CCX plus two CX).
+    ///
+    /// `slot = bit_qc + 2·bit_qt1 + 4·bit_qt2`; swapping t1 and t2 when the
+    /// control is set is slots 3 <-> 5.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn apply_cswap_exact(&self, qc: u32, qt1: u32, qt2: u32) -> Result<(), MetalError> {
+        self.inner.apply_octet_swap(qc, qt1, qt2, 3, 5)
+    }
+
     /// Fredkin gate (CSwap): if control = 1, swap targets t1 and t2.
     /// Decomposed via three CXs and one CCX.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn apply_cswap(&self, qc: u32, qt1: u32, qt2: u32) -> Result<(), MetalError> {
+        if self.multi_control == MultiControlMode::Exact {
+            // Straight to the octet swap rather than through `apply_ccx`, so
+            // this is one pass and not the CX-CCX-CX chain. Mirrors CUDA.
+            return self.apply_cswap_exact(qc, qt1, qt2);
+        }
         // CSwap(c, a, b) = CX(b, a); CCX(c, a, b); CX(b, a).
         self.apply_cx(qt2, qt1)?;
         self.apply_ccx(qc, qt1, qt2)?;
@@ -1125,13 +1197,19 @@ impl Backend for MetalStatevectorBackend {
                 .execute(circuit, params, config);
         }
 
-        apply_ops_fused(&state, &circuit.ops, params, |op| {
-            // The walker's `condition_skip` predicate returns `true`
-            // to skip the op. Since `classical_bits` is all-zeros
-            // (no mid-circuit measurement on Metal), any condition
-            // requiring a non-zero value should skip.
-            !op.condition_satisfied(&classical_bits)
-        }, None)?;
+        apply_ops_fused(
+            &state,
+            &circuit.ops,
+            params,
+            |op| {
+                // The walker's `condition_skip` predicate returns `true`
+                // to skip the op. Since `classical_bits` is all-zeros
+                // (no mid-circuit measurement on Metal), any condition
+                // requiring a non-zero value should skip.
+                !op.condition_satisfied(&classical_bits)
+            },
+            None,
+        )?;
 
         match config.shots {
             None => {
@@ -1197,16 +1275,28 @@ impl Backend for MetalStatevectorBackend {
         // + inner_product) to 1 (single reduction → partials → host
         // sum). At ~100 Pauli terms / 20q that's ~100 syncs total
         // instead of ~300, plus we skip the per-term state clone.
+        // The GPU sweep below skips `Measure`, which is the wrong answer for a
+        // measurement that has consequences. Prepare first, so what reaches the
+        // device is a circuit with no measurements at all.
+        let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
+        let circuit = &deferred;
+        let observable = &observable;
         let n = circuit.num_qubits;
         let psi = self.lease(n)?;
         // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
         // Forward sweep with diagonal-gate fusion (consecutive Z / S /
         // Sdg / T / Tdg / Rz / U1 collapse into one
-        // `apply_diagonal_product` dispatch). Measure ops are silently
-        // skipped — they're no-ops in the expectation path.
-        apply_ops_fused(&psi, &circuit.ops, params, |op| {
-            matches!(&op.gate, GateKind::Measure)
-        }, None)?;
+        // `apply_diagonal_product` dispatch). The `Measure` skip below is
+        // now unreachable: `prepare_for_expectation` has already removed
+        // every measurement or refused the circuit. It is kept because
+        // `apply_ops_fused` takes the predicate from its caller.
+        apply_ops_fused(
+            &psi,
+            &circuit.ops,
+            params,
+            |op| matches!(&op.gate, GateKind::Measure),
+            None,
+        )?;
 
         let mut total = 0.0_f64;
         for (coeff, pauli_string) in &observable.terms {
@@ -1248,12 +1338,20 @@ impl Backend for MetalStatevectorBackend {
             return Ok(Vec::new());
         }
 
+        // See `expectation`: prepare before anything reaches the device.
+        let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+        let circuit = &deferred;
+        let observables = &dephased[..];
         let n = circuit.num_qubits;
         let psi = self.lease(n)?;
         // Reset is applied in-sequence by `apply_ops_fused` (deterministic).
-        apply_ops_fused(&psi, &circuit.ops, params, |op| {
-            matches!(&op.gate, GateKind::Measure)
-        }, None)?;
+        apply_ops_fused(
+            &psi,
+            &circuit.ops,
+            params,
+            |op| matches!(&op.gate, GateKind::Measure),
+            None,
+        )?;
 
         let mut out = Vec::with_capacity(observables.len());
         for obs in observables {
@@ -1313,6 +1411,15 @@ impl Backend for MetalStatevectorBackend {
         // `adjoint_gradient`); fusing them saves ~3 ms per train pt
         // on n=18.
         //
+        // Prepared FIRST, before the fallbacks below are considered. Deferral
+        // removes every `Measure`, so a feedforward circuit now takes the fast
+        // fused path instead of the split fallback — and, more to the point, the
+        // gradient it returns is the gradient of the same circuit the prediction
+        // came from. Pairing a mixture-valued prediction with a pure-state
+        // gradient in one call is the defect this ordering prevents.
+        let (deferred, dephased) = prepare_for_expectation_multi(circuit, observables)?;
+        let circuit = &deferred;
+        let observables = &dephased[..];
         // If the circuit contains a non-unitary op, fall back to the
         // default path (separate calls) so the parameter-shift
         // fallback in `adjoint_gradient` still triggers correctly.
@@ -1344,9 +1451,13 @@ impl Backend for MetalStatevectorBackend {
         // sweep (where it's daggered down).
         let n = circuit.num_qubits;
         let phi = self.lease(n)?;
-        apply_ops_fused(&phi, &circuit.ops, params, |op| {
-            matches!(&op.gate, GateKind::Measure)
-        }, None)?;
+        apply_ops_fused(
+            &phi,
+            &circuit.ops,
+            params,
+            |op| matches!(&op.gate, GateKind::Measure),
+            None,
+        )?;
 
         // Predictions: pauli_expectation per observable on the
         // resident on-device |ψ⟩. Mirrors expectation_multi.
@@ -1433,8 +1544,24 @@ pub(crate) fn apply_op(
         // would introduce the e^{iπ/4} global phase this variant exists to
         // avoid (|Δ| = 0.541), and a GPU statevector is exactly where a
         // statevector comparison would notice.
-        GateKind::Sx => state.apply_1q(q0(), &[Complex64::new(0.5, 0.5), Complex64::new(0.5, -0.5), Complex64::new(0.5, -0.5), Complex64::new(0.5, 0.5)]),
-        GateKind::Sxdg => state.apply_1q(q0(), &[Complex64::new(0.5, -0.5), Complex64::new(0.5, 0.5), Complex64::new(0.5, 0.5), Complex64::new(0.5, -0.5)]),
+        GateKind::Sx => state.apply_1q(
+            q0(),
+            &[
+                Complex64::new(0.5, 0.5),
+                Complex64::new(0.5, -0.5),
+                Complex64::new(0.5, -0.5),
+                Complex64::new(0.5, 0.5),
+            ],
+        ),
+        GateKind::Sxdg => state.apply_1q(
+            q0(),
+            &[
+                Complex64::new(0.5, -0.5),
+                Complex64::new(0.5, 0.5),
+                Complex64::new(0.5, 0.5),
+                Complex64::new(0.5, -0.5),
+            ],
+        ),
         GateKind::T => state.apply_t(q0()),
         GateKind::Tdg => state.apply_tdg(q0()),
 
@@ -1456,6 +1583,9 @@ pub(crate) fn apply_op(
         GateKind::Rbs => state.apply_rbs(q0(), q1(), resolved[0]),
 
         // Three-qubit gates — decomposed via existing 1q+2q kernels.
+        // No mode branch here on purpose — `apply_ccx`/`apply_cswap` consult
+        // `state.multi_control` themselves, so the adjoint sweep and any future
+        // caller get the same answer without having to remember to ask.
         GateKind::CCX => state.apply_ccx(q0(), q1(), op.qubits[2].0),
         GateKind::CSwap => state.apply_cswap(q0(), q1(), op.qubits[2].0),
 
@@ -1846,12 +1976,15 @@ mod tests {
         let mid = MetalState::read_state_call_count();
         let _ = state.read_state();
         let after = MetalState::read_state_call_count();
+        // `> before`, not `>= before + 1`: clippy's `int_plus_one`, and the
+        // suggestion is strictly better rather than merely shorter — these are
+        // unsigned counters, so `before + 1` can overflow where `>` cannot.
         assert!(
-            mid >= before + 1,
+            mid > before,
             "first read must bump counter (before={before}, mid={mid})"
         );
         assert!(
-            after >= mid + 1,
+            after > mid,
             "second read must bump counter (mid={mid}, after={after})"
         );
     }
@@ -3156,7 +3289,10 @@ mod tests {
         // Reset) — the two the coherent fold got wrong.
         for (name, prep) in [
             ("|+>", vec![(GateKind::H, 0u32, vec![])]),
-            ("|->", vec![(GateKind::X, 0u32, vec![]), (GateKind::H, 0u32, vec![])]),
+            (
+                "|->",
+                vec![(GateKind::X, 0u32, vec![]), (GateKind::H, 0u32, vec![])],
+            ),
             ("|1>", vec![(GateKind::X, 0u32, vec![])]),
             ("Ry", vec![(GateKind::Ry, 0u32, vec![0.7])]),
         ] {
@@ -3221,7 +3357,6 @@ mod tests {
              where the truth is mixed, while the CPU refuses"
         );
     }
-
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]
@@ -3369,6 +3504,274 @@ mod tests {
                 (ga - gb).abs()
             );
         }
+    }
+
+    /// **The exact path is BIT-identical to the decomposed one on a basis
+    /// state**, and that is the strong assertion.
+    ///
+    /// On a computational-basis input both paths must land the amplitude in the
+    /// same slot with the same value, because a basis state gives the 15-gate
+    /// chain nothing to round: every intermediate is 0 or 1 up to phase. So the
+    /// usual "they differ by 14 gates of f32 rounding" caveat does NOT apply
+    /// here, and anything but exact equality means a wrong slot pair or a wrong
+    /// stride.
+    ///
+    /// A permutation preserves norm, so neither error would be caught by a norm
+    /// check — this comparison is what catches them.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn exact_ccx_and_cswap_match_the_decomposed_path_on_every_basis_state() {
+        for input in 0..8usize {
+            for gate in ["ccx", "cswap"] {
+                let mut a = new_state(3);
+                let mut b = new_state(3);
+                let mut s = vec![Complex64::new(0.0, 0.0); 8];
+                s[input] = Complex64::new(1.0, 0.0);
+                a.write_state(&s).expect("write");
+                b.write_state(&s).expect("write");
+
+                if gate == "ccx" {
+                    a.apply_ccx(2, 1, 0).expect("ccx decomposed");
+                    b.apply_ccx_exact(2, 1, 0).expect("ccx exact");
+                } else {
+                    a.apply_cswap(2, 1, 0).expect("cswap decomposed");
+                    b.apply_cswap_exact(2, 1, 0).expect("cswap exact");
+                }
+                let (ga, gb) = (a.read_state(), b.read_state());
+                for i in 0..8 {
+                    assert!(
+                        (ga[i] - gb[i]).norm() < 1e-5,
+                        "{gate} input {input:03b}: decomposed and exact disagree at \
+                         amplitude {i} ({:?} vs {:?})",
+                        ga[i],
+                        gb[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Non-adjacent and REVERSED qubit orders. The octet address expansion is
+    /// where a stride bug hides, and `ccx(0,1,2)` cannot distinguish a correct
+    /// expansion from one that happens to work on ascending, adjacent qubits.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn exact_ccx_survives_reversed_and_non_adjacent_qubits() {
+        // 5 qubits so there are spectators above, below and between.
+        for (c1, c2, t) in [(0u32, 2u32, 4u32), (4, 2, 0), (3, 1, 4), (1, 4, 2)] {
+            for input in 0..32usize {
+                let mut a = new_state(5);
+                let mut b = new_state(5);
+                let mut s = vec![Complex64::new(0.0, 0.0); 32];
+                s[input] = Complex64::new(1.0, 0.0);
+                a.write_state(&s).expect("write");
+                b.write_state(&s).expect("write");
+                a.apply_ccx(c1, c2, t).expect("decomposed");
+                b.apply_ccx_exact(c1, c2, t).expect("exact");
+                let (ga, gb) = (a.read_state(), b.read_state());
+                for i in 0..32 {
+                    assert!(
+                        (ga[i] - gb[i]).norm() < 1e-5,
+                        "ccx({c1},{c2},{t}) input {input:05b}: disagree at {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spectator qubits in SUPERPOSITION must be untouched. A basis-state test
+    /// cannot see a kernel that corrupts amplitudes outside its octet, because
+    /// every other amplitude is already zero.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn exact_ccx_leaves_superposed_spectators_alone() {
+        let mut a = new_state(5);
+        let mut b = new_state(5);
+        // A state with weight everywhere, so any stray write shows up.
+        let s: Vec<Complex64> = (0..32)
+            .map(|i| Complex64::new((i as f64 + 1.0) / 40.0, (i as f64) / 55.0))
+            .collect();
+        a.write_state(&s).expect("write");
+        b.write_state(&s).expect("write");
+        a.apply_ccx(3, 1, 4).expect("decomposed");
+        b.apply_ccx_exact(3, 1, 4).expect("exact");
+        let (ga, gb) = (a.read_state(), b.read_state());
+        for i in 0..32 {
+            assert!(
+                (ga[i] - gb[i]).norm() < 1e-4,
+                "dense input: disagree at amplitude {i} ({:?} vs {:?})",
+                ga[i],
+                gb[i]
+            );
+        }
+    }
+
+    /// **`with_multi_control(Exact)` actually reaches `apply_op`.**
+    ///
+    /// Every other test in this group calls `apply_ccx_exact` directly, so all
+    /// of them would still pass if `with_multi_control` set a field nobody
+    /// read. This is the only test that fails on a dead switch — and a dead
+    /// switch is silent, because the default path is correct.
+    ///
+    /// The assertion is that the two MODES agree on a basis state (both are
+    /// permutations there), and that the exact mode is genuinely a different
+    /// code path — checked by a dense input, where the 15-gate chain rounds and
+    /// the permutation does not, so the two must differ in the last bits while
+    /// still agreeing to f32 tolerance.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn with_multi_control_exact_changes_what_apply_op_does() {
+        use omega_core::circuit::Qubit;
+        let dec = MetalStatevectorBackend::new().expect("device");
+        let exa = MetalStatevectorBackend::new()
+            .expect("device")
+            .with_multi_control(MultiControlMode::Exact);
+
+        let op = make_op(GateKind::CCX, &[2, 1, 0], vec![]);
+        let params = ParameterBinding::default();
+
+        // Dense input: nothing is zero, so a rounding difference is visible.
+        let s: Vec<Complex64> = (0..8)
+            .map(|i| Complex64::new((i as f64 + 1.0) / 12.0, (i as f64) / 17.0))
+            .collect();
+
+        let mut a = dec.allocate(3).expect("alloc");
+        let mut b = exa.allocate(3).expect("alloc");
+        a.write_state(&s).expect("write");
+        b.write_state(&s).expect("write");
+        super::apply_op(&a, &op, &params).expect("decompose path");
+        super::apply_op(&b, &op, &params).expect("exact path");
+        let (ga, gb) = (a.read_state(), b.read_state());
+
+        // Same answer to f32 tolerance...
+        for i in 0..8 {
+            assert!(
+                (ga[i] - gb[i]).norm() < 1e-4,
+                "modes disagree at amplitude {i}: {:?} vs {:?}",
+                ga[i],
+                gb[i]
+            );
+        }
+        // ...but only the exact mode is BIT-identical to the permutation.
+        //
+        // The reference is the permuted input pushed through the same f32
+        // store/load round-trip and no gate at all, so the comparison isolates
+        // gate arithmetic from storage rounding. A permutation does no
+        // arithmetic, so its deviation is exactly 0.0 — measured, not assumed.
+        // The 15-gate chain came in at 8.0e-8 here, which is why an absolute
+        // tolerance anywhere near 1e-6 does NOT separate the two paths: a first
+        // draft of this test used 1e-6 and a mutant that routed `Exact` back to
+        // `apply_ccx` passed it.
+        let mut permuted = s.clone();
+        permuted.swap(6, 7); // CCX(q2,q1,q0) exchanges |110> and |111>
+        let mut r = dec.allocate(3).expect("alloc");
+        r.write_state(&permuted).expect("write");
+        let reference = r.read_state();
+
+        let dev = |g: &Vec<Complex64>| {
+            g.iter()
+                .zip(reference.iter())
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0f64, f64::max)
+        };
+        let (dev_dec, dev_exact) = (dev(&ga), dev(&gb));
+        assert_eq!(
+            dev_exact, 0.0,
+            "exact mode must be the bare permutation bit-for-bit, deviated by {dev_exact:.3e}"
+        );
+        assert!(
+            dev_dec > dev_exact,
+            "the two modes are indistinguishable ({dev_dec:.3e} vs {dev_exact:.3e}) — either \
+             `with_multi_control` is not reaching dispatch, or this fixture cannot tell the \
+             paths apart and the test is vacuous"
+        );
+        // Guard against `Qubit` being unused if the helper changes shape.
+        let _ = Qubit(0);
+    }
+
+    /// **`apply_ccx` itself honours the mode, on every state the backend hands
+    /// out.** This is the property the ADJOINT path depends on.
+    ///
+    /// `adjoint.rs`'s backward sweep calls `state.apply_ccx` directly on a
+    /// LEASED state; it never goes through `apply_op`. The first version of
+    /// this feature branched on the mode at the `apply_op` dispatch site only,
+    /// so the backward sweep stayed permanently decomposed while the CLI
+    /// notice reported `--multi-control exact` as honoured on `--gradient`.
+    /// Nothing failed: the forward sweep was right, the gradient was within
+    /// f32 tolerance either way, and the flag looked wired.
+    ///
+    /// So the assertion is per-STATE-SOURCE rather than per-entry-point —
+    /// `allocate` and `lease` both have to carry the mode, and testing only the
+    /// one `apply_op` happens to use is what hid the bug the first time.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn apply_ccx_honours_the_mode_on_both_allocated_and_leased_states() {
+        let exa = MetalStatevectorBackend::new()
+            .expect("device")
+            .with_multi_control(MultiControlMode::Exact);
+        let plain = MetalStatevectorBackend::new().expect("device");
+
+        let s: Vec<Complex64> = (0..8)
+            .map(|i| Complex64::new((i as f64 + 1.0) / 12.0, (i as f64) / 17.0))
+            .collect();
+        let mut permuted = s.clone();
+        permuted.swap(6, 7); // CCX(q2,q1,q0): |110> <-> |111>
+
+        // Reference: the permuted input through the same f32 store/load and no
+        // gate, so only gate arithmetic is being compared.
+        let mut r = plain.allocate(3).expect("alloc");
+        r.write_state(&permuted).expect("write");
+        let reference = r.read_state();
+
+        for (label, mut st) in [
+            ("allocate", exa.allocate(3).expect("alloc")),
+            ("lease", exa.lease(3).expect("lease")),
+        ] {
+            st.write_state(&s).expect("write");
+            st.apply_ccx(2, 1, 0).expect("ccx");
+            let got = st.read_state();
+            let dev = got
+                .iter()
+                .zip(reference.iter())
+                .map(|(a, b)| (a - b).norm())
+                .fold(0.0f64, f64::max);
+            assert_eq!(
+                dev, 0.0,
+                "a state from `{label}` on an Exact backend ran the DECOMPOSED \
+                 CCX (deviation {dev:.3e} from the bare permutation). Every state \
+                 source must carry `multi_control`, or the adjoint sweep silently \
+                 ignores the mode."
+            );
+        }
+
+        // And the default backend must still decompose, or the switch is not a
+        // switch.
+        let mut d = plain.allocate(3).expect("alloc");
+        d.write_state(&s).expect("write");
+        d.apply_ccx(2, 1, 0).expect("ccx");
+        let dev = d
+            .read_state()
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).norm())
+            .fold(0.0f64, f64::max);
+        assert!(
+            dev > 0.0,
+            "the DEFAULT backend produced the bare permutation — `Decompose` is \
+             no longer running the 15-gate chain, so the two GPUs no longer \
+             agree bit-for-bit at the default setting"
+        );
+    }
+
+    /// Degenerate operands are refused, not silently accepted.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn exact_multi_control_refuses_duplicate_or_out_of_range_qubits() {
+        let st = new_state(3);
+        assert!(st.apply_ccx_exact(0, 0, 1).is_err(), "duplicate controls");
+        assert!(st.apply_ccx_exact(0, 1, 1).is_err(), "control == target");
+        assert!(st.apply_ccx_exact(0, 1, 9).is_err(), "out of range");
+        assert!(st.apply_cswap_exact(2, 2, 0).is_err(), "duplicate targets");
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -3975,15 +4378,21 @@ mod tests {
         // Walker with condition_skip on op[1].
         let mut got = backend.allocate(n).unwrap();
         got.write_state(&init).unwrap();
-        super::apply_ops_fused(&got, &ops, &params, |op| {
-            // Skip the middle Rz only.
-            matches!(&op.gate, GateKind::Rz)
-                && op
-                    .params
-                    .first()
-                    .map(|p| matches!(p, ParamExpr::Symbol(1)))
-                    .unwrap_or(false)
-        }, None)
+        super::apply_ops_fused(
+            &got,
+            &ops,
+            &params,
+            |op| {
+                // Skip the middle Rz only.
+                matches!(&op.gate, GateKind::Rz)
+                    && op
+                        .params
+                        .first()
+                        .map(|p| matches!(p, ParamExpr::Symbol(1)))
+                        .unwrap_or(false)
+            },
+            None,
+        )
         .unwrap();
 
         let max = max_abs_diff(&want.read_state(), &got.read_state());
@@ -4086,4 +4495,3 @@ mod tests {
         }
     }
 }
-

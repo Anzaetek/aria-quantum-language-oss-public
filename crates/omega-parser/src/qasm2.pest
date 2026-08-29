@@ -1,9 +1,16 @@
 // QASM 2.0 PEG grammar for pest
 
-program = { SOI ~ header ~ statement* ~ EOI }
+// The version statement is OPTIONAL. OpenQASM 3 says so in as many words, and
+// the specification's own examples take it at its word: of the 21 programs in
+// `third_party/openqasm-examples/`, **20 carry no `OPENQASM` line at all** and
+// the twenty-first writes `OPENQASM 3;`. A mandatory `D.D` header rejected the
+// entire corpus before a single statement was read.
+program = { SOI ~ header? ~ statement* ~ EOI }
 
 header = { "OPENQASM" ~ version ~ ";" }
-version = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+// The minor version is optional too: `OPENQASM 3;` is what `teleport.qasm`
+// writes, and it failed here at the `.` — measured as a bare `--> 2:10`.
+version = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 
 statement = {
     include_stmt
@@ -31,8 +38,15 @@ creg_decl = { "creg" ~ ident ~ "[" ~ integer ~ "]" ~ ";" }
 // alongside the QASM 2 forms so a header `OPENQASM 3.0;` parses with
 // the same grammar. Both lower to the same `QregDecl` / `CregDecl`
 // AST variant.
-qubit_decl_v3 = { "qubit" ~ "[" ~ integer ~ "]" ~ ident ~ ";" }
-bit_decl_v3   = { "bit"   ~ "[" ~ integer ~ "]" ~ ident ~ ";" }
+// The size is OPTIONAL: `qubit q;` / `bit c;` declare a single qubit or bit and
+// are what `qpt.qasm` and `teleport.qasm` write. Without this they did not fail
+// as declarations at all — the ordered choice fell through to `gate_app_stmt`,
+// which happily matched `qubit` as a GATE NAME and `q` as its operand, so the
+// file parsed and died at lowering with `unknown gate: qubit`. That is the same
+// trap recorded for `reset` below: a rule that does not match is not a rule
+// that refuses.
+qubit_decl_v3 = { "qubit" ~ ("[" ~ integer ~ "]")? ~ ident ~ ";" }
+bit_decl_v3   = { "bit"   ~ ("[" ~ integer ~ "]")? ~ ident ~ ";" }
 
 gate_def = {
     "gate" ~ ident ~ param_list_def? ~ qubit_list_def ~ "{" ~ gate_body ~ "}"
@@ -75,7 +89,26 @@ reset_stmt   = { "reset" ~ qubit_ref ~ ";" }
 // ORDER MATTERS: pest's `|` is an ordered choice, and `gate_app_stmt` would
 // match `reset q[0];` as a gate application named `reset` — which parsed, then
 // died at lowering with "unknown gate: reset". The specific forms go first.
-if_stmt = { "if" ~ "(" ~ ident ~ "==" ~ integer ~ ")" ~ (measure_stmt | reset_stmt | gate_app_stmt) }
+// The body may also be a BRACED BLOCK — `if (c1==1) { x q[2]; }`. OpenQASM 3
+// allows either form ("braces optional in this case", as `teleport.qasm`'s own
+// comment puts it), and both `teleport.qasm` and `inverseqft2.qasm` use braces.
+// A block may hold more than one statement, and every one of them inherits the
+// guard.
+// The condition target may be a whole register (`c == 1`, QASM 2.0's form and
+// OpenQASM 3's `bitarray == const int`) or a SINGLE BIT (`c[0] == true`,
+// OpenQASM 3's `bit == const bool`). Both are what qiskit accepts, and the
+// second is what `to_qasm3` writes — so without it we could not read the file
+// we produce.
+//
+// The boolean spelling is not optional politeness: `c[0] == 1` is `bit ==
+// const int`, which strict OpenQASM 3 consumers REJECT. Accepting only the
+// integer form here would have entrenched an invalid spelling on both sides
+// and made the round trip look healthy.
+if_stmt = { "if" ~ "(" ~ cond_target ~ "==" ~ cond_value ~ ")" ~ (if_block | measure_stmt | reset_stmt | gate_app_stmt) }
+cond_target = { ident ~ "[" ~ integer ~ "]" | ident }
+cond_value  = { bool_lit | integer }
+bool_lit    = { "true" | "false" }
+if_block = { "{" ~ (measure_stmt | reset_stmt | gate_app_stmt)* ~ "}" }
 
 // Expressions (for gate parameters)
 expr = { prefix_op? ~ atom ~ (bin_op ~ prefix_op? ~ atom)* }
@@ -98,4 +131,7 @@ integer = @{ ASCII_DIGIT+ }
 ident   = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
-COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
+// Block comments are part of the language and are used by the specification's
+// own examples (`adder.qasm`, `vqe.qasm` open with one). Only `//` was handled,
+// so those files failed at their first line.
+COMMENT    = _{ ("//" ~ (!"\n" ~ ANY)*) | ("/*" ~ (!"*/" ~ ANY)* ~ "*/") }

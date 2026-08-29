@@ -85,6 +85,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use omega_core::circuit::CircuitIR;
+
+mod common;
 use omega_core::executor::{
     measure_pairs, needs_collapse, project_counts_onto_creg, Backend as CoreBackend, ExecConfig,
     ExecResult, MidCircuitMode,
@@ -217,11 +219,7 @@ fn to_str_counts(
 /// key that does not fit its register is a **defect** and belongs in `Error`.
 /// Routing both through one error type would file the second as the first,
 /// which is the silent direction — see `docs/BRIDGES.md`.
-fn run_in_tree(
-    backend: &dyn CoreBackend,
-    ir: &CircuitIR,
-    seed: u64,
-) -> Result<StrCounts, Status> {
+fn run_in_tree(backend: &dyn CoreBackend, ir: &CircuitIR, seed: u64) -> Result<StrCounts, Status> {
     let collapse = needs_collapse(ir);
     let config = ExecConfig {
         shots: Some(SHOTS),
@@ -309,10 +307,10 @@ fn runner_dir() -> PathBuf {
 
 #[allow(dead_code)]
 fn venv_python(slug: &str) -> PathBuf {
-    runner_dir()
-        .join(format!(".venv-{slug}"))
-        .join("bin")
-        .join("python")
+    // Shared resolver: honours ARIA_QISKIT_PY and both venv locations. A
+    // bridge-local-only lookup made this lane self-skip on hosts whose venv
+    // sits where ci.sh puts it — green, but comparing against nothing.
+    common::venv_python(slug)
 }
 
 #[allow(dead_code)]
@@ -330,7 +328,9 @@ fn force_runner_env(slug: &str) {
 /// prefix inside `BridgeError::Backend`, and every refusal would have landed
 /// in `Error` — reddening the matrix for backends that behaved correctly.
 #[allow(dead_code)]
-fn bridge_status(res: Result<omega_bridges::Counts, omega_bridges::BridgeError>) -> Result<StrCounts, Status> {
+fn bridge_status(
+    res: Result<omega_bridges::Counts, omega_bridges::BridgeError>,
+) -> Result<StrCounts, Status> {
     use omega_bridges::BridgeError;
     match res {
         Ok(c) => Ok(c),
@@ -404,7 +404,10 @@ fn nway_counts_matrix_agrees_with_qiskit() {
     }
 
     let corpus = crosscheck_corpus();
-    assert!(!corpus.files.is_empty(), "corpus is empty — nothing to compare");
+    assert!(
+        !corpus.files.is_empty(),
+        "corpus is empty — nothing to compare"
+    );
     eprintln!(
         "\nN-way counts matrix — corpus {} ({} fixtures), {SHOTS} shots, gate = \
          {K_SIGMA}x the per-circuit null RMS",
@@ -586,7 +589,10 @@ fn report_and_assert(
             .or_insert(0) += 1;
     }
 
-    eprintln!("\n  {:<16} {:>7} {:>9} {:>15} {:>14} {:>6}", "engine", "agree", "disagree", "cannot-express", "not-installed", "error");
+    eprintln!(
+        "\n  {:<16} {:>7} {:>9} {:>15} {:>14} {:>6}",
+        "engine", "agree", "disagree", "cannot-express", "not-installed", "error"
+    );
     for (engine, tally) in &per_engine {
         let g = |t: &str| tally.get(t).copied().unwrap_or(0);
         eprintln!(
@@ -702,8 +708,14 @@ fn the_l2_gate_has_a_floor_for_deterministic_circuits() {
     let mut det: StrCounts = HashMap::new();
     det.insert("1".into(), 20_000);
     let gate = l2_gate(&det, 20_000, 20_000);
-    assert!(gate > 0.0, "a zero gate would fail on a single rounded count");
-    assert!(gate < 1e-3, "the floor must stay far below any real disagreement");
+    assert!(
+        gate > 0.0,
+        "a zero gate would fail on a single rounded count"
+    );
+    assert!(
+        gate < 1e-3,
+        "the floor must stay far below any real disagreement"
+    );
 }
 
 /// The key conversion must be tested against the shape it exists for, not
@@ -731,7 +743,11 @@ fn projected_keys_match_the_bridge_convention_on_partial_measure() {
         "terminal measures — this fixture must take the Skip + project route, \
          which is the route the projection exists for"
     );
-    assert_eq!(key_width(&ir), 2, "keys must be creg-width, not qubit-width");
+    assert_eq!(
+        key_width(&ir),
+        2,
+        "keys must be creg-width, not qubit-width"
+    );
 
     let backend = omega_backend_statevector::StatevectorBackend::new();
     let counts = run_in_tree(&backend, &ir, 0xC0FFEE).expect("statevector run");

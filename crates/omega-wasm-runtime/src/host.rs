@@ -29,6 +29,18 @@ pub struct HostState {
     /// Typically a JSON config selecting `num_params`, `optimizer`,
     /// `max_iters`, etc., or a problem payload (e.g. a QUBO matrix).
     pub input_bytes: Vec<u8>,
+    /// Admission control, when a governor is present.
+    ///
+    /// `None` is a NORMAL state, not a misconfiguration: the standalone
+    /// `omega-wasm-cli` has no server and no ledger to participate in, and must
+    /// keep working. Only `omega-server` injects one.
+    ///
+    /// The WASM route never bypassed the capacity guard — that runs inside the
+    /// backend on both the execute and expectation paths. What it bypassed was
+    /// the governor's global RESERVATION LEDGER, so two large jobs arriving
+    /// through different doors could each pass capacity individually and
+    /// collectively oversubscribe. This is the hook that closes that.
+    pub admission: Option<std::sync::Arc<dyn omega_core::admission::Admission>>,
 }
 
 /// Result returned by a WASM optimization loop.
@@ -53,7 +65,17 @@ impl HostState {
             progress: Vec::new(),
             final_result: None,
             input_bytes: Vec::new(),
+            admission: None,
         }
+    }
+
+    /// Attach admission control. `omega-server` calls this; nothing else does.
+    pub fn with_admission(
+        mut self,
+        gov: std::sync::Arc<dyn omega_core::admission::Admission>,
+    ) -> Self {
+        self.admission = Some(gov);
+        self
     }
 
     /// Stage the input payload the guest will read via `omega_input_*`.
@@ -66,6 +88,57 @@ impl HostState {
         let id = self.circuits.len() as u32 + 1;
         self.circuits.insert(id, circuit);
         id
+    }
+
+    /// Register a circuit, but ask [`Self::admission`] first when one is set.
+    ///
+    /// Separate from [`Self::register_circuit`] rather than replacing it: the
+    /// unadmitted form is what `omega-server` itself uses to PRE-register the
+    /// circuit a lambda was invoked with, which the governor has already priced
+    /// on the HTTP path. Routing that through admission again would charge the
+    /// same job twice and refuse work that was legitimately admitted.
+    ///
+    /// So the two entry points mean different things — "the guest is asking for
+    /// this" and "the server already approved this" — and collapsing them would
+    /// lose that distinction.
+    pub fn register_circuit_admitted(
+        &mut self,
+        circuit: CircuitIR,
+    ) -> std::result::Result<u32, omega_core::admission::Refusal> {
+        if let Some(gov) = self.admission.as_ref() {
+            gov.admit_circuit(circuit.num_qubits)?;
+        }
+        Ok(self.register_circuit(circuit))
+    }
+
+    /// Take the governor's HELD ticket for one execution, or `None` when no
+    /// governor is present (the standalone CLI case, a normal state).
+    ///
+    /// The ticket is capacity CHARGED in the server's ledger for as long as
+    /// the value lives; every simulating entry point below binds it to a
+    /// local immediately before backend work, so the charge covers exactly
+    /// the interval the run occupies the machine. This is the charging half
+    /// registration deliberately does not do — a registered circuit costs
+    /// nothing until it runs, and a running circuit is never invisible to
+    /// the ledger. A refusal reaches the guest as an error naming admission
+    /// control (with the governor's retryable/permanent distinction in the
+    /// text), never as a trap.
+    fn run_ticket(
+        &self,
+        circuit: &CircuitIR,
+        analytic: bool,
+    ) -> Result<Option<omega_core::admission::RunTicket>> {
+        match self.admission.as_ref() {
+            Some(gov) => gov
+                .admit_run(circuit.num_qubits, analytic)
+                .map(Some)
+                .map_err(|r| {
+                    omega_core::error::OmegaError::Backend(format!(
+                        "refused by admission control: {r}"
+                    ))
+                }),
+            None => Ok(None),
+        }
     }
 
     /// Register a Z-observable on given qubits with given coefficients.
@@ -90,7 +163,14 @@ impl HostState {
         let ising = qubo.to_ising();
         let circuit = qaoa_circuit(&ising, depth);
         let observable = ising.to_observable();
-        let cid = self.register_circuit(circuit);
+        // Admitted, not bare: this is the guest asking for a circuit, which is
+        // exactly the door the governor's ledger was blind to. The error type is
+        // already `String` here, so the refusal reaches the guest as a message
+        // rather than a trap — a guest killed mid-optimisation cannot report why
+        // it stopped.
+        let cid = self
+            .register_circuit_admitted(circuit)
+            .map_err(|r| format!("refused by admission control: {r}"))?;
         let oid = self.register_observable(observable);
         Ok((cid, oid, ising.offset))
     }
@@ -115,6 +195,7 @@ impl HostState {
             ))
         })?;
 
+        let _ticket = self.run_ticket(circuit, true)?;
         let binding = build_binding(circuit, params);
 
         match circuit.circuit_type {
@@ -144,6 +225,9 @@ impl HostState {
             ))
         })?;
 
+        // The WASM backend is the dense statevector even in shot mode, so the
+        // ticket prices analytic=true honestly (see admit_run's contract).
+        let _ticket = self.run_ticket(circuit, true)?;
         let binding = build_binding(circuit, params);
         let config = ExecConfig {
             shots: Some(shots),
@@ -171,6 +255,7 @@ impl HostState {
                 circuit_id
             ))
         })?;
+        let _ticket = self.run_ticket(circuit, true)?;
         let binding = build_binding(circuit, params);
         let config = ExecConfig {
             shots: None,
@@ -215,6 +300,7 @@ impl HostState {
             ))
         })?;
 
+        let _ticket = self.run_ticket(circuit, true)?;
         let binding = build_binding(circuit, params);
         let config = ExecConfig {
             shots: Some(1),
@@ -254,6 +340,10 @@ impl HostState {
             ))
         })?;
 
+        // ONE ticket for the whole batch: the observables share a single
+        // execution's state, so per-observable tickets would charge the same
+        // occupancy N times.
+        let _ticket = self.run_ticket(circuit, true)?;
         let binding = build_binding(circuit, params);
         let backend = StatevectorBackend::new();
 
@@ -290,6 +380,7 @@ impl HostState {
             ))
         })?;
 
+        let _ticket = self.run_ticket(circuit, true)?;
         let binding = build_binding(circuit, params);
 
         let grad_pairs = match circuit.circuit_type {
@@ -363,6 +454,7 @@ impl HostState {
                 )))
             }
         };
+        let _ticket = self.run_ticket(circuit, true)?;
         let binding = build_binding(circuit, params);
         let backend = StatevectorBackend::new();
         let grad_pairs =

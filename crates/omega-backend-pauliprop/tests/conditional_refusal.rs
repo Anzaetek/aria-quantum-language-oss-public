@@ -1,6 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `pauliprop` must REFUSE a classically-conditioned gate, not silently apply
-//! it unconditionally.
+//! `pauliprop` must never silently apply a classically-conditioned gate
+//! unconditionally — it must either **answer the mixture correctly** or refuse.
+//!
+//! # This file changed direction, and the reason matters
+//!
+//! It originally required a *refusal*, because there was no representation of a
+//! mixture to return. There is one now: `omega_core::defer_measure` defers the
+//! measurement into a quantum control and dephases the observable, so this
+//! backend answers the feedforward circuit exactly instead of abstaining.
+//!
+//! What did NOT change is the property under test: the unguarded answer must
+//! never be passed off as the guarded one. The bar simply moved from "refuses"
+//! to "gets it right", and the third test below — which measures truth by
+//! sampling a different backend — is what makes that check independent of this
+//! one's arithmetic.
+//!
+//! The `op.condition` guard in `sim.rs` is retained as a backstop. It is now
+//! unreachable through `expectation`, since deferral removes every condition
+//! before `propagate` sees the circuit, but `propagate` is not the only possible
+//! caller and a live wrong answer is worse than dead code.
 //!
 //! # The defect
 //!
@@ -51,30 +69,69 @@ fn feedforward() -> CircuitIR {
     ir
 }
 
+/// **The feedforward circuit is now ANSWERED, and the answer is the mixture.**
+///
+/// `h q0; measure q0 -> c0; if(c==1) x q1` deferred is `h q0; cx q0,q1` — a Bell
+/// state — and `⟨Z₁⟩` on a Bell state is **exactly 0**, which is the mixture's
+/// value. The old silent behaviour gave −1.
+///
+/// Exact equality, not a tolerance: `Z₁` on a Bell state is a cancellation of
+/// two terms of equal magnitude, not a limit.
 #[test]
-fn a_conditioned_gate_is_refused_with_a_typed_error() {
-    let err = PauliPropBackend::new()
+fn the_feedforward_circuit_is_answered_with_the_mixture_value() {
+    let val = PauliPropBackend::new()
         .expectation(&feedforward(), &ParameterBinding::new(), &Observable::z(1))
-        .expect_err("a guarded gate has no conjugation representation");
+        .expect("deferral makes this circuit expressible");
     assert!(
-        matches!(err, OmegaError::Unsupported(_)),
-        "must be Unsupported (a correct refusal, which the N-way matrix files \
-         as `cannot-express`), not a generic error: {err:?}"
-    );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("conditioned") && msg.contains("statevector"),
-        "the message must name the construct and point at a backend that \
-         models it; got: {msg}"
+        val.abs() < 1e-12,
+        "<Z1> for the feedforward mixture is 0; got {val}. -1 would mean the \
+         guard was applied unconditionally (the original defect); +1 would mean \
+         it was dropped."
     );
 }
 
-/// The refusal must be load-bearing, not incidental.
+/// **A circuit that genuinely cannot be deferred is still refused, by name.**
 ///
-/// Strip the condition and the same circuit is accepted — so the error comes
-/// from the guard specifically, not from `Measure`, the register, or the
-/// observable. Without this, a backend that refused *everything* would pass the
-/// test above.
+/// `h q0; measure q0 -> c0; h q0` uses the measured qubit coherently afterwards,
+/// so there is no deferred form: the measurement cannot move past work that
+/// depends on it having happened. This is also the reset-and-reuse shape, i.e.
+/// every QEC ancilla.
+///
+/// This was a **live wrong answer** until the shared rule landed. `Measure` was
+/// grouped with `Id` and `Barrier` as a no-op, so this circuit was evaluated as
+/// `h; h` = identity and returned `⟨Z₀⟩ = +1` where the truth is 0 — the
+/// measurement destroys the coherence that the second `H` would otherwise
+/// restore.
+#[test]
+fn a_coherently_reused_measured_qubit_is_refused_by_name() {
+    let mut ir = CircuitIR::new(1, CircuitType::GateBased);
+    ir.num_classical_bits = 1;
+    ir.ops = vec![
+        op(GateKind::H, &[0], None),
+        op(GateKind::Measure, &[0], Some(0)),
+        op(GateKind::H, &[0], None),
+    ];
+    let err = PauliPropBackend::new()
+        .expectation(&ir, &ParameterBinding::new(), &Observable::z(0))
+        .expect_err("a measured qubit used coherently afterwards is not deferrable");
+    assert!(
+        matches!(err, OmegaError::Unsupported(_)),
+        "must be Unsupported — an honest abstention, which the N-way matrix \
+         files as `cannot-express` rather than a failure: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("measured") && msg.contains("used again"),
+        "the message must name the construct that caused the refusal; got: {msg}"
+    );
+}
+
+/// The deferral must not have quietly become "ignore the guard".
+///
+/// Strip the condition and the same circuit gives a DIFFERENT answer: −1, since
+/// the X now fires unconditionally. If deferral were secretly dropping the
+/// guard, this value and the previous test's 0 would coincide, and both tests
+/// would pass while the backend was wrong. The two together pin the gap.
 #[test]
 fn the_same_circuit_without_the_guard_is_accepted() {
     let mut ir = feedforward();

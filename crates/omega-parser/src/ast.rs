@@ -33,7 +33,17 @@ pub enum Qasm2Stmt {
     If {
         creg: String,
         value: u64,
-        then: Box<Qasm2Stmt>,
+        /// `Some(i)` when the guard addresses a SINGLE BIT (`c[i] == true`,
+        /// OpenQASM 3's `bit == const bool`); `None` when it compares the whole
+        /// register (`c == 1`). The two are different predicates — the reason
+        /// `to_qasm` refuses a single-bit guard on a wide register rather than
+        /// widening it — so they cannot share a representation.
+        bit: Option<u32>,
+        /// The guarded body. A `Vec` because OpenQASM 3 allows a braced block
+        /// (`if (c==1) { x q[0]; y q[1]; }`) as well as a single bare
+        /// statement; the bare form is simply a body of length one, so both
+        /// spellings share one lowering path and cannot diverge.
+        then: Vec<Qasm2Stmt>,
     },
     Reset(QubitRef),
 }

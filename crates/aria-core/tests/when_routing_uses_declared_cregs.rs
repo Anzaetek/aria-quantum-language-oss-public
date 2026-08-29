@@ -35,7 +35,10 @@ fn a_creg_not_named_m_or_c_still_gives_a_runtime_condition() {
         1,
         "the X must carry a runtime condition; with name-based routing this went \
          to compile-time evaluation instead. Instructions: {:?}",
-        c.instructions.iter().map(|i| (i.gate.kind, i.condition.is_some())).collect::<Vec<_>>()
+        c.instructions
+            .iter()
+            .map(|i| (i.gate.kind, i.condition.is_some()))
+            .collect::<Vec<_>>()
     );
     let (cl, v) = guarded[0].condition.as_ref().unwrap();
     assert_eq!(cl.register, "flags");
@@ -53,7 +56,10 @@ fn the_conventional_names_still_work() {
         );
         let c = instantiate(&src).unwrap_or_else(|e| panic!("creg `{reg}`: {e}"));
         assert_eq!(
-            c.instructions.iter().filter(|i| i.condition.is_some()).count(),
+            c.instructions
+                .iter()
+                .filter(|i| i.condition.is_some())
+                .count(),
             1,
             "creg `{reg}` must still produce a runtime condition"
         );
@@ -76,7 +82,10 @@ fn a_compile_time_guard_over_a_loop_variable_stays_compile_time() {
         c.instructions.iter().all(|i| i.condition.is_none()),
         "a loop-variable guard must be resolved at lowering, not emitted as a \
          runtime condition: {:?}",
-        c.instructions.iter().map(|i| (i.gate.kind, i.condition.clone())).collect::<Vec<_>>()
+        c.instructions
+            .iter()
+            .map(|i| (i.gate.kind, i.condition.clone()))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         c.instructions.len(),
@@ -126,7 +135,10 @@ fn only_a_declared_classical_register_can_be_conditioned_on() {
                 "{label}: accepted, producing {} instruction(s) with {} condition(s) — \
                  a gate cannot be guarded on this",
                 c.instructions.len(),
-                c.instructions.iter().filter(|i| i.condition.is_some()).count()
+                c.instructions
+                    .iter()
+                    .filter(|i| i.condition.is_some())
+                    .count()
             ),
             Err(e) => assert!(
                 !e.is_empty(),

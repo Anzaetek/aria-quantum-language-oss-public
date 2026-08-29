@@ -468,10 +468,31 @@ pub fn render_gate_model_spec(circuit: &Circuit, name: &str) -> Option<String> {
     Some(out)
 }
 
+/// Do two exported angles agree?
+///
+/// This was a flat `(a - c).abs() > 1e-9`, which is wrong in BOTH directions,
+/// and quietly so:
+///
+/// * **Too loose deep in a large QFT.** The smallest rotation in QFT(n) is
+///   `pi / 2^(n-1)` — 7.3e-10 at n = 33, already under the tolerance. A gate
+///   whose angle had been ZEROED still compared equal, so the recognizers
+///   below would accept a circuit that is NOT the QFT and this module would
+///   stamp it with the `qftLowered_correct` proof. A soundness hole, not a
+///   precision nit: the export claims a machine-checked theorem.
+/// * **Too tight for large angles.** QPE weights reach ~1e18, where adjacent
+///   f64 values are 1024 apart, so two bit-identical computations can differ
+///   by far more than 1e-9 and be refused.
+///
+/// Relative with an absolute floor fixes both: the floor keeps genuine zeros
+/// comparable, the relative term scales with magnitude.
+fn angles_match(a: f64, c: f64) -> bool {
+    (a - c).abs() <= 1e-12 * c.abs() + 1e-15
+}
+
 /// Recognize the **QFT** circuit on `n` qubits — the gate list
 /// `CircuitBuilder::qft` / `examples/aria/qft.aria` lower to. Returns `Some(n)`
 /// iff `circuit`'s non-meta gates match the canonical QFT(n) gate-for-gate
-/// (kind, wires, angles within `1e-9`), proved correct by
+/// (kind, wires, angles per [`angles_match`]), proved correct by
 /// `QuantumProofs.QFTExport.qftLowered_correct`.
 fn qft_recognized(circuit: &Circuit) -> Option<usize> {
     use crate::ast::CircuitBuilder;
@@ -513,7 +534,7 @@ fn qft_recognized(circuit: &Circuit) -> Option<usize> {
         for (pg, pr) in g.gate.params.iter().zip(r.gate.params.iter()) {
             match (pg.try_as_f64(), pr.try_as_f64()) {
                 (Some(a), Some(c)) => {
-                    if (a - c).abs() > 1e-9 {
+                    if !angles_match(a, c) {
                         return None;
                     }
                 }
@@ -651,7 +672,7 @@ fn qpe_recognized(circuit: &Circuit) -> Option<usize> {
         for (pg, pr) in g.gate.params.iter().zip(r.gate.params.iter()) {
             match (pg.try_as_f64(), pr.try_as_f64()) {
                 (Some(a), Some(c)) => {
-                    if (a - c).abs() > 1e-9 {
+                    if !angles_match(a, c) {
                         return None;
                     }
                 }
@@ -803,7 +824,7 @@ fn grover_recognized(circuit: &Circuit) -> Option<usize> {
         for (pg, pr) in g.gate.params.iter().zip(r.gate.params.iter()) {
             match (pg.try_as_f64(), pr.try_as_f64()) {
                 (Some(a), Some(c)) => {
-                    if (a - c).abs() > 1e-9 {
+                    if !angles_match(a, c) {
                         return None;
                     }
                 }
@@ -931,6 +952,44 @@ fn sanitize_lean(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The old flat `1e-9` was wrong in BOTH directions. These pin both, so a
+    /// future "simplification" back to an absolute tolerance fails loudly.
+    #[test]
+    fn angle_tolerance_is_relative_not_a_flat_1e_9() {
+        use super::angles_match;
+        use std::f64::consts::PI;
+
+        // TOO LOOSE: the deepest QFT(33) rotation is pi/2^32 ~= 7.3e-10, which
+        // is UNDER 1e-9 — so a ZEROED angle used to compare equal to it, and a
+        // circuit that is not the QFT got stamped with `qftLowered_correct`.
+        let deepest = PI / 2f64.powi(32);
+        assert!(
+            deepest < 1e-9,
+            "premise: {deepest:e} is under the old tolerance"
+        );
+        assert!(
+            !angles_match(0.0, deepest),
+            "a zeroed angle must NOT match the deepest QFT(33) rotation"
+        );
+        assert!(
+            angles_match(deepest, deepest),
+            "a real match must still hold"
+        );
+
+        // TOO TIGHT: at QPE-scale weights adjacent f64 values are 1024 apart, so
+        // two correct computations can differ by far more than 1e-9.
+        let big = 1e18_f64;
+        let neighbour = f64::from_bits(big.to_bits() + 1);
+        assert!(
+            (neighbour - big).abs() > 1e-9,
+            "premise: one ulp at 1e18 exceeds the old tolerance"
+        );
+        assert!(
+            angles_match(big, neighbour),
+            "one ulp apart at 1e18 must still count as equal"
+        );
+    }
+
     use super::*;
     use crate::ast::CircuitBuilder;
 

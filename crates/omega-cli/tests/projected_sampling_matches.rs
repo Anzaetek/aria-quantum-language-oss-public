@@ -35,7 +35,10 @@ fn src(n: usize) -> String {
     s
 }
 
-fn counts(ir: &omega_core::circuit::CircuitIR, seed: u64) -> HashMap<omega_core::outcome::Outcome, u32> {
+fn counts(
+    ir: &omega_core::circuit::CircuitIR,
+    seed: u64,
+) -> HashMap<omega_core::outcome::Outcome, u32> {
     let cfg = ExecConfig {
         shots: Some(4000),
         seed: Some(seed),
@@ -233,10 +236,14 @@ fn wide_src_pair(n: usize, a: usize, b: usize) -> String {
     // cos|0> + sin|1> with cos^2 = 0.85, entangled, then one side flipped:
     // outcomes are 01 (p = 0.85) and 10 (p = 0.15) — never 00 or 11, and never
     // equally weighted.
-    s.push_str(&format!("ry(0.7954) q[{a}];\ncx q[{a}], q[{b}];\nx q[{b}];\n"));
+    s.push_str(&format!(
+        "ry(0.7954) q[{a}];\ncx q[{a}], q[{b}];\nx q[{b}];\n"
+    ));
     // Crossed: a -> c1, b -> c0. With an anti-correlated pair this is
     // load-bearing; with a Bell pair it would not be.
-    s.push_str(&format!("measure q[{a}] -> c[1];\nmeasure q[{b}] -> c[0];\n"));
+    s.push_str(&format!(
+        "measure q[{a}] -> c[1];\nmeasure q[{b}] -> c[0];\n"
+    ));
     s
 }
 
@@ -324,8 +331,14 @@ fn mps_reset_circuit_above_the_cliff_is_also_projected() {
         ExecResult::Counts(c) => c,
         o => panic!("{o:?}"),
     };
-    let bad: Vec<String> = c.keys().filter(|o| o.as_u64() != Some(0b01) && o.as_u64() != Some(0b10)).map(|o| o.to_bitstring()).collect();
-    let n01 = *c.get(&omega_core::outcome::Outcome::from_u64(0b01, 2)).unwrap_or(&0);
+    let bad: Vec<String> = c
+        .keys()
+        .filter(|o| o.as_u64() != Some(0b01) && o.as_u64() != Some(0b10))
+        .map(|o| o.to_bitstring())
+        .collect();
+    let n01 = *c
+        .get(&omega_core::outcome::Outcome::from_u64(0b01, 2))
+        .unwrap_or(&0);
     assert!(
         bad.is_empty(),
         "reset path emitted keys outside the 2-bit creg's anti-correlated \
@@ -405,11 +418,13 @@ fn noisy_counts(src: &str, shots: u32, seed: u64) -> HashMap<omega_core::outcome
     use omega_core::noise::{NoiseModel, ReadoutError};
 
     let ir = omega_parser::lower_to_ir(src).expect("lower");
-    let mut model = NoiseModel::default();
     // Readout error is the arm that flips bits: it must act on the QUBIT index,
     // while the key is built on the classical index. Flipping a packed creg key
     // would apply qubit q's detector error to classical bit q.
-    model.readout = ReadoutError::symmetric(0.02);
+    let model = NoiseModel {
+        readout: ReadoutError::symmetric(0.02),
+        ..Default::default()
+    };
     let cfg = ExecConfig {
         shots: Some(shots),
         seed: Some(seed),
@@ -447,7 +462,10 @@ fn the_noisy_backend_projects_above_the_cliff() {
     );
     let total: u32 = c.values().sum();
     assert_eq!(total, 400);
-    let n01 = *c.get(&omega_core::outcome::Outcome::from_u64(0b01, 2)).unwrap_or(&0) as f64 / total as f64;
+    let n01 = *c
+        .get(&omega_core::outcome::Outcome::from_u64(0b01, 2))
+        .unwrap_or(&0) as f64
+        / total as f64;
     // 0.85 ideal, softened by 2% readout on each of the two reported bits.
     assert!(
         n01 > 0.70,

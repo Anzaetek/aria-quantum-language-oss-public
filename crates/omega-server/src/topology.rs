@@ -331,29 +331,7 @@ pub fn detect_cgroup_limit_bytes() -> Option<u64> {
 
 /// Total physical RAM, when the platform makes it cheap to ask.
 pub fn detect_total_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
-                return kb.checked_mul(1024);
-            }
-        }
-        None
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
+    omega_core::hostmem::total_bytes()
 }
 
 #[cfg(test)]
@@ -623,96 +601,21 @@ mod tests {
 /// `None` when the platform will not say, and the caller must then fall back to
 /// the ledger alone rather than inventing a number.
 pub fn detect_available_memory_now() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        // MemAvailable is the kernel's own estimate of what a new allocation
-        // can get without swapping — better than MemFree, which ignores
-        // reclaimable page cache.
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        parse_mem_available(&meminfo)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("vm_stat").output().ok()?;
-        parse_vm_stat(&String::from_utf8_lossy(&out.stdout))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
-}
-
-/// `MemAvailable:` from /proc/meminfo, in bytes. Split out to be testable
-/// without a Linux box — hence unused on non-Linux builds.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn parse_mem_available(meminfo: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
-            return kb.checked_mul(1024);
-        }
-    }
-    None
-}
-
-/// Free + inactive pages from `vm_stat`, in bytes. Unused off macOS.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-///
-/// Inactive pages count as available: macOS reclaims them under pressure. Free
-/// alone reads catastrophically low on a healthy Mac and would refuse
-/// everything.
-pub fn parse_vm_stat(out: &str) -> Option<u64> {
-    let mut page_size: u64 = 4096;
-    if let Some(first) = out.lines().next() {
-        // "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
-        if let Some(i) = first.find("page size of ") {
-            let rest = &first[i + 13..];
-            if let Some(n) = rest.split_whitespace().next() {
-                if let Ok(v) = n.parse::<u64>() {
-                    page_size = v;
-                }
-            }
-        }
-    }
-    let pages = |label: &str| -> u64 {
-        out.lines()
-            .find(|l| l.starts_with(label))
-            .and_then(|l| l.split(':').nth(1))
-            .map(|v| v.trim().trim_end_matches('.').replace(',', ""))
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-    let free = pages("Pages free");
-    let inactive = pages("Pages inactive");
-    if free == 0 && inactive == 0 {
-        return None;
-    }
-    free.checked_add(inactive)?.checked_mul(page_size)
+    omega_core::hostmem::available_bytes()
 }
 
 #[cfg(test)]
 mod pressure_tests {
-    use super::*;
-
+    /// The parsers themselves live in `omega_core::hostmem` and are tested
+    /// there, so that the governor and a bare `omega-run` capacity check read
+    /// the machine through exactly one implementation. This asserts only the
+    /// wiring — that this module still asks that implementation, rather than
+    /// growing a second copy that can drift.
     #[test]
-    fn linux_mem_available_parses() {
-        let mi = "MemTotal:       131072000 kB\nMemFree:         1000000 kB\nMemAvailable:    64000000 kB\n";
-        assert_eq!(parse_mem_available(mi), Some(64_000_000 * 1024));
-        // Absent field must be None, never a guess.
-        assert_eq!(parse_mem_available("MemTotal: 1 kB\n"), None);
-    }
-
-    #[test]
-    fn macos_vm_stat_counts_inactive_as_available() {
-        let out = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
-Pages free:                               100000.\n\
-Pages active:                             500000.\n\
-Pages inactive:                           200000.\n";
-        // Free alone would read 1.5 GiB on a healthy Mac and refuse everything;
-        // inactive is reclaimable and must count.
-        let got = parse_vm_stat(out).expect("parses");
-        assert_eq!(got, (100_000 + 200_000) * 16384);
-        assert!(got > 4 << 30, "free+inactive should be GB-scale, got {got}");
-        assert_eq!(parse_vm_stat("garbage"), None);
+    fn the_probe_delegates_to_the_shared_implementation() {
+        assert_eq!(
+            super::detect_total_memory_bytes(),
+            omega_core::hostmem::total_bytes()
+        );
     }
 }

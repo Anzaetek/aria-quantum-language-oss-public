@@ -9,7 +9,37 @@ over a small instance.
 | model | covers | status |
 |---|---|---|
 | `Governor.tla` | admission control (`crates/omega-server/src/worker.rs`) | **checked** — safety holds, liveness fails as predicted |
+| `HostGate.tla` | host-wide admission across separate processes, and the failsafe when one dies (`crates/omega-hostgate`) | **checked** — safety and the failsafe hold; two rejected designs produce their counterexamples |
 | `DurableBatch.tla` | batch lifecycle across crash/reconnect (planned — `FIXES_PLAN.md` A9/A10) | not yet |
+
+`HostGate.tla` is checked by `check_hostgate.py` — python3, no dependencies, no
+JVM — which enumerates the same state space from an independent implementation
+of the same transition relation. TLC remains the authority; the point of the
+second artefact is that a proof needing a toolchain nobody has installed is a
+proof that stops being run. When both are available their **distinct-state
+counts must agree**, and a divergence means one of them has drifted.
+
+Current results, `needs=(2,1,1) capacity=4`:
+
+| configuration | states | outcome |
+|---|---|---|
+| baseline | 13 824 | safety holds; after every crash the books come back into balance |
+| `AtomicLedger = FALSE` | 5 715 | `AccountingCoversReality` **violated in two steps** — a crash mid-rewrite truncates the file, every holder vanishes from the accounting while its memory is still resident, and the next request is admitted on top of it |
+| `IdentityKeyed = FALSE` | 13 824 | `EventuallyReclaimed` **violated in three steps** — Acquire, Crash, Restart: a recycled PID makes the dead holder's record look live, so the prune never reclaims it and that capacity is gone until reboot |
+
+The second and third rows are the argument for temp-file-plus-rename and for
+keying holders on `(pid, start_time)`. **The day either stops failing, either
+the model or the claim is wrong.**
+
+Writing the model also found a defect in the model itself, which is worth
+recording because it is the kind that makes a spec worse than useless. `Release`
+was originally guarded by "this process is alive", so a *restarted* process
+could release its dead predecessor's record — repairing, inside the model, the
+exact leak the model existed to expose. `IdentityKeyed = FALSE` passed. The fix
+is the distinction between `StillHeld` (what the prune asks of a file record,
+and therefore exactly as good as the keying scheme) and `Owns` (what a process
+knows about its own guard, which is always incarnation-scoped because a
+predecessor's guard died with its address space).
 
 ## What these models do *not* catch
 

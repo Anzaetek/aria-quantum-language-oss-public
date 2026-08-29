@@ -88,6 +88,30 @@ pub fn expectation(
     Err(BridgeError::NotCompiled(Backend::Qiskit, "qiskit"))
 }
 
+/// See [`expectation_mixture`].
+#[cfg(not(feature = "bridge-qiskit"))]
+pub fn expectation_mixture(
+    _qasm: &str,
+    _observables: &[crate::WireObservable],
+) -> Result<Vec<f64>, BridgeError> {
+    Err(BridgeError::NotCompiled(Backend::Qiskit, "qiskit"))
+}
+
+/// Exact expectation values of a circuit that is a MIXTURE over measurement
+/// outcomes — mid-circuit measurement plus classically-conditioned gates.
+///
+/// `expectation` refuses these circuits because `Statevector.from_instruction`
+/// cannot answer them; this mode evolves every measurement branch exactly
+/// (no shots — the value is still analytic, and shares the analytic lane's
+/// tolerance). Same wire format as `expectation`. `reset` is still refused.
+#[cfg(feature = "bridge-qiskit")]
+pub fn expectation_mixture(
+    qasm: &str,
+    observables: &[crate::WireObservable],
+) -> Result<Vec<f64>, BridgeError> {
+    expectation_with_mode(qasm, observables, "expectation-mixture")
+}
+
 /// Exact expectation values of `observables` on the state `qasm` prepares.
 ///
 /// Uses `Statevector.from_instruction` — no shots, so the result carries no
@@ -101,13 +125,22 @@ pub fn expectation(
     qasm: &str,
     observables: &[crate::WireObservable],
 ) -> Result<Vec<f64>, BridgeError> {
+    expectation_with_mode(qasm, observables, "expectation")
+}
+
+#[cfg(feature = "bridge-qiskit")]
+fn expectation_with_mode(
+    qasm: &str,
+    observables: &[crate::WireObservable],
+    mode: &str,
+) -> Result<Vec<f64>, BridgeError> {
     if observables.is_empty() {
         return Err(BridgeError::InvalidInput(
             "observables must not be empty".into(),
         ));
     }
     let payload = serde_json::json!({
-        "mode": "expectation",
+        "mode": mode,
         "qasm": qasm,
         "observables": observables,
     })

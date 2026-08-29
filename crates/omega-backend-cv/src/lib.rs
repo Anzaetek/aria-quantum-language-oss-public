@@ -33,6 +33,178 @@
 
 use num_complex::Complex64;
 
+/// What a multi-mode state costs, and the padded-product trap.
+///
+/// Separated from the state types because the arithmetic must be checkable
+/// **without allocating anything** — the whole point is to refuse before a
+/// `(cutoff + PAD)^n_modes` allocation is attempted.
+pub mod capacity;
+
+/// Multi-mode states, and the mode-local primitive that is the only way a
+/// padded single-mode operator may touch one.
+pub mod multimode;
+
+/// Padding headroom for the non-unitary truncated operators: enough that the
+/// mass above `cutoff + PAD` is far below any tolerance a caller can set, for
+/// the magnitudes this truncated representation can carry at all.
+///
+/// **Per mode.** Lifting this into a multi-mode product basis costs
+/// `(cutoff + PAD)^n_modes` — 18.41 TiB at `cutoff = 8, n = 6` against 4 MiB
+/// for the state. See [`capacity`] and [`multimode`]; the padded dimension must
+/// stay an inner summation index.
+pub(crate) const PAD: usize = 96;
+
+/// Apply the truncated displacement operator to **one** `cutoff`-length fiber,
+/// writing `out.len()` amplitudes so the caller can measure what the cutoff cut.
+///
+/// Extracted so the single-mode path and the mode-local multi-mode path share
+/// ONE implementation. Two copies of the Miatto–Quesada recurrence would be two
+/// conventions, and a convention that exists twice is the defect class this
+/// repository keeps finding — most recently in four separate places that each
+/// conflated a register's declared width with its information content.
+///
+/// `out` may be longer than `input`; `out.len()` sets the working dimension, and
+/// everything at or above `input.len()` is the spill the caller accounts for.
+/// Only the first `input.len()` columns of the operator are built: the input has
+/// no amplitude above the cutoff to multiply the rest by.
+pub(crate) fn displace_fiber(input: &[Complex64], alpha: Complex64, out: &mut [Complex64]) {
+    let cutoff = input.len();
+    let dim = out.len();
+    debug_assert!(
+        dim >= cutoff,
+        "the padded dimension cannot be below the cutoff"
+    );
+    for v in out.iter_mut() {
+        *v = Complex64::new(0.0, 0.0);
+    }
+    let mut prev_col: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
+
+    // Column 0: D[m][0] = (α/√m)·D[m-1][0], starting from e^{-|α|²/2}.
+    prev_col[0] = Complex64::new((-0.5 * alpha.norm_sqr()).exp(), 0.0);
+    for m in 1..dim {
+        prev_col[m] = prev_col[m - 1] * alpha / (m as f64).sqrt();
+    }
+    for (m, v) in prev_col.iter().enumerate() {
+        out[m] += v * input[0];
+    }
+
+    // Columns 1..cutoff by recurrence off the previous column.
+    let conj_alpha = alpha.conj();
+    let mut col: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
+    for (n, &amp_n) in input.iter().enumerate().skip(1) {
+        let inv_sqrt_n = 1.0 / (n as f64).sqrt();
+        for m in 0..dim {
+            let mut t = -conj_alpha * prev_col[m];
+            if m > 0 {
+                t += prev_col[m - 1] * (m as f64).sqrt();
+            }
+            col[m] = t * inv_sqrt_n;
+        }
+        if amp_n != Complex64::new(0.0, 0.0) {
+            for (m, v) in col.iter().enumerate() {
+                out[m] += v * amp_n;
+            }
+        }
+        std::mem::swap(&mut prev_col, &mut col);
+    }
+}
+
+/// Apply the truncated squeeze operator `S(r)` (REAL `r`) to one `cutoff`-length
+/// fiber, writing `out.len()` amplitudes so the caller can measure the spill.
+///
+/// Same shape and same reason as [`displace_fiber`]: one implementation, so the
+/// single-mode and any future mode-local path cannot drift into two
+/// conventions.
+///
+/// # The recurrence, and the anchor that fixes its sign
+///
+/// With `s = sech r` and `t = tanh r`, columns are built from
+///
+/// ```text
+///   S[m][0]  =  even ladder only, S[0][0] = 1/√cosh r,
+///               S[2k][0] = S[2k-2][0] · (−t) · √((2k−1)/(2k))
+///   S[m][n]  =  (1/√n) · [ √m · s · S[m−1][n−1]  +  t · √(n−1) · S[m][n−2] ]
+/// ```
+///
+/// **Column 0 is exactly [`FockState::squeezed_vacuum`]'s series**, and that is
+/// deliberate rather than a coincidence worth noting: the constructor is already
+/// gated against piquasso, so reproducing it column-0 pins this operator's sign
+/// and normalisation to an externally validated reference instead of to my
+/// reading of a convention. `squeeze_on_vacuum_reproduces_the_constructor`
+/// asserts it.
+///
+/// Spot-check the general recurrence at `n = 1`, where the second term vanishes:
+/// `S[1][1] = s · S[0][0] = sech r / √cosh r = (cosh r)^{-3/2}`, the standard
+/// value of `⟨1|S(r)|1⟩`.
+///
+/// Only the first `input.len()` columns are built — the input carries no
+/// amplitude above the cutoff for the rest to multiply.
+pub(crate) fn squeeze_fiber(input: &[Complex64], r: f64, out: &mut [Complex64]) {
+    let cutoff = input.len();
+    let dim = out.len();
+    debug_assert!(
+        dim >= cutoff,
+        "the padded dimension cannot be below the cutoff"
+    );
+    for v in out.iter_mut() {
+        *v = Complex64::new(0.0, 0.0);
+    }
+    let sech = 1.0 / r.cosh();
+    let tanh = r.tanh();
+
+    // Column 0: the squeezed vacuum, even sub-ladder only.
+    let mut col0: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
+    let mut c = 1.0 / r.cosh().sqrt();
+    col0[0] = Complex64::new(c, 0.0);
+    let mut k = 1usize;
+    while 2 * k < dim {
+        c *= -tanh * (((2 * k - 1) as f64) / ((2 * k) as f64)).sqrt();
+        col0[2 * k] = Complex64::new(c, 0.0);
+        k += 1;
+    }
+    for (m, v) in col0.iter().enumerate() {
+        out[m] += v * input[0];
+    }
+    if cutoff == 1 {
+        return;
+    }
+
+    // `prev2` is column n-2, `prev1` is column n-1. The recurrence reaches back
+    // two columns, unlike displacement's one, because squeezing moves photons in
+    // PAIRS — which is also why every odd column of a squeezed vacuum is zero.
+    // At iteration `n`, `prev1` must hold column `n-1` and `prev2` column
+    // `n-2`. So entering `n = 1`, `prev1` is column 0 — NOT `prev2`. Getting
+    // this backwards makes every column from 1 up come out zero, and the
+    // squeezed-VACUUM anchor still passes, because a vacuum input only ever
+    // multiplies column 0. Caught by
+    // `squeeze_applies_to_a_state_that_already_has_structure`, whose norm came
+    // out as exactly e^{-|α|²} — the weight of the |0> component alone.
+    let mut prev1: Vec<Complex64> = col0;
+    let mut prev2: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
+    let mut col: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
+
+    for (n, &amp_n) in input.iter().enumerate().skip(1) {
+        let inv_sqrt_n = 1.0 / (n as f64).sqrt();
+        for m in 0..dim {
+            let mut term = Complex64::new(0.0, 0.0);
+            if m > 0 {
+                term += prev1[m - 1] * ((m as f64).sqrt() * sech);
+            }
+            if n >= 2 {
+                term += prev2[m] * (tanh * ((n - 1) as f64).sqrt());
+            }
+            col[m] = term * inv_sqrt_n;
+        }
+        if amp_n != Complex64::new(0.0, 0.0) {
+            for (m, v) in col.iter().enumerate() {
+                out[m] += v * amp_n;
+            }
+        }
+        std::mem::swap(&mut prev2, &mut prev1);
+        std::mem::swap(&mut prev1, &mut col);
+    }
+}
+
 /// A single CV mode truncated at `cutoff` Fock levels: `|0⟩ .. |cutoff-1⟩`.
 #[derive(Clone, Debug)]
 pub struct FockState {
@@ -335,47 +507,9 @@ impl FockState {
         }
 
         let cutoff = self.amps.len();
-        // Padding headroom: enough that the mass above `cutoff + PAD` is far
-        // below any tolerance a caller can set, for the magnitudes this
-        // truncated representation can carry at all.
-        const PAD: usize = 96;
         let dim = cutoff + PAD;
-
-        // Exact matrix elements, column by column (Miatto–Quesada). Only the
-        // first `cutoff` columns are needed: the input has no amplitude above
-        // the cutoff to multiply the rest by.
-        let mut prev_col: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
         let mut out: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
-
-        // Column 0: D[m][0] = (α/√m)·D[m-1][0], starting from e^{-|α|²/2}.
-        prev_col[0] = Complex64::new((-0.5 * alpha.norm_sqr()).exp(), 0.0);
-        for m in 1..dim {
-            prev_col[m] = prev_col[m - 1] * alpha / (m as f64).sqrt();
-        }
-        for (m, v) in prev_col.iter().enumerate() {
-            out[m] += v * self.amps[0];
-        }
-
-        // Columns 1..cutoff by recurrence off the previous column.
-        let conj_alpha = alpha.conj();
-        let mut col: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
-        for n in 1..cutoff {
-            let inv_sqrt_n = 1.0 / (n as f64).sqrt();
-            for m in 0..dim {
-                let mut t = -conj_alpha * prev_col[m];
-                if m > 0 {
-                    t += prev_col[m - 1] * (m as f64).sqrt();
-                }
-                col[m] = t * inv_sqrt_n;
-            }
-            let amp_n = self.amps[n];
-            if amp_n != Complex64::new(0.0, 0.0) {
-                for (m, v) in col.iter().enumerate() {
-                    out[m] += v * amp_n;
-                }
-            }
-            std::mem::swap(&mut prev_col, &mut col);
-        }
+        displace_fiber(&self.amps, alpha, &mut out);
 
         // Split at the cutoff: what stays, and what the cutoff cuts.
         let spill_mass: f64 = out[cutoff..].iter().map(|a| a.norm_sqr()).sum();
@@ -390,6 +524,70 @@ impl FockState {
         // being added on the same footing as the newly measured spill.
         let prior = self.lost_norm;
         let prior_contrib = prior.sqrt();
+
+        self.amps.copy_from_slice(&out[..cutoff]);
+        self.lost_norm = (spill_mass + prior_contrib).min(1.0);
+        self.lost_n_weight += spill_weight + prior_contrib;
+        Ok(())
+    }
+
+    /// Apply the squeeze operator `S(r)` to this state, in place. **Real `r`.**
+    ///
+    /// The OPERATOR form. [`Self::squeezed_vacuum`] is the constructor and stays
+    /// the right choice on a pristine vacuum, where it carries an exact analytic
+    /// tail this path can only measure.
+    ///
+    /// # Why this exists
+    ///
+    /// Until now squeezing could only ever be the FIRST thing that happened to a
+    /// mode, because it existed solely as a constructor. So `displace then
+    /// squeeze` — an ordinary CV circuit — was inexpressible, and the piquasso
+    /// differential corpus said so out loud and skipped those cases rather than
+    /// quietly narrowing itself. This closes half of that gap; see the note on
+    /// phase below for the half that remains.
+    ///
+    /// # Real `r` only, and a phase is REFUSED rather than approximated
+    ///
+    /// The general operator is `S(ξ) = exp[(ξ̄a² − ξa†²)/2]` with `ξ = r e^{iφ}`.
+    /// This implements `φ = 0`.
+    ///
+    /// A phased version differs only by conjugating one term of the recurrence,
+    /// so writing it would be easy and validating it would not: the anchor that
+    /// fixes this implementation's sign convention is
+    /// [`Self::squeezed_vacuum`], which is itself real-only. Shipping a phase
+    /// whose convention rests on nothing but my reading of the literature is the
+    /// exact shape of defect this crate's differential corpus exists to catch,
+    /// so it is refused by name and the caller learns immediately.
+    ///
+    /// # Truncation
+    ///
+    /// Squeezing pushes population UP the ladder, so the cutoff bites harder
+    /// here than for a phase rotation. The operator is applied into a
+    /// [`PAD`]-extended space and the mass above the cutoff is measured and
+    /// added to [`Self::lost_norm`], on the same footing as
+    /// [`Self::displace`] — including the incoming `√ε` term, for the reason
+    /// given there: at `r = 0.5` the true amplitude error was measured at ~1700×
+    /// the linear lost-mass budget, so folding prior loss in linearly would
+    /// under-report, and an under-reporting leak metric is worse than a wrong
+    /// amplitude because callers use it to decide whether an answer is usable.
+    pub fn squeeze(&mut self, r: f64) -> Result<(), CvError> {
+        if !r.is_finite() {
+            return Err(CvError::Unrepresentable {
+                what: "squeezing parameter is not finite",
+            });
+        }
+        let cutoff = self.amps.len();
+        let dim = cutoff + PAD;
+        let mut out: Vec<Complex64> = vec![Complex64::new(0.0, 0.0); dim];
+        squeeze_fiber(&self.amps, r, &mut out);
+
+        let spill_mass: f64 = out[cutoff..].iter().map(|a| a.norm_sqr()).sum();
+        let spill_weight: f64 = out[cutoff..]
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (cutoff + i) as f64 * a.norm_sqr())
+            .sum();
+        let prior_contrib = self.lost_norm.sqrt();
 
         self.amps.copy_from_slice(&out[..cutoff]);
         self.lost_norm = (spill_mass + prior_contrib).min(1.0);
