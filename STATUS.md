@@ -181,13 +181,30 @@ prior CUDA verification in this repo was x86_64 + RTX PRO 6000 + nvcc 12.9.
    entry outlived the fix, which is the failure mode this list exists to avoid
    — a stale open item sends the next reader to re-solve closed work and makes
    the live entries look equally doubtful. → request E2
-7. **`tools/qec_cross_check/run.sh` bootstraps with plain `pip`** —
-   `pymatching` cannot source-build on aarch64. → request E6.
-   **Confirmed on the hardware 2026-08-16**, and it is worse than "plain pip":
-   there is **no aarch64 wheel on PyPI at all**
-   (`--only-binary=:all:` → "no matching distribution"), *and* the cmake source
-   build fails on a GB10. The MANDATORY QEC cross-check therefore cannot run on
-   arm64 today by any route.
+7. **`tools/qec_cross_check/run.sh` cannot run on aarch64; runs on x86_64** —
+   → request E6. This is an **architecture** limit, not a universal one, and
+   the earlier wording ("cannot run today by any route") was true only of the
+   machine that recorded it.
+   - **aarch64 (DGX Spark GB10, 2026-08-16):** no `pymatching` wheel on PyPI
+     (`--only-binary=:all:` → "no matching distribution") *and* the cmake
+     source build fails. The decoder half of the cross-check cannot run there.
+     That machine is no longer in the estate.
+   - **x86_64 (akilles, linux, 2026-09-26): runs, and PASSES.**
+     `pip install --only-binary=:all: pymatching` resolves to
+     `pymatching-2.4.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl`
+     (Python 3.12.3). `run.sh` zero-config bootstrap created the venv, built
+     `aria-cli`, and ran both halves: encoded-algorithm cross-check vs qiskit
+     2.5.2 (+ stim) **20 passed, 0 failed**; surface-code decoder vs
+     PyMatching 2.4.0 at d=3 and d=5, p=0.05, 20000 shots — shot-for-shot
+     logical-class agreement 100.00% in every sector, logical rates identical
+     to 4 digits (d=3: X 0.0367, Z 0.0336; d=5: X 0.0251, Z 0.0238) —
+     **12 passed, 0 failed**. So the MANDATORY QEC cross-check is green on the
+     x86_64 host the estate actually has.
+   - Gotcha, environment not packaging: behind a TLS-intercepting proxy, plain
+     `pip` fails with `CERTIFICATE_VERIFY_FAILED ... self signed certificate in
+     certificate chain`, exactly as cargo does. Point `PIP_CERT` (and
+     `CARGO_HTTP_CAINFO`, for the `cargo build` inside `run.sh`) at the proxy's
+     CA bundle. That is a proxy setting and not what this item is about.
 8. ~~**No `RUST_TEST_THREADS` in `ci.sh`**~~ **CLOSED 2026-08-16** — set
    stage-scoped on the CUDA stage. But the stated cause was **wrong**:
    `!Send`/`!Sync` is a compile-time property that *prevents* cross-thread
