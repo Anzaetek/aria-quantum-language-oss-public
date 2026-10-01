@@ -200,6 +200,31 @@ prior CUDA verification in this repo was x86_64 + RTX PRO 6000 + nvcc 12.9.
      to 4 digits (d=3: X 0.0367, Z 0.0336; d=5: X 0.0251, Z 0.0238) —
      **12 passed, 0 failed**. So the MANDATORY QEC cross-check is green on the
      x86_64 host the estate actually has.
+   - **What that green proves — narrower than the counts suggest** (independent
+     grok-4.7 review 2026-10-02, citations checked by hand):
+     - Of the 12 decoder lines, only the 4 shot-for-shot lines actually test
+       aria's decoder. The 4 "all weight≤t correctable (PyMatching)" lines call
+       PyMatching alone (`check_decoder.py` `guaranteed_correctable_ok`). The 4
+       rate lines are sums of the same bits, so given 100% agreement they pass
+       by identity. "Identical to 4 digits" is that identity, not a second
+       measurement.
+     - 100% agreement is *required* of any two correct uniform-weight MWPM
+       decoders here, because for odd d equal-weight corrections differ by a
+       stabilizer. It is not evidence of shared tie-breaking, and it is also
+       not a stress test.
+     - PyMatching is built from aria's own check matrix and logical
+       (`from_check_matrix(self.H, faults_matrix=self.L)`). A lattice or
+       observable bug is shared by both sides and cannot show up.
+     - Only the logical bit is compared, never correction support or weight. A
+       mutant that XORs a stabilizer into a correct correction stays fully green.
+     - The 20 algorithm lines run the **logical** twins (`qec_grover.aria`
+       says so in its header). The Steane-encoded run is a separate harness
+       (`crates/apps/qec-grover`), and this stage does not exercise it.
+     - If `pymatching` does not import on a re-run, `run.sh` prints a banner
+       but still exits 0. A missing `stim` silently drops 4 of the 20 checks.
+     Net: "aria's exact MWPM returns the same logical class as uniform-weight
+     PyMatching on aria's own H, d=3,5, p=0.05" — true and useful, but not an
+     independent check of the code construction or of correction minimality.
    - Gotcha, environment not packaging: behind a TLS-intercepting proxy, plain
      `pip` fails with `CERTIFICATE_VERIFY_FAILED ... self signed certificate in
      certificate chain`, exactly as cargo does. Point `PIP_CERT` (and
