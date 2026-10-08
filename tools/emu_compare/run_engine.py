@@ -39,9 +39,12 @@ SKIP = 7  # not 3: omega-hostgate exits 3 when it refuses a run
 # precision is a property of the engine as run here, stated, not measured.
 ENGINES = {
     "omega-cpu": {"precision": "complex128", "kind": "omega", "device": "cpu"},
-    # omega-run's CUDA statevector arm is f32 (`cuda-f32`): the crate's f64
-    # path (f64_path.rs) is not reachable from omega-run.
+    # omega-run's default CUDA statevector arm is f32 (`cuda-f32`).
     "omega-cuda": {"precision": "complex64", "kind": "omega", "device": "cuda"},
+    # `--precision f64` reaches the double arm (`cuda-f64`): 1q/2q unitary
+    # circuits only, one launch per gate, no fusion.
+    "omega-cuda-f64": {"precision": "complex128", "kind": "omega", "device": "cuda",
+                       "omega_precision": "f64"},
     "qulacs-cpu": {"precision": "complex128", "kind": "qulacs"},
     # qsimcirq's state is float32 throughout; it has no double option.
     "qsim-cpu": {"precision": "complex64", "kind": "qsim"},
@@ -325,6 +328,8 @@ def run_omega(engine, spec, qasm, out, reps):
     version = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout.strip()
     cmd = [exe, qasm, "--statevector", "--backend", "statevector", "--device", spec["device"],
            "--dump-state-npy", out]
+    if "omega_precision" in spec:
+        cmd[-2:-2] = ["--precision", spec["omega_precision"]]
     # omega-run refuses `--timing-reps 0` (it would report the warm-up as the
     # median), so a state-only run (`--reps 0`, the bit-order check) omits the
     # flag. The explicit `--device` still guards the arm: `--dump-state-npy`

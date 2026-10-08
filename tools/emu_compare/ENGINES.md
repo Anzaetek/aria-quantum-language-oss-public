@@ -9,7 +9,8 @@ what runs here and what each engine can and cannot do.
 | engine | package | precision | notes |
 |---|---|---|---|
 | `omega-cpu` | `omega-run --device cpu` | complex128 | |
-| `omega-cuda` | `omega-run --device cuda` (`--features cuda`) | **complex64** | the CLI reaches only the f32 arm — STATUS §5 #19 |
+| `omega-cuda` | `omega-run --device cuda` (`--features cuda`) | **complex64** | the default f32 arm (`cuda-f32`), diagonal-gate fusion |
+| `omega-cuda-f64` | `omega-run --device cuda --precision f64` | complex128 | the double arm (`cuda-f64`): 1q/2q unitary circuits only, one launch per gate, no fusion; refuses 3-qubit gates, reset, conditions, collapse |
 | `qulacs-cpu` | qulacs 0.6.14 | complex128 | its QASM converter lacks `cu1`/`rzz`; read through `run_engine.parse_qasm`, which refuses unknown gates |
 | `qsim-cpu` | qsimcirq 0.22.1 (cirq 1.7.0) | **complex64 only** | no double path at all; the PyPI wheel has no GPU (`use_gpu` → "not supported"); `cpu_threads` defaults to 1 and is set explicitly |
 | `aer-cpu` | qiskit-aer 0.17.2 on qiskit 2.5.2 | complex128 | |

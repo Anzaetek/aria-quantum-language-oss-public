@@ -54,6 +54,8 @@ mod forward_graph;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 mod backward_graph;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+pub mod f64_backend;
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 pub mod f64_path;
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 mod imp;

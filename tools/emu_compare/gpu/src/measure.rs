@@ -113,6 +113,20 @@ pub fn admit(cands: &[Cand]) -> Option<Variant> {
         })
 }
 
+/// `"{x} <= {tol}"` or `"{x} > {tol}"`, from the comparison itself: a
+/// witness asserts what was observed, never a pass it did not check.
+pub fn gate_text(x: f64, tol: f64) -> String {
+    let rel = if x <= tol { "<=" } else { ">" };
+    format!("{x:.3e} {rel} {tol:.0e}")
+}
+
+/// Whether the Aer floor's own answer passed the gates. A floor that failed
+/// them is timing a wrong answer, so its speed proves nothing about the loop:
+/// the floor check is withheld rather than asserted.
+pub fn floor_usable(gap: f64, state: Option<(f64, f64)>) -> bool {
+    gap <= GATE_REL_F32 && state.is_none_or(|(omf, md)| omf <= GATE_REL_F32 && md <= GATE_REL_F32)
+}
+
 fn min_of(mut f: impl FnMut() -> Result<f64, String>) -> Result<f64, String> {
     let mut m = f64::INFINITY;
     for _ in 0..FLOOR_CALLS {
@@ -484,11 +498,13 @@ impl Ctx {
     ) -> Result<Result<(), String>, String> {
         let n = art.qubits;
         let state_mib = (1u64 << n) * 8 / (1 << 20); // complex64
+                                                     // Load first: its wait can take minutes, and a device reading taken
+                                                     // before it would describe a card the row never ran on.
+        let load_before = wait_quiet(self.void_above)?;
         let before = match wait_card() {
             Ok(b) => b,
             Err(e) => return Ok(Err(e)),
         };
-        let load_before = wait_quiet(self.void_above)?;
         let engines = [
             Engine::Ours,
             Engine::Custatevec(variant),
@@ -526,7 +542,16 @@ impl Ctx {
                 } else {
                     state_mib
                 };
-                let got = census::per_pid_mib()?.get(&a.pid()).copied().unwrap_or(0);
+                let held = census::holders()?;
+                let visitors = census::foreign(&held, &[a.pid()]);
+                if !visitors.is_empty() {
+                    return Ok(Err(format!(
+                        "the GPU was not ours mid-row: {visitors:?} beside {} (repeat {})",
+                        e.label(),
+                        times[i].len() + 1
+                    )));
+                }
+                let got = held.iter().find(|h| h.pid == a.pid()).map_or(0, |h| h.mib);
                 if got < need {
                     return Err(format!(
                         "ABORT (§7 E5: the lane aborts whole on a failed device census): {} pid {} holds {got} MiB \
@@ -637,12 +662,19 @@ impl Ctx {
         let gate_w = |label: &str, g: f64, c: &Cand| -> Vec<PathWitness> {
             let mut w = vec![witness(
                 "value_gate",
-                &format!("max rel gap over the row {g:.3e} <= {GATE_REL_F32:.0e} vs {label}"),
+                &format!(
+                    "max rel gap over the row {} vs {label}",
+                    gate_text(g, GATE_REL_F32)
+                ),
             )];
             if let Some((omf, md)) = c.state {
                 w.push(witness(
                     "state_gate_vs_aer_double",
-                    &format!("|1-F|={omf:.3e} max|dpsi|={md:.3e} <= {GATE_REL_F32:.0e}"),
+                    &format!(
+                        "|1-F| {}; max|dpsi| {}",
+                        gate_text(omf, GATE_REL_F32),
+                        gate_text(md, GATE_REL_F32)
+                    ),
                 ));
             }
             w
@@ -678,8 +710,17 @@ impl Ctx {
         // Context: every candidate not timed in the row, from its gate-stage sweep.
         let mut context = BTreeMap::new();
         let floor_min = floor_arm.timing.get().expect("present").min_s;
+        let floor_ok = floor_usable(gaps[2], cand(engines[2]).state);
         context.insert(
-            format!("{} (floor, timed in the row)", engines[2].label()),
+            format!(
+                "{} (floor, timed in the row{})",
+                engines[2].label(),
+                if floor_ok {
+                    ""
+                } else {
+                    "; REFUSED by its own gate, so not a floor"
+                }
+            ),
             floor_arm,
         );
         for c in cands {
@@ -740,9 +781,17 @@ impl Ctx {
             overhead_rule: OVERHEAD_RULE.to_string(),
             competitor_per_call_floor_s: comp_floor,
             competitor_min_over_floor: multiple,
-            floor_arm_min_s: Some(floor_min),
+            floor_arm_min_s: floor_ok.then_some(floor_min),
         };
         let classification = classify(ratio, o.min_s, o.median_s, t.min_s, t.median_s);
+        if !floor_ok {
+            notes.push(format!(
+                "floor check withheld: the Aer floor at {} fails its own gate (value gap {}), so its speed \
+                 is the speed of a wrong answer and says nothing about the cuStateVec loop",
+                variant.as_str(),
+                gate_text(gaps[2], GATE_REL_F32)
+            ));
+        }
 
         notes.push(format!(
             "observable O = {} ({} terms); reference {ref_value:+.15} ({ref_label})",
@@ -828,7 +877,11 @@ impl Ctx {
                 ratio_competitor_over_ours: ratio,
                 classification,
                 overhead_dominated: comp_floor > 0.0 && multiple < OVERHEAD_FLOOR_MULTIPLE,
-                floor_check: Some(FloorCheck { arm: engines[2].label(), min_s: floor_min, verdict }),
+                floor_check: floor_ok.then(|| FloorCheck {
+                    arm: engines[2].label(),
+                    min_s: floor_min,
+                    verdict,
+                }),
                 derivation: Witness::present(derivation),
             })),
             notes,
@@ -953,6 +1006,30 @@ mod tests {
             versions: BTreeMap::new(),
             witnesses: vec![],
         }
+    }
+
+    #[test]
+    fn a_witness_never_asserts_a_pass_it_did_not_check() {
+        assert_eq!(gate_text(6.3e-7, 1e-6), "6.300e-7 <= 1e-6");
+        assert_eq!(
+            gate_text(2.1e-6, 1e-6),
+            "2.100e-6 > 1e-6",
+            "a failed gap must read as failed"
+        );
+    }
+
+    #[test]
+    fn a_floor_that_fails_its_gate_is_not_a_floor() {
+        assert!(floor_usable(6.3e-7, Some((6.5e-7, 1.6e-8))));
+        assert!(!floor_usable(2.1e-6, None), "value gap over 1e-6");
+        assert!(
+            !floor_usable(6.3e-7, Some((2.2e-6, 2.9e-8))),
+            "state gate failed"
+        );
+        assert!(
+            floor_usable(6.3e-7, None),
+            "no state above the oracle line is not a failure"
+        );
     }
 
     #[test]

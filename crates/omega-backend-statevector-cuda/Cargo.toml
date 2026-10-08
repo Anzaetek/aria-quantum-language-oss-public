@@ -40,6 +40,8 @@ cudarc = { version = "0.19", default-features = false, features = ["driver", "nv
 [dev-dependencies]
 # Test-only: parses the Qiskit reference statevector in tests/f64_vs_qiskit.rs.
 serde_json = "1"
+# Test-only: tests/f64_backend_vs_cpu.rs parses the same QASM the f32 arm is checked on.
+omega-parser = { path = "../omega-parser" }
 criterion = { workspace = true }
 
 [[bench]]

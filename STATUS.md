@@ -824,7 +824,8 @@ than patched per caller.
    proof — `reset` without the `X` on outcome 1, `fold` replaced by the real
    channel, the purity cross-term halved — each break the proof. The four
    abstract `sorry`s in `Reset.lean` remain by design (see above); the
-   stabilizer three are still open.
+   stabilizer three were then still open (all three are now proved in the
+   concrete model, below).
    **Stabilizer T1 done in the concrete model, 2026-10-06.**
    `proofs/lean4/QuantumProofs/StabilizerModel.lean` models a Pauli as the
    record `i^k X^x Z^z` acting on amplitudes over bitstrings. The record
@@ -857,7 +858,6 @@ than patched per caller.
    True` (T2 and `full_rank_needed` fail), `ω`'s bilinear form with one term
    (`omega_eq_symp` fails), the subset product selecting `c i = 0`, `vec`
    dropping the `z` bits, and `commuting` only on the diagonal.
-   `echelon_reduction_complete` is next.
    **Exhaustiveness, consistency, and an inhabitant at every `n`, same file,
    2026-10-07.** `not_plus_and_minus`: no Pauli is both `+` and `−` a product
    of generators. `exhaustive`: on a full-rank state, every *Hermitian* Pauli
@@ -872,10 +872,61 @@ than patched per caller.
    without its sign (`not_plus_and_minus` fails at its own line), `adj`
    without negating the phase (`exhaustive_needs_hermitian` is then refuted
    by `decide`, and `exhaustive` inherits `sorryAx`), and `zGen` as `−Z_i`
-   (`zeroState`'s `stabilizes` fails). This closes no new target: item 4
-   stays at 6 of its 7 targets proved in the concrete models, and
-   `echelon_reduction_complete` — that the pivoted `𝔽₂` elimination
-   algorithm is complete — is proved by no one yet.
+   (`zeroState`'s `stabilizes` fails). This closed no new target.
+   **Stabilizer T3 done in the same model, 2026-10-08; item 4 is now 7 of 7
+   targets proved in the concrete models** (the abstract files' `sorry`s stay,
+   as above). The algorithm is explicit and mirrors `stabilizer_expectation`
+   in `crates/omega-backend-pauli/src/sim.rs` step for step: a pivot table
+   keyed by column over the `2n` bits (`x` first), each generator inserted by
+   scanning columns and adding the stored pivot row at each set bit or
+   storing itself at the first free one (`insertRow`), and the target reduced
+   the same way, with a "not in the group" exit at a set bit with no pivot
+   (`reduceRow`). `reducesToIdentity s p` is that run ending on `some 0`, not
+   span membership. Both recurse structurally, so `decide` evaluates concrete
+   runs. `echelon_reduction_complete` is proved with **one hypothesis the
+   abstract statement omits, `Independent s`**, and `t3_full_rank_needed`
+   shows it is necessary (`|0⟩|+⟩` with `Z⊗I` twice: `I⊗Z` commutes with
+   everything and takes the "not in the group" exit). **At the call site the
+   hypothesis holds by construction, through one unproved link:**
+   `stabilizer_expectation` is private and reached only from `sim.rs`'s two
+   expectation paths. Both start at `StabilizerTableau::zero_state(n)`
+   (stabilizers `Z_0 … Z_{n-1}`, independent), and `apply_circuit` changes the
+   tableau only through its update methods (Clifford conjugations,
+   `measure`, and `reset` as measure-then-`X`). That those updates keep the
+   `n` stabilizer rows independent is the Aaronson–Gottesman tableau
+   invariant, which is not proved in this repo; the only runtime backstop is
+   the `debug_assert` after the loop, which release builds drop. No Hermitian hypothesis is needed, because the run
+   reads only bits, not the phase. **Scope of the conclusion:** T3 certifies
+   that the "not in the group" exit (`sim.rs`'s `None => return 0.0`) is
+   unreachable for a commuting Pauli on a full-rank table. The sign of the
+   `±1` the backend then returns comes from its phase bookkeeping
+   (`mul_pauli_row`), which no concrete theorem covers. The algorithmic core,
+   `reducesToIdentity_of_mem` (bits in the generators' span ⇒ the run
+   reaches the identity), needs no full rank. It goes through the echelon
+   invariant (each stored row leads at its own column), insertion keeping
+   the table echelon and absorbing the row, and a lowest-pivot lemma.
+   `inGroup_reduces` is the abstract docstring's reading ("whenever `P` is
+   in the group"), with no rank hypothesis. Non-vacuity: `greedy_misses_bell_YY`
+   and `witness_T3_elimination` are group members (`YY` on Bell; `ZZ` with
+   generators `XX`, `XZ⊗XZ`, which share a pivot column) that the pivoted
+   run reduces and a bit model of the old single greedy pass does not, both
+   by `decide`. `t3_rejects_anticommuting` shows the predicate is false on
+   `Z⊗I` on Bell. `zeroState_Z_reduces` (every `n`) and `bellAlt_ZZ_reduces`
+   instantiate the theorem itself. The `ci.sh` gate now lists 30 theorems
+   (the headline T3 results; helper lemmas are covered transitively, since a
+   `sorry` in one surfaces as `sorryAx` on the theorems listed). A
+   misspelled member reports 29 of 30 and fails. Definition mutations, each
+   breaking a proof or a `decide` witness: `reduceRow` without the XOR
+   (`reduceRow_complete`, `bell_YY_reduces`, `witness_T3_elimination`);
+   `insertRow` overwriting an occupied pivot, or keeping the first row
+   without eliminating (`insertRow_echelon`/`_keeps`/`_absorbs`, and
+   `witness_T3_elimination`, since Bell's own generators never collide);
+   `insertRow` dropping the row at a free pivot; either skip test inverted;
+   `reducesToIdentity := True` (`t3_rejects_anticommuting` and
+   `t3_full_rank_needed`). Two make no statement false, and are not
+   defects: `reduceRow` continuing past a missing pivot gives the same
+   predicate (that bit is never cleared afterwards), and scanning `z` first
+   is also complete (it breaks only the `rfl` tying `cols` to `vec`).
    **Statement defect found and fixed 2026-09-30 (Reset.lean).** T1 and T2
    were false in any model where `project` is measure-then-renormalise: on
    `|0⟩` (unentangled, so `Deterministic`) the outcome-`true` branch has
@@ -1107,8 +1158,9 @@ than patched per caller.
     Three separate things to settle. **Two are closed (2026-10-02): the
     example now implements what the proof proves, and the `A⁻¹b` claim is
     asserted against closed forms. The third — the harness being
-    structurally blind — is unchanged, and so is the hand-maintained nature
-    of the circuit↔theorem correspondence; see the end of this item.**
+    structurally blind — is unchanged. The circuit↔theorem correspondence is
+    no longer hand-kept: it has been checked by parsing both sources since
+    2026-10-06 (end of this item).**
     - ~~**The example does not implement what the proof proves.**~~ **It does
       now — CLOSED 2026-10-02; the detail is at the end of this bullet.**
       `HHL.lean` is
@@ -1940,6 +1992,60 @@ than patched per caller.
     the matmul-shaped candidates, and they are now competing against zgesdd
     rather than against Jacobi.
 
+    **Cross-check from the other direction, settled the same day (2026-10-08).**
+    The E3 MPS-vs-quimb harness, re-run on akilles (32 threads, Linux), ran
+    our SVD as `jacobi`, since the Accelerate hook is macOS-only. Our χ = 32
+    minimum came out 4-6× slower than andromeda's E3 rows. Once
+    `E3_SVD_KERNEL` (`2d0e85b`) could pin the delegate, both boxes were run
+    on `jacobi`. Our arm, minimum seconds:
+
+    | shape | andromeda, jacobi | akilles, jacobi | andromeda, Accelerate (E3) |
+    |---|---|---|---|
+    | 14q d12 χ32 | 0.0804 | 0.0798 | 0.0143 |
+    | 14q d24 χ32 | 0.280 | 0.284 | 0.0515 |
+    | 20q d12 χ32 | 0.210 | 0.215 | 0.0302 |
+    | 20q d24 χ32 | 0.728 | 0.724 | 0.119 |
+    | 14q d24 χ128 | 0.597 | 0.698 | 0.132 |
+    | 20q d24 χ128 | 12.12 | 12.39 | 1.126 |
+
+    **The gap was the kernel, essentially in full.** With the kernel held
+    fixed, the two boxes agree within 2.5% on all four χ = 32 shapes.
+    Changing only the kernel on the same box moves our time 5.4-6.9× at
+    χ = 32 and 4.5× / 10.8× at χ = 128. That is a third independent reading
+    of the 4.1-7.8× above: this item's own M4 measurement, the akilles
+    replicate from the Linux side, and a same-box A/B.
+
+    The one genuine box difference left is χ = 128 at 14q d24 (0.597 vs
+    0.698, 14%), where the blocks are large enough for ISA and BLAS to show
+    once the kernel no longer dominates.
+
+    Scope, so the table is not over-read:
+    * The two akilles runs (d8cdb6c and 5883791) agree within 2-4% from
+      depth 12 up. That is reproducibility on one box and bounds the noise;
+      it is not the cross-box claim.
+    * akilles ran at `load_before` 6-26 (peer lanes), andromeda at 1.2-1.9.
+    * The depth-4 rows are sub-millisecond and directional only (0.67-0.92
+      ms; omitted above).
+    * The comparison is our arm against our arm. The quimb arm differs
+      between the boxes in interpreter (CPython 3.12.3 vs 3.14) and BLAS
+      (scipy-openblas 0.3.34 vs Accelerate), so no ratio of ratios is
+      licensed. On akilles quimb's χ = 128 minima spread 11.5-149 s across
+      identical runs: its unpinned thread pools oversubscribe 32 cores, so
+      those columns support only "oversubscribed".
+    * The pin's witness is the capability row's kernel field plus the
+      timings themselves. Speed rows do not carry `svd_delegate`, and on
+      andromeda the run-log line printed the platform default until
+      `d53360b`. On akilles the default is `jacobi` either way.
+    * `accelerate-zgesdd` names a dispatch policy, not the kernel every
+      block took: below `MIN_DIM_FOR_LAPACK` = 16 it runs Jacobi. That is
+      harmless at χ = 32 and 128, but not at small χ.
+    * Every timed row is void-truncating, because the HEA oracle at these
+      shapes is ~1e-18, i.e. zero, with both arms' gaps at ~1e-16. This lane
+      has no degenerate-oracle guard (the dense lane's
+      `NONTRIVIAL_MIN_ABS`), so a value gate here compares ~0 with ~0. If
+      these rows were ever promoted to speed rows, that gate would be
+      vacuous. They stay outside every `rows.jsonl`.
+
 17. **No proper comparison against alternative emulators.** Owner requirement,
     2026-09-27. The external implementations in this tree are **correctness
     oracles, not competitors**: qiskit/qiskit-aer, Stim, PyMatching, piquasso,
@@ -2147,23 +2253,36 @@ than patched per caller.
     same omission moved sideways: it binds only a caller who remembers to
     set it, and that caller can put `--watch` on the command. Which
     invocations are watched belongs in the scripts that start them.
-19. **`omega-run`'s CUDA statevector arm is f32 only, so there is no
-    like-for-like double-precision GPU row against cuStateVec.** Found
-    2026-10-06 building the akilles timing plumbing for §5 #17: the arm
-    `omega-run --device cuda --backend statevector` reaches is `cuda-f32`
-    (the `--timing-reps` line reports `"arm":"cuda-f32"`). A double forward
-    path exists in `crates/omega-backend-statevector-cuda/src/f64_path.rs`,
-    and nothing in `omega-run` reaches it. The yardstick it would be compared
-    against runs double on this card: qiskit-aer-gpu 0.15.1 with
-    `cuStateVec_enable=True, precision="double"` on the RTX PRO 6000 (sm_120,
-    via the driver JIT-compiling the wheel's sm_90 PTX) reads 1−F = 7.3e-15
-    against Aer CPU double on a 20-qubit random circuit, against 1.3e-7 at
-    single. So a GPU speed row today compares our complex64 to their
-    complex128 and must be labelled so (§17's precision rule), or published
-    as a capability row. **Recorded, deliberately not wired:** reaching the
-    f64 path from the CLI is a separate decision with its own test burden
-    (an f64-vs-CPU differential at 1e-12 on the shapes the f32 arm is
-    already checked on, and the timing arm label `cuda-f64`).
+19. ~~**`omega-run`'s CUDA statevector arm is f32 only, so there is no
+    like-for-like double-precision GPU row against cuStateVec.**~~ **CLOSED
+    2026-10-08.** `omega-run --device cuda --precision f64` now reaches
+    `CudaStatevectorF64Backend` (`crates/omega-backend-statevector-cuda/src/
+    f64_backend.rs`), a circuit executor over the existing `f64_path.rs`
+    kernels; its timing line reports `"arm":"cuda-f64"`, and the emulator
+    harness names it `omega-cuda-f64`. Scope, refused by name rather than
+    approximated: one- and two-qubit unitaries only (no 8×8 f64 kernel, so
+    `ccx`/`cswap` are refused), no `reset`, no classically conditioned gate, no
+    measurement in collapse mode; one launch per gate, no diagonal fusion, so a
+    timing row from it is an unfused-f64 row. Every gate matrix comes from the
+    CPU backend's `gates` module and `expectation` uses the CPU's own
+    `expectation_pauli`, so the two arms cannot disagree on a convention.
+    `tests/f64_backend_vs_cpu.rs` checks it against the f64 CPU statevector at
+    **1e-12**, without phase alignment, on the circuits the f32 arm is already
+    checked on (the `gpu_parity.rs` circuit, Bell, the bit-order circuit at 3
+    and 16 qubits) and on E5's two workload families at 20 qubits, plus one
+    circuit that applies every accepted gate on both qubit orders. Measured on
+    the RTX PRO 6000: worst |Δamp| 2.2e-16 (every gate), 8.8e-18
+    (`random1_20q`), 2.9e-17 (`hea_20q_d24`), while the f32 arm reads 5.1e-9 on
+    `random1_20q` — the bar separates the precisions, and a test asserts that it
+    does. Mutations, each red: `(qa, qb)` swapped at the 4×4 launch (5 tests),
+    `u2`'s parameters swapped, `rbs`'s angle negated, the 4×4's imaginary parts
+    conjugated (2 tests each). `omega-cli/tests/precision_flag.rs` drives the
+    flag through `--dump-state-npy` against the CPU dump at 1e-12 and pins the
+    label, and refuses `--precision` off `--device cuda --backend statevector`
+    (exit 2) — a CPU run is already f64, and an ignored flag would let a row
+    claim a precision it did not select. This adds an arm; it does not change
+    E5's rows, which remain f32-against-f32 by design (`PLAN-EMULATOR-COMPARISON
+    §E5`). A `cuda-f64` row is a new row with its own id.
 
 20. ~~**`omega-hostgate run --watch` can kill a healthy run on a transient
     unreadable census.**~~ **FIXED 2026-10-08.** Reported from akilles after a
@@ -2214,24 +2333,48 @@ than patched per caller.
     `ps` on macOS cannot. That is a platform-split refinement on top of a fix
     that already removes the reported failure.
 
-21. **§4.4a's external-CPU threshold ignores how many threads the row's own
-    arm declares.** The census itself is now wired in every lane — it landed
-    with E4 (dense, pauliprop, cv), the macOS backing and the pre-row half
-    landed 2026-10-08 with the stabilizer lane, and the fermionic lane and
-    `mps_quimb_compare` followed the same day onto the shared
-    `wait_quiet_external` + `ExternalCpu::with_pre_row` path. What is still
-    open is the threshold. It is one figure in cores — 2.0 on a small host,
-    8.0 on a large one, reusing `void_above` — and it says nothing about the
-    row it is applied to. A 1.5-core neighbour is noise for a single-threaded
-    stabilizer row and real contention for a 32-thread dense row, and nothing
-    in the schema connects the threshold to the arm's declared `threads`. The
-    fix is not obvious: scaling the threshold by `cores - threads` assumes the
-    arm actually uses the threads it declares, and a row whose arm declares 1
-    thread but calls into a BLAS that opens 10 would then be held to a
-    threshold it should not get. §4.3a's qulacs finding (1.37 s at 32 threads
-    against 0.0015 s at 16, under load) is the same subject from the other
-    side, and whatever rule lands should account for both or say which it
-    covers.
+21. **§4.4a's external-CPU threshold is one figure in cores and says nothing
+    about the row it is applied to — MEASURED 2026-10-08, and it can flip a
+    published classification.**
+
+    **Correction, 2026-10-08:** an earlier version of this entry said the
+    census "is wired in every lane". That conflated two different things. A
+    `CpuCensus` over the row landed in every lane with E4; the **pre-row**
+    census (`ExternalCpu::with_pre_row`, which is what lets a row be gated on
+    external cores rather than on `load1_before`) is attached by **three**:
+    the stabilizer, fermionic and `mps_quimb_compare` lanes. Dense, GPU, CV
+    and pauliprop still gate their entry on `load1`, and on a 32-core host
+    `load1` sits above 1.0 routinely while the box is externally quiet. So the
+    threshold work below is blocked on that wiring, not merely adjacent to it.
+
+    **The receipt, from the E5 review lane.** During a load-50 spike on
+    akilles (quantum's tests, a quimb run and a photonic demo together) the GPU
+    lane waited for `load1 < 8` exactly as §4.4 requires, and then **admitted
+    rows at 2.5–2.6 external cores**. There our arm read **142 ms against
+    96 ms quiet** on HEA 24q, which turns that row from a **win (1.324) into a
+    tie** — with **no GPU holder and 1% device utilisation**, so every
+    device-side gate was clean and said nothing. The six published GPU rows ran
+    at 0.19–0.27 external cores and stand, but that was margin, not policy.
+
+    **Why it bites hardest exactly where the thread count suggests it should
+    not.** A kernel-launch-bound GPU arm is single-thread *latency* bound: its
+    wall time is dominated by one thread's dispatch loop, so a neighbour
+    stealing that thread's turn costs it ~50% while a 32-thread dense row
+    sharing the same 2.5 cores barely notices. So the rule cannot simply scale
+    the threshold with `threads` — the arm that declares the FEWEST threads can
+    be the most sensitive. §4.3a's qulacs finding (1.37 s at 32 threads against
+    0.0015 s at 16, under load) is the same subject from the other side, and
+    whatever rule lands should account for both or say which it covers.
+
+    A further trap recorded with it: an arm that declares 1 thread but calls
+    into a BLAS that opens 10 would be handed a threshold it should not get, so
+    a naive `cores − threads` rule is unsound in the other direction too.
+
+    **Proposed, not adopted:** a per-lane threshold for `Lane::DenseGpu` of
+    1–2 cores in `load.rs`, the way small hosts get 2.0. `load.rs` is the one
+    place allowed to hold it — the source scan refuses a lane-local threshold
+    (`load_threshold.rs:161`) — so this is a change to the shared rule and not
+    something a lane can take unilaterally.
 
 22. **The results doc can cite a comparison phase that has no rows.**
     `crates/omega-emu-compare/tests/doc_rows.rs` (E7) refuses a row id the

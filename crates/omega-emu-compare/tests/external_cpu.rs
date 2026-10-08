@@ -21,24 +21,8 @@ fn cores() -> usize {
         .unwrap_or(1)
 }
 
-/// The two "own work must not void" tests share the box with whatever else is
-/// running, and a neighbour's burst is real external CPU that this census is
-/// right to count. A census that leaked the lane's own work would read about
-/// twelve to sixteen extra cores on EVERY attempt, so each of those tests takes
-/// up to five attempts and asserts on the quietest one: a leak still fails, a
-/// transient neighbour does not.
-const OWN_WORK_ATTEMPTS: usize = 5;
-
-fn quietest_of(mut attempt: impl FnMut() -> f64, below: f64) -> (f64, Vec<f64>) {
-    let mut seen = Vec::new();
-    for _ in 0..OWN_WORK_ATTEMPTS {
-        seen.push(attempt());
-        if *seen.last().unwrap() < below {
-            break;
-        }
-    }
-    (seen.iter().cloned().fold(f64::INFINITY, f64::min), seen)
-}
+mod common;
+use common::{assert_attributed_to_the_lane, own_contribution};
 
 #[test]
 fn the_arithmetic_subtracts_the_own_tree() {
@@ -103,25 +87,17 @@ fn the_lanes_own_threads_do_not_void_the_row() {
         })
         .collect();
     std::thread::sleep(Duration::from_millis(300));
-    let (quietest, seen) = quietest_of(
-        || {
-            let census = CpuCensus::start(&[std::process::id()]).unwrap();
-            let t = Instant::now();
-            while t.elapsed() < Duration::from_secs(3) {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            census.finish().unwrap().external_cores_during_row
-        },
-        4.0,
-    );
+    let c = own_contribution(&[std::process::id()], || {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
     stop.store(true, Ordering::Relaxed);
     for s in spinners {
         let _ = s.join();
     }
-    assert!(
-        quietest < 4.0,
-        "16 of the lane's own threads read as {quietest:.2} external cores at best (attempts: {seen:.2?})"
-    );
+    assert_attributed_to_the_lane("16 spinning threads inside the lane", n, c);
 }
 
 /// Twelve busy CHILDREN of the lane that it starts and reaps INSIDE the row:
@@ -134,31 +110,24 @@ fn children_the_lane_reaps_during_the_row_are_its_own() {
     let _box = BOX.lock().unwrap_or_else(|e| e.into_inner());
     let n = 12usize;
     assert!(cores() >= 2 * n, "needs a box with >= {} cores", 2 * n);
-    let (quietest, seen) = quietest_of(
-        || {
-            let census = CpuCensus::start(&[std::process::id()]).unwrap();
-            let mut burners: Vec<Child> = (0..n)
-                .map(|_| {
-                    Command::new("sh")
-                        .arg("-c")
-                        .arg("while :; do :; done")
-                        .spawn()
-                        .unwrap()
-                })
-                .collect();
-            std::thread::sleep(Duration::from_secs(3));
-            for b in &mut burners {
-                let _ = b.kill();
-                let _ = b.wait();
-            }
-            census.finish().unwrap().external_cores_during_row
-        },
-        4.0,
-    );
-    assert!(
-        quietest < 4.0,
-        "12 of the lane's own reaped children read as {quietest:.2} external cores at best (attempts: {seen:.2?})"
-    );
+    let mut burners: Vec<Child> = Vec::new();
+    let c = own_contribution(&[std::process::id()], || {
+        burners = (0..n)
+            .map(|_| {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg("while :; do :; done")
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        std::thread::sleep(Duration::from_secs(3));
+        for b in &mut burners {
+            let _ = b.kill();
+            let _ = b.wait();
+        }
+    });
+    assert_attributed_to_the_lane("12 children reaped inside the row", n, c);
 }
 
 /// The unsafe direction. A child of the lane that burned CPU BEFORE the census

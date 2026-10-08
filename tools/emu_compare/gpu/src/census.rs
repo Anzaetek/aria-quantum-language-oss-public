@@ -120,6 +120,19 @@ pub fn before() -> Result<Before, String> {
     })
 }
 
+/// Holders other than the processes the row expects on the card right now.
+/// Taken at every repeat, from the same reading as the arm's own memory: a
+/// job that arrives and leaves inside a row is invisible to the before and
+/// after readings, and two coexisting CUDA processes distort each other by up
+/// to ~45% (measured), under the 5x spread flag.
+pub fn foreign(holders: &[GpuHolder], expected: &[u32]) -> Vec<GpuHolder> {
+    holders
+        .iter()
+        .filter(|h| !expected.contains(&h.pid))
+        .cloned()
+        .collect()
+}
+
 /// Whether a "before" reading admits starting a row at all.
 pub fn quiet(b: &Before) -> bool {
     b.holders.is_empty() && b.util_pct <= GPU_UTIL_VOID_PCT
@@ -189,6 +202,27 @@ mod tests {
         assert!(
             parse_util("").is_err(),
             "no GPU must not read as an idle GPU"
+        );
+    }
+
+    #[test]
+    fn a_visitor_beside_the_running_arm_is_foreign() {
+        let h = |pid, name: &str| GpuHolder {
+            pid,
+            mib: 1000,
+            name: name.into(),
+        };
+        let held = vec![h(42, "emu-compare-gpu-ours"), h(7, "llama-server")];
+        let f = foreign(&held, &[42]);
+        assert_eq!(
+            f.len(),
+            1,
+            "the ollama server beside our arm must be seen: {f:?}"
+        );
+        assert_eq!(f[0].pid, 7);
+        assert!(
+            foreign(&held[..1], &[42]).is_empty(),
+            "our own arm is not a visitor"
         );
     }
 

@@ -1853,7 +1853,11 @@ fn sample_counts(
 /// repo or the private monorepo (checked 2026-09-04), so it was not a target
 /// anyone was tracking. What exercises these forms is
 /// `tests/parallel_shift_integration.rs` and the dense-oracle corpus tests.
-fn expectation_pauli(sv: &[Complex64], num_qubits: u32, pauli_string: &[(u32, PauliOp)]) -> f64 {
+pub fn expectation_pauli(
+    sv: &[Complex64],
+    num_qubits: u32,
+    pauli_string: &[(u32, PauliOp)],
+) -> f64 {
     let n = num_qubits as usize;
     let dim = 1usize << n;
     let mut result = Complex64::new(0.0, 0.0);

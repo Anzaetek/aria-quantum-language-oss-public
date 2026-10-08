@@ -10,12 +10,12 @@
 //! be the row that flips.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use omega_backend_mps::select::AUTO_EPS;
 use omega_backend_mps::svd::SvdResultFlat;
-use omega_backend_mps::{default_svd_flat_fn, MpsBackend, SvdFlatFn};
+use omega_backend_mps::{default_svd_kernel, MpsBackend, SvdFlatFn, SvdKernel};
 use omega_backend_statevector::StatevectorBackend;
 use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, ParamExpr, Qubit};
 use omega_core::executor::{Backend, Observable, PauliOp};
@@ -25,10 +25,107 @@ static SVD_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SVD_MAX_COLS: AtomicUsize = AtomicUsize::new(0);
 static SVD_LOCK: Mutex<()> = Mutex::new(());
 
+/// Which SVD kernel the shim delegates to, from `E3_SVD_KERNEL`.
+///
+/// Unset is the platform default, which is what every row published before
+/// 2026-10-08 used. The override exists because the delegate is otherwise a
+/// **compile-time `cfg`** (`default_svd_kernel`, `mps.rs`), so it could be
+/// *reported* in a row and never *set* — and the akilles E3 replicate then
+/// produced χ=32 rows 4–6× slower than andromeda's that nobody could attribute,
+/// because the two boxes had also silently run two different kernels of ours
+/// (jacobi on Linux, accelerate-zgesdd on macOS). A knob a row states but
+/// cannot pin makes any cross-box reading of that row unsound.
+///
+/// Refuses an unknown name, and refuses a kernel this target cannot build,
+/// rather than falling back. `default_svd_flat_fn` documents why: a fallback
+/// turns "the promotion did not happen" into a silent 4-8× loss that still
+/// reports a sound certificate, which is the one failure nothing downstream
+/// can see. The same argument applies to an override that quietly did nothing.
+/// `E3_SVD_KERNEL`'s value to a kernel, by the spelling a certificate uses.
+///
+/// Keyed on [`SvdKernel::as_str`] rather than on a second list of names, so
+/// the string that selects a kernel is definitionally the string a row reports
+/// for it. A separate match here would be two spellings of one fact, and the
+/// one the test pinned would stop being the one the harness read.
+///
+/// `Custom` is deliberately not selectable: it is the label a `with_svd_fn`
+/// shim earns, not a kernel this crate can install, and `svd_flat_fn` returns
+/// `None` for it.
+pub fn parse_svd_kernel(name: &str) -> Option<SvdKernel> {
+    [SvdKernel::Jacobi, SvdKernel::AccelerateZgesdd]
+        .into_iter()
+        .find(|k| k.as_str() == name.trim())
+}
+
+/// Resolve a requested kernel name against an availability predicate.
+///
+/// `available` is a parameter rather than a call to [`SvdKernel::is_available`]
+/// because the guard it feeds only ever *fires* on a target where the
+/// requested kernel is missing — `accelerate-zgesdd` off macOS. Calling
+/// `is_available` directly would leave that branch untestable on a Mac, which
+/// is where this code was written: a mutation deleting the check reddened
+/// nothing until the predicate became injectable. The branch matters precisely
+/// on the box it cannot be exercised from, since a Linux run that silently
+/// substituted jacobi for a requested accelerate-zgesdd would publish a row
+/// whose stated delegate is not the one that ran — the confound this whole
+/// override exists to remove.
+pub fn resolve_svd_kernel(
+    name: &str,
+    available: impl Fn(SvdKernel) -> bool,
+) -> Result<SvdKernel, String> {
+    let want = parse_svd_kernel(name).ok_or_else(|| {
+        format!(
+            "E3_SVD_KERNEL={name:?} is not a kernel; expected \"jacobi\" or \
+             \"accelerate-zgesdd\""
+        )
+    })?;
+    if !available(want) {
+        return Err(format!(
+            "E3_SVD_KERNEL={name:?} names a kernel this target cannot build; \
+             accelerate-zgesdd is macOS only, and silently running jacobi instead \
+             would publish a row whose stated delegate is not the one that ran"
+        ));
+    }
+    Ok(want)
+}
+
+/// Which SVD kernel the shim delegates to, from `E3_SVD_KERNEL`.
+///
+/// Unset is the platform default, which is what every row published before
+/// 2026-10-08 used. The override exists because the delegate is otherwise a
+/// **compile-time `cfg`** (`default_svd_kernel`, `mps.rs`), so it could be
+/// *reported* in a row and never *set* — and the akilles E3 replicate then
+/// produced chi=32 rows 4-6x slower than andromeda's that nobody could
+/// attribute, because the two boxes had also silently run two different
+/// kernels of ours (jacobi on Linux, accelerate-zgesdd on macOS). A knob a row
+/// states but cannot pin makes any cross-box reading of that row unsound.
+///
+/// Panics on a bad or unavailable request rather than falling back.
+/// `default_svd_flat_fn` documents why: a fallback turns "the promotion did
+/// not happen" into a silent 4-8x loss that still reports a sound certificate,
+/// which is the one failure nothing downstream can see. The same argument
+/// applies to an override that quietly did nothing.
+pub fn selected_svd_kernel() -> SvdKernel {
+    static SELECTED: OnceLock<SvdKernel> = OnceLock::new();
+    *SELECTED.get_or_init(|| match std::env::var("E3_SVD_KERNEL") {
+        Err(_) => default_svd_kernel(),
+        Ok(name) => {
+            resolve_svd_kernel(&name, SvdKernel::is_available).unwrap_or_else(|why| panic!("{why}"))
+        }
+    })
+}
+
+fn selected_svd_flat_fn() -> SvdFlatFn {
+    selected_svd_kernel()
+        .svd_flat_fn()
+        .expect("selected_svd_kernel only returns available kernels")
+}
+
 /// Shim over the production SVD. `with_svd_fn` is how the harness proves the
 /// measured path ran: the certificate then says `custom` because the shim is
-/// what was installed, and the shim's body is [`default_svd_flat_fn`], which
-/// is the kernel a normal `MpsBackend::new` would have called.
+/// what was installed, and the shim's body is [`selected_svd_flat_fn`] — the
+/// kernel a normal `MpsBackend::new` would have called, unless
+/// `E3_SVD_KERNEL` asked for the other one.
 pub fn witness_svd(
     a: &[num_complex::Complex64],
     rows: usize,
@@ -37,7 +134,7 @@ pub fn witness_svd(
     max_rank: usize,
     threshold: f64,
 ) -> SvdResultFlat {
-    let out = (default_svd_flat_fn())(a, rows, cols, lda, max_rank, threshold);
+    let out = (selected_svd_flat_fn())(a, rows, cols, lda, max_rank, threshold);
     SVD_CALLS.fetch_add(1, Ordering::Relaxed);
     SVD_MAX_COLS.fetch_max(cols, Ordering::Relaxed);
     out
@@ -774,4 +871,91 @@ pub fn grid_chis() -> &'static [usize] {
 /// not part of the sweep.
 pub fn mapping_shapes() -> &'static [(u32, usize)] {
     &[(14, 12), (20, 12)]
+}
+
+#[cfg(test)]
+mod svd_kernel_override_tests {
+    use super::*;
+
+    /// The function the harness actually reads, not a copy of its logic. An
+    /// earlier draft of this module defined its own `parse` here; that is the
+    /// duplicated-predicate defect, where the copy the test pins stops being
+    /// the copy the code uses and both stay green.
+    use super::parse_svd_kernel as parse;
+
+    #[test]
+    fn both_kernels_are_nameable_by_their_certificate_spelling() {
+        // The spelling a row carries must be the spelling that selects the
+        // kernel, or `svd_delegate` and `E3_SVD_KERNEL` drift apart and a run
+        // pinned to one kernel reports the other.
+        assert_eq!(parse("jacobi"), Some(SvdKernel::Jacobi));
+        assert_eq!(
+            parse("accelerate-zgesdd"),
+            Some(SvdKernel::AccelerateZgesdd)
+        );
+        assert_eq!(parse("  jacobi  "), Some(SvdKernel::Jacobi));
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_kernel_is_refused_rather_than_defaulted() {
+        // Falling back to the platform default on a typo is the failure this
+        // override exists to prevent: the row would state the default and the
+        // operator would believe they had pinned the other one.
+        for bad in ["", "zgesdd", "accelerate", "Jacobi", "custom", "jacobi2"] {
+            assert_eq!(parse(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn custom_is_not_selectable_even_though_it_has_a_spelling() {
+        // `SvdKernel::Custom` is the label a `with_svd_fn` shim earns, not a
+        // kernel this crate can install. `svd_flat_fn` returns None for it, so
+        // admitting the name would panic later with a worse message.
+        assert_eq!(parse("custom"), None);
+        assert!(!SvdKernel::Custom.is_available());
+    }
+
+    #[test]
+    fn the_default_is_the_platform_default_and_is_available() {
+        // Unset `E3_SVD_KERNEL` must behave exactly as before this override
+        // existed, on whichever box the sweep runs.
+        assert!(default_svd_kernel().is_available());
+        #[cfg(target_os = "macos")]
+        assert_eq!(default_svd_kernel(), SvdKernel::AccelerateZgesdd);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(default_svd_kernel(), SvdKernel::Jacobi);
+    }
+
+    #[test]
+    fn an_unavailable_kernel_is_refused_on_every_target() {
+        // The branch that only fires off macOS, exercised on macOS by feeding
+        // the predicate rather than the platform. Deleting the check in
+        // `resolve_svd_kernel` reddens this; before the predicate was a
+        // parameter, it reddened nothing.
+        let err = resolve_svd_kernel("accelerate-zgesdd", |_| false)
+            .expect_err("an unavailable kernel must be refused");
+        assert!(err.contains("cannot build"), "{err}");
+        assert!(err.contains("not the one that ran"), "{err}");
+        // And available means admitted, so the guard is not refusing always.
+        assert_eq!(
+            resolve_svd_kernel("accelerate-zgesdd", |_| true),
+            Ok(SvdKernel::AccelerateZgesdd)
+        );
+        // A bad name is refused before availability is ever consulted.
+        let err = resolve_svd_kernel("zgesdd", |_| panic!("must not be asked"))
+            .expect_err("a bad name must be refused");
+        assert!(err.contains("is not a kernel"), "{err}");
+    }
+
+    #[test]
+    fn accelerate_is_only_available_on_macos() {
+        // The availability check in `selected_svd_kernel` is the thing that
+        // stops a Linux box from reporting `accelerate-zgesdd` while running
+        // jacobi, which is precisely the confound that made the akilles E3
+        // replicate's chi=32 rows unreadable against andromeda's.
+        #[cfg(target_os = "macos")]
+        assert!(SvdKernel::AccelerateZgesdd.is_available());
+        #[cfg(not(target_os = "macos"))]
+        assert!(!SvdKernel::AccelerateZgesdd.is_available());
+    }
 }

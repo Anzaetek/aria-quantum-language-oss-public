@@ -20,8 +20,13 @@ unconditional in `P`, and cannot be here: a record carries its own phase, and
 Hermitian (`inGroup_hermitian`). `zeroState n` (`|0^n⟩`, stabilized by every
 `Z_i`) is full rank at every `n` (`zeroState_independent`), with
 `⟨Z_i⟩ = 1` and `⟨X_i⟩ = 0` (`zeroState_Z`, `zeroState_X`), so the premises are
-not an `n = 2` accident. T3 — that the pivoted `𝔽₂` elimination algorithm is
-complete — is still not proved here.
+not an `n = 2` accident. T3, that the pivoted `𝔽₂` elimination is complete,
+is proved for an explicit pivot-table algorithm (`insertRow`, `reduceRow`):
+on a full-rank state, a Pauli that anticommutes with no generator reduces to
+the identity (`echelon_reduction_complete`). Full rank is a hypothesis the
+abstract statement omits, and `t3_full_rank_needed` shows it cannot be
+dropped. A single greedy pass without pivoting fails on group members
+(`greedy_misses_bell_YY`, `witness_T3_elimination`).
 
 The model:
 
@@ -727,5 +732,471 @@ theorem zeroState_Z (n : ℕ) (i : Fin n) : expectation (zeroState n) (zGen n i)
     anticommutes with `Z_i`. -/
 theorem zeroState_X (n : ℕ) (i : Fin n) : expectation (zeroState n) (xGen n i) = 0 :=
   (expectation_trichotomy _ _).1 ⟨i, by simp [zeroState, omega, zGen, xGen]⟩
+
+
+/-! ## T3 — the pivoted elimination is complete
+
+The reduction in `stabilizer_expectation` (crate `omega-backend-pauli`), step
+for step. A Pauli's bits are a row of `2n` columns, `x` bits first. A pivot table
+maps each column to at most one stored row. Each generator is inserted in
+order: scan the columns in increasing order; at a set bit, add the pivot row
+stored there if there is one, otherwise store the row there and stop. A row
+that runs out of columns is dropped. To reduce a target, scan the columns the
+same way: at a set bit, add the stored pivot row, or stop with "not in the
+group" when there is none.
+
+`reducesToIdentity s p` says that this run on `p` never takes the "not in the
+group" exit and ends on the zero row. It is the algorithm's output, not span
+membership. Mathlib has no row-echelon or Gaussian-elimination development to
+reuse here. `Matrix.Transvection` reduces a square matrix to diagonal form by
+row **and column** operations as an existence theorem, and column operations
+do not preserve the row space.
+
+Two changes to the algorithm leave every statement here true, and are not
+defects. Continuing past a missing pivot instead of exiting gives the same
+predicate: the unmatched bit at that column is never cleared afterwards,
+since every row added later leads at a higher column, so the run cannot end
+on `0`. Scanning the `z` columns first also gives a complete algorithm: the
+proof uses only that columns are scanned in one fixed order. -/
+
+/-- A row of bits over `m` columns. -/
+abbrev Row (m : ℕ) := Fin m → ZMod 2
+
+/-- A pivot table: at most one stored row per column. -/
+abbrev Table (m : ℕ) := Fin m → Option (Row m)
+
+/-- The empty table. -/
+def emptyTable {m : ℕ} : Table m := fun _ => none
+
+/-- Insert `row`, scanning the last `d` columns `m - d, …, m - 1` in order. -/
+def insertRow {m : ℕ} (T : Table m) : ℕ → Row m → Table m
+  | 0, _ => T
+  | d + 1, row =>
+    if h : m - (d + 1) < m then
+      if row ⟨m - (d + 1), h⟩ = 0 then insertRow T d row
+      else match T ⟨m - (d + 1), h⟩ with
+        | some b => insertRow T d (row + b)
+        | none => Function.update T ⟨m - (d + 1), h⟩ (some row)
+    else T
+
+/-- Reduce `t`, scanning the last `d` columns in order. `none` is the
+    "not in the group" exit. -/
+def reduceRow {m : ℕ} (T : Table m) : ℕ → Row m → Option (Row m)
+  | 0, t => some t
+  | d + 1, t =>
+    if h : m - (d + 1) < m then
+      if t ⟨m - (d + 1), h⟩ = 0 then reduceRow T d t
+      else match T ⟨m - (d + 1), h⟩ with
+        | some b => reduceRow T d (t + b)
+        | none => none
+    else some t
+
+/-- Insert the rows in order, starting from `T`. -/
+def buildFrom {m : ℕ} (T : Table m) (rows : List (Row m)) : Table m :=
+  rows.foldl (fun T r => insertRow T m r) T
+
+/-- The bits of a Pauli as one row: columns `0 … n-1` are `x`, `n … 2n-1` are `z`. -/
+def cols (p : Pauli n) : Row (n + n) := Fin.append p.x p.z
+
+/-- The pivot table the backend builds from the generators, in order. -/
+def stabTable (s : StabState n) : Table (n + n) :=
+  buildFrom emptyTable ((List.finRange n).map fun i => cols (s.gens i))
+
+/-- **The run reaches the identity**: the reduction of `p` against the
+    generators' pivot table never exits early and ends on the zero row. -/
+def reducesToIdentity (s : StabState n) (p : Pauli n) : Prop :=
+  reduceRow (stabTable s) (n + n) (cols p) = some 0
+
+/-! ### The echelon invariant -/
+
+/-- Every stored row has its leading `1` at its own column. -/
+def Echelon {m : ℕ} (T : Table m) : Prop :=
+  ∀ c b, T c = some b → b c = 1 ∧ ∀ c' : Fin m, c'.val < c.val → b c' = 0
+
+/-- The stored row at `c`, or `0`. -/
+def entry {m : ℕ} (T : Table m) (c : Fin m) : Row m := (T c).getD 0
+
+/-- The span of the stored rows. -/
+noncomputable def tableSpan {m : ℕ} (T : Table m) : Submodule (ZMod 2) (Row m) :=
+  Submodule.span (ZMod 2) (Set.range (entry T))
+
+lemma zmod2_eq_one_of_ne_zero {a : ZMod 2} (h : a ≠ 0) : a = 1 :=
+  (zmod2_cases a).resolve_left h
+
+lemma row_add_self {m : ℕ} (r : Row m) : r + r = 0 := by
+  funext i; exact zmod2_add_self (r i)
+
+lemma entry_some {m : ℕ} {T : Table m} {c : Fin m} {b : Row m} (h : T c = some b) :
+    entry T c = b := by simp [entry, h]
+
+lemma entry_mem {m : ℕ} (T : Table m) (c : Fin m) : entry T c ∈ tableSpan T :=
+  Submodule.subset_span ⟨c, rfl⟩
+
+lemma entry_low {m : ℕ} {T : Table m} (hE : Echelon T) {c j : Fin m} (hj : j.val < c.val) :
+    entry T c j = 0 := by
+  cases hc : T c with
+  | none => simp [entry, hc]
+  | some b => rw [entry_some hc]; exact (hE c b hc).2 j hj
+
+lemma column_bound {m d : ℕ} (hd : d + 1 ≤ m) : m - (d + 1) < m := by omega
+
+/-! ### Insertion keeps the table echelon and absorbs the row -/
+
+lemma low_skip {m : ℕ} {row : Row m} {c0 : Fin m} (h0 : row c0 = 0)
+    (hlow : ∀ c : Fin m, c.val < c0.val → row c = 0) :
+    ∀ c : Fin m, c.val < c0.val + 1 → row c = 0 := by
+  intro c hc
+  rcases Nat.lt_succ_iff_lt_or_eq.mp hc with hc | hc
+  · exact hlow c hc
+  · rw [Fin.ext hc]; exact h0
+
+lemma low_add {m : ℕ} {T : Table m} (hE : Echelon T) {row b : Row m} {c0 : Fin m}
+    (hb : T c0 = some b) (h0 : row c0 ≠ 0) (hlow : ∀ c : Fin m, c.val < c0.val → row c = 0) :
+    ∀ c : Fin m, c.val < c0.val + 1 → (row + b) c = 0 := by
+  obtain ⟨hb1, hblow⟩ := hE c0 b hb
+  intro c hc
+  rcases Nat.lt_succ_iff_lt_or_eq.mp hc with hc | hc
+  · simp [hlow c hc, hblow c hc]
+  · rw [Fin.ext hc, Pi.add_apply, zmod2_eq_one_of_ne_zero h0, hb1]; decide
+
+lemma insertRow_echelon {m : ℕ} (T : Table m) (hE : Echelon T) :
+    ∀ (d : ℕ) (row : Row m), d ≤ m → (∀ c : Fin m, c.val < m - d → row c = 0) →
+      Echelon (insertRow T d row) := by
+  intro d
+  induction d with
+  | zero => intro row _ _; exact hE
+  | succ d ih =>
+    intro row hd hlow
+    have h := column_bound hd
+    simp only [insertRow, h, dite_true]
+    split_ifs with h0
+    · exact ih row (by omega) fun c hc =>
+        low_skip (c0 := ⟨m - (d + 1), h⟩) h0 hlow c (by simp; omega)
+    · split
+      · rename_i b hb
+        exact ih (row + b) (by omega) fun c hc =>
+          low_add (c0 := ⟨m - (d + 1), h⟩) hE hb h0 hlow c (by simp; omega)
+      · intro c b hcb
+        by_cases hc : c = ⟨m - (d + 1), h⟩
+        · subst hc
+          simp only [Function.update_self, Option.some.injEq] at hcb
+          subst hcb
+          exact ⟨zmod2_eq_one_of_ne_zero h0, fun c' hc' => hlow c' hc'⟩
+        · rw [Function.update_of_ne hc] at hcb
+          exact hE c b hcb
+
+lemma insertRow_keeps {m : ℕ} (T : Table m) :
+    ∀ (d : ℕ) (row : Row m) (c : Fin m) (b : Row m),
+      T c = some b → insertRow T d row c = some b := by
+  intro d
+  induction d with
+  | zero => intro row c b h; exact h
+  | succ d ih =>
+    intro row c b hc
+    simp only [insertRow]
+    split_ifs with h h0
+    · exact ih row c b hc
+    · cases hT : T ⟨m - (d + 1), h⟩ with
+      | some b' => simpa [hT] using ih (row + b') c b hc
+      | none =>
+        have hne : c ≠ ⟨m - (d + 1), h⟩ := by rintro rfl; rw [hc] at hT; exact absurd hT (by simp)
+        simpa [hT, Function.update_of_ne hne] using hc
+    · exact hc
+
+lemma tableSpan_mono {m : ℕ} {T T' : Table m} (h : ∀ c b, T c = some b → T' c = some b) :
+    tableSpan T ≤ tableSpan T' := by
+  rw [tableSpan, Submodule.span_le]
+  rintro _ ⟨c, rfl⟩
+  cases hc : T c with
+  | none => simp [entry, hc]
+  | some b => rw [entry_some hc, ← entry_some (h c b hc)]; exact entry_mem _ _
+
+lemma insertRow_absorbs {m : ℕ} (T : Table m) (hE : Echelon T) :
+    ∀ (d : ℕ) (row : Row m), d ≤ m → (∀ c : Fin m, c.val < m - d → row c = 0) →
+      row ∈ tableSpan (insertRow T d row) := by
+  intro d
+  induction d with
+  | zero =>
+    intro row _ hlow
+    have : row = 0 := funext fun c => hlow c (by omega)
+    rw [this]; exact Submodule.zero_mem _
+  | succ d ih =>
+    intro row hd hlow
+    have h := column_bound hd
+    simp only [insertRow, h, dite_true]
+    split_ifs with h0
+    · exact ih row (by omega) fun c hc =>
+        low_skip (c0 := ⟨m - (d + 1), h⟩) h0 hlow c (by simp; omega)
+    · split
+      · rename_i b hb
+        have hrb : row + b ∈ tableSpan (insertRow T d (row + b)) :=
+          ih (row + b) (by omega) fun c hc =>
+            low_add (c0 := ⟨m - (d + 1), h⟩) hE hb h0 hlow c (by simp; omega)
+        have hb' : b ∈ tableSpan (insertRow T d (row + b)) := by
+          have := entry_mem (insertRow T d (row + b)) ⟨m - (d + 1), h⟩
+          rwa [entry_some (insertRow_keeps T d (row + b) _ b hb)] at this
+        have hsub := Submodule.sub_mem _ hrb hb'
+        rwa [add_sub_cancel_right] at hsub
+      · have := entry_mem (Function.update T ⟨m - (d + 1), h⟩ (some row)) ⟨m - (d + 1), h⟩
+        rwa [entry_some (T := Function.update T ⟨m - (d + 1), h⟩ (some row))
+          (c := ⟨m - (d + 1), h⟩) (b := row) (by simp)] at this
+
+lemma buildFrom_spec {m : ℕ} : ∀ (rows : List (Row m)) (T : Table m), Echelon T →
+    Echelon (buildFrom T rows) ∧ tableSpan T ≤ tableSpan (buildFrom T rows) ∧
+      ∀ r ∈ rows, r ∈ tableSpan (buildFrom T rows)
+  | [], T, hE => ⟨hE, le_rfl, by simp⟩
+  | r :: rs, T, hE => by
+    have hlow : ∀ c : Fin m, c.val < m - m → r c = 0 := fun c hc => absurd hc (by omega)
+    have hE' := insertRow_echelon T hE m r le_rfl hlow
+    obtain ⟨h1, h2, h3⟩ := buildFrom_spec rs (insertRow T m r) hE'
+    refine ⟨h1, (tableSpan_mono (insertRow_keeps T m r)).trans h2, ?_⟩
+    intro x hx
+    rcases List.mem_cons.mp hx with rfl | hx
+    · exact h2 (insertRow_absorbs T hE m x le_rfl hlow)
+    · exact h3 x hx
+
+/-! ### Reduction against an echelon table is complete -/
+
+lemma eval_combo {m : ℕ} {T : Table m} (hE : Echelon T) (a : Fin m → ZMod 2) (j : Fin m)
+    (hlow : ∀ c : Fin m, c.val < j.val → a c • entry T c = 0) :
+    (∑ c, a c • entry T c) j = a j * entry T j j := by
+  rw [Finset.sum_apply, Finset.sum_eq_single j]
+  · simp
+  · intro c _ hcj
+    rcases lt_or_gt_of_ne (Fin.val_ne_of_ne hcj) with hlt | hgt
+    · rw [hlow c hlt]; rfl
+    · simp [entry_low hE hgt]
+  · simp
+
+/-- **The lowest-pivot lemma.** A combination of stored rows that vanishes below
+    column `k` vanishes at `k` too when no row is stored at `k`. -/
+lemma no_pivot_zero {m : ℕ} {T : Table m} (hE : Echelon T) {v : Row m} (hv : v ∈ tableSpan T)
+    {k : Fin m} (hlow : ∀ c : Fin m, c.val < k.val → v c = 0) (hk : T k = none) : v k = 0 := by
+  obtain ⟨a, rfl⟩ := (Submodule.mem_span_range_iff_exists_fun (ZMod 2)).mp hv
+  have P : ∀ j : ℕ, j ≤ k.val → ∀ c : Fin m, c.val < j → a c • entry T c = 0 := by
+    intro j
+    induction j with
+    | zero => intro _ c hc; omega
+    | succ j ih =>
+      intro hj c hc
+      rcases Nat.lt_succ_iff_lt_or_eq.mp hc with hc | hc
+      · exact ih (by omega) c hc
+      · have hcol := eval_combo hE a c fun c' hc' => ih (by omega) c' (by omega)
+        rw [hlow c (by omega)] at hcol
+        cases hT : T c with
+        | none => simp [entry, hT]
+        | some b =>
+          rw [entry_some hT, (hE c b hT).1, mul_one] at hcol
+          rw [← hcol, zero_smul]
+  rw [eval_combo hE a k (P k.val le_rfl), entry, hk]; simp
+
+lemma reduceRow_complete {m : ℕ} (T : Table m) (hE : Echelon T) :
+    ∀ (d : ℕ) (t : Row m), d ≤ m → t ∈ tableSpan T → (∀ c : Fin m, c.val < m - d → t c = 0) →
+      reduceRow T d t = some 0 := by
+  intro d
+  induction d with
+  | zero =>
+    intro t _ _ hlow
+    simp only [reduceRow]
+    exact congrArg some (funext fun c => hlow c (by omega))
+  | succ d ih =>
+    intro t hd ht hlow
+    have h := column_bound hd
+    simp only [reduceRow, h, dite_true]
+    split_ifs with h0
+    · exact ih t (by omega) ht fun c hc =>
+        low_skip (c0 := ⟨m - (d + 1), h⟩) h0 hlow c (by simp; omega)
+    · split
+      · rename_i b hb
+        have hb' : b ∈ tableSpan T := by rw [← entry_some hb]; exact entry_mem _ _
+        exact ih (t + b) (by omega) (Submodule.add_mem _ ht hb') fun c hc =>
+          low_add (c0 := ⟨m - (d + 1), h⟩) hE hb h0 hlow c (by simp; omega)
+      · rename_i hnone
+        exact absurd (no_pivot_zero (k := ⟨m - (d + 1), h⟩) hE ht hlow hnone) h0
+
+/-- `cols` is linear in the bits. -/
+def colsLin : (Bits n × Bits n) →ₗ[ZMod 2] Row (n + n) where
+  toFun v := Fin.append v.1 v.2
+  map_add' v w := by
+    funext i; refine Fin.addCases (fun i => ?_) (fun i => ?_) i <;>
+      simp only [Fin.append_left, Fin.append_right, Prod.fst_add, Prod.snd_add, Pi.add_apply]
+  map_smul' a v := by
+    funext i; refine Fin.addCases (fun i => ?_) (fun i => ?_) i <;>
+      simp only [Fin.append_left, Fin.append_right, Prod.smul_fst, Prod.smul_snd, Pi.smul_apply,
+        smul_eq_mul, RingHom.id_apply]
+
+lemma cols_eq (p : Pauli n) : cols p = colsLin (vec p) := rfl
+
+lemma stabTable_spec (s : StabState n) :
+    Echelon (stabTable s) ∧ ∀ i, cols (s.gens i) ∈ tableSpan (stabTable s) := by
+  obtain ⟨hE, -, hrows⟩ := buildFrom_spec ((List.finRange n).map fun i => cols (s.gens i))
+    emptyTable (by intro c b h; simp [emptyTable] at h)
+  exact ⟨hE, fun i => hrows _ (List.mem_map.mpr ⟨i, List.mem_finRange i, rfl⟩)⟩
+
+/-- The algorithmic core: a Pauli whose bits lie in the span of the generators'
+    bits reduces to the identity. No full rank is needed here; the table is
+    built from whatever generators are given. -/
+lemma reducesToIdentity_of_mem (s : StabState n) (p : Pauli n) (hp : vec p ∈ genSpan s) :
+    reducesToIdentity s p := by
+  obtain ⟨hE, hgen⟩ := stabTable_spec s
+  have ht : cols p ∈ tableSpan (stabTable s) := by
+    have hle : genSpan s ≤ (tableSpan (stabTable s)).comap colsLin := by
+      rw [genSpan, Submodule.span_le]
+      rintro _ ⟨i, rfl⟩
+      exact hgen i
+    exact hle hp
+  exact reduceRow_complete _ hE (n + n) (cols p) le_rfl ht fun c hc => absurd hc (by omega)
+
+/-- **T3 — elimination is complete.** On a full-rank state, the pivoted
+    reduction of a Pauli that anticommutes with no generator never takes the
+    "not in the group" exit and ends on the identity.
+
+    Against the abstract statement this adds one hypothesis, `Independent s`,
+    and it is necessary: on `|0⟩ ⊗ |+⟩` with `Z ⊗ I` listed twice, `I ⊗ Z`
+    anticommutes with nothing and the run takes the "not in the group" exit
+    (`t3_full_rank_needed`). Full rank is what makes the centralizer the group
+    up to phase (`genSpan_orthogonal`). Unlike `exhaustive`, no Hermitian
+    hypothesis is needed: the run reads only the `x` and `z` bits, never the
+    phase, so `i · P` reduces exactly when `P` does. -/
+theorem echelon_reduction_complete (s : StabState n) (hs : Independent s) (p : Pauli n)
+    (h : ¬ Anticommutes s p) : reducesToIdentity s p := by
+  have hc : ∀ i, omega (s.gens i) p = 0 := fun i =>
+    (zmod2_cases _).resolve_right fun h1 => h ⟨i, h1⟩
+  apply reducesToIdentity_of_mem
+  rw [← genSpan_orthogonal s hs]; exact mem_orthogonal_of_gens s _ hc
+
+/-- **T3 in the abstract file's words**: "terminates at the identity whenever
+    `P` is in the group". A `±` product of generators reduces to the identity,
+    with or without full rank. -/
+theorem inGroup_reduces (s : StabState n) (p : Pauli n)
+    (h : InGroupPlus s p ∨ InGroupMinus s p) : reducesToIdentity s p := by
+  apply reducesToIdentity_of_mem
+  rcases h with ⟨l, rfl⟩ | ⟨l, rfl⟩ <;>
+  · show vec (prodList (l.map s.gens)) ∈ genSpan s
+    rw [vec_prodList]
+    refine list_sum_mem fun v hv => ?_
+    obtain ⟨g, hg, rfl⟩ := List.mem_map.mp hv
+    obtain ⟨i, -, rfl⟩ := List.mem_map.mp hg
+    exact Submodule.subset_span ⟨i, rfl⟩
+
+/-! ### Witnesses for T3, and the defect it guards against -/
+
+/-- **Witness for T3.** Its premises are inhabited: the Bell state is full rank,
+    and `YY` anticommutes with neither `XX` nor `ZZ`. -/
+theorem witness_T3 : Independent bell ∧ ¬ Anticommutes bell pYY :=
+  ⟨bell_independent, show ¬ ∃ i, omega (bellGens i) pYY = 1 by decide⟩
+
+/-- The run itself, evaluated rather than proved through T3: reducing `YY`
+    against the Bell table reaches the identity. -/
+theorem bell_YY_reduces : reducesToIdentity bell pYY := by
+  show reduceRow (buildFrom emptyTable ((List.finRange 2).map fun i => cols (bellGens i))) (2 + 2)
+    (cols pYY) = some 0
+  decide
+
+/-- **The full-rank hypothesis does work in T3.** With `Z ⊗ I` listed twice on
+    `|0⟩ ⊗ |+⟩`, `I ⊗ Z` anticommutes with nothing and the reduction takes the
+    "not in the group" exit. -/
+theorem t3_full_rank_needed :
+    ¬ Independent zeroPlusDep ∧ ¬ Anticommutes zeroPlusDep pIZ ∧
+      ¬ reducesToIdentity zeroPlusDep pIZ := by
+  refine ⟨full_rank_needed.1, full_rank_needed.2.2, ?_⟩
+  show ¬ reduceRow (buildFrom emptyTable ((List.finRange 2).map fun i => cols (zzGens i))) (2 + 2)
+    (cols pIZ) = some 0
+  decide
+
+/-- The pre-fix single greedy pass, on bits. Generator `g` is multiplied in when
+    some qubit carries the same non-identity letter in `g` and in the target. The
+    backend then reported `⟨P⟩ = 0` for any non-zero residue. -/
+def greedyStep (t g : Bits n × Bits n) : Bits n × Bits n :=
+  if ∃ q, (g.1 q ≠ 0 ∨ g.2 q ≠ 0) ∧ (t.1 q ≠ 0 ∨ t.2 q ≠ 0) ∧ g.1 q = t.1 q ∧ g.2 q = t.2 q
+  then t + g else t
+
+/-- The greedy pass reaches the identity. -/
+def greedyReduces (s : StabState n) (p : Pauli n) : Prop :=
+  ((List.finRange n).map fun i => vec (s.gens i)).foldl greedyStep (vec p) = 0
+
+/-- **The defect, at two qubits.** On the Bell state, `YY` is in the group with
+    `⟨YY⟩ = −1`. The pivoted reduction reaches the identity, and the greedy pass
+    does not: no qubit of `YY` matches `XX` or `ZZ` letter for letter, so it
+    multiplies by nothing and the old code returned `0`. -/
+theorem greedy_misses_bell_YY :
+    ¬ greedyReduces bell pYY ∧ reducesToIdentity bell pYY ∧ expectation bell pYY = -1 :=
+  ⟨show ¬ ((List.finRange 2).map fun i => vec (bellGens i)).foldl greedyStep (vec pYY) = 0 by
+      decide,
+    bell_YY_reduces, bell_YY_direct⟩
+
+/-- **The predicate is not always true.** `Z ⊗ I` anticommutes with `XX`, and
+    its run against the Bell table takes the "not in the group" exit. -/
+theorem t3_rejects_anticommuting : Anticommutes bell pZI ∧ ¬ reducesToIdentity bell pZI := by
+  refine ⟨witness_T1.1, ?_⟩
+  show ¬ reduceRow (buildFrom emptyTable ((List.finRange 2).map fun i => cols (bellGens i)))
+    (2 + 2) (cols pZI) = some 0
+  decide
+
+/-- T3 at every `n`: on `|0^n⟩`, each `Z_i` reduces to the identity, through
+    the theorem and its full-rank premise. -/
+theorem zeroState_Z_reduces (n : ℕ) (i : Fin n) : reducesToIdentity (zeroState n) (zGen n i) :=
+  echelon_reduction_complete _ (zeroState_independent n) _ (by
+    rintro ⟨j, hj⟩; simp [zeroState, omega, zGen] at hj)
+
+/-! ### Generators that are not already echelon
+
+The Bell generators `XX`, `ZZ` lead at different columns, so building their
+table never adds one row into another. With `XX` and `XZ ⊗ XZ = −(Y ⊗ Y)` both
+lead at column `0`, so inserting the second one must first add `XX` into it;
+only the resulting row `(00 | 11)` can reduce `ZZ`. -/
+
+/-- `XZ ⊗ XZ`, the record `X^{11} Z^{11}` with phase `0`; as an operator it is
+    `−(Y ⊗ Y)`. -/
+def pXZXZ : Pauli 2 := ⟨0, ![1, 1], ![1, 1]⟩
+
+/-- The generators `XX` and `XZ ⊗ XZ`. -/
+def bellAltGens : Fin 2 → Pauli 2 := ![pXX, pXZXZ]
+
+/-- The Bell state again, generated by `XX` and `XZ ⊗ XZ`. -/
+noncomputable def bellAlt : StabState 2 where
+  gens := bellAltGens
+  ψ := bellVec
+  hermitian := by decide
+  commuting := by decide
+  normalized := bell.normalized
+  stabilizes := by
+    intro i; fin_cases i
+    · exact bell.stabilizes 0
+    · funext y
+      simp [act, bellAltGens, pXZXZ, bellVec, dotProduct, Fin.sum_univ_two]
+      split_ifs with h
+      · rw [h, show y 1 + 1 + (y 1 + 1) = 0 from zmod2_add_self _, sgn_zero, one_mul]
+      · rfl
+
+lemma bellAlt_independent : Independent bellAlt := by
+  have hv : (fun i => vec (bellAlt.gens i)) = ![vec pXX, vec pXZXZ] := by
+    funext i; fin_cases i <;> rfl
+  rw [Independent, hv, LinearIndependent.pair_iff]
+  intro a b h
+  have h1 := congrArg (fun v : Bits 2 × Bits 2 => v.1 0) h
+  have h2 := congrArg (fun v : Bits 2 × Bits 2 => v.2 0) h
+  simp [vec, pXX, pXZXZ] at h1 h2
+  subst h2
+  simpa using h1
+
+/-- **Witness for T3 with elimination at insertion.** `ZZ = XX · (XZ ⊗ XZ)` is
+    in the group generated by `XX` and `XZ ⊗ XZ` on a full-rank state; the
+    pivoted run reaches the identity, and the greedy pass does not: neither
+    generator matches `ZZ` letter for letter on any qubit. -/
+theorem witness_T3_elimination :
+    Independent bellAlt ∧ ¬ Anticommutes bellAlt pZZ ∧ InGroupPlus bellAlt pZZ ∧
+      reducesToIdentity bellAlt pZZ ∧ ¬ greedyReduces bellAlt pZZ := by
+  refine ⟨bellAlt_independent, show ¬ ∃ i, omega (bellAltGens i) pZZ = 1 by decide,
+    ⟨[0, 1], show pZZ = prodList ([0, 1].map bellAltGens) by rw [Pauli.ext_iff]; decide⟩, ?_, ?_⟩
+  · show reduceRow (buildFrom emptyTable ((List.finRange 2).map fun i => cols (bellAltGens i)))
+      (2 + 2) (cols pZZ) = some 0
+    decide
+  · show ¬ ((List.finRange 2).map fun i => vec (bellAltGens i)).foldl greedyStep (vec pZZ) = 0
+    decide
+
+/-- T3 instantiated on the non-echelon generators, through the theorem. -/
+theorem bellAlt_ZZ_reduces : reducesToIdentity bellAlt pZZ :=
+  echelon_reduction_complete _ bellAlt_independent _ witness_T3_elimination.2.1
 
 end QuantumProofs.StabilizerModel

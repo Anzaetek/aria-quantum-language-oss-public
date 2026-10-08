@@ -373,7 +373,7 @@ fn map(path: &str) {
     );
     println!(
         "svd_delegate={}",
-        omega_backend_mps::default_svd_kernel().as_str()
+        quimb_lane::selected_svd_kernel().as_str()
     );
     let mut quimb = QuimbProc::spawn().expect("quimb");
     println!("quimb_hello={}", quimb.hello);
@@ -560,7 +560,7 @@ fn time(path: &str) {
     );
     println!(
         "svd_delegate={} certificate_kernel=custom (shim over the delegate)",
-        omega_backend_mps::default_svd_kernel().as_str()
+        quimb_lane::selected_svd_kernel().as_str()
     );
     let mut quimb = QuimbProc::spawn().expect("quimb");
     println!("quimb_hello={}", quimb.hello);
@@ -583,7 +583,11 @@ fn time(path: &str) {
             ours_floor_s: ours_floor,
             quimb_floor_s: quimb_floor,
             ours_threads: rayon::current_num_threads() as u32,
-            svd_delegate: omega_backend_mps::default_svd_kernel().as_str().to_string(),
+            // The kernel that was INSTALLED, not the one this platform
+            // defaults to. Those differ exactly when `E3_SVD_KERNEL` is set,
+            // which is the case the field has to be able to report or the
+            // override would be unobservable in the row it changes.
+            svd_delegate: quimb_lane::selected_svd_kernel().as_str().to_string(),
             knob,
         },
         &quimb.hello,

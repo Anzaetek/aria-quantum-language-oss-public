@@ -151,10 +151,19 @@ impl StateF64 {
     }
 
     /// Copy the state back as interleaved `(re, im)` f64 pairs.
+    /// Synchronises the stream after the copy, as the f32 arm's `read_state`
+    /// does: cudarc's `clone_dtoh` into a `Vec` issues `cuMemcpyDtoHAsync` and
+    /// does not synchronise, so completion would otherwise rest on the CUDA
+    /// rule for pageable host memory rather than on this code.
     pub fn to_host(&self) -> Result<Vec<f64>, CudaError> {
-        self.stream
+        let host = self
+            .stream
             .clone_dtoh(&self.state)
-            .map_err(|e| CudaError::Driver(format!("copy f64 state to host: {e}")))
+            .map_err(|e| CudaError::Driver(format!("copy f64 state to host: {e}")))?;
+        self.stream
+            .synchronize()
+            .map_err(|e| CudaError::Driver(format!("synchronize after f64 copy: {e}")))?;
+        Ok(host)
     }
 
     fn launch_cfg(threads: u64) -> LaunchConfig {

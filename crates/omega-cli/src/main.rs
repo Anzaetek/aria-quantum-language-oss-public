@@ -93,6 +93,9 @@ fn print_usage() {
     eprintln!("  --dump-state-npy F     Same guards as --dump-state-bits, but F is a");
     eprintln!("                         NumPy .npy file of complex128 (qubit 0 = LOW");
     eprintln!("                         bit of the index). For the emulator comparison.");
+    eprintln!("  --precision f32|f64    CUDA statevector arm (needs --device cuda): f32 is");
+    eprintln!("                         the default; f64 runs 1q/2q unitary circuits in");
+    eprintln!("                         double and refuses anything else by name.");
     eprintln!("  --timing-reps N        Benchmark: run the statevector evolution 1 + N");
     eprintln!("                         times in this process (the first is a warm-up)");
     eprintln!("                         and print one `omega-timing:` JSON line to");
@@ -984,6 +987,9 @@ fn main() {
     // `dump_state_bits` too); only the file format at the write site differs.
     let mut dump_state_npy = false;
     let mut timing_reps: Option<usize> = None;
+    // `--precision`: which CUDA statevector arm runs. `None` is the f32 arm.
+    let mut cuda_f64 = false;
+    let mut precision_given = false;
 
     let mut i = 2;
     while i < args.len() {
@@ -1043,6 +1049,18 @@ fn main() {
             "--dump-state-npy" => {
                 dump_state_bits = Some(flag_value(&args, &mut i, "--dump-state-npy"));
                 dump_state_npy = true;
+            }
+            "--precision" => {
+                let v = flag_value(&args, &mut i, "--precision");
+                cuda_f64 = match v.as_str() {
+                    "f32" => false,
+                    "f64" => true,
+                    other => {
+                        eprintln!("--precision must be f32 or f64, got {other:?}");
+                        std::process::exit(2);
+                    }
+                };
+                precision_given = true;
             }
             "--timing-reps" => {
                 let n: usize = flag_parse(
@@ -1871,6 +1889,35 @@ fn main() {
             std::process::exit(1);
         })
     });
+    // `--precision` picks between the two CUDA statevector arms, so it is
+    // meaningless anywhere else. Refused rather than ignored: a CPU run is
+    // already f64, and an ignored flag would let a row claim a precision it
+    // did not select.
+    // Only the CUDA dispatch reads the arm choice; without the feature,
+    // `--device cuda` cannot get past the device gate anyway.
+    #[cfg(not(feature = "cuda"))]
+    let _ = cuda_f64;
+    if precision_given {
+        let modes = bridge_name.is_some()
+            || observable_str.is_some()
+            || fermionic_str.is_some()
+            || hamiltonian_path.is_some()
+            || gradient_str.is_some()
+            || gradient_fn_str.is_some();
+        if requested_device != Some(omega_core::device::DeviceKind::Cuda)
+            || !matches!(chosen, "statevector" | "sv")
+            || noise_json.is_some()
+            || modes
+        {
+            eprintln!(
+                "--precision selects the CUDA statevector arm: it needs an explicit \
+                 --device cuda, --backend statevector, no --noise and no mode flag \
+                 (the CPU statevector is f64 already)."
+            );
+            std::process::exit(2);
+        }
+    }
+
     if let Some(dev) = requested_device {
         use omega_core::device::DeviceKind as D;
         if dev != D::Cpu {
@@ -2976,20 +3023,31 @@ fn main() {
                     #[cfg(feature = "cuda")]
                     {
                         info("Device: cuda".to_string());
-                        let cuda_result =
-                            match omega_backend_statevector_cuda::CudaStatevectorBackend::new()
-                                .map(|b| b.with_multi_control(multi_control))
-                            {
-                                Ok(b) => timed_execute(timing_reps, "cuda-f32", || {
+                        let arm = if cuda_f64 { "cuda-f64" } else { "cuda-f32" };
+                        let cuda_result = if cuda_f64 {
+                            match omega_backend_statevector_cuda::f64_backend::CudaStatevectorF64Backend::new() {
+                                Ok(b) => timed_execute(timing_reps, arm, || {
                                     b.execute(&circuit, &params, &config)
                                 }),
                                 Err(e) => Err(omega_core::error::OmegaError::Backend(format!(
                                     "cuda unavailable: {e}"
                                 ))),
-                            };
+                            }
+                        } else {
+                            match omega_backend_statevector_cuda::CudaStatevectorBackend::new()
+                                .map(|b| b.with_multi_control(multi_control))
+                            {
+                                Ok(b) => timed_execute(timing_reps, arm, || {
+                                    b.execute(&circuit, &params, &config)
+                                }),
+                                Err(e) => Err(omega_core::error::OmegaError::Backend(format!(
+                                    "cuda unavailable: {e}"
+                                ))),
+                            }
+                        };
                         match cuda_result {
                             Ok(r) => {
-                                executed_arm = "cuda-f32";
+                                executed_arm = arm;
                                 Ok(r)
                             }
                             // Same graceful fallback semantics as Metal.

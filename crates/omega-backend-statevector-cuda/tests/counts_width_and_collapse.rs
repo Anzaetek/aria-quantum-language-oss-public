@@ -123,7 +123,7 @@ fn skip_mode_counts_key_on_the_qubit_register_width() {
         panic!("shots run must return Counts");
     };
     assert!(!counts.is_empty(), "sampler returned nothing to check");
-    for (k, _) in counts.iter() {
+    for k in counts.keys() {
         assert_eq!(
             k.width() as usize,
             want,

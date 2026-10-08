@@ -82,6 +82,9 @@ enum Backing {
         /// Children of the own tree alive when the census opened, with the
         /// CPU they had already used (see [`live_children`]).
         children0: Vec<ChildAtStart>,
+        /// `(pid, starttime)` of each own pid, so a recycled pid is refused
+        /// rather than read as the lane's own.
+        own_start: Vec<(u32, u64)>,
     },
     /// `ps -axo pid=,time=`, sampled. Seconds.
     Ps { system0: f64, own0: f64 },
@@ -107,6 +110,7 @@ impl CpuCensus {
                 own0: tree_ticks(own)?,
                 hz: user_hz()?,
                 children0: live_children(own)?,
+                own_start: own_starttimes(own)?,
             }
         } else {
             let table = ps_table()?;
@@ -154,13 +158,19 @@ impl CpuCensus {
                 own0,
                 hz,
                 children0,
+                own_start,
             } => {
                 let system1 = system_busy()?;
-                // Read the reaped set BEFORE the own tree's counters: a child
-                // reaped between the two reads would otherwise have its
-                // cutime credited without its pre-window ticks taken back.
-                let pre_window = pre_window_ticks_of_reaped(&children0);
-                let own1 = tree_ticks(&self.own)?.saturating_sub(pre_window);
+                let own1 = own_minus_pre_window(
+                    || tree_ticks(&self.own),
+                    || pre_window_ticks_of_reaped(&children0),
+                )?;
+                if let Some(pid) = recycled(&own_start, |p| stat_fields(p).map(|f| f.1)) {
+                    return Err(format!(
+                        "own pid {pid} now names a different process than when the census opened: \
+                         its counters are somebody else's, so the census cannot answer"
+                    ));
+                }
                 let wall = self.t0.elapsed().as_secs_f64();
                 Ok(external_cpu_since(
                     system1.saturating_sub(system0),
@@ -419,6 +429,47 @@ fn pre_window_ticks_of_reaped(children0: &[ChildAtStart]) -> u64 {
         .sum()
 }
 
+/// The own tree's ticks with the pre-window ticks of reaped children taken
+/// back. The two reads cannot be atomic, so the ORDER decides which way the
+/// race between them errs. The own counters are read FIRST: a child reaped
+/// between the reads is then missing from the own read (its cutime not yet
+/// credited) but present in the reaped set (its pre-window ticks taken back),
+/// so the lane is under-credited and external CPU reads HIGH — the safe
+/// direction. The other order over-credits the lane and reads a busy box as
+/// quiet.
+///
+/// Known limit: only children one level below an own pid are recorded. A
+/// grandchild that worked before the window, reaped by an undeclared child
+/// that the lane then reaps inside the window, still rides into the own tree.
+/// Every lane today starts its arms as fresh processes with no descendants.
+fn own_minus_pre_window(
+    mut read_own: impl FnMut() -> Result<u64, String>,
+    mut read_pre_window: impl FnMut() -> u64,
+) -> Result<u64, String> {
+    let own = read_own()?;
+    Ok(own.saturating_sub(read_pre_window()))
+}
+
+/// `(pid, starttime)` of every own pid when the census opens.
+fn own_starttimes(own: &[u32]) -> Result<Vec<(u32, u64)>, String> {
+    own.iter()
+        .map(|&p| {
+            stat_fields(p)
+                .map(|f| (p, f.1))
+                .ok_or_else(|| format!("/proc/{p}/stat: an own pid is not alive at census start"))
+        })
+        .collect()
+}
+
+/// The first own pid whose process is no longer the one recorded at the
+/// start (exited, or the pid recycled for an unrelated process).
+fn recycled(start: &[(u32, u64)], now: impl Fn(u32) -> Option<u64>) -> Option<u32> {
+    start
+        .iter()
+        .find(|(p, t)| now(*p) != Some(*t))
+        .map(|(p, _)| *p)
+}
+
 fn tree_ticks(own: &[u32]) -> Result<u64, String> {
     let mut total = 0u64;
     for pid in own {
@@ -565,5 +616,56 @@ pub fn external_void_reason(
         ))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod census_order_tests {
+    use super::{own_minus_pre_window, recycled};
+    use std::cell::Cell;
+
+    /// A child that burned `PRE` ticks before the window is reaped BETWEEN the
+    /// two reads. Whichever read comes second sees the reap. The own tree
+    /// must never be credited with the child's pre-window work: that
+    /// over-statement reads as a quiet box (external = all − own, clamped).
+    #[test]
+    fn a_reap_between_the_two_reads_never_over_credits_the_lane() {
+        const OWN: u64 = 1_000;
+        const PRE: u64 = 2_400; // ~24 core-seconds at 100 Hz, as cozy-rose's test
+                                // The reap lands right after the first read, whichever read that is.
+        let reads = Cell::new(0u32);
+        let reaped_yet = || {
+            let n = reads.get();
+            reads.set(n + 1);
+            n >= 1
+        };
+        let own = || Ok(if reaped_yet() { OWN + PRE } else { OWN });
+        let pre = || if reaped_yet() { PRE } else { 0 };
+        let got = own_minus_pre_window(own, pre).unwrap();
+        assert!(
+            got <= OWN,
+            "the lane was credited {got} ticks for {OWN} of its own work: a reap between the \
+             reads leaked {} ticks of pre-window work into the own tree",
+            got - OWN
+        );
+    }
+
+    #[test]
+    fn a_recycled_own_pid_is_refused() {
+        let start = [(10u32, 500u64), (11, 600)];
+        assert_eq!(
+            recycled(&start, |p| Some(if p == 10 { 500 } else { 600 })),
+            None
+        );
+        assert_eq!(
+            recycled(&start, |p| Some(if p == 11 { 999 } else { 500 })),
+            Some(11),
+            "pid reused"
+        );
+        assert_eq!(
+            recycled(&start, |p| (p == 10).then_some(500)),
+            Some(11),
+            "pid gone"
+        );
     }
 }

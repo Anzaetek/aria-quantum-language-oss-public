@@ -38,6 +38,8 @@ fn cores() -> usize {
         .map(|n| n.get())
         .unwrap_or(1)
 }
+mod common;
+use common::{assert_attributed_to_the_lane, own_contribution};
 
 // ---------------------------------------------------------------------------
 // parsing
@@ -228,72 +230,15 @@ fn the_lanes_own_threads_do_not_void_the_row() {
         })
         .collect();
     std::thread::sleep(Duration::from_millis(500));
-    let census = CpuCensus::start(&[std::process::id()]).expect("the ps path must be available");
-    let t = Instant::now();
-    while t.elapsed() < Duration::from_secs(3) {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let ext = census.finish().expect("a census");
+    let c = own_contribution(&[std::process::id()], || {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
     stop.store(true, Ordering::Relaxed);
     for s in spinners {
         let _ = s.join();
     }
-
-    // The desktop is on this box, so the bar is "our own threads did not get
-    // counted", not "the reading is zero". Four of our threads counted as
-    // external would put this well past 4.
-    assert!(
-        ext.external_cores_during_row < n as f64,
-        "{n} of the lane's own threads read as {:.2} external cores; the census counted our \
-         own work as somebody else's",
-        ext.external_cores_during_row
-    );
-}
-
-/// The hazard a short row creates, and the floor that removes it.
-///
-/// A census over a few milliseconds reads a cumulative counter twice and gets
-/// the same value, so it reports **zero** external cores — and zero is the
-/// answer that admits the row. This is not hypothetical: it was published.
-/// `stab-clifford-24q-d100-z0-expectation` came out at `window_s 0.013668`
-/// and `external_cores_during_row 0.0` while the pre-row census, taken
-/// seconds earlier over 2.0 s, read 0.607 cores on the same box.
-///
-/// So the test runs a census around a row that takes microseconds, with three
-/// burners going, and requires that it still sees them. Removing the floor
-/// from `CpuCensus::finish` makes it report zero and this test reddens.
-#[test]
-fn a_row_too_fast_to_resolve_does_not_read_as_a_quiet_box() {
-    let _box = BOX.lock().unwrap_or_else(|e| e.into_inner());
-    let n = 3usize;
-    assert!(cores() >= 2 * n, "needs a box with >= {} cores", 2 * n);
-
-    let burners = Burners::spawn(n);
-    std::thread::sleep(Duration::from_millis(500));
-
-    let census = CpuCensus::start(&[std::process::id()]).expect("the ps path must be available");
-    // The row: a few microseconds of work, which is the shape of the fast
-    // expectation rows in this lane.
-    let mut x = 0u64;
-    for _ in 0..1000 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-    }
-    assert_ne!(x, 1, "keep the loop");
-    let ext = census.finish().expect("a census");
-    drop(burners);
-
-    assert!(
-        ext.window_s >= omega_emu_compare::CENSUS_MIN_WINDOW_S,
-        "the census reported a {:.4}s window, under the {:.1}s floor: at that length the \
-         counters cannot hold a tick and the reading is quantisation, not measurement",
-        ext.window_s,
-        omega_emu_compare::CENSUS_MIN_WINDOW_S
-    );
-    assert!(
-        ext.external_cores_during_row >= n as f64 * 2.0 / 3.0,
-        "a microsecond row with {n} burners running read {:.2} external cores over {:.3}s; \
-         a fast row must not read as a quiet box",
-        ext.external_cores_during_row,
-        ext.window_s
-    );
+    assert_attributed_to_the_lane("4 spinning threads inside the lane", n, c);
 }

@@ -164,6 +164,23 @@ else
   cargo test --workspace
 fi
 
+# --- Example test modules (NOT covered by `cargo test --workspace`) ---------
+# `cargo test --workspace` builds no test target inside an `examples/` binary,
+# so a `#[cfg(test)] mod` there compiles and never runs. Measured rather than
+# assumed: `cargo test --workspace --no-run` builds zero `mps_quimb_compare`
+# targets.
+#
+# That is the same shape of hole the clippy comment above says this script was
+# closing, and it bit immediately: the six `svd_kernel_override_tests` added
+# with `E3_SVD_KERNEL` on 2026-10-08 would have sat in the tree, green on
+# demand and never once run by CI. They are the tests that keep a pinned SVD
+# delegate from being reported as the platform default, which is precisely the
+# failure that made the akilles chi=32 replicate rows unattributable.
+#
+# Named per example rather than globbed, so adding an example with tests is a
+# deliberate line here instead of a silent inclusion or a silent omission.
+cargo test -p omega-backend-mps --example mps_quimb_compare
+
 # --- Reset-channel regression gates (every CPU backend) ---------------------
 # `reset q` is the non-unitary CHANNEL rho -> |0><0|_q (x) Tr_q(rho): the qubit
 # is discarded and any entanglement it had is DESTROYED, not transferred. Three
@@ -1388,9 +1405,9 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
     # every symbol has a meaning. Group membership is combinatorial (a record
     # equal to a signed product of generators), not an eigen-condition. The
     # abstract file's targets stay targets (its symbols are free axioms).
-    lean_axioms "Stabilizer model theorems" 19 \
-      'import QuantumProofs.StabilizerModel\nopen QuantumProofs.StabilizerModel\n#print axioms expectation_trichotomy\n#print axioms anticommutes_iff_operators\n#print axioms act_mul\n#print axioms act_swap\n#print axioms inner_act_left\n#print axioms witness_T1\n#print axioms bell_YY_direct\n#print axioms zero_only_when_anticommuting\n#print axioms commuting_hermitian_in_group\n#print axioms genSpan_orthogonal\n#print axioms witness_T2\n#print axioms full_rank_needed\n#print axioms exhaustive\n#print axioms inGroup_hermitian\n#print axioms exhaustive_needs_hermitian\n#print axioms not_plus_and_minus\n#print axioms zeroState_independent\n#print axioms zeroState_Z\n#print axioms zeroState_X\n'
-    echo "  OK: Stabilizer model T1 (trichotomy, record product = operator product, symplectic = operator anticommutation) + T2 (0 only by anticommuting, centralizer = group up to sign, on full rank) + witnesses, incl. the dependent-generator counterexample; exhaustive on Hermitian Paulis (i*ZZ shows the hypothesis is needed), +/- branches disjoint, |0^n> full-rank inhabitant at every n, sorry-free"
+    lean_axioms "Stabilizer model theorems" 30 \
+      'import QuantumProofs.StabilizerModel\nopen QuantumProofs.StabilizerModel\n#print axioms expectation_trichotomy\n#print axioms anticommutes_iff_operators\n#print axioms act_mul\n#print axioms act_swap\n#print axioms inner_act_left\n#print axioms witness_T1\n#print axioms bell_YY_direct\n#print axioms zero_only_when_anticommuting\n#print axioms commuting_hermitian_in_group\n#print axioms genSpan_orthogonal\n#print axioms witness_T2\n#print axioms full_rank_needed\n#print axioms exhaustive\n#print axioms inGroup_hermitian\n#print axioms exhaustive_needs_hermitian\n#print axioms not_plus_and_minus\n#print axioms zeroState_independent\n#print axioms zeroState_Z\n#print axioms zeroState_X\n#print axioms reducesToIdentity_of_mem\n#print axioms echelon_reduction_complete\n#print axioms inGroup_reduces\n#print axioms witness_T3\n#print axioms bell_YY_reduces\n#print axioms t3_full_rank_needed\n#print axioms greedy_misses_bell_YY\n#print axioms t3_rejects_anticommuting\n#print axioms zeroState_Z_reduces\n#print axioms witness_T3_elimination\n#print axioms bellAlt_ZZ_reduces\n'
+    echo "  OK: Stabilizer model T1 (trichotomy, record product = operator product, symplectic = operator anticommutation) + T2 (0 only by anticommuting, centralizer = group up to sign, on full rank) + witnesses, incl. the dependent-generator counterexample; exhaustive on Hermitian Paulis (i*ZZ shows the hypothesis is needed), +/- branches disjoint, |0^n> full-rank inhabitant at every n; T3 (the pivot-table elimination reaches the identity on every commuting Pauli, on full rank; the greedy pass does not) + full-rank-needed and rejects-anticommuting fixtures, sorry-free"
     # Gate-model export obligation: the `aria export --gate-model` artefact for
     # Bell must build sorry-free (closed by QuantumProofs.BellPrep theorems).
     if ( cd proofs/lean4 && lake build QuantumProofs.Generated.GateModel.Bell_Spec >/dev/null 2>&1 ); then

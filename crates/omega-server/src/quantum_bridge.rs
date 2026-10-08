@@ -412,7 +412,22 @@ fn opencl_statevector_available() -> bool {
     })
 }
 
-fn exec_target_for(sel: &OmegaBackendSel) -> crate::worker::ExecTarget {
+/// Whether a statevector run in this mid-circuit mode may go to a device.
+///
+/// Collapse mode keys counts on the classical register, per shot, through
+/// the CPU's trajectory loop; the CUDA and OpenCL backends refuse it
+/// (`Unsupported`), and before this rule a device-built server returned that
+/// refusal as HTTP 400 for a circuit the CPU answers. The CLI already keeps
+/// these runs on the CPU (`sv_sampling_cpu_only_reason`). Pricing and
+/// dispatch both read this one function so they cannot disagree.
+fn statevector_device_allowed(mode: &MidCircuitMode) -> bool {
+    *mode != MidCircuitMode::Collapse
+}
+
+fn exec_target_for(sel: &OmegaBackendSel, mode: &MidCircuitMode) -> crate::worker::ExecTarget {
+    if !statevector_device_allowed(mode) {
+        return crate::worker::ExecTarget::Cpu;
+    }
     // CUDA first, matching the dispatch order in `exec_statevector`. If these
     // two ever disagree the reservation is against the wrong pool — the defect
     // the availability memo exists to prevent.
@@ -507,7 +522,17 @@ fn gradient_shapes(circuits: &[OmegaCircuitIR]) -> Vec<JobShape> {
 fn execute_shape(ir: &OmegaCircuitIR, shots: Option<u32>) -> JobShape {
     // `/execute` is the one endpoint that can actually reach a device, so it
     // is the one that passes the device-capable target.
-    let base = shape_for(ir, true, 1, exec_target_for(&resolve_backend(ir)), None);
+    let mode = match ir.mid_circuit_mode {
+        OmegaMidCircuitMode::Skip => MidCircuitMode::Skip,
+        OmegaMidCircuitMode::Collapse => MidCircuitMode::Collapse,
+    };
+    let base = shape_for(
+        ir,
+        true,
+        1,
+        exec_target_for(&resolve_backend(ir), &mode),
+        None,
+    );
     match shots {
         None => base.returning_statevector(),
         Some(_) => base.with_shots(),
@@ -923,6 +948,9 @@ fn exec_statevector(
     binding: &ParameterBinding,
     config: &ExecConfig,
 ) -> omega_core::error::Result<ExecResult> {
+    if !statevector_device_allowed(&config.mid_circuit_mode) {
+        return omega_backend_statevector::StatevectorBackend::new().execute(core, binding, config);
+    }
     #[cfg(feature = "cuda")]
     {
         // The SAME memo admission priced against, so a fallback cannot happen
@@ -2688,6 +2716,25 @@ mod tests {
         );
         let err = expectation_quantum_ir(&ir, &obs).unwrap_err();
         assert!(format!("{err}").contains("plugin"));
+    }
+
+    /// A collapse-mode statevector run never goes to a device: the device
+    /// backends refuse collapse mode, so a device-built server would answer
+    /// HTTP 400 where the CPU answers. Measured on akilles with
+    /// OMEGA_DEVICE=cuda: `creg c[1]; h q[1]; if (c==0) x q[0];` in collapse
+    /// mode was a 400 naming the unsupported mode; the CPU answers {"0": 64}.
+    #[test]
+    fn collapse_mode_statevector_runs_stay_on_the_cpu() {
+        assert!(statevector_device_allowed(&MidCircuitMode::Skip));
+        assert!(
+            !statevector_device_allowed(&MidCircuitMode::Collapse),
+            "collapse mode must be routed to the CPU before any device branch"
+        );
+        assert_eq!(
+            exec_target_for(&OmegaBackendSel::Statevector, &MidCircuitMode::Collapse),
+            crate::worker::ExecTarget::Cpu,
+            "pricing must agree with dispatch: a collapse run is host work"
+        );
     }
 
     #[test]

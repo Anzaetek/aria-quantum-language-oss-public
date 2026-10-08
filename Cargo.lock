@@ -2717,6 +2717,7 @@ dependencies = [
  "num-complex",
  "omega-backend-statevector",
  "omega-core",
+ "omega-parser",
  "rand 0.10.1",
  "serde_json",
  "smallvec",

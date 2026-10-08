@@ -78,7 +78,11 @@ pub fn pauli_mult_phase(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
 /// The state |ψ⟩ is uniquely defined by the n stabilizer generators.
 pub struct StabilizerTableau {
     pub n: usize,
-    pub rows: Vec<PauliRow>,
+    /// Crate-private so only this crate's update methods can change it: the
+    /// elimination in `sim.rs`'s `stabilizer_expectation` is complete only
+    /// while the `n` stabilizer rows stay independent (STATUS §5 #4, T3), and
+    /// those methods are what keep them so.
+    pub(crate) rows: Vec<PauliRow>,
 }
 
 impl StabilizerTableau {
