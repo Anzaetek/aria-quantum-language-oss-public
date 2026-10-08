@@ -1,0 +1,23 @@
+[package]
+name = "omega-backend-stabrank"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Stabilizer-rank backend: exact-phase CH-form Clifford kernel with amplitudes, inner products and Pauli matrix elements."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+omega-backend-pauli = { path = "../omega-backend-pauli" }
+num-complex = { workspace = true }
+
+[dev-dependencies]
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+# Test-only, and only for the three-way agreement fixture: the two engines
+# are siblings with no dependency edge between them in either direction.
+omega-backend-majoranaprop = { path = "../omega-backend-majoranaprop" }
+num-complex = { workspace = true }

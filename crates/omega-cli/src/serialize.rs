@@ -54,7 +54,8 @@ fn format_bits(o: &Outcome, num_qubits: u32, circuit_type: &CircuitType) -> Stri
         // The WIDTH COMES FROM THE KEY, not from `num_qubits`. Those differ
         // whenever the outcome is the classical register, and padding to
         // `num_qubits` is what printed a 2-bit result as 1024 characters.
-        CircuitType::GateBased => o.to_bitstring(),
+        // Occupation wires are bits, the same encoding as a qubit circuit.
+        CircuitType::GateBased | CircuitType::Fermionic => o.to_bitstring(),
     }
 }
 
@@ -215,6 +216,23 @@ pub fn exec_result_to_json(
 ///
 /// `fidelity_estimate` is named `~` in the human output for a reason and the
 /// key says so here too: it is an estimate, not a proven bound.
+///
+/// `svd_kernel` names the kernel that computed the other three numbers, and it
+/// is here because two kernels can now produce them. Since `STATUS.md` §5 item
+/// 16's promotion, macOS compresses bonds with Accelerate `zgesdd` and every
+/// other target with the one-sided Jacobi kernel; both bounds are sound, and
+/// the Accelerate one sits ABOVE the Jacobi reference by up to ~1e-12 of the
+/// block norm. So the same circuit on two platforms yields two certificates
+/// that differ in their last digits, and without this field the only way to
+/// find out why is to diff the two JSON blocks and go looking. Values are
+/// `"jacobi"`, `"accelerate-zgesdd"`, or `"custom"` for a kernel installed
+/// through `with_svd_fn` that `omega-backend-mps` cannot name (the CUDA
+/// `gesvdj` arm).
+///
+/// `"accelerate-zgesdd"` names the DISPATCH POLICY, not a count: that kernel
+/// hands blocks below a measured size gate back to the Jacobi kernel, so a
+/// small-χ run can report it and carry a bit-for-bit Jacobi certificate. See
+/// [`omega_backend_mps::SvdKernel::AccelerateZgesdd`].
 pub fn attach_mps_certificate(mut doc: Value, stats: &omega_backend_mps::MpsRunStats) -> Value {
     if let Some(map) = doc.as_object_mut() {
         map.insert(
@@ -224,6 +242,35 @@ pub fn attach_mps_certificate(mut doc: Value, stats: &omega_backend_mps::MpsRunS
                 "fidelity_estimate": stats.fidelity_estimate,
                 "fidelity_estimate_is_a_bound": false,
                 "max_bond_reached": stats.max_bond_reached,
+                "svd_kernel": stats.svd_kernel.as_str(),
+            }),
+        );
+    }
+    doc
+}
+
+/// Attach where an MPS run's bond-compression SVDs ran — the CUDA device or
+/// the CPU fallback — beside the truncation certificate.
+///
+/// The CUDA hook falls back to the CPU per call and the result looks the same
+/// either way, so a document that says "cuda" but not how many SVDs actually
+/// ran there would repeat, in machine-readable form, the silent fallback
+/// `STATUS.md` §5.16 found. Present only for runs that installed the hook;
+/// absent, not null-padded, otherwise. `last_fallback` is `null` when nothing
+/// fell back.
+pub fn attach_cuda_svd_dispatch(
+    mut doc: Value,
+    gpu_calls: u64,
+    cpu_fallbacks: u64,
+    last_fallback: Option<&str>,
+) -> Value {
+    if let Some(map) = doc.as_object_mut() {
+        map.insert(
+            "cuda_svd".to_string(),
+            json!({
+                "gpu_calls": gpu_calls,
+                "cpu_fallbacks": cpu_fallbacks,
+                "last_fallback": last_fallback,
             }),
         );
     }
@@ -277,6 +324,202 @@ pub fn attach_pauliprop_certificate(
     doc
 }
 
+/// Majorana-propagation twin of [`attach_pauliprop_certificate`], under its
+/// own key so a consumer never has to guess which cut axis `max_*` names.
+/// `dropped_mass` is a bound for the same reason (every Majorana monomial
+/// has operator norm 1); `max_length` is the length cut, never a weight.
+/// Theorem 1's prior beside the measured bound. Shown as what it is: an
+/// ensemble average (arXiv:2503.18939v4, eqs. 8–9), never a per-run claim.
+fn majoranaprop_apriori_json(cert: &omega_backend_majoranaprop::MajoranaPropCertificate) -> Value {
+    json!({
+        "mse_ratio_bound": cert.apriori_mse_ratio,
+        "vacuous": cert.apriori_is_vacuous(),
+        "average_case_only": true,
+        "ensemble": "random length-4 generators, uniform angles, homogeneous observable",
+        "source": "arXiv:2503.18939v4 Thm 1",
+    })
+}
+
+/// The exact mixed-radix engine's certificate (PLAN-QUDIT.md Q2). Same keys
+/// as the truncating engines where they mean the same thing — `dropped_mass`
+/// is a bound and it is **zero**, `exact` is `true` — plus the dimensions
+/// the run was exact over. Honest only because the engine refuses, before
+/// allocating, anything it could not hold exactly; a consumer branching on
+/// `exact` gets a value the engine can stand behind, not a default.
+pub fn attach_quditsv_certificate(
+    mut doc: Value,
+    cert: &omega_backend_quditsv::QuditSvCertificate,
+) -> Value {
+    if let Some(map) = doc.as_object_mut() {
+        map.insert(
+            "quditsv".to_string(),
+            json!({
+                "exact": cert.exact,
+                "dropped_mass": cert.dropped_mass,
+                "dropped_mass_is_a_bound": true,
+                "dims": cert.dims,
+                "product_dim": cert.product_dim,
+            }),
+        );
+    }
+    doc
+}
+
+pub fn attach_majoranaprop_certificate(
+    mut doc: Value,
+    cert: &omega_backend_majoranaprop::MajoranaPropCertificate,
+) -> Value {
+    if let Some(map) = doc.as_object_mut() {
+        map.insert(
+            "majoranaprop_truncation".to_string(),
+            json!({
+                "dropped_mass": cert.dropped_mass,
+                "dropped_mass_is_a_bound": true,
+                "observable_range": cert.observable_range,
+                "vacuous_at": cert.observable_range + cert.value.abs(),
+                "informative": cert.is_informative(),
+                "exact": cert.is_exact(),
+                "final_terms": cert.final_terms,
+                "peak_terms": cert.peak_terms,
+                "coeff_min": cert.coeff_min,
+                "max_length": cert.max_length,
+                "max_terms": cert.max_terms,
+                "branching_gates": cert.branching_gates,
+                // Which basis the engine was seeded in — the engine's own
+                // record, not the CLI's. `"ladder"` means the Majorana sum
+                // came straight from the fermionic operator (F3) and no
+                // Pauli image was ever handed to the engine.
+                "seed_basis": cert.seed_basis.as_str(),
+                "apriori": majoranaprop_apriori_json(cert),
+            }),
+        );
+    }
+    doc
+}
+
+/// Attach the stabilizer-rank certificate (PLAN-MAJORANA-STIM.md S3).
+///
+/// Same contract as its three neighbours above — present only when a run
+/// produced one, **absent** rather than null-padded otherwise, so "no
+/// certificate" and "a certificate reading zero" stay apart.
+///
+/// # This block's dropped-mass field is NOT the one next door
+///
+/// There is no `dropped_mass` key here, and that is deliberate. The two
+/// truncating lanes report masses that are **different quantities in
+/// different pictures**, and a consumer that reads them as one field under
+/// two names will compute a wrong error budget:
+///
+/// * `majoranaprop_truncation.dropped_mass` is **observable-side**
+///   (Heisenberg). majoranaprop truncates the *operator* sum, every Majorana
+///   monomial has `|⟨M⟩| ≤ 1`, so the discarded L1 mass bounds the error in
+///   `⟨O⟩` **additively and by itself**: `|Δ⟨O⟩| ≤ dropped_mass`. The field is
+///   the bound.
+/// * `stabrank_truncation.state_dropped_mass` is **state-side**
+///   (Schrödinger). stabrank truncates the *state*, and a state enters an
+///   expectation **twice** — `⟨ψ|O|ψ⟩` is bilinear in it — so the same kind of
+///   L1 mass `m` enters quadratically and scaled by the observable's range:
+///   `|Δ⟨O⟩| ≤ R·m·(2+m)`. The field is an **input** to the bound, not the
+///   bound. `expectation_error_bound` is the bound, and it is the only key in
+///   this block comparable to majoranaprop's `dropped_mass`.
+///
+/// So **the two masses do not compose.** Adding them, averaging them, or
+/// feeding one engine's budget to the other is meaningless: there is no
+/// arithmetic that turns an observable-side mass and a state-side mass into a
+/// combined error, and no phase of this project pipes one engine's truncated
+/// output into the other, so the question never legitimately arises.
+///
+/// # What two runs of one job *do* give you: an intersection
+///
+/// Each engine returns a certified interval `[value − bound, value + bound]`
+/// — for majoranaprop `bound = dropped_mass`, for stabrank
+/// `bound = expectation_error_bound`. Both are sound bounds on the *same*
+/// exact number, so that number lies in **both** intervals, hence in their
+/// intersection, which is itself sound and no wider than either. Intersecting
+/// is the supported way to combine the lanes, and the only one.
+///
+/// An **empty intersection is a bug in one of the two engines**, never a
+/// property of the job, and it is the cross-lane failure signal S3's
+/// `stabrank_majoranaprop_intervals.rs` exists to catch. The correct response
+/// to one is to find the unsound bound, never to widen a bound until the
+/// intervals meet.
+///
+/// Full prose, with the derivation: `crates/omega-backend-stabrank/`
+/// `CROSS-LANE-INTERVALS.md`.
+///
+/// # Keys a reader should know the shape of
+///
+/// `expectation_error_bound` is **re-derivable** from the two raw fields it is
+/// a function of: `expectation_error_bound == observable_range *
+/// state_dropped_mass * (2 + state_dropped_mass)`, exactly, in f64. Both
+/// inputs are emitted beside it precisely so a consumer can check that the
+/// derived number has not drifted from them.
+///
+/// `truncated_norm_sqr` is `⟨ψ′|ψ′⟩` of the state actually read out, and it is
+/// here so the no-renormalisation rule is **checkable rather than promised**:
+/// the bound above is derived for the raw truncated state, and an engine that
+/// rescaled `ψ′` back to unit norm would satisfy a bound nobody derived.
+/// Read it as "different from 1", **not** as a deficit — it is usually below
+/// 1 and it is not always. The branches of the decomposition are not
+/// orthogonal, so `‖ψ′‖² = 1 − ‖Δ‖² − 2Re⟨ψ′|Δ⟩` for the dropped part `Δ`,
+/// and a `Δ` overlapping the survivors negatively leaves the remainder
+/// *longer* than the state it came from. Measured: two of the forty witness
+/// cells of the engine's `tests/truncation_witness.rs` sit at `1.2285` where
+/// the other thirty-eight sit at `0.7285` or `0.9785`. A consumer that treats
+/// `> 1` as impossible will reject correct runs.
+///
+/// `max_chi` is the truncating cut and `max_branches` is the ceiling; they are
+/// separate keys because they are different kinds of limit. Reaching
+/// `max_branches` **refuses** the run and discards nothing, so two completed
+/// runs under different `max_branches` return the same number; `max_chi`
+/// discards branches and owes the mass and the bound above.
+///
+/// `informative` is the key to branch on, as with the other engines: `false`
+/// means every value the observable could take is consistent with the result.
+/// A `stabrank` run that would be uninformative is refused by the engine
+/// rather than returned, so a `false` here should not occur through this door;
+/// the key is emitted anyway so a consumer need not know that to be safe.
+pub fn attach_stabrank_certificate(
+    mut doc: Value,
+    cert: &omega_backend_stabrank::StabRankCertificate,
+) -> Value {
+    if let Some(map) = doc.as_object_mut() {
+        map.insert(
+            "stabrank_truncation".to_string(),
+            json!({
+                // Deliberately NOT named `dropped_mass`: see this function's
+                // doc. The name carries the picture, and the picture is the
+                // difference between a bound and an input to one.
+                "state_dropped_mass": cert.state_dropped_mass,
+                "state_dropped_mass_is_a_bound": false,
+                "expectation_error_bound": cert.expectation_error_bound,
+                "expectation_error_bound_formula": "observable_range * m * (2 + m), m = state_dropped_mass",
+                "composes_with_majoranaprop_dropped_mass": false,
+                "observable_range": cert.observable_range,
+                "vacuous_at": cert.observable_range + cert.value.abs(),
+                "informative": cert.is_informative(),
+                "exact": cert.is_exact(),
+                "final_chi": cert.final_chi,
+                "peak_chi": cert.peak_chi,
+                "coeff_min": cert.coeff_min,
+                "max_chi": cert.max_chi,
+                "max_branches": cert.max_branches,
+                // Not renormalised, and not bounded above by 1: see the doc.
+                "truncated_norm_sqr": cert.truncated_norm_sqr,
+                // The engine's own record of which basis it was seeded in, as
+                // majoranaprop's is. `"pauli"` is the only value stabrank can
+                // report — the Schrödinger seed is the state |0…0⟩ and a
+                // fermionic observable arrives already mapped by
+                // Jordan–Wigner — so a reader comparing the two engines' runs
+                // of one job should expect `"ladder"` on one side and
+                // `"pauli"` on this one, and that is not a disagreement.
+                "seed_basis": cert.seed_basis.as_str(),
+            }),
+        );
+    }
+    doc
+}
+
 pub fn expectation_to_json(observable: &str, value: f64) -> Value {
     json!({
         "mode": "expectation",
@@ -284,6 +527,21 @@ pub fn expectation_to_json(observable: &str, value: f64) -> Value {
         "value": value,
         "build": provenance(),
     })
+}
+
+/// How `observable` (echoed as typed) became the Pauli sum that was measured.
+///
+/// Present only when the input was not already a Pauli sum — today, the
+/// `--expectation-fermionic` ladder spelling lowered through Jordan–Wigner.
+/// `observable` stays the string the user typed, unchanged, so consumers
+/// keyed on it keep working; the mapping block is what lets a reader re-derive
+/// the number: `{"input_basis": "ladder", "mapping": "jordan_wigner",
+/// "mapped_terms": N, "mapped_observable": "<--expectation grammar>"}`.
+pub fn attach_observable_mapping(mut doc: Value, mapping: &Value) -> Value {
+    if let Some(map) = doc.as_object_mut() {
+        map.insert("observable_mapping".to_string(), mapping.clone());
+    }
+    doc
 }
 
 pub fn gradient_to_json(observable: &str, method: &str, grads: &[(String, f64)]) -> Value {
@@ -498,6 +756,7 @@ mod tests {
             discarded_weight: 3.25e-3,
             fidelity_estimate: 0.87,
             max_bond_reached: 64,
+            svd_kernel: omega_backend_mps::SvdKernel::Jacobi,
         };
         let doc = attach_mps_certificate(json!({"mode": "counts"}), &stats);
         let cert = &doc["mps_truncation"];
@@ -509,6 +768,40 @@ mod tests {
         assert_eq!(cert["fidelity_estimate_is_a_bound"], false);
         // The original document is preserved, not replaced.
         assert_eq!(doc["mode"], "counts");
+    }
+
+    /// **The kernel name is carried, not generated.** Every kernel the stats
+    /// can name must come out of the JSON as its own string, asserted from BOTH
+    /// sides: a serializer that hard-codes `"accelerate-zgesdd"` — or that
+    /// writes `default_svd_kernel()` instead of reading the field it was handed
+    /// — passes any one-sided check, and would then label a Jacobi run's
+    /// certificate with the kernel that did not produce it.
+    #[test]
+    fn the_mps_certificate_carries_whichever_kernel_it_is_given() {
+        use omega_backend_mps::SvdKernel;
+        let expected = [
+            (SvdKernel::Jacobi, "jacobi"),
+            (SvdKernel::AccelerateZgesdd, "accelerate-zgesdd"),
+            (SvdKernel::Custom, "custom"),
+        ];
+        for (kernel, name) in expected {
+            let stats = omega_backend_mps::MpsRunStats {
+                discarded_weight: 1e-9,
+                fidelity_estimate: 1.0,
+                max_bond_reached: 32,
+                svd_kernel: kernel,
+            };
+            let doc = attach_mps_certificate(json!({}), &stats);
+            assert_eq!(
+                doc["mps_truncation"]["svd_kernel"], name,
+                "{kernel:?} must serialise as {name}"
+            );
+        }
+        // Three kernels, three distinct strings — one `as_str` arm collapsed
+        // onto another would make two of the assertions above agree for the
+        // wrong reason.
+        let names: std::collections::BTreeSet<&str> = expected.iter().map(|(_, n)| *n).collect();
+        assert_eq!(names.len(), expected.len());
     }
 
     #[test]

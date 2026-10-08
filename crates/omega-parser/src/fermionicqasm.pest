@@ -1,0 +1,62 @@
+// FERMIONICQASM 1.0 PEG grammar for pest.
+// This is an in-house format. It carries no authority of a standard.
+
+program = { SOI ~ header ~ statement* ~ EOI }
+
+// The version RULE is permissive so that `FERMIONICQASM 2.0;` fails at the
+// version CHECK in parse_fermionicqasm with a message naming both versions,
+// not at a pest position — the qasm2 house split: the grammar admits, the
+// code refuses where the message can name things (qasm2.pest, dim_group).
+header  = { "FERMIONICQASM" ~ version ~ ";" }
+version = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+
+// ORDER MATTERS: pest's `|` is ordered choice. Under OPTICQASM-shaped rules
+// `creg c[4];` parses silently as a gate named `creg`, while
+// `measure m[0] -> c[0];` is a hard error. Specific forms first — qasm2.pest's
+// `reset` lesson, applied before the bug ships.
+statement = {
+    mode_decl
+  | creg_decl
+  | load_stmt
+  | measure_stmt
+  | gate_app
+}
+
+// `mode m[4];`       -> 4 spinless fermionic modes, wires 0..3.
+// `mode m[4] spin;`  -> 4 SPATIAL modes -> 8 wires in BLOCKS: 0..3 spin-up
+//                       (alpha), 4..7 spin-down (beta). qiskit-cold-atom's
+//                       convention. NOT `pol`'s interleaved (s,p) -> 2s+p map —
+//                       same optionality, different wire map, so the lowering
+//                       is not shared.
+mode_decl   = { "mode" ~ ident ~ "[" ~ integer ~ "]" ~ spin_marker? ~ ";" }
+spin_marker = { "spin" }
+
+creg_decl = { "creg" ~ ident ~ "[" ~ integer ~ "]" ~ ";" }
+
+// State preparation. Every gate below conserves particle number, so a file
+// without `load` can only phase the vacuum. Must precede every gate_app —
+// enforced in lowering, where the refusal names the line.
+load_stmt = { "load" ~ mode_list ~ ";" }
+
+// Gate set: ffsim's number-conserving primitives. `orbrot` is deliberately
+// absent from 1.0 — writers decompose it to `givens` before emission.
+// Longest spelling first, as opticqasm.pest orders bs_rx | bs.
+gate_app  = { gate_name ~ ("(" ~ param_list ~ ")")? ~ mode_list ~ ";" }
+gate_name = @{ "numnum" | "num" | "givens" | "tunnel" | ident }
+
+param_list = { param ~ ("," ~ param)* }
+param      = { symbol | number }
+symbol     = @{ "$" ~ (ASCII_ALPHANUMERIC | "_")+ }
+
+mode_list = { mode_ref ~ ("," ~ mode_ref)* }
+mode_ref  = { ident ~ "[" ~ integer ~ "]" }
+
+measure_stmt = { "measure" ~ mode_ref ~ "->" ~ cbit_ref ~ ";" }
+cbit_ref     = { ident ~ "[" ~ integer ~ "]" }
+
+number  = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+integer = @{ ASCII_DIGIT+ }
+ident   = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }

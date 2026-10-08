@@ -372,3 +372,17 @@ over.
   that should consult the declared registers, and it is the same class as
   `RegisterDecl::polarized` being a flag rather than a convention. Fixing it
   means threading the circuit's creg list into the check.
+* ~~**P6 residual — `try_to_omega_ir` lowered an unbound compound parameter
+  to `Concrete(0.0)`.**~~ **FIXED 2026-09-30 (`c5451a8`).** Same class as
+  the original P6 — a silent path beside a refusing one. `rz(2*theta)` with
+  `theta` unbound was neither concrete nor a bare symbol, so the fallback arm
+  emitted `rz(0)` and the circuit ran, confidently, as a different circuit;
+  a concrete expression the evaluator rejects (`foo(1)`, `1/0`) took the same
+  arm. Both are refused now — the compound case names the gate, the
+  expression and its free symbols and says to bind before lowering; the
+  concrete case carries the evaluator's reason. A bare symbol still travels
+  as a symbol and a bound expression still lowers to its value; both are
+  guarded in `crates/aria-core/tests/omega_lowering_refuses_silently_broken_circuits.rs`.
+  The two remote callers in `aria-runtime` bind every free symbol before
+  lowering, so neither can reach the refusal. `to_omega_ir`'s expect message
+  no longer claims an unmapped gate is the only refusal.

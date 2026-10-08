@@ -602,6 +602,8 @@ mod classify_tests {
             "ppvm-noise-not-supported",
             "bloqade-multi-creg-not-supported",
             "bloqade-ahs-not-implemented",
+            "ffsim-unsupported-gate",
+            "ffsim-not-supported",
         ];
         let unavailable = [
             "qiskit-not-installed",
@@ -610,6 +612,7 @@ mod classify_tests {
             "bloqade-not-installed",
             "tsim-not-installed",
             "ppvm-not-installed",
+            "ffsim-not-installed",
         ];
         let real_errors = [
             "bad-request",
@@ -622,6 +625,7 @@ mod classify_tests {
             "bloqade-execute",
             "tsim-internal",
             "ppvm-internal",
+            "ffsim-execute",
             "qasm-parse",
             "qasm-emit",
             "qpy-parse",

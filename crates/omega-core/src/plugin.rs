@@ -248,6 +248,13 @@ impl BackendRegistry {
 /// refused before dispatch. `pub` so the ABI-limitation policy is testable
 /// without a loaded plugin.
 pub fn circuit_ffi_limitation(circuit: &CircuitIR) -> Option<String> {
+    // `FfiCircuit` carries `num_qubits` and nothing about dimension, so a
+    // qudit register cannot even be described to a plugin — it would arrive
+    // as `num_qubits` qubits and run as such. Refused host-side, before
+    // flattening, in the same sentence every in-tree engine uses.
+    if let Err(e) = circuit.refuse_qudits("plugin ABI") {
+        return Some(e.to_string());
+    }
     let mut measured = false;
     for op in &circuit.ops {
         if op.condition.is_some() {
@@ -312,6 +319,14 @@ pub fn gate_kind_to_ffi(gate: &GateKind) -> Result<u32> {
         GateKind::Rbs => GATE_RBS,
         GateKind::CCX => GATE_CCX,
         GateKind::CSwap => GATE_CSWAP,
+        // Qudit gates have no FFI constant: the plugin ABI is qubit-only and a
+        // qudit circuit is already refused host-side by `circuit_ffi_limitation`
+        // before this is reached. Named so the map stays exhaustive.
+        GateKind::Rxy | GateKind::CSum => {
+            return Err(OmegaError::Unsupported(format!(
+                "gate {gate:?} is a qudit gate with no plugin ABI encoding (PLAN-QUDIT.md Q2)"
+            )))
+        }
         GateKind::PhaseShifter => GATE_PS,
         GateKind::BeamSplitterRx => GATE_BS_RX,
         GateKind::Measure => GATE_MEASURE,

@@ -498,8 +498,13 @@ fn try_adjoint_gradient(
 /// 2-term `±π/2` rule applies to single-Pauli rotation generators
 /// (spectrum `±1/2` → frequency 1); the 4-term Banchi-Crooks variant
 /// applies to controlled rotations whose generator spectrum is
-/// `{0, 0, ±1/2}` → frequencies `{1/2, 1}` — see
-/// `verification/Verification/Adjoint/AdjointEqShift.lean` (CRz block).
+/// `{0, 0, ±1/2}` → frequencies `{1/2, 1}`.
+///
+/// This cited `Verification/Adjoint/AdjointEqShift.lean` (CRz block); that
+/// file does not exist here or in the private monorepo (checked 2026-09-04).
+/// The rule is checked numerically instead — the 4-term CRz path is exercised
+/// against adjoint AD in
+/// `omega-backend-statevector/tests/parallel_shift_integration.rs`.
 enum SlotShiftRule {
     /// `f'(θ) = (1/2)·(f(θ+π/2) − f(θ-π/2))`.
     TwoTerm,

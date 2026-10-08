@@ -426,6 +426,92 @@ async fn function_create_then_invoke_executes_bell() {
     );
 }
 
+/// **`POST /v1/functions/{id}/invoke` refuses a wrong-length `params` with a
+/// 400, and still runs the right length.**
+///
+/// `rx(theta)` leaves one free symbol. `"params": []` used to bind it to 0.0 —
+/// `rx(0)` is the identity — so the route answered `200 {"status":
+/// "completed"}` with a clean |0⟩ histogram, a well-formed result for a
+/// circuit the caller never described and no way from the wire to tell the
+/// difference. It is now `OmegaError::ParameterCount` out of
+/// `Registry::execute_circuit`, mapped to 400 beside the other malformed-body
+/// rejections rather than the blanket 500 this arm used to return.
+#[tokio::test]
+async fn invoke_with_a_wrong_length_params_is_a_400_not_a_zero_padded_run() {
+    let (token, app) = fresh_router_default(rights::ADMIN_ROLE);
+
+    let body = serde_json::json!({
+        "source": "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[1];\ncreg c[1];\nrx(theta) q[0];\n"
+    })
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(req_post_auth("/v1/circuits", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let cid = read_body_json(resp.into_body()).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body =
+        serde_json::json!({"circuit_id": cid, "name": "rx", "default_shots": 256}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(req_post_auth("/v1/functions", &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let fid = read_body_json(resp.into_body()).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let path = format!("/v1/functions/{}/invoke", fid);
+
+    // Too few: the symbol would have been bound to 0.0.
+    let body = serde_json::json!({"params": [], "shots": 256, "seed": 42}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(req_post_auth(&path, &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an empty params on a one-symbol circuit is the caller's error"
+    );
+    let v = read_body_json(resp.into_body()).await;
+    assert_eq!(v["status"], "failed");
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("theta"),
+        "the refusal must name the symbol it could not bind, got: {err}"
+    );
+
+    // Too many: the extra would have been dropped.
+    let body = serde_json::json!({"params": [0.1, 0.2], "shots": 256, "seed": 42}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(req_post_auth(&path, &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Exactly one still runs: rx(pi)|0⟩ = |1⟩ up to phase, every shot on "1".
+    let body =
+        serde_json::json!({"params": [std::f64::consts::PI], "shots": 256, "seed": 42}).to_string();
+    let resp = app
+        .oneshot(req_post_auth(&path, &token, &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = read_body_json(resp.into_body()).await;
+    assert_eq!(v["status"], "completed");
+    let counts = v["result"]["counts"].as_object().unwrap();
+    assert_eq!(counts.get("1").and_then(|c| c.as_u64()), Some(256));
+}
+
 #[tokio::test]
 async fn get_unknown_circuit_returns_404() {
     let (token, app) = fresh_router_default(rights::READ);
@@ -941,6 +1027,171 @@ async fn quantum_expectation_refuses_wide_auto_circuit_that_densifies_via_mps() 
     let v = read_body_json(resp.into_body()).await;
     let err = v["error"].as_str().unwrap_or_default();
     assert!(err.contains("GB"), "refusal must quote the cost: {err}");
+}
+
+async fn post_json(
+    app: &axum::Router,
+    token: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(req_post_auth(path, token, &body.to_string()))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v = read_body_json(resp.into_body()).await;
+    (status, v)
+}
+
+/// The query and the route that would run the circuit must reach the same
+/// decision. A probe that only returns 200 has not been shown to know the price.
+#[tokio::test]
+async fn admission_query_agrees_with_the_route_that_would_run_it() {
+    let (token, app) = fresh_router_default(rights::EXECUTE);
+
+    // 40-qubit statevector, shot mode. `/execute` refuses this; the query must
+    // refuse it with the same text, which is how a divergent price shows up
+    // (shot mode and a returned statevector are not the same number of bytes).
+    let huge_exec = serde_json::json!({
+        "circuit": {
+            "num_qubits": 40,
+            "num_classical_bits": 0,
+            "is_photonic": false,
+            "mid_circuit_mode": "Skip",
+            "backend": "Statevector",
+            "ops": [
+                {"gate": "T", "qubits": [0], "params": [], "classical_bit": null, "condition": null}
+            ]
+        },
+        "shots": 8
+    });
+    let mut huge_ask = huge_exec.clone();
+    huge_ask["route"] = serde_json::json!("execute");
+    let (ask_status, ask) = post_json(&app, &token, "/v1/quantum/admission", &huge_ask).await;
+    let (run_status, run) = post_json(&app, &token, "/v1/quantum/execute", &huge_exec).await;
+    assert_eq!(
+        ask_status,
+        StatusCode::OK,
+        "the question itself is well-formed: {ask}"
+    );
+    assert_eq!(ask["admitted"], false, "{ask}");
+    assert_eq!(
+        ask["status"].as_u64(),
+        Some(413),
+        "a permanent refusal, not a retry: {ask}"
+    );
+    assert_eq!(run_status, StatusCode::PAYLOAD_TOO_LARGE, "{run}");
+    assert_eq!(
+        ask["error"], run["error"],
+        "query and /execute must spell the refusal the same way"
+    );
+    let peak = ask["peak_bytes"]
+        .as_u64()
+        .expect("a priced refusal names its cost");
+    let cap = ask["capacity_bytes"].as_u64().expect("budget");
+    assert!(
+        peak > cap,
+        "refused circuit priced at {peak} against a budget of {cap}"
+    );
+
+    // The same width on /expectation, default Auto. This is the densify hole:
+    // priced as MPS tensors it is megabytes and would be admitted; the route
+    // prices the statevector the expectation actually allocates.
+    let huge_exp = serde_json::json!({
+        "circuit": {
+            "num_qubits": 34,
+            "num_classical_bits": 0,
+            "is_photonic": false,
+            "mid_circuit_mode": "Skip",
+            "backend": "Auto",
+            "ops": [
+                {"gate": "Ry", "qubits": [0], "params": [0.3], "classical_bit": null, "condition": null}
+            ]
+        },
+        "observable": "Z0"
+    });
+    let mut exp_ask = huge_exp.clone();
+    exp_ask["route"] = serde_json::json!("expectation");
+    let (ask_status, ask) = post_json(&app, &token, "/v1/quantum/admission", &exp_ask).await;
+    let (run_status, run) = post_json(&app, &token, "/v1/quantum/expectation", &huge_exp).await;
+    assert_eq!(ask_status, StatusCode::OK, "{ask}");
+    assert_eq!(
+        ask["admitted"], false,
+        "Auto expectation that densifies: {ask}"
+    );
+    assert_eq!(run_status, StatusCode::PAYLOAD_TOO_LARGE, "{run}");
+    assert_eq!(ask["error"], run["error"]);
+    let exp_peak = ask["peak_bytes"].as_u64().expect("priced");
+    assert!(
+        exp_peak > ask["capacity_bytes"].as_u64().unwrap_or(0),
+        "expectation price {exp_peak} must be the dense one, above the budget"
+    );
+
+    // A gradient holds a second state. 40 qubits dense is refused either way;
+    // the text has to match /gradient specifically, not the expectation price.
+    let huge_grad = serde_json::json!({
+        "circuit": {
+            "num_qubits": 40,
+            "num_classical_bits": 0,
+            "is_photonic": false,
+            "mid_circuit_mode": "Skip",
+            "backend": "Statevector",
+            "ops": [
+                {"gate": "Ry", "qubits": [0], "params": [0.3], "classical_bit": null, "condition": null}
+            ]
+        },
+        "observable": "Z0"
+    });
+    let mut grad_ask = huge_grad.clone();
+    grad_ask["route"] = serde_json::json!("gradient");
+    let (ask_status, ask) = post_json(&app, &token, "/v1/quantum/admission", &grad_ask).await;
+    let (run_status, run) = post_json(&app, &token, "/v1/quantum/gradient", &huge_grad).await;
+    assert_eq!(ask_status, StatusCode::OK, "{ask}");
+    assert_eq!(ask["admitted"], false, "{ask}");
+    assert_eq!(run_status, StatusCode::PAYLOAD_TOO_LARGE, "{run}");
+    assert_eq!(ask["error"], run["error"]);
+
+    // Two qubits, shot mode. The route accepts it, so the query must say so —
+    // and must have released its reservation, or this execute would be the
+    // one that finds the budget still held.
+    let small = serde_json::json!({
+        "circuit": {
+            "num_qubits": 2,
+            "num_classical_bits": 0,
+            "is_photonic": false,
+            "mid_circuit_mode": "Skip",
+            "backend": "Statevector",
+            "ops": [
+                {"gate": "H",  "qubits": [0],    "params": [], "classical_bit": null, "condition": null},
+                {"gate": "CX", "qubits": [0, 1], "params": [], "classical_bit": null, "condition": null}
+            ]
+        },
+        "shots": 32,
+        "seed": 1
+    });
+    let mut small_ask = small.clone();
+    small_ask["route"] = serde_json::json!("execute");
+    let (ask_status, ask) = post_json(&app, &token, "/v1/quantum/admission", &small_ask).await;
+    let (run_status, run) = post_json(&app, &token, "/v1/quantum/execute", &small).await;
+    assert_eq!(ask_status, StatusCode::OK, "{ask}");
+    assert_eq!(
+        ask["admitted"], true,
+        "2-qubit Bell must be acceptable: {ask}"
+    );
+    let small_peak = ask["peak_bytes"].as_u64().expect("priced");
+    let small_cap = ask["capacity_bytes"].as_u64().expect("budget");
+    assert!(
+        small_peak > 0 && small_peak <= small_cap,
+        "accepted circuit priced at {small_peak} against {small_cap}"
+    );
+    assert_eq!(
+        run_status,
+        StatusCode::OK,
+        "route must actually accept it: {run}"
+    );
+    assert_eq!(run["backend"], "statevector");
 }
 
 #[tokio::test]
@@ -1726,7 +1977,7 @@ async fn quantum_execute_pattern_bell_returns_cross_wire_golden() {
     // C1.3/C1.4: POST the compiled Bell MBQC pattern to
     // /v1/quantum/execute_pattern → photonic one-way backend → the canonical
     // output statevector. The exact pattern + golden are pinned identically on
-    // the quantum-core side (its `omega_pattern_cross_wire_golden` test), so
+    // the quantum-core side (its `omega_pattern_cross_wire_golden` test, quantum-core/src/backends/omega.rs:792), so
     // matching them here proves the over-the-wire equality. MBQC prepares the
     // |+⟩ input, so the Bell circuit's output is CX·(H⊗I)|++⟩ = (|00⟩+|01⟩)/√2.
     let (token, app) = fresh_router_default(rights::EXECUTE);

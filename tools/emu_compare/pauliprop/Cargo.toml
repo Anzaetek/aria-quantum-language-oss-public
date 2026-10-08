@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "emu-compare-pauliprop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Pauliprop lane of the emulator comparison (E7): omega-backend-pauliprop against monoprop 0.9.0"
+
+[dependencies]
+omega-emu-compare = { path = "../../../crates/omega-emu-compare" }
+omega-core = { path = "../../../crates/omega-core" }
+omega-parser = { path = "../../../crates/omega-parser" }
+omega-backend-pauliprop = { path = "../../../crates/omega-backend-pauliprop" }
+omega-backend-statevector = { path = "../../../crates/omega-backend-statevector" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

@@ -664,3 +664,70 @@ and is separate work.
 
 Please record the measured two-thread wall clock either way. If CUDA shows no
 speedup, that is a finding, not a failure, and it belongs in the ledger.
+
+---
+
+## CI test-threading on big-RAM boxes — evaluated 2026-08-29; the serial lines are load-bearing
+
+Raised on the RTX PRO 6000 box (x86_64, 96 GB card, ~123 GiB host): "CI looks
+single-threaded — with this much RAM, run more test threads." Checked against
+`ci.sh` rather than assumed, and the answer is that CI is already parallel
+everywhere it safely can be. The serial spots are two, both deliberate, and
+**neither is a memory constraint** — more RAM changes nothing:
+
+1. **The tch stage** (`ci.sh:433`, `--test-threads=1`): libtorch has a
+   **process-global RNG**, so parallel tests race on it and the numeric
+   assertions go flaky. Serial by correctness, not by resources.
+2. **The CUDA stage** (`ci.sh:516`, `RUST_TEST_THREADS=1`, unset at `:572` so
+   nothing downstream inherits it): the long comment above the line is the
+   authority — CUDA stream capture is not protected against concurrent
+   submission to the same stream, and whether each backend instance owns a
+   distinct `Arc<CudaStream>` was never instrumented. Do not lift the line on
+   circumstantial evidence; the comment says exactly what instrumentation
+   would justify removing it.
+
+Two facts that cap the upside even if the CUDA line were lifted:
+`PLAN-CUDA-STREAMS.md` measured two host threads on one CUDA backend at
+**0.70x–0.99x — never faster at any width** — the GPU itself is the
+serialization point; and the long sequential stretches one actually watches in
+a CI run (the wasm example's per-iteration `expectations:` stream, the QML
+training epochs) are single programs emitting output, not test scheduling.
+
+**The only real lever** is the same one `ci.sh:505-516` already names:
+instrument per-backend stream ownership, and only then revisit both the
+`RUST_TEST_THREADS=1` line and the per-thread-streams design that
+`PLAN-CUDA-STREAMS.md` measured and declined. Until someone does that
+instrumentation, the *lift-the-serial-lines* reading of the suggestion is
+evaluated-and-closed — recorded here so it is not re-derived from scratch on
+the next big box. The broader reading is a live TODO, below.
+
+### OPEN (owner request, 2026-08-29) — faster CI via multithreading / more cores, when free memory allows
+
+The owner wants CI wall-clock down on big boxes, and the two load-bearing
+serial lines above are NOT the only lever. What is actually available, in
+rough value order:
+
+1. **Run independent optional stages concurrently.** The tail of `ci.sh`
+   (tch, CUDA, cross-checks, Lean) is a straight line of stages that mostly
+   do not share state. The tch/CUDA env-scoping fix (the exit-127 leak,
+   fixed 2026-08-29) exists precisely because these stages leaked into each
+   other; any concurrency must keep each stage's env scoped the same way.
+2. **`cargo-nextest`** — parallelises across test *binaries* as well as
+   within them, and its process-per-test isolation would let some
+   currently-serial suites run wide: the tch stage's global-RNG constraint
+   is per-process, so process isolation dissolves it. The CUDA
+   shared-stream question does NOT dissolve — same GPU either way — so that
+   stage keeps its serialisation regardless of runner.
+3. **Parallelise the stage-8 harness loop** — the `aria-verify all`
+   examples are independent programs run one after another, and they
+   dominate wall-clock on this box. Memory-cheap, embarrassingly parallel.
+4. **Gate parallelism on free memory, measured** — parallel rustc + linkers
+   are the RAM hogs. Read `MemAvailable` from `/proc/meminfo` (macOS:
+   `vm_stat`) and derive the job count from it, defaulting to today's
+   behaviour on small boxes. "When free memory allows" is the owner's
+   stated condition; make it an input, not a vibe.
+
+Standing constraint regardless of approach: the tch global-RNG line and the
+CUDA shared-stream line stay serial (in-process) until the instrumentation
+named in the tch-stage comment in `ci.sh` is done. The speed-ups above come
+from *around* them.

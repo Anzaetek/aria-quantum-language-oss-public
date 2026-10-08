@@ -95,6 +95,8 @@ pub fn shadow_circuits(n: usize, num_snapshots: usize, seed: u64) -> Vec<(Circui
             circuit_type: CircuitType::GateBased,
             symbols: HashMap::new(),
             custom_gates: HashMap::new(),
+            qudit_registers: Vec::new(),
+            fermionic_registers: Vec::new(),
         };
 
         circuits.push((circuit, bases));

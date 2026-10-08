@@ -1,0 +1,13 @@
+# 2-site Fermi-Hubbard, t = 1, U = 4, chemical potential 0.
+# Mode order is site-major, spin-minor:
+# 0 = site 0 up, 1 = site 0 down, 2 = site 1 up, 3 = site 1 down.
+# Hopping is written in both orders. The identity is absent (no
+# constant shift). Open boundaries: fermi_hubbard(..., periodic=False).
+# The half-filled ground energy is 2 - 2*sqrt(2). The lowest
+# eigenvalue of this operator on the whole Fock space is -1.
+4.0 [0^ 0 1^ 1] +
+-1.0 [0^ 2] +
+-1.0 [1^ 3] +
+-1.0 [2^ 0] +
+4.0 [2^ 2 3^ 3] +
+-1.0 [3^ 1]

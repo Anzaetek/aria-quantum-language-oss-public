@@ -23,7 +23,7 @@ as an unproven assumption with its rationale.
 | A4 | Sampling is from the Born-rule distribution of the ideal state; shot noise is `O(1/√N)` with the declared shot count. | **conformance-checked** — sampled estimators land within `4σ_MC` of the closed-form law (see the `noise` app anchors). |
 | A5 | The Rust **circuit-builder** lowering (`CircuitBuilder` / `.aria` → omega IR) preserves gate order and operands. | **conformance-checked** — the same builder feeds both omega and the oracle; a lowering bug shows as an oracle mismatch. |
 
-| A6 | `Reset` is the **channel** (projective measure, then `X` if the outcome was 1) on every backend that implements it. The backends do **not** share an acceptance criterion for analytic mode — see below. | **conformance-checked, with a known divergence** — `omega-backend-statevector-metal::reset_matches_cpu` asserts CPU/Metal agreement up to global phase on unentangled resets (incl. `\|−⟩`, `\|1⟩`) and that both refuse the entangled analytic case. **Lean target**: `verification/.../Reset.lean` T1–T4 (all `sorry`). |
+| A6 | `Reset` is the **channel** (projective measure, then `X` if the outcome was 1) on every backend that implements it. The backends do **not** share an acceptance criterion for analytic mode — see below. | **conformance-checked, with a known divergence** — `omega-backend-statevector-metal::reset_matches_cpu` asserts CPU/Metal agreement up to global phase on unentangled resets (incl. `\|−⟩`, `\|1⟩`) and that both refuse the entangled analytic case. **CPU/CUDA**: `omega-backend-statevector-cuda/tests/reset_criterion.rs`. **CPU/MPS/pauli**: `omega-bridges/tests/reset_acceptance_conformance.rs` (2026-09-25) pins all three divergent policies, including the disagreement on `H q0; Reset q0`. **Lean target**: `verification/.../Reset.lean` T1–T4 (all `sorry`). |
 | A7 | `stabilizer_expectation` returns exactly `0`/`+1`/`−1` per the anticommute / in-group-± trichotomy, and `0` **only** on anticommutation; measurement sampling and exact probabilities agree with a dense reference. | **conformance-checked** — in-repo test `measurement_and_probabilities_agree_with_dense_reference` (300 random Clifford circuits vs an in-test dense oracle: probabilities within 1e-9 and normalised, no shot on a zero-probability outcome) plus `expectation_agrees_with_statevector_on_random_clifford_circuits` (400 circuits). **Lean**: `gPhase_correct` PROVED (phase table = Aaronson–Gottesman closed form, all 16 pairs); trichotomy + elimination-completeness are `sorry` targets. |
 
 > **Reset acceptance is NOT uniform across backends.** An earlier version of A6
@@ -36,13 +36,24 @@ as an unproven assumption with its rationale.
 > | `statevector-metal` | same predicate, **looser tolerance** | `1e-4` (f32) |
 > | `statevector-cuda` | `p0 ∈ (1e-6, 1−1e-6)` (random *outcome*) | — |
 > | `mps` | all analytic resets | — |
-> | `pauli` | non-Z-eigenstate | — |
+> | `pauli` | **ALL analytic resets** (corrected 2026-09-25 — see below) | — |
 >
 > Metal's looser tolerance means it **accepts** states the CPU refuses: a qubit
 > at purity `1 − 8·10⁻⁶` is genuinely entangled, and Metal returns a pure state
 > for it (dropping a branch of weight up to `5·10⁻⁵`). Sharing the predicate
 > function does not make the acceptance sets equal — a claim to that effect was
 > wrong and is withdrawn here.
+>
+> **Correction, 2026-09-25 — the `pauli` row was wrong.** It read
+> "non-Z-eigenstate", which implies `pauli` ACCEPTS `X q0; Reset q0` because
+> `X|0⟩ = |1⟩` is a Z-eigenstate. Measured: it refuses that too, and every other
+> analytic reset. `LIMITATIONS.md` had it right all along — "pauliprop ...
+> refuse `Reset`. They evolve a pure state, or conjugate observables unitarily,
+> and cannot represent the channel." A backend that cannot represent the channel
+> does not get to have an input-state criterion, so the eigenstate of the qubit
+> was never the deciding factor. Two documents in this repo disagreed and the
+> ledger was the wrong one; found by writing the conformance test below, which
+> failed on its first run.
 
 
 > A1/A5 together are the LE2 "L1 differential conformance" leg: *the Rust

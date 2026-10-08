@@ -67,6 +67,8 @@ pub fn vqe_circuit(n: usize, layers: usize) -> CircuitIR {
         circuit_type: CircuitType::GateBased,
         symbols,
         custom_gates: HashMap::new(),
+        qudit_registers: Vec::new(),
+        fermionic_registers: Vec::new(),
     }
 }
 

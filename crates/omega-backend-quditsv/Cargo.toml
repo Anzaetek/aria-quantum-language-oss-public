@@ -1,0 +1,25 @@
+[package]
+name = "omega-backend-quditsv"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Exact dense mixed-radix (qudit) statevector backend for the omega runtime — the in-tree reference for qudit circuits. PLAN-QUDIT.md Q2."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+# The d = 2 gate MATRICES come from the statevector backend's `gates` module,
+# so on qubit wires this engine agrees with the dense qubit engine on every
+# convention by construction — and the d = 2 differential test is then a
+# test of the mixed-radix addressing, not of two hand-typed matrix tables.
+# This crate never calls the statevector's apply path.
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+smallvec = { workspace = true }

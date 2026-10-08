@@ -392,8 +392,10 @@ fn split_gamma_beta(
     let mut gammas = Vec::new();
     let mut betas = Vec::new();
     for (&sid, &v) in symbol_ids.iter().zip(values.iter()) {
-        let default = format!("sym_{}", sid);
-        let name = names.get(&sid).unwrap_or(&default);
+        let name = names
+            .get(&sid)
+            .cloned()
+            .unwrap_or_else(|| omega_core::circuit::fallback_symbol_name(sid));
         if name.starts_with("gamma") {
             gammas.push(v);
         } else if name.starts_with("beta") {

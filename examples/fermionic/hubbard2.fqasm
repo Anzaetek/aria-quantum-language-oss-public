@@ -1,0 +1,35 @@
+// 2-site Fermi-Hubbard, t = 1, U = 4, two-electron ground state.
+// Same mode order as hubbard2_op.txt: site-major, spin-minor.
+// The eigenvector angle is pi/8, from tan(pi/8) = sqrt(2)-1 = -E/(2t).
+// phi = (1/2) arccos(-sqrt(2) sin(pi/8))
+// psi = (1/2) arccos(sqrt(sqrt(2)-1))
+// numnum(pi) on modes 0 and 1 sits between two spin-symmetric orbital
+// rotations. Because the adjacent decomposition implements the spatial
+// rotation of angle -alpha when the Givens angle is alpha, the first
+// rotation is entered at -phi and the second at +psi. The prepared
+// state is the ground state derived in docs/FERMIONIC_EXAMPLES.md,
+// cos(pi/8)|S> + sin(pi/8)|D>.
+FERMIONICQASM 1.0;
+mode m[4];
+load m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(-1.0713275984980535) m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];
+givens(-1.0713275984980535) m[1], m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];
+numnum(3.1415926535897931) m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(0.4358055811269364) m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];
+givens(0.4358055811269364) m[1], m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];

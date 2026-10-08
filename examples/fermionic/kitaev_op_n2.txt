@@ -1,0 +1,7 @@
+# Kitaev chain, N = 2 sites, sweet spot t = Delta = 1, mu = 0.
+# Spinless modes 0..N-1. Each bond is -t (hop + h.c.) + t (pair + h.c.).
+# Ground energy -(N-1). The two product states |+>^N and |->^N are both ground states.
+-1 [0^ 1] +
+-1 [1^ 0] +
+1 [0 1] +
+1 [1^ 0^]

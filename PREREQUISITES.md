@@ -42,6 +42,7 @@ are installed here, **each in its own venv** — never system Python:
 | `.venv-qiskit` | `ARIA_QISKIT_XCHECK=1` | qiskit 2.5.1, qiskit-aer 0.17.2, numpy 2.5.1, scipy 1.18.0 | 193 MB |
 | `tools/qec_cross_check/.venv` | `ARIA_QEC_XCHECK=1` | qiskit 2.5.1, PyMatching 2.4.0, stim 1.16.0 | 566 MB |
 | `.venv-piquasso` | `ARIA_CV_XCHECK=1` | piquasso 8.0.1, numpy 2.4.6 | 400 MB |
+| `tools/pp_cross_check/.venv` | `ARIA_PP_XCHECK=1` | monoprop 0.9.0, numpy 2.5.3 (CPython 3.12) | ~150 MB |
 | `bindings/aria-py/.venv` | aria-py python tests | maturin, pytest, the built `aria_py` wheel. Build it with a **CPython &le; 3.13** (`python3.13 -m venv bindings/aria-py/.venv`) — pyo3 0.23 refuses anything newer, and ci.sh then auto-detects this venv. See `ARIA_PY_PYTHON` in `OPTIONAL_TESTS.md` | 120 MB |
 | `crates/omega-bridges/python/.venv-qiskit` | bridge runner python tests | qiskit, qiskit-aer, **pytest** | 200 MB |
 | `crates/omega-bridges/python/.venv-{perceval,bloqade,tsim,ppvm}` | `ARIA_BRIDGE_XCHECK=1` | see `requirements-*.txt` | ~3 GB total |
@@ -118,6 +119,21 @@ $ ./.venv-piquasso/bin/pip install piquasso numpy
 
 `verify_fixture.py` finds it at `.venv-piquasso` first, then
 `tools/cv_cross_check/.venv`, then falls back to whatever interpreter runs it.
+
+Same shape for the pauliprop backend vs **monoprop** (Algorithmiq's
+Pauli/Majorana-propagation code, `arXiv:2503.18939` authors). The fixture
+`tools/pp_cross_check/monoprop_fixture.jsonl` is committed and checked by
+`cargo test -p omega-backend-pauliprop` with no Python; `ARIA_PP_XCHECK=1`
+regenerates it live and checks for drift. The venv is only for that:
+
+```console
+$ python3 -m venv tools/pp_cross_check/.venv
+$ ./tools/pp_cross_check/.venv/bin/pip install monoprop numpy
+```
+
+`ci.sh` looks for it at exactly that path. monoprop ships a prebuilt wheel
+(`monoprop==0.9.0` here, 2026-09-10); the `COMMPLACE rank=0 ...` line it
+prints on import goes to stderr and is harmless.
 
 Measured here 2026-08-06, both `CI_EXIT=0`:
 

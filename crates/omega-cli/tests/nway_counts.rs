@@ -557,7 +557,9 @@ fn nway_counts_matrix_agrees_with_qiskit() {
 }
 
 /// Bridge engines other than the anchor, as their features allow.
-#[allow(unused_mut, dead_code)]
+// `vec_init_then_push`: the pushes are `cfg`-gated, so `vec![]` cannot express
+// them; clippy only sees the lint once a bridge feature is on.
+#[allow(unused_mut, dead_code, clippy::vec_init_then_push)]
 fn bridge_engines() -> Vec<(&'static str, omega_bridges::Backend)> {
     let mut v: Vec<(&'static str, omega_bridges::Backend)> = Vec::new();
     #[cfg(feature = "bridge-perceval")]

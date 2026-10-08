@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "emu-compare-cv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "CV row of the emulator comparison (E7): omega-backend-cv against piquasso 8.0.1, one capability/correctness row"
+
+[dependencies]
+omega-emu-compare = { path = "../../../crates/omega-emu-compare" }
+omega-backend-cv = { path = "../../../crates/omega-backend-cv" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

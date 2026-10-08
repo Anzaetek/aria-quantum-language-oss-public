@@ -1,39 +1,55 @@
 //! Matrix Product State representation and operations.
 //!
-//! An n-qubit state is represented as a chain of tensors:
-//!   A[0] (1 x 2 x d1), A[1] (d1 x 2 x d2), ..., A[n-1] (d_{n-1} x 2 x 1)
-//! where d_i is the bond dimension between sites i and i+1.
+//! An n-site state is represented as a chain of tensors:
+//!   A[0] (1 x d_0 x b1), A[1] (b1 x d_1 x b2), ..., A[n-1] (b_{n-1} x d_{n-1} x 1)
+//! where b_i is the bond dimension between sites i and i+1 and d_q the
+//! physical dimension of site q (2 for a qubit; per-site, mixed radix allowed).
+//! Everything here is dimension-generic: the gate kernels, the SWAP network,
+//! `to_statevector`, sampling (one DIGIT `< d` per site), mid-circuit
+//! measurement and the product-operator expectation. The one place `d = 2` is
+//! still required is packing digits into a BIT-string key
+//! ([`Mps::pack_bits`] / [`Mps::pack_outcome`]), which refuses a digit `>= 2`
+//! by assertion rather than writing it into a bit.
 
 use num_complex::Complex64;
 use rand::RngExt;
 
 use crate::svd::{truncated_svd_flat, SvdResultFlat};
 
-/// A single MPS tensor: shape (bond_left, physical=2, bond_right).
-/// Stored as a flat array in row-major order.
+/// A single MPS tensor: shape (bond_left, phys, bond_right), `phys = 2` for a
+/// qubit site. Stored as a flat array in row-major order.
 #[derive(Clone, Debug)]
 pub struct MpsTensor {
     pub bond_left: usize,
+    /// Physical (local Hilbert space) dimension of this site.
+    pub phys: usize,
     pub bond_right: usize,
-    /// Data indexed as [left * 2 * bond_right + phys * bond_right + right]
+    /// Data indexed as [left * phys * bond_right + p * bond_right + right]
     pub data: Vec<Complex64>,
 }
 
 impl MpsTensor {
+    /// A zeroed qubit tensor (`phys = 2`).
     pub fn new(bond_left: usize, bond_right: usize) -> Self {
+        Self::with_phys(bond_left, 2, bond_right)
+    }
+
+    /// A zeroed tensor of physical dimension `phys`.
+    pub fn with_phys(bond_left: usize, phys: usize, bond_right: usize) -> Self {
         Self {
             bond_left,
+            phys,
             bond_right,
-            data: vec![Complex64::new(0.0, 0.0); bond_left * 2 * bond_right],
+            data: vec![Complex64::new(0.0, 0.0); bond_left * phys * bond_right],
         }
     }
 
-    pub fn get(&self, left: usize, phys: usize, right: usize) -> Complex64 {
-        self.data[left * 2 * self.bond_right + phys * self.bond_right + right]
+    pub fn get(&self, left: usize, p: usize, right: usize) -> Complex64 {
+        self.data[left * self.phys * self.bond_right + p * self.bond_right + right]
     }
 
-    pub fn set(&mut self, left: usize, phys: usize, right: usize, val: Complex64) {
-        self.data[left * 2 * self.bond_right + phys * self.bond_right + right] = val;
+    pub fn set(&mut self, left: usize, p: usize, right: usize, val: Complex64) {
+        self.data[left * self.phys * self.bond_right + p * self.bond_right + right] = val;
     }
 }
 
@@ -49,6 +65,128 @@ impl MpsTensor {
 /// so an unsorted provider would silently mis-truncate. The CPU kernel sorts;
 /// cuSOLVER returns descending order.
 pub type SvdFlatFn = fn(&[Complex64], usize, usize, usize, usize, f64) -> SvdResultFlat;
+
+/// Which truncated-SVD kernel a run's bond compressions went through.
+///
+/// # Why a run has to say this
+///
+/// Two kernels now produce the production certificate: the one-sided Jacobi
+/// kernel on every target, and Accelerate `zgesdd` by default on macOS. Both
+/// are sound and they do not agree in the last digits — the Accelerate path's
+/// `discarded_weight` sits ABOVE the Jacobi reference's by up to ~1e-12 of the
+/// block norm (`accelerate::backward_error_allowance`). So the same circuit
+/// yields two certificates that differ far below any threshold and are not
+/// bit-identical, and nothing in the record said which kernel produced which
+/// until this existed. A reader who diffs a macOS run against a Linux one and
+/// has no field to look at spends a day on it.
+///
+/// The rule is the one `omega-hostgate status` follows about budget sources:
+/// when two sources can produce a number, the record names the one that did.
+///
+/// # The label and the code come from one place
+///
+/// [`Self::svd_flat_fn`] maps each variant to the function that implements it,
+/// so the name a certificate carries and the kernel that ran are the same match
+/// arm. A label set independently of the hook is a label that can lie, which is
+/// how [`crate::MpsBackend::with_svd_fn`] is handled: an arbitrary function
+/// pointer cannot be named, so it reports [`Self::Custom`] rather than
+/// inheriting whatever the default was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SvdKernel {
+    /// [`truncated_svd_flat`], the threaded one-sided Jacobi kernel. The
+    /// reference the Accelerate bound is held above, the kernel on every
+    /// non-macOS target, and — through the size gate — the kernel macOS still
+    /// uses on blocks below `accelerate::MIN_DIM_FOR_LAPACK`.
+    Jacobi,
+    /// `accelerate::accelerate_svd_flat`: Accelerate LAPACK `zgesdd` in f64
+    /// above the size gate, delegating to [`Self::Jacobi`] below it. macOS
+    /// only, and the default there — see `STATUS.md` §5 item 16.
+    ///
+    /// **This names the ENTRY POINT the run went through, which is not the
+    /// same as "every block was solved by LAPACK".** The gate
+    /// (`accelerate::MIN_DIM_FOR_LAPACK` = 16 on `min(m, n)`) exists because
+    /// LAPACK measurably loses on small blocks, so a shallow or small-χ run can
+    /// report `accelerate-zgesdd` and carry a certificate that is bit-for-bit
+    /// the Jacobi kernel's — a χ=7 chain produces 14-column θ blocks and never
+    /// reaches LAPACK at all. That is the gate working, and it is why this
+    /// variant does not promise a number: what it promises is the dispatch
+    /// POLICY, which is what a reader comparing two platforms' certificates
+    /// needs to know. Per-call dispatch counts are a measurement harness's job
+    /// (`examples/accelerate_svd_share.rs` counts both outcomes); putting them
+    /// on the hook would change [`SvdFlatFn`]'s contract, which the CUDA arm
+    /// shares.
+    AccelerateZgesdd,
+    /// A kernel installed through [`crate::MpsBackend::with_svd_fn`] /
+    /// [`Mps::set_svd_fn`] that this crate cannot name: the CUDA `gesvdj` arm
+    /// in `omega-backend-mps-cuda`, or a measurement shim such as
+    /// `examples/mps_stage_profile.rs`'s timing wrapper.
+    ///
+    /// Deliberately not resolved by comparing function addresses. Rust does not
+    /// guarantee distinct `fn` items have distinct addresses, so an identity
+    /// test could silently report one kernel's name for another's output — the
+    /// exact failure this field exists to prevent.
+    Custom,
+}
+
+impl SvdKernel {
+    /// The spelling that goes into a certificate, human or JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jacobi => "jacobi",
+            Self::AccelerateZgesdd => "accelerate-zgesdd",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// The hook function this variant names, or `None` when the variant does
+    /// not name one that this target can build ([`Self::AccelerateZgesdd`] off
+    /// macOS) or that this crate owns ([`Self::Custom`]).
+    pub fn svd_flat_fn(self) -> Option<SvdFlatFn> {
+        match self {
+            Self::Jacobi => Some(truncated_svd_flat),
+            #[cfg(target_os = "macos")]
+            Self::AccelerateZgesdd => Some(crate::accelerate::accelerate_svd_flat),
+            #[cfg(not(target_os = "macos"))]
+            Self::AccelerateZgesdd => None,
+            Self::Custom => None,
+        }
+    }
+
+    /// Is this kernel available on the target being built?
+    pub fn is_available(self) -> bool {
+        self.svd_flat_fn().is_some()
+    }
+}
+
+/// The kernel the MPS backends install when the caller does not ask for one —
+/// Accelerate `zgesdd` on macOS, the Jacobi kernel everywhere else.
+///
+/// This `cfg` is the whole promotion. Accelerate is in the base macOS SDK, so
+/// there is no optional dependency to probe and no feature to opt into; a
+/// target check is the only availability question there is. Every non-macOS
+/// target keeps the Jacobi kernel bit for bit.
+pub const fn default_svd_kernel() -> SvdKernel {
+    #[cfg(target_os = "macos")]
+    {
+        SvdKernel::AccelerateZgesdd
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SvdKernel::Jacobi
+    }
+}
+
+/// The hook the MPS backends install by default.
+///
+/// Panics rather than falling back if [`default_svd_kernel`] ever names a
+/// kernel this target cannot build. A fallback here would turn "the promotion
+/// did not happen" into a silent 4-8x loss that still reports a sound
+/// certificate, which is the one failure mode nothing downstream can see.
+pub fn default_svd_flat_fn() -> SvdFlatFn {
+    default_svd_kernel()
+        .svd_flat_fn()
+        .expect("default_svd_kernel named a kernel this target cannot build")
+}
 
 /// A two-site-gate accelerator in the calling convention of [`Mps::apply_2q`]:
 /// given the adjacent `(left, right)` tensors, the 4×4 `gate`, the bond cap, and
@@ -66,11 +204,15 @@ pub type SvdFlatFn = fn(&[Complex64], usize, usize, usize, usize, f64) -> SvdRes
 pub type Contract2qFn =
     fn(&MpsTensor, &MpsTensor, &[Complex64; 16], usize, f64) -> Option<(MpsTensor, MpsTensor, f64)>;
 
-/// Matrix Product State for n qubits.
+/// Matrix Product State for n sites (qubits, or qudits of per-site dimension).
 #[derive(Clone)]
 pub struct Mps {
     pub tensors: Vec<MpsTensor>,
     pub n: usize,
+    /// Per-site physical dimension (`dims[q] == tensors[q].phys`). All 2 for
+    /// a qubit chain; mixed radix is allowed. A SWAP moves a site's dimension
+    /// along with its state, so the SWAP network keeps this in step.
+    pub dims: Vec<usize>,
     pub max_bond_dim: usize,
     /// Accumulated relative truncation error across every two-site split in the
     /// run so far: Σ over splits of (dropped Σσ² / total Σσ²). 0.0 means every
@@ -92,7 +234,7 @@ pub struct Mps {
     /// In **canonical gauge** each εᵢ is the true local discarded probability
     /// weight and this product is a genuine LOWER bound on the state fidelity.
     /// This MPS is deliberately not canonical (see the truncation comment in
-    /// `split_two_site`), so εᵢ is measured against the block norm rather than
+    /// [`Self::apply_2q_with_svd_flat`]), so εᵢ is measured against the block norm rather than
     /// the global one and the product is an ESTIMATE.
     ///
     /// Measured across 108 non-Clifford circuits with non-flat Schmidt spectra
@@ -139,17 +281,31 @@ pub(crate) fn normalize_expectation(value: Complex64, norm_sq: f64) -> f64 {
 }
 
 impl Mps {
-    /// Create |00...0> state as MPS with bond dimension 1.
+    /// Create |00...0> state as MPS with bond dimension 1 (all sites qubits).
     pub fn zero_state(n: usize, max_bond_dim: usize) -> Self {
+        Self::zero_state_dims(&vec![2; n], max_bond_dim)
+    }
+
+    /// Create |0...0> over sites of the given physical dimensions (mixed radix
+    /// allowed), bond dimension 1. Every dimension must be >= 2.
+    pub fn zero_state_dims(dims: &[usize], max_bond_dim: usize) -> Self {
+        for (q, &d) in dims.iter().enumerate() {
+            assert!(
+                d >= 2,
+                "site {q} has physical dimension {d}; every site needs d >= 2"
+            );
+        }
+        let n = dims.len();
         let mut tensors = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut t = MpsTensor::new(1, 1);
+        for &d in dims {
+            let mut t = MpsTensor::with_phys(1, d, 1);
             t.set(0, 0, 0, Complex64::new(1.0, 0.0)); // |0>
             tensors.push(t);
         }
         Self {
             tensors,
             n,
+            dims: dims.to_vec(),
             max_bond_dim,
             discarded_weight: 0.0,
             fidelity_estimate: 1.0,
@@ -158,6 +314,12 @@ impl Mps {
             svd_fn: truncated_svd_flat,
             contract_fn: None,
         }
+    }
+
+    /// True when every site is a qubit — the precondition for reading a
+    /// sampled outcome as a bit string (see [`Self::pack_bits`]).
+    pub fn is_qubit_only(&self) -> bool {
+        self.dims.iter().all(|&d| d == 2)
     }
 
     /// Enable adaptive truncation with relative singular-value threshold `eps`
@@ -180,19 +342,51 @@ impl Mps {
     }
 
     /// Apply a single-qubit gate (2x2 matrix) to qubit q.
+    ///
+    /// Qubit wrapper over [`Self::apply_1`]; refuses a site whose dimension is
+    /// not 2 instead of silently reading only its first two levels.
     pub fn apply_1q(&mut self, q: usize, gate: &[Complex64; 4]) {
+        assert_eq!(
+            self.dims[q], 2,
+            "apply_1q on site {q} of dimension {}: use apply_1",
+            self.dims[q]
+        );
+        self.apply_1(q, gate);
+    }
+
+    /// Apply a single-site gate to site `q`. `gate` is `d×d` row-major with
+    /// `d = self.dims[q]`: `new[l,s',r] = Σ_s gate[s'·d + s] · old[l,s,r]`.
+    pub fn apply_1(&mut self, q: usize, gate: &[Complex64]) {
+        let d = self.dims[q];
+        assert_eq!(
+            gate.len(),
+            d * d,
+            "apply_1: site {q} has dimension {d}, so the gate must be {d}x{d}"
+        );
+        let zero = Complex64::new(0.0, 0.0);
         let t = &self.tensors[q];
+        debug_assert_eq!(t.phys, d, "site {q}: tensor phys disagrees with dims");
         let bl = t.bond_left;
         let br = t.bond_right;
-        let mut new_data = vec![Complex64::new(0.0, 0.0); bl * 2 * br];
+        let mut new_data = vec![zero; bl * d * br];
+        let mut a = vec![zero; d];
 
         for l in 0..bl {
             for r in 0..br {
-                let a0 = t.get(l, 0, r);
-                let a1 = t.get(l, 1, r);
-                // new[l,s',r] = sum_s gate[s',s] * old[l,s,r]
-                new_data[l * 2 * br + r] = gate[0] * a0 + gate[1] * a1;
-                new_data[l * 2 * br + br + r] = gate[2] * a0 + gate[3] * a1;
+                for (s, a_s) in a.iter_mut().enumerate() {
+                    *a_s = t.get(l, s, r);
+                }
+                // new[l,s',r] = sum_s gate[s',s] * old[l,s,r], accumulated over
+                // s ascending and opening on the s = 0 product: for d = 2 this
+                // is exactly the qubit kernel's `g0*a0 + g1*a1`, bit for bit.
+                for out in 0..d {
+                    let row = &gate[out * d..(out + 1) * d];
+                    let mut v = row[0] * a[0];
+                    for (g, x) in row.iter().zip(a.iter()).skip(1) {
+                        v += *g * *x;
+                    }
+                    new_data[l * d * br + out * br + r] = v;
+                }
             }
         }
 
@@ -201,8 +395,47 @@ impl Mps {
 
     /// Apply a two-qubit gate (4x4 matrix) to adjacent qubits (q, q+1).
     /// Uses SVD to split the result back into two tensors, truncating to max_bond_dim.
+    ///
+    /// Qubit wrapper over [`Self::apply_2`]; refuses a non-qubit pair.
     pub fn apply_2q(&mut self, q: usize, gate: &[Complex64; 16]) {
         assert!(q + 1 < self.n, "q+1 out of range");
+        self.assert_qubit_pair(q, q + 1, "apply_2q");
+        self.apply_2(q, gate);
+    }
+
+    fn assert_qubit_pair(&self, a: usize, b: usize, what: &str) {
+        assert!(
+            self.dims[a] == 2 && self.dims[b] == 2,
+            "{what} on sites ({a}, {b}) of dimensions ({}, {}): use the slice API",
+            self.dims[a],
+            self.dims[b]
+        );
+    }
+
+    /// Apply a two-site gate to adjacent sites (q, q+1). `gate` is
+    /// `(d0·d1)×(d0·d1)` row-major, `d0 = dims[q]`, `d1 = dims[q+1]`, with the
+    /// combined index `s0·d1 + s1` (for qubits: `ss = s0*2 + s1`). Uses SVD to
+    /// split the result back into two tensors, truncating to max_bond_dim.
+    pub fn apply_2(&mut self, q: usize, gate: &[Complex64]) {
+        assert!(q + 1 < self.n, "q+1 out of range");
+        let out = (self.dims[q], self.dims[q + 1]);
+        self.apply_2_reshaping(q, gate, out);
+    }
+
+    /// [`Self::apply_2`] where the gate's OUTPUT pair has dimensions
+    /// `out = (e0, e1)` (with `e0·e1 = d0·d1`) — only the SWAP between sites of
+    /// different dimension needs `out ≠ (d0, d1)`. `self.dims` is updated.
+    fn apply_2_reshaping(&mut self, q: usize, gate: &[Complex64], out: (usize, usize)) {
+        assert!(q + 1 < self.n, "q+1 out of range");
+        let (d0, d1) = (self.dims[q], self.dims[q + 1]);
+        assert_eq!(
+            gate.len(),
+            (d0 * d1) * (d0 * d1),
+            "apply_2: sites ({q}, {}) have dimensions ({d0}, {d1}), so the gate must be \
+             {n}x{n}",
+            q + 1,
+            n = d0 * d1
+        );
 
         // Offer the whole contract-gate-SVD to an accelerator first (e.g. Metal
         // θ-contraction). It returns `Some` only when it actually ran; `None`
@@ -211,12 +444,17 @@ impl Mps {
         // FIXED rank and knows nothing about `adaptive_eps`, so skip it in
         // adaptive mode — otherwise `mps:auto` would silently fill the bond to
         // the ceiling on a GPU build. Correctness over GPU speed for auto mode.
-        if self.adaptive_eps.is_none() {
+        // The hook is a qubit kernel (`&[Complex64; 16]`): consulted only for a
+        // qubit pair that stays a qubit pair.
+        if d0 == 2 && d1 == 2 && out == (2, 2) && self.adaptive_eps.is_none() {
             if let Some(cf) = self.contract_fn {
+                let gate16: &[Complex64; 16] = gate
+                    .try_into()
+                    .expect("a qubit-pair gate has 16 entries (checked above)");
                 if let Some((nl, nr, rel_discarded)) = cf(
                     &self.tensors[q],
                     &self.tensors[q + 1],
-                    gate,
+                    gate16,
                     self.max_bond_dim,
                     1e-14,
                 ) {
@@ -232,67 +470,113 @@ impl Mps {
 
         // Route through the configured SVD provider (CPU by default, GPU
         // `gesvdj` when set via `set_svd_fn`). Read the fn pointer out first so
-        // the `&mut self` borrow in `apply_2q_with_svd_flat` doesn't conflict.
+        // the `&mut self` borrow in `apply_2_with_svd_flat` doesn't conflict.
         let svd_fn = self.svd_fn;
-        self.apply_2q_with_svd_flat(q, gate, |m, m_dim, n, stride, max_rank, threshold| {
-            svd_fn(m, m_dim, n, stride, max_rank, threshold)
-        });
+        self.apply_2_with_svd_flat_reshaping(
+            q,
+            gate,
+            out,
+            |m, m_dim, n, stride, max_rank, threshold| {
+                svd_fn(m, m_dim, n, stride, max_rank, threshold)
+            },
+        );
     }
 
     /// Apply a two-qubit gate with a caller-supplied flat-buffer SVD
-    /// function. The closure receives the contracted-and-gated `Θ'`
-    /// reshaped as a flat row-major matrix of shape `(bl*2) × (2*br)`
-    /// — no nested `Vec<Vec<_>>` allocation. The CUDA backend wires
-    /// `CudaSvdContext::truncated_svd_flat` in through this hook.
-    ///
-    /// Closure args: `(matrix, m, n, stride, max_rank, threshold)`,
-    /// where `matrix[i * stride + j]` is element `(i, j)`.
+    /// function. Qubit wrapper over [`Self::apply_2_with_svd_flat`].
     pub fn apply_2q_with_svd_flat<F>(&mut self, q: usize, gate: &[Complex64; 16], svd_fn: F)
     where
         F: FnOnce(&[Complex64], usize, usize, usize, usize, f64) -> SvdResultFlat,
     {
         assert!(q + 1 < self.n, "q+1 out of range");
+        self.assert_qubit_pair(q, q + 1, "apply_2q_with_svd_flat");
+        self.apply_2_with_svd_flat(q, gate, svd_fn);
+    }
+
+    /// Apply a two-site gate with a caller-supplied flat-buffer SVD
+    /// function. The closure receives the contracted-and-gated `Θ'`
+    /// reshaped as a flat row-major matrix of shape `(bl*d0) × (d1*br)`
+    /// — no nested `Vec<Vec<_>>` allocation. The CUDA backend wires
+    /// `CudaSvdContext::truncated_svd_flat` in through this hook.
+    ///
+    /// Closure args: `(matrix, m, n, stride, max_rank, threshold)`,
+    /// where `matrix[i * stride + j]` is element `(i, j)`.
+    pub fn apply_2_with_svd_flat<F>(&mut self, q: usize, gate: &[Complex64], svd_fn: F)
+    where
+        F: FnOnce(&[Complex64], usize, usize, usize, usize, f64) -> SvdResultFlat,
+    {
+        assert!(q + 1 < self.n, "q+1 out of range");
+        let out = (self.dims[q], self.dims[q + 1]);
+        self.apply_2_with_svd_flat_reshaping(q, gate, out, svd_fn);
+    }
+
+    fn apply_2_with_svd_flat_reshaping<F>(
+        &mut self,
+        q: usize,
+        gate: &[Complex64],
+        out: (usize, usize),
+        svd_fn: F,
+    ) where
+        F: FnOnce(&[Complex64], usize, usize, usize, usize, f64) -> SvdResultFlat,
+    {
+        assert!(q + 1 < self.n, "q+1 out of range");
+        let (d0, d1) = (self.dims[q], self.dims[q + 1]);
+        let (e0, e1) = out;
+        let din = d0 * d1;
+        assert_eq!(
+            e0 * e1,
+            din,
+            "output pair ({e0}, {e1}) cannot hold ({d0}, {d1})"
+        );
+        assert_eq!(gate.len(), din * din, "two-site gate must be {din}x{din}");
 
         let tl = &self.tensors[q];
         let tr = &self.tensors[q + 1];
+        debug_assert_eq!(tl.phys, d0, "site {q}: tensor phys disagrees with dims");
+        debug_assert_eq!(
+            tr.phys,
+            d1,
+            "site {}: tensor phys disagrees with dims",
+            q + 1
+        );
         let bl = tl.bond_left;
         let bm = tl.bond_right; // = tr.bond_left
         let br = tr.bond_right;
 
-        // The matrix layout the SVD consumes is `(bl*2) × (2*br)`
+        // The matrix layout the SVD consumes is `(bl*e0) × (e1*br)`
         // row-major. Equivalently — and this is the key for the
         // flat-buffer refactor — that's the *same* memory layout as
-        // `Theta'[l, s0, s1, r]` with strides `(4*br, 2*br, br, 1)`:
+        // `Theta'[l, s0, s1, r]` with strides `(e0*e1*br, e1*br, br, 1)`:
         //
         //   Theta'[l, s0, s1, r]
-        //     = matrix[l*2 + s0][s1*br + r]
-        //     = matrix_flat[(l*2 + s0) * (2*br) + s1*br + r]
-        //     = matrix_flat[l*4*br + s0*2*br + s1*br + r]
+        //     = matrix[l*e0 + s0][s1*br + r]
+        //     = matrix_flat[(l*e0 + s0) * (e1*br) + s1*br + r]
         //
         // So we build Theta' directly as the SVD's input buffer and
-        // skip the host-side reshape that the old API needed.
+        // skip the host-side reshape that the old API needed. (For qubits
+        // e0 = e1 = d0 = d1 = 2 and every index below is the old one.)
 
         // Step 1: Contract two sites into Theta[l, s0, s1, r].
         //
         // Parallel over `l` (one output block per left-bond value), inner sum
         // untouched — each element's summation order is exactly the serial
-        // loop's, so the result is BIT-IDENTICAL at any thread count. O(4χ³)
+        // loop's, so the result is BIT-IDENTICAL at any thread count. O(d²χ³)
         // work; secondary to the SVD but no longer negligible once the SVD is
         // parallel too (Amdahl).
         use rayon::prelude::*;
-        let mut theta = vec![Complex64::new(0.0, 0.0); bl * 4 * br];
+        let mut theta = vec![Complex64::new(0.0, 0.0); bl * din * br];
         theta
-            .par_chunks_mut(4 * br)
+            .par_chunks_mut(din * br)
             .enumerate()
             .for_each(|(l, block)| {
-                for s0 in 0..2 {
-                    for s1 in 0..2 {
+                for s0 in 0..d0 {
+                    for s1 in 0..d1 {
                         for r in 0..br {
                             let mut val = Complex64::new(0.0, 0.0);
                             for m in 0..bm {
                                 val += tl.get(l, s0, m) * tr.get(m, s1, r);
                             }
-                            block[s0 * 2 * br + s1 * br + r] = val;
+                            block[s0 * d1 * br + s1 * br + r] = val;
                         }
                     }
                 }
@@ -300,23 +584,22 @@ impl Mps {
 
         // Step 2: Apply gate to physical indices. We write directly
         // into the row-major matrix layout consumed by Step 3 (SVD).
-        // Note that `Theta'[l, s_out, r] = matrix_flat[(l*2+s0_out)*(2*br) + s1_out*br + r]`
-        // is the same flat layout as `Theta[l, s_in, r]` indexed by
-        // `(l*2+s0_in)*(2*br) + s1_in*br + r`, so the two share an
-        // identical stride pattern — only the gate row index differs.
-        let cols = 2 * br;
-        let mut matrix_flat = vec![Complex64::new(0.0, 0.0); bl * 4 * br];
+        // `Theta[l, ss_in, r]` sits at `l*din*br + ss_in*br + r` with
+        // `ss_in = s0*d1 + s1`; the output index splits as
+        // `ss_out = s0_out*e1 + s1_out`.
+        let cols = e1 * br;
+        let mut matrix_flat = vec![Complex64::new(0.0, 0.0); bl * din * br];
         for l in 0..bl {
-            let theta_base = l * 4 * br;
-            let mat_base = l * 2 * cols;
+            let theta_base = l * din * br;
+            let mat_base = l * e0 * cols;
             for r in 0..br {
-                for ss_out in 0..4 {
+                for ss_out in 0..din {
                     let mut val = Complex64::new(0.0, 0.0);
-                    for ss_in in 0..4 {
-                        val += gate[ss_out * 4 + ss_in] * theta[theta_base + ss_in * br + r];
+                    for ss_in in 0..din {
+                        val += gate[ss_out * din + ss_in] * theta[theta_base + ss_in * br + r];
                     }
-                    let s0_out = ss_out >> 1;
-                    let s1_out = ss_out & 1;
+                    let s0_out = ss_out / e1;
+                    let s1_out = ss_out % e1;
                     matrix_flat[mat_base + s0_out * cols + s1_out * br + r] = val;
                 }
             }
@@ -326,8 +609,9 @@ impl Mps {
         // Step 3: SVD and truncate (CPU or GPU via the injected fn). The
         // total two-site weight is Σσ²_kept + discarded_weight — with the
         // orthonormal-by-construction kernel that also equals ‖Θ'‖²_F, the
-        // pre-SVD Frobenius norm.
-        let rows = bl * 2;
+        // pre-SVD Frobenius norm. Nothing below mentions the physical
+        // dimension: the certificate is the same quantity for any d.
+        let rows = bl * e0;
         let total: f64 = matrix_flat.iter().map(|z| z.norm_sqr()).sum();
         let mut svd = svd_fn(&matrix_flat, rows, cols, cols, self.max_bond_dim, 1e-14);
         // Adaptive truncation: the kernel returns the kept σ sorted descending
@@ -395,23 +679,23 @@ impl Mps {
         self.max_bond_reached = self.max_bond_reached.max(new_bm);
 
         // Step 4: Build new tensors directly from flat U / Vt buffers.
-        // A[l, s0, m] = U[(l*2+s0) * new_bm + m] * sqrt(S[m])
+        // A[l, s0, m] = U[(l*e0+s0) * new_bm + m] * sqrt(S[m])
         // B[m, s1, r] = sqrt(S[m]) * Vt[m * cols + s1*br + r]
-        let mut new_tl = MpsTensor::new(bl, new_bm);
-        let mut new_tr = MpsTensor::new(new_bm, br);
+        let mut new_tl = MpsTensor::with_phys(bl, e0, new_bm);
+        let mut new_tr = MpsTensor::with_phys(new_bm, e1, br);
 
         for l in 0..bl {
-            for s0 in 0..2 {
+            for s0 in 0..e0 {
                 for m in 0..new_bm {
                     let sqrt_s = svd.s[m].sqrt();
-                    new_tl.set(l, s0, m, svd.u[(l * 2 + s0) * new_bm + m] * sqrt_s);
+                    new_tl.set(l, s0, m, svd.u[(l * e0 + s0) * new_bm + m] * sqrt_s);
                 }
             }
         }
 
         for m in 0..new_bm {
             let sqrt_s = svd.s[m].sqrt();
-            for s1 in 0..2 {
+            for s1 in 0..e1 {
                 for r in 0..br {
                     new_tr.set(m, s1, r, sqrt_s * svd.vt[m * cols + s1 * br + r]);
                 }
@@ -420,73 +704,99 @@ impl Mps {
 
         self.tensors[q] = new_tl;
         self.tensors[q + 1] = new_tr;
+        self.dims[q] = e0;
+        self.dims[q + 1] = e1;
     }
 
-    /// Apply a two-qubit gate to non-adjacent qubits by SWAPping to make them adjacent.
+    /// Apply a two-qubit gate to non-adjacent qubits by SWAPping to make them
+    /// adjacent. Qubit wrapper over [`Self::apply_2_distant`].
     pub fn apply_2q_distant(&mut self, q0: usize, q1: usize, gate: &[Complex64; 16]) {
+        self.assert_qubit_pair(q0, q1, "apply_2q_distant");
+        self.apply_2_distant(q0, q1, gate);
+    }
+
+    /// Apply a two-site gate to sites `(q0, q1)` in any order and at any
+    /// distance, SWAPping `min(q0,q1)` next to `max(q0,q1)` and back. `gate` is
+    /// `(d0·d1)×(d0·d1)` with `d0 = dims[q0]`, `d1 = dims[q1]` and combined
+    /// index `s0·d1 + s1` where `s0` is `q0`'s level. The SWAPs carry each
+    /// site's dimension with its state, and the reverse SWAPs restore `dims`.
+    pub fn apply_2_distant(&mut self, q0: usize, q1: usize, gate: &[Complex64]) {
+        assert_ne!(q0, q1, "a two-site gate needs two distinct sites");
+        let (d0, d1) = (self.dims[q0], self.dims[q1]);
+        assert_eq!(
+            gate.len(),
+            (d0 * d1) * (d0 * d1),
+            "apply_2_distant: sites ({q0}, {q1}) have dimensions ({d0}, {d1}), so the gate \
+             must be {n}x{n}",
+            n = d0 * d1
+        );
         let (qa, qb) = if q0 < q1 { (q0, q1) } else { (q1, q0) };
+
+        // In chain order the pair is (qa, qb); re-index the gate when the
+        // caller named them the other way round.
+        let reoriented;
+        let oriented: &[Complex64] = if q0 < q1 {
+            gate
+        } else {
+            reoriented = reorient_pair_gate(gate, d0, d1);
+            &reoriented
+        };
 
         if qb - qa == 1 {
             // Already adjacent
-            if q0 < q1 {
-                self.apply_2q(qa, gate);
-            } else {
-                // Need to swap qubit indices in the gate
-                let mut swapped = *gate;
-                // Swap rows 1,2 and cols 1,2
-                for col in 0..4 {
-                    swapped.swap(4 + col, 2 * 4 + col);
-                }
-                for row in 0..4 {
-                    swapped.swap(row * 4 + 1, row * 4 + 2);
-                }
-                self.apply_2q(qa, &swapped);
-            }
+            self.apply_2(qa, oriented);
             return;
         }
 
         // SWAP chain: move qa next to qb
-        let swap_gate = swap_matrix();
         for i in qa..qb - 1 {
-            self.apply_2q(i, &swap_gate);
+            self.swap_adjacent(i);
         }
         // Apply gate to (qb-1, qb)
-        if q0 < q1 {
-            self.apply_2q(qb - 1, gate);
-        } else {
-            let mut swapped = *gate;
-            for col in 0..4 {
-                swapped.swap(4 + col, 2 * 4 + col);
-            }
-            for row in 0..4 {
-                swapped.swap(row * 4 + 1, row * 4 + 2);
-            }
-            self.apply_2q(qb - 1, &swapped);
-        }
+        self.apply_2(qb - 1, oriented);
         // SWAP back
         for i in (qa..qb - 1).rev() {
-            self.apply_2q(i, &swap_gate);
+            self.swap_adjacent(i);
+        }
+    }
+
+    /// SWAP the states of adjacent sites `(i, i+1)`, their dimensions with
+    /// them. A qubit pair goes through the exact qubit SWAP (and so through the
+    /// accelerator hook, as before).
+    fn swap_adjacent(&mut self, i: usize) {
+        let (da, db) = (self.dims[i], self.dims[i + 1]);
+        if da == 2 && db == 2 {
+            let s = swap_matrix();
+            self.apply_2(i, &s);
+        } else {
+            let s = swap_matrix_dims(da, db);
+            self.apply_2_reshaping(i, &s, (db, da));
         }
     }
 
     /// Compute the full statevector by contracting all tensors.
     /// Only feasible for small n (testing).
     pub fn to_statevector(&self) -> Vec<Complex64> {
-        let dim = 1usize << self.n;
+        // Mixed radix, site 0 the least-significant digit: for an all-qubit
+        // chain `digit(q) = (basis >> q) & 1` exactly as before.
+        let dim: usize = self.dims.iter().product();
         let mut sv = vec![Complex64::new(0.0, 0.0); dim];
 
         for basis in 0..dim {
-            // For each tensor, the physical index is the bit of `basis`
+            // For each tensor, the physical index is the q-th digit of `basis`
             let mut left_vec = vec![Complex64::new(1.0, 0.0)]; // 1x1 initial
+            let mut rem = basis;
 
             for q in 0..self.n {
-                let bit = (basis >> q) & 1;
+                let d = self.dims[q];
+                let digit = rem % d;
+                rem /= d;
                 let t = &self.tensors[q];
                 let mut new_left = vec![Complex64::new(0.0, 0.0); t.bond_right];
                 for r in 0..t.bond_right {
                     let mut sum = Complex64::new(0.0, 0.0);
                     for l in 0..t.bond_left {
-                        sum += left_vec[l] * t.get(l, bit, r);
+                        sum += left_vec[l] * t.get(l, digit, r);
                     }
                     new_left[r] = sum;
                 }
@@ -527,19 +837,23 @@ impl Mps {
     /// ⟨ψ|O|ψ⟩ for a **product operator** `O = ⊗_q O_q`, contracted straight
     /// through the tensors — never through a dense statevector.
     ///
-    /// `site_ops[q]` is site `q`'s 2×2 operator, row-major `[m00, m01, m10,
-    /// m11]`, in the same physical basis [`Self::to_statevector`] uses: bit `q`
-    /// of the basis index is site `q`'s physical index.
+    /// `site_ops[q]` is site `q`'s `d×d` operator (`d = self.dims[q]`),
+    /// row-major — for a qubit `[m00, m01, m10, m11]` — in the same physical
+    /// basis [`Self::to_statevector`] uses: digit `q` of the (mixed-radix)
+    /// basis index is site `q`'s physical index. Any slice-like container
+    /// works (`[Complex64; 4]` for a qubit chain, `Vec<Complex64>` for a
+    /// mixed one).
     ///
     /// # Identity sites must still be passed
     ///
     /// `site_ops` has length `self.n`, and a site outside the operator's
-    /// support is passed as an explicit `[1,0,0,1]` rather than skipped. That
+    /// support is passed as an explicit identity (`[1,0,0,1]` on a qubit, the
+    /// `d×d` identity on a qudit) rather than skipped. That
     /// is not a convenience of the signature — it is required. Skipping the
     /// sites outside the support is valid **only in canonical gauge**, where
     /// the untouched chain contracts to the identity. This MPS is deliberately
     /// not canonical (see [`Self::fidelity_estimate`] and the truncation note
-    /// in `split_two_site`), so every site contributes its gauge and the sweep
+    /// in [`Self::apply_2q_with_svd_flat`]), so every site contributes its gauge and the sweep
     /// must cross all of them. This is the same assumption whose violation
     /// biased sampled counts until [`Self::right_environments`] replaced it.
     ///
@@ -558,29 +872,40 @@ impl Mps {
     ///
     /// The returned value is **unnormalized** — see
     /// [`Self::expectation_product`].
-    pub fn contract_product_operator(&self, site_ops: &[[Complex64; 4]]) -> Complex64 {
+    pub fn contract_product_operator<O: AsRef<[Complex64]>>(&self, site_ops: &[O]) -> Complex64 {
         assert_eq!(
             site_ops.len(),
             self.n,
-            "contract_product_operator needs one 2x2 operator per site, \
+            "contract_product_operator needs one d x d operator per site, \
              identities included"
         );
+        let ops: Vec<&[Complex64]> = site_ops.iter().map(|o| o.as_ref()).collect();
+        self.contract_site_operators(&ops)
+    }
+
+    /// The sweep behind [`Self::contract_product_operator`]: `site_ops[q]` is
+    /// site `q`'s `d×d` operator (`d = self.dims[q]`), row-major. Same loop
+    /// nest and summation order as the qubit sweep, with `0..2` replaced by
+    /// `0..d`, so an all-qubit chain gives the identical value.
+    fn contract_site_operators(&self, site_ops: &[&[Complex64]]) -> Complex64 {
+        assert_eq!(site_ops.len(), self.n, "one operator per site");
         let zero = Complex64::new(0.0, 0.0);
         // L[l, l'] over (ket bond, bra bond). Site 0 has bond_left == 1, so the
         // sweep opens on the 1x1 scalar 1.
         let mut left = vec![Complex64::new(1.0, 0.0)];
         for q in 0..self.n {
             let t = &self.tensors[q];
-            let (bl, br) = (t.bond_left, t.bond_right);
-            let o = &site_ops[q];
+            let (bl, br, d) = (t.bond_left, t.bond_right, t.phys);
+            let o = site_ops[q];
+            assert_eq!(o.len(), d * d, "site {q}: operator must be {d}x{d}");
 
             // tmp[l', s, r] = Σ_l L[l,l'] · A[l,s,r]      — O(χ³)
-            let mut tmp = vec![zero; bl * 2 * br];
+            let mut tmp = vec![zero; bl * d * br];
             for l in 0..bl {
                 for lp in 0..bl {
                     let c = left[l * bl + lp];
-                    for s in 0..2 {
-                        let base = (lp * 2 + s) * br;
+                    for s in 0..d {
+                        let base = (lp * d + s) * br;
                         for r in 0..br {
                             tmp[base + r] += c * t.get(l, s, r);
                         }
@@ -589,16 +914,16 @@ impl Mps {
             }
 
             // u[l', s', r] = Σ_s O[s',s] · tmp[l', s, r]  — O(χ²), and written
-            // densely over all four entries on purpose: branching past a zero
+            // densely over all entries on purpose: branching past a zero
             // operator entry would make the result depend on the sign of a zero
             // amplitude for some inputs and not others.
-            let mut u = vec![zero; bl * 2 * br];
+            let mut u = vec![zero; bl * d * br];
             for lp in 0..bl {
-                for sp in 0..2 {
-                    for s in 0..2 {
-                        let coeff = o[sp * 2 + s];
-                        let src = (lp * 2 + s) * br;
-                        let dst = (lp * 2 + sp) * br;
+                for sp in 0..d {
+                    for s in 0..d {
+                        let coeff = o[sp * d + s];
+                        let src = (lp * d + s) * br;
+                        let dst = (lp * d + sp) * br;
                         for r in 0..br {
                             u[dst + r] += coeff * tmp[src + r];
                         }
@@ -609,8 +934,8 @@ impl Mps {
             // L'[r, r'] = Σ_{l',s'} u[l',s',r] · conj(A[l',s',r'])  — O(χ³)
             let mut next = vec![zero; br * br];
             for lp in 0..bl {
-                for sp in 0..2 {
-                    let src = (lp * 2 + sp) * br;
+                for sp in 0..d {
+                    let src = (lp * d + sp) * br;
                     for r in 0..br {
                         let uv = u[src + r];
                         for rp in 0..br {
@@ -653,9 +978,10 @@ impl Mps {
     /// information, and `0.0` is the honest answer where the dense path's is an
     /// artefact of the amplitudes that happened to survive.
     ///
-    /// Only the real part is returned: a Pauli string is Hermitian, so the
-    /// imaginary part is zero up to rounding.
-    pub fn expectation_product(&self, site_ops: &[[Complex64; 4]]) -> f64 {
+    /// Only the real part is returned: a Pauli string (or any Hermitian
+    /// product) has a real expectation, so the imaginary part is zero up to
+    /// rounding.
+    pub fn expectation_product<O: AsRef<[Complex64]>>(&self, site_ops: &[O]) -> f64 {
         normalize_expectation(
             self.contract_product_operator(site_ops),
             self.state_norm_sqr_contracted(),
@@ -672,13 +998,22 @@ impl Mps {
     /// once (`O(n · χ²)`). This sweep keeps one, so an expectation stays
     /// `O(χ²)` in memory end to end, which is the point of the whole item.
     pub fn state_norm_sqr_contracted(&self) -> f64 {
-        let ident = [
-            Complex64::new(1.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(0.0, 0.0),
-            Complex64::new(1.0, 0.0),
-        ];
-        self.contract_product_operator(&vec![ident; self.n]).re
+        // Per-site d×d identity. For an all-qubit chain these are exactly the
+        // `[1,0,0,1]` operators the qubit sweep always used, so the value is
+        // unchanged bit for bit.
+        let idents: Vec<Vec<Complex64>> = self
+            .dims
+            .iter()
+            .map(|&d| {
+                let mut m = vec![Complex64::new(0.0, 0.0); d * d];
+                for s in 0..d {
+                    m[s * d + s] = Complex64::new(1.0, 0.0);
+                }
+                m
+            })
+            .collect();
+        let ops: Vec<&[Complex64]> = idents.iter().map(|m| m.as_slice()).collect();
+        self.contract_site_operators(&ops).re
     }
 
     /// Right-environment matrices for exact sequential sampling.
@@ -703,7 +1038,7 @@ impl Mps {
             let (bl, br) = (t.bond_left, t.bond_right);
             let e_next = &envs[q + 1];
             let mut e = vec![zero; bl * bl];
-            for s in 0..2 {
+            for s in 0..t.phys {
                 // tmp[l, r'] = Σ_r A[l,s,r] · E_{q+1}[r,r']
                 let mut tmp = vec![zero; bl * br];
                 for l in 0..bl {
@@ -786,17 +1121,31 @@ impl Mps {
     /// 64-site ceiling, which is the point of the whole exercise — a 1024-qubit
     /// chain has a perfectly well-defined shot outcome and only the key type
     /// ever prevented reporting it.
+    ///
+    /// # A bit packer, not a digit packer
+    ///
+    /// [`Self::sample_bits_with_envs_into`] writes one DIGIT per site, and on
+    /// a qudit site that digit can be `>= 2`. Every digit that lands in the
+    /// key must be a bit: a `2` packed into a bit string is a silent lie
+    /// (it would be read as `0` or as `1` depending on the masking), so it is
+    /// refused by assertion. A site the projection drops never enters the key
+    /// and is not checked.
     pub fn pack_outcome(
         bits: &[u8],
         cbit_of: Option<&[Option<u32>]>,
         width: u32,
     ) -> omega_core::outcome::Outcome {
         match cbit_of {
-            None => omega_core::outcome::Outcome::from_bits(&bits[..width as usize]),
+            None => {
+                let packed = &bits[..width as usize];
+                assert_bits(packed, "pack_outcome");
+                omega_core::outcome::Outcome::from_bits(packed)
+            }
             Some(map) => {
                 let mut o = omega_core::outcome::Outcome::zeros(width);
                 for (q, bit) in bits.iter().enumerate() {
                     if let Some(Some(c)) = map.get(q) {
+                        assert_bits(std::slice::from_ref(bit), "pack_outcome");
                         o.set_bit(*c, *bit);
                     }
                 }
@@ -810,22 +1159,31 @@ impl Mps {
     /// `cbit_of` is `Some` when the key is the CLASSICAL register: each site
     /// lands at its classical index, and an unmeasured site is dropped. `None`
     /// keys on the qubit register, which is only representable below 64 sites.
+    ///
+    /// Like [`Self::pack_outcome`], a BIT packer: every digit that lands in
+    /// the key must be `< 2`, and a qudit digit `>= 2` is refused by assertion
+    /// rather than masked into a bit.
     pub fn pack_bits(bits: &[u8], cbit_of: Option<&[Option<u32>]>) -> u64 {
         let mut result = 0u64;
         for (q, bit) in bits.iter().enumerate() {
             match cbit_of {
                 Some(map) => {
                     if let Some(Some(c)) = map.get(q) {
+                        assert_bits(std::slice::from_ref(bit), "pack_bits");
                         result |= ((*bit & 1) as u64) << *c;
                     }
                 }
-                None => result |= ((*bit & 1) as u64) << q,
+                None => {
+                    assert_bits(std::slice::from_ref(bit), "pack_bits");
+                    result |= ((*bit & 1) as u64) << q;
+                }
             }
         }
         result
     }
 
-    /// Sample a shot, writing **one bit per site** into `out`.
+    /// Sample a shot, writing **one digit per site** into `out`: `out[q]` is
+    /// site `q`'s level, `0 <= out[q] < dims[q]` (a bit on a qubit site).
     ///
     /// Every site must be drawn even when it is not reported, because each
     /// outcome conditions the ones after it — so the projection can only narrow
@@ -838,6 +1196,14 @@ impl Mps {
     ///
     /// `out` is reused across shots; the sampling loop is hot and this keeps it
     /// to one allocation per run rather than one per shot.
+    ///
+    /// # The draw, and why `d = 2` is unchanged bit for bit
+    ///
+    /// One uniform `u` per site, and only when the branch weights are not all
+    /// zero; the level is the first `k` with `u < (p_0 + … + p_k) / total`,
+    /// the last level otherwise. At `d = 2` that is exactly the old
+    /// `u < p_0 / total ? 0 : 1` — the same comparison on the same operands,
+    /// the same RNG consumption — so a qubit chain draws the same stream.
     pub fn sample_bits_with_envs_into(
         &self,
         envs: &[Vec<Complex64>],
@@ -850,46 +1216,51 @@ impl Mps {
         let mut left_vec = vec![Complex64::new(1.0, 0.0)];
         // Scratch buffers recycled across sites (and, via the swap below,
         // with left_vec): this loop runs shots × n times, so per-site
-        // allocations dominate otherwise.
-        let mut w = [Vec::new(), Vec::new()];
+        // allocations dominate otherwise. One branch vector per level.
+        let dmax = self.dims.iter().copied().max().unwrap_or(2);
+        let mut w: Vec<Vec<Complex64>> = vec![Vec::new(); dmax];
+        let mut p = vec![0.0f64; dmax];
 
         for q in 0..self.n {
             let t = &self.tensors[q];
-            let (bl, br) = (t.bond_left, t.bond_right);
+            let (bl, br, d) = (t.bond_left, t.bond_right, t.phys);
             let e_next = &envs[q + 1];
 
             // w_s[r] = Σ_l v[l] A[l,s,r];  p_s = Re(w_s E_{q+1} w_s†) ≥ 0.
-            let mut p = [0.0f64; 2];
-            for (bit, (w_bit, p_bit)) in w.iter_mut().zip(p.iter_mut()).enumerate() {
-                w_bit.clear();
-                w_bit.resize(br, zero);
-                for (r, w_r) in w_bit.iter_mut().enumerate() {
+            for (level, (w_s, p_s)) in w.iter_mut().zip(p.iter_mut()).take(d).enumerate() {
+                w_s.clear();
+                w_s.resize(br, zero);
+                for (r, w_r) in w_s.iter_mut().enumerate() {
                     for l in 0..bl {
-                        *w_r += left_vec[l] * t.get(l, bit, r);
+                        *w_r += left_vec[l] * t.get(l, level, r);
                     }
                 }
                 let mut prob = zero;
                 for r in 0..br {
                     for rp in 0..br {
-                        prob += w_bit[r] * e_next[r * br + rp] * w_bit[rp].conj();
+                        prob += w_s[r] * e_next[r * br + rp] * w_s[rp].conj();
                     }
                 }
-                *p_bit = prob.re.max(0.0);
+                *p_s = prob.re.max(0.0);
             }
 
-            let total = p[0] + p[1];
-            let bit = if total > 0.0 && rng.random::<f64>() < p[0] / total {
-                0usize
+            // Summed left to right: for d = 2 this is `p[0] + p[1]`.
+            let mut total = p[0];
+            for &pk in &p[1..d] {
+                total += pk;
+            }
+            let digit = if total > 0.0 {
+                pick_level(rng.random::<f64>(), &p[..d], total)
             } else {
-                1usize
+                d - 1
             };
-            out[q] = bit as u8;
+            out[q] = digit as u8;
 
             // Condition on the outcome; rescale so the running prefix
             // stays O(1) (only probability *ratios* matter downstream).
-            let norm = p[bit].sqrt();
+            let norm = p[digit].sqrt();
             let inv = if norm > 0.0 { 1.0 / norm } else { 1.0 };
-            std::mem::swap(&mut left_vec, &mut w[bit]);
+            std::mem::swap(&mut left_vec, &mut w[digit]);
             for v in &mut left_vec {
                 *v *= inv;
             }
@@ -908,7 +1279,7 @@ impl Mps {
             let t = &self.tensors[k];
             let (bl, br) = (t.bond_left, t.bond_right);
             let mut next = vec![zero; br * br];
-            for s in 0..2 {
+            for s in 0..t.phys {
                 // u[l', r] = Σ_l L[l,l'] · A[l,s,r]
                 let mut u = vec![zero; bl * br];
                 for l in 0..bl {
@@ -934,15 +1305,20 @@ impl Mps {
         env
     }
 
-    /// Mid-circuit projective measurement of a single qubit.
-    /// Computes P(q=0), samples outcome, projects the local tensor,
-    /// and renormalizes. Returns the measurement outcome (0 or 1).
+    /// Mid-circuit projective measurement of a single site.
+    /// Computes the outcome probabilities, samples a level, projects the local
+    /// tensor, and renormalizes. Returns the measured DIGIT (`0..dims[q]`; 0
+    /// or 1 on a qubit).
     ///
     /// The outcome probabilities contract the full state — left environment,
     /// local tensor, right environment — because local tensor norms are only
     /// the true marginals when the chain is canonical around site q, which
     /// plain-SVD gate splits do not maintain (same mechanism as the sampling
     /// fix in [`Mps::sample_with_envs`]).
+    ///
+    /// At `d = 2` the draw is the old one exactly: one uniform `u`, always
+    /// consumed; outcome 0 iff `u < p_0 / total` (or `u < 0.5` on a zero-norm
+    /// site, since `(0 + 1) / 2 == 0.5`).
     pub fn measure_site(&mut self, q: usize, rng: &mut impl rand::Rng) -> u8 {
         let left = self.left_environment(q);
         let right = self.right_environments();
@@ -950,11 +1326,12 @@ impl Mps {
         let t = &self.tensors[q];
         let bl = t.bond_left;
         let br = t.bond_right;
+        let d = t.phys;
         let zero = Complex64::new(0.0, 0.0);
 
         // p(b) = Σ_{l,l',r,r'} L[l,l'] A[l,b,r] E[r,r'] conj(A[l',b,r'])
-        let mut norm_sq = [0.0_f64; 2];
-        for (phys, p_bit) in norm_sq.iter_mut().enumerate() {
+        let mut norm_sq = vec![0.0_f64; d];
+        for (phys, p_level) in norm_sq.iter_mut().enumerate() {
             // m[l, r'] = Σ_r A[l,b,r] · E[r,r']
             let mut m = vec![zero; bl * br];
             for l in 0..bl {
@@ -975,21 +1352,32 @@ impl Mps {
                     p += left[l * bl + lp] * g;
                 }
             }
-            *p_bit = p.re.max(0.0);
+            *p_level = p.re.max(0.0);
         }
 
-        let total = norm_sq[0] + norm_sq[1];
-        let p0 = if total > 0.0 { norm_sq[0] / total } else { 0.5 };
-        let outcome: u8 = if rng.random::<f64>() < p0 { 0 } else { 1 };
+        // Summed left to right: for d = 2 this is `norm_sq[0] + norm_sq[1]`.
+        let mut total = norm_sq[0];
+        for &pk in &norm_sq[1..] {
+            total += pk;
+        }
+        let u = rng.random::<f64>();
+        let outcome = if total > 0.0 {
+            pick_level(u, &norm_sq, total)
+        } else {
+            // Degenerate site: uniform over the levels (0.5 at d = 2).
+            (0..d)
+                .find(|&k| u < (k + 1) as f64 / d as f64)
+                .unwrap_or(d - 1)
+        };
 
-        // Project: zero out the other physical dimension and renormalize
-        let norm = norm_sq[outcome as usize].sqrt();
+        // Project: zero out the other levels and renormalize
+        let norm = norm_sq[outcome].sqrt();
         let inv_norm = if norm > 0.0 { 1.0 / norm } else { 1.0 };
 
-        let new_data: Vec<Complex64> = (0..bl * 2 * br)
+        let new_data: Vec<Complex64> = (0..bl * d * br)
             .map(|idx| {
-                let phys = (idx / br) % 2;
-                if phys == outcome as usize {
+                let phys = (idx / br) % d;
+                if phys == outcome {
                     self.tensors[q].data[idx] * inv_norm
                 } else {
                     Complex64::new(0.0, 0.0)
@@ -998,7 +1386,33 @@ impl Mps {
             .collect();
         self.tensors[q].data = new_data;
 
-        outcome
+        outcome as u8
+    }
+}
+
+/// The level a uniform draw `u` selects from unnormalised weights `p` summing
+/// to `total > 0`: the first `k` with `u < (p_0 + … + p_k) / total`, the last
+/// level if rounding leaves `u` above every partial sum. At `d = 2` the only
+/// comparison is `u < p_0 / total`, the old qubit draw verbatim.
+fn pick_level(u: f64, p: &[f64], total: f64) -> usize {
+    let d = p.len();
+    let mut cum = 0.0;
+    for (k, &pk) in p.iter().enumerate().take(d - 1) {
+        cum = if k == 0 { pk } else { cum + pk };
+        if u < cum / total {
+            return k;
+        }
+    }
+    d - 1
+}
+
+/// Refuse a digit `>= 2` on its way into a bit-string key.
+fn assert_bits(digits: &[u8], what: &str) {
+    if let Some(bad) = digits.iter().find(|&&b| b >= 2) {
+        panic!(
+            "{what}: digit {bad} is not a bit — a qudit outcome packed into a bit-string \
+             key would be a silent lie (d = 2 sites only)"
+        );
     }
 }
 
@@ -1011,6 +1425,41 @@ fn swap_matrix() -> [Complex64; 16] {
         o, i, o, o, // |10> -> |01>
         o, o, o, i, // |11> -> |11>
     ]
+}
+
+/// The `(da·db)²` SWAP between adjacent sites of dimensions `(da, db)`:
+/// `|a, b⟩ → |b, a⟩`, row-major, input combined index `a·db + b` and output
+/// combined index `b·da + a` (the output pair has dimensions `(db, da)`). For
+/// `da = db = 2` it is [`swap_matrix`] entry for entry.
+fn swap_matrix_dims(da: usize, db: usize) -> Vec<Complex64> {
+    let n = da * db;
+    let mut m = vec![Complex64::new(0.0, 0.0); n * n];
+    for a in 0..da {
+        for b in 0..db {
+            m[(b * da + a) * n + (a * db + b)] = Complex64::new(1.0, 0.0);
+        }
+    }
+    m
+}
+
+/// Re-orient a two-site gate from the pair `(q0, q1)` to `(q1, q0)`:
+/// `G'[(s1·d0+s0), (t1·d0+t0)] = G[(s0·d1+s1), (t0·d1+t1)]`, `d0 = dim(q0)`,
+/// `d1 = dim(q1)`. Pure data movement; for `d0 = d1 = 2` it is exactly the old
+/// qubit kernel's "swap rows 1,2 and cols 1,2".
+fn reorient_pair_gate(gate: &[Complex64], d0: usize, d1: usize) -> Vec<Complex64> {
+    let n = d0 * d1;
+    let mut out = vec![Complex64::new(0.0, 0.0); n * n];
+    for s0 in 0..d0 {
+        for s1 in 0..d1 {
+            for t0 in 0..d0 {
+                for t1 in 0..d1 {
+                    out[(s1 * d0 + s0) * n + (t1 * d0 + t0)] =
+                        gate[(s0 * d1 + s1) * n + (t0 * d1 + t1)];
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

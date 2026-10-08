@@ -1,0 +1,24 @@
+[package]
+name = "omega-backend-sector"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Exact fixed-particle-number (Hamming-weight) sector backend for the omega runtime — PLAN-OPEN-20260825 §3c T2."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+# The gate MATRICES come from the statevector backend's `gates` module, so
+# the two engines agree on every convention by construction (Rbs sign, CU3
+# phases, CRz halves, Gate2Q index order). The sector backend never calls the
+# statevector's apply path.
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+num-complex = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+smallvec = { workspace = true }

@@ -31,6 +31,12 @@ omega-backend-statevector = { path = "../omega-backend-statevector" }
 # tableau vs Pauli-image table). Weak evidence on its own — see K3 — but it
 # would take a shared misreading to survive both representations.
 omega-backend-pauli = { path = "../omega-backend-pauli" }
+# The monoprop cross-check (tests/monoprop_xcheck.rs) renders each fixture
+# circuit to OpenQASM 2 and lowers it through the real parser, so the r<P>(θ)
+# sign convention is exercised by the production path, not re-typed in the
+# test. serde_json reads the committed fixture.
+omega-parser = { path = "../omega-parser" }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "pauliprop_bench"

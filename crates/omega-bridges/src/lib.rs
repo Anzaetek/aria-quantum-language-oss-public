@@ -101,6 +101,15 @@ pub enum Backend {
     Tsim,
     Cirq,
     Qadence,
+    /// IBM `ffsim` — fermionic simulation in the fixed-particle-number
+    /// basis. Present as the **differential anchor for the fermionic
+    /// surface** (`PLAN-OPEN-20260825.md` §3c.0e item 2), not as a sampler.
+    ///
+    /// Expectation-only, and NOT on the QASM2 wire: `Rbs` has no QASM2
+    /// spelling and lowering it to CX + rotations makes ffsim reject the
+    /// circuit. The circuit travels as a QPY blob from the pure-Rust writer
+    /// — see [`ffsim::expectation`].
+    Ffsim,
 }
 
 impl Backend {
@@ -115,6 +124,7 @@ impl Backend {
             "tsim" | "bloqade-tsim" => Backend::Tsim,
             "cirq" | "circ" => Backend::Cirq,
             "qadence" => Backend::Qadence,
+            "ffsim" => Backend::Ffsim,
             other => return Err(BridgeError::UnknownBackend(other.to_string())),
         })
     }
@@ -131,6 +141,7 @@ impl Backend {
             Backend::Tsim => cfg!(feature = "bridge-tsim"),
             Backend::Cirq => cfg!(feature = "bridge-cirq"),
             Backend::Qadence => cfg!(feature = "bridge-qadence"),
+            Backend::Ffsim => cfg!(feature = "bridge-ffsim"),
         }
     }
 
@@ -215,6 +226,7 @@ pub fn run_qasm2(
         Backend::Tsim => tsim::run(qasm, shots, noise),
         Backend::Cirq => cirq::run(qasm, shots, noise),
         Backend::Qadence => qadence::run(qasm, shots, noise),
+        Backend::Ffsim => ffsim::run(qasm, shots, noise),
     }
 }
 
@@ -245,6 +257,11 @@ pub fn expectation_qasm2(
         // Stim's tableau, reached through the tsim venv — exact integers, and
         // Clifford-only by construction. See `tsim::expectation`.
         Backend::Tsim => tsim::expectation(qasm, observables),
+        // ffsim HAS an expectation mode, but not over QASM2 — its input is a
+        // `CircuitIR` carried as QPY, because the gate it exists to check
+        // (`Rbs`) cannot be spelled in QASM2. `ffsim::expectation_qasm2`
+        // says exactly that rather than the generic message below.
+        Backend::Ffsim => ffsim::expectation_qasm2(qasm, observables),
         other => Err(BridgeError::CannotExpress(
             other,
             format!(
@@ -345,6 +362,10 @@ pub fn run_opticqasm(
 
 mod bloqade;
 mod cirq;
+/// ffsim entry points. Public because its input is a `CircuitIR` over QPY,
+/// not the QASM2 string every other backend takes, so it cannot sit behind
+/// `expectation_qasm2`.
+pub mod ffsim;
 // The shared cross-check corpus locator. Public and in the library (not in a
 // test file) because two harnesses in two different crates must agree on
 // *which* corpus ran — see the module docs.
@@ -389,6 +410,7 @@ mod tests {
         assert_eq!(Backend::parse("cirq").unwrap(), Backend::Cirq);
         assert_eq!(Backend::parse("circ").unwrap(), Backend::Cirq);
         assert_eq!(Backend::parse("qadence").unwrap(), Backend::Qadence);
+        assert_eq!(Backend::parse("ffsim").unwrap(), Backend::Ffsim);
     }
 
     #[test]

@@ -20,12 +20,35 @@
 //!    tolerance the test contract demands is unreachable in
 //!    single-pass f32 Jacobi.
 //!
+//! Both reasons still stand, and a third measurement has since closed the
+//! GPU question outright: on an RTX PRO 6000 Blackwell — the BEST case for a
+//! GPU SVD here, with native f64 and sub-microsecond dispatch — cuSOLVER
+//! loses on six of eight shapes (`STATUS.md` §5.16).
+//!
 //! Re-open triggers (TODO.md): batched-SVD via MLX or Accelerate
-//! (fits QML gradient sweeps, not single-execute MPS); randomized
-//! SVD or block Lanczos (GPU-friendly matmul-shaped but breaks the
+//! (recorded as fitting "QML gradient sweeps, not single-execute MPS" —
+//! **that half is now measured false**: the Accelerate `zgesdd` kernel takes
+//! the SVD share of single-`expectation` MPS evolution from 89-95% to 58-74%,
+//! worth 4.1-7.8x at depth ≥ 12 on an M4, with the truncation bound intact);
+//! randomized SVD or block Lanczos (GPU-friendly matmul-shaped but breaks the
 //! bit-for-bit Jacobi reference); re-scoping the GPU-MPS effort
 //! entirely to the θ-contraction half (`mps.rs:100-128`), which IS
 //! GPU-friendly.
+//!
+//! # The Accelerate kernel was written here and no longer lives here
+//!
+//! `src/accelerate.rs` and its two measurement harnesses moved to
+//! `omega_backend_mps::accelerate` on 2026-10-02, when `STATUS.md` §5 item 16's
+//! decision made `zgesdd` the DEFAULT macOS bond-compression kernel. They were
+//! written beside the θ-contraction because that is where the item was being
+//! worked, and that home was the problem: `omega-cli` reaches this crate only
+//! behind the `metal` feature, which exists to keep a stock `cargo build` free
+//! of `dep:metal`. Accelerate is in the base macOS SDK and has no optional
+//! dependency to keep out of anything, so being gated beside one withheld a
+//! 4-8x speedup from every default macOS build for a reason that did not apply
+//! to it. The new home is behind `cfg(target_os = "macos")` and nothing else.
+//!
+//! What is left here is the `metal` arm proper, and it still has no kernel.
 //!
 //! # What this crate ships today
 //!

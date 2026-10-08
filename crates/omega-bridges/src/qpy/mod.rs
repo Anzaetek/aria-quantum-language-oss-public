@@ -48,7 +48,10 @@ pub use parameter_expression::{
 };
 pub use program_table::{read_program_table, ProgramTable, ProgramType};
 pub use registers::{read_register_table, Register, RegisterKind, RegisterTable};
-pub use write::{write_qpy_circuit_ir, WRITER_QISKIT_VERSION, WRITER_QPY_VERSION};
+pub use write::{
+    gate_kind_to_qiskit_name, qiskit_params, write_qpy_circuit_ir, RBS_XX_PLUS_YY_BETA,
+    WRITER_QISKIT_VERSION, WRITER_QPY_VERSION,
+};
 
 /// QPY format versions this reader claims to handle. Accepting up to
 /// the latest documented version; rejecting anything newer with a

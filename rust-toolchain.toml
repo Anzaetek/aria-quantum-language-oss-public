@@ -9,7 +9,7 @@
 # 4. Update STATUS.md "Latest landed" with the bump date and any
 #    clippy-fix notes.
 [toolchain]
-channel = "1.95.0"
+channel = "1.99.0"
 profile = "default"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-wasip1"]

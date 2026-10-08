@@ -1,0 +1,12 @@
+// Kitaev sweet spot, N = 2, one-particle ground state.
+// load mode 0, then givens(-pi/4). That is (|10> + |01>)/sqrt(2),
+// an eigenstate of -X0 X1 with eigenvalue -1.
+// |+> on both modes, which is kitaev_n2.qasm, is not a fixed particle
+// number. FermionicQASM 1.0 cannot prepare it: after load, every gate
+// conserves particle number. The two states share the energy -1.
+// They are not the same state. N = 8 and N = 64 are the same obstruction
+// at every particle number; see docs/FERMIONIC_EXAMPLES.md.
+FERMIONICQASM 1.0;
+mode m[2];
+load m[0];
+givens(-0.7853981633974483) m[0], m[1];

@@ -1,0 +1,34 @@
+# Citations whose referent is REAL but structurally invisible from this tree.
+#
+# This file is not an excuse list. An entry must say why the referent cannot be
+# seen here, and the bar is EXISTENCE CONFIRMED ELSEWHERE, not plausibility.
+#
+# The distinction, learned 2026-09-04: a citation of something in the private
+# monorepo is exempt only once someone has gone and looked, and the entry
+# records where it was found (file:line). A citation nobody has checked is a
+# finding — and that day the check paid for itself, because 19 Lean citations
+# that "plausibly existed in the monorepo" turned out to exist nowhere at all,
+# while one cross-repo test citation turned out to be real.
+#
+# So: never add an entry to quiet the tool. Add it after confirming, and say
+# who/what confirmed it.
+#
+# Format:  name  # reason
+insecure_random_get  # WASI ABI import name (paired with secure_random), not an in-repo symbol
+repcode_d3r3_5q      # benchmark circuit under gitignored fixes/ (perf-baseline-m5max-20260818.txt)
+omega_pattern_cross_wire_golden  # verified 2026-09-04 to exist at quantum-core/src/backends/omega.rs:792 (inline #[test] in the private monorepo); cited from here by file:line
+
+# --- Added 2026-09-04 when the identifier pass grew a markdown arm. ---
+# All six were inspected individually; none was a false claim. Kept as
+# allowlist entries rather than doc edits because each name is correct as
+# written for its audience.
+circuit_to_pattern   # quantum-core public API, confirmed at quantum-core/src/mbqc/compile.rs:207, re-exported mbqc/mod.rs:34
+cpuinfo_max_freq     # Linux sysfs node (/sys/.../cpufreq/cpuinfo_max_freq), an OS interface this repo reads, not defines
+pbi_start_tvsec      # macOS proc_bsdinfo struct field, named by PROTOCOL.md as part of the wire spec it defines
+wide_chain_19q       # benchmark circuit under gitignored fixes/ (PLAN-MPS-FIX ledger)
+grover_generic_28q   # benchmark circuit under gitignored fixes/ (PLAN-SV-PERF ledger)
+xy_model_20q         # benchmark circuit under gitignored fixes/ (PLAN-SV-PERF ledger)
+
+# --- Added 2026-09-05. Surfaced by the wildcard/markdown arm after the
+# "CLOSED, exits 0" ledger line was written — the ledger was wrong for a day.
+create_single_mode_squeezing_matrix  # piquasso (external oracle), confirmed at piquasso/_math/gate_matrices.py:93 on upstream main (github Budapest-Quantum-Computing-Group/piquasso); FIXES_PLAN.md:2152 cites it with its file path, as an oracle's behaviour not an in-repo symbol. Checked against main, not the 8.0.1 tag.

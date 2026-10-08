@@ -19,8 +19,8 @@ use omega_core::params::ParameterBinding;
 
 use crate::gates;
 use crate::mps::Mps;
-use crate::svd::truncated_svd_flat;
-use crate::{Contract2qFn, SvdFlatFn};
+use crate::{default_svd_kernel, Contract2qFn, SvdFlatFn, SvdKernel};
+use omega_backend_quditsv::gates as qg;
 
 /// Truncation certificate for the most recent run through an [`MpsBackend`].
 ///
@@ -47,6 +47,18 @@ pub struct MpsRunStats {
     /// run actually is. Evidence, not a proof, and the label says so.
     pub fidelity_estimate: f64,
     pub max_bond_reached: usize,
+    /// WHICH kernel computed the two numbers above.
+    ///
+    /// `discarded_weight` is a bound, and two sound kernels bound the same
+    /// split differently in the last digits — the Accelerate `zgesdd` path
+    /// reports up to ~1e-12 of the block norm ABOVE the Jacobi reference, by
+    /// construction (see `accelerate::backward_error_allowance`). Since that
+    /// kernel became the macOS default, one circuit has two certificates: both
+    /// sound, neither bit-identical to the other. Naming the kernel is the
+    /// difference between a reader diffing two platforms' JSON and reading one
+    /// field, and it is the same rule `omega-hostgate status` follows — when
+    /// two sources can produce a number, the record says which one did.
+    pub svd_kernel: SvdKernel,
 }
 
 impl Default for MpsRunStats {
@@ -57,11 +69,17 @@ impl Default for MpsRunStats {
     /// fidelity over trajectories — so an accumulator starting at 0.0 stays at
     /// 0.0 for ever and every run reports a fidelity of zero. The two fields
     /// accumulate in opposite directions and cannot share a derive.
+    ///
+    /// `svd_kernel` starts at the target default rather than at `Jacobi`, so a
+    /// reset accumulator that is read before any split happened still names the
+    /// kernel a split WOULD have gone through. `record_stats` overwrites it
+    /// with the kernel the backend actually installed.
     fn default() -> Self {
         Self {
             discarded_weight: 0.0,
             fidelity_estimate: 1.0,
             max_bond_reached: 0,
+            svd_kernel: default_svd_kernel(),
         }
     }
 }
@@ -126,11 +144,16 @@ pub const DEFAULT_MAX_DISCARDED_WEIGHT: f64 = 1e-6;
 pub struct MpsBackend {
     pub max_bond_dim: usize,
     /// Bond-compression SVD provider handed to every `Mps` this backend runs.
-    /// CPU Jacobi by default; `with_svd_fn` swaps in a GPU `gesvdj` accelerator
-    /// (see `omega-backend-mps-cuda`). Wiring here means the whole MPS circuit —
-    /// adjacent gates and the SWAP network for distant gates — runs its
-    /// truncations on the GPU, with a transparent CPU fallback.
+    /// [`default_svd_kernel`] by default — Accelerate `zgesdd` on macOS, the
+    /// CPU Jacobi kernel elsewhere; `with_svd_fn` swaps in a GPU `gesvdj`
+    /// accelerator (see `omega-backend-mps-cuda`). Wiring here means the whole
+    /// MPS circuit — adjacent gates and the SWAP network for distant gates —
+    /// runs its truncations through it, with a transparent CPU fallback.
     svd_fn: SvdFlatFn,
+    /// The NAME of `svd_fn`, carried beside it so the certificate can say which
+    /// kernel produced it. Set together with `svd_fn` and never independently,
+    /// which is what keeps it from being decoration — see [`SvdKernel`].
+    svd_kernel: SvdKernel,
     /// Optional two-site-gate accelerator handed to every `Mps` this backend
     /// runs (the Metal θ-contraction; see `omega-backend-mps-metal`). `None` =
     /// the built-in contract+SVD path. Transparent CPU fall-through, so wiring
@@ -155,12 +178,45 @@ impl MpsBackend {
     pub fn new(max_bond_dim: usize) -> Self {
         Self {
             max_bond_dim,
-            svd_fn: truncated_svd_flat,
+            svd_fn: crate::default_svd_flat_fn(),
+            svd_kernel: default_svd_kernel(),
             contract_fn: None,
             adaptive_eps: None,
             max_discarded_weight: DEFAULT_MAX_DISCARDED_WEIGHT,
             stats: Mutex::new(MpsRunStats::default()),
         }
+    }
+
+    /// Install a NAMED bond-compression kernel, overriding the target default.
+    ///
+    /// The pair `(function, name)` comes out of [`SvdKernel::svd_flat_fn`], so
+    /// a caller cannot install one kernel and report another — which is the
+    /// whole value of the certificate field. Use this rather than
+    /// [`Self::with_svd_fn`] whenever the kernel has a name; `with_svd_fn`
+    /// exists for the ones this crate cannot name.
+    ///
+    /// # Panics
+    ///
+    /// If `kernel` is not available on this target (asking for
+    /// [`SvdKernel::AccelerateZgesdd`] off macOS, or for
+    /// [`SvdKernel::Custom`]). Silently falling back would hand back a backend
+    /// running a kernel the caller did not ask for.
+    pub fn with_svd_kernel(mut self, kernel: SvdKernel) -> Self {
+        let f = kernel.svd_flat_fn().unwrap_or_else(|| {
+            panic!(
+                "SVD kernel {} is not available on this target",
+                kernel.as_str()
+            )
+        });
+        self.svd_fn = f;
+        self.svd_kernel = kernel;
+        self
+    }
+
+    /// Which bond-compression kernel this backend will run — readable before a
+    /// run, where [`MpsRunStats::svd_kernel`] reports it after one.
+    pub fn svd_kernel(&self) -> SvdKernel {
+        self.svd_kernel
     }
 
     /// Raise (or lower) the discarded-weight ceiling this backend will return a
@@ -211,6 +267,88 @@ impl MpsBackend {
         *self.stats.lock().unwrap()
     }
 
+    /// `⟨ψ|O_0 ⊗ O_1 ⊗ … ⊗ O_{n−1}|ψ⟩ / ⟨ψ|ψ⟩` for one `d_q × d_q` operator per
+    /// wire (row-major, identities included), evolved and contracted **on the
+    /// chain** — `O(χ²)` memory, no dense readout.
+    ///
+    /// This is the measurement door for a `d ≠ 2` wire. [`Backend::expectation`]
+    /// takes a Pauli [`Observable`], which is defined on qubits only and is
+    /// refused by name on any other wire, so before this entry the only way to
+    /// read a number off a qutrit chain was `execute(shots: None)` — which ends
+    /// in [`Mps::to_statevector`], a `Π d_q` dense contraction that is not MPS
+    /// evolution at all and that the bond dimension does not bound
+    /// (`STATUS.md` records that trap: a profile taken through it measured
+    /// reconstruction, not the MPS). PLAN-QUDIT Q4 measures through this.
+    ///
+    /// # Contract
+    ///
+    /// * `site_ops.len()` must equal the wire count and `site_ops[q].len()`
+    ///   must equal `d_q²` for the dimension the circuit declares on wire `q`;
+    ///   both are checked against `circuit.wire_dims()` **before** evolution and
+    ///   refused with the wire named, not after a run that then panics inside
+    ///   the sweep.
+    /// * Hermiticity is the caller's: only the real part is returned, as
+    ///   [`Mps::expectation_product`] does for a Pauli string.
+    /// * The circuit is prepared exactly as `expectation` prepares it — an
+    ///   analytic `Reset` is refused; a measurement nothing reads is **elided**
+    ///   (Qiskit's `remove_final_measurements`: it changes no observable of the
+    ///   prepared state); a measurement a later condition reads is deferred to
+    ///   a controlled gate and that wire's operator is **dephased** in the
+    ///   computational basis (`O ↦ Σ_k |k⟩⟨k|O|k⟩⟨k|`), which is what
+    ///   [`Observable::dephase`] does to a Pauli (`X, Y ↦ 0`, `Z` kept)
+    ///   generalised to a `d × d` operator. The obligation and the wrong answer
+    ///   are the ones `defer_measure` documents; the basis is just wider. On a
+    ///   `d ≠ 2` wire the read case is refused before this point (a classical
+    ///   bit cannot hold the digit), so in practice the dephasing fires on the
+    ///   qubit wires of a mixed-radix chain.
+    /// * The truncation certificate is checked as on every other analytic path:
+    ///   a run past the discarded-weight ceiling is refused, and
+    ///   [`Self::last_run_stats`] carries the certificate of the run either way.
+    pub fn expectation_site_operators<O: AsRef<[Complex64]>>(
+        &self,
+        circuit: &CircuitIR,
+        params: &ParameterBinding,
+        site_ops: &[O],
+    ) -> Result<f64> {
+        let dims = circuit.wire_dims();
+        if site_ops.len() != dims.len() {
+            return Err(mps_refuse(format!(
+                "site-operator expectation needs one operator per wire: {} operators for \
+                 {} wires",
+                site_ops.len(),
+                dims.len()
+            )));
+        }
+        for (q, (op, &d)) in site_ops.iter().zip(&dims).enumerate() {
+            let d = d as usize;
+            if op.as_ref().len() != d * d {
+                return Err(mps_refuse(format!(
+                    "site-operator expectation: wire {q} has dimension {d}, so its operator \
+                     must have {} entries, not {}",
+                    d * d,
+                    op.as_ref().len()
+                )));
+            }
+        }
+        reject_reset_in_analytic_mode(circuit)?;
+        let (deferred, measured) =
+            omega_core::defer_measure::prepare_circuit_for_expectation(circuit)?;
+        let mut ops: Vec<Vec<Complex64>> = site_ops.iter().map(|o| o.as_ref().to_vec()).collect();
+        for &q in &measured {
+            let d = dims[q as usize] as usize;
+            let o = &mut ops[q as usize];
+            for r in 0..d {
+                for c in 0..d {
+                    if r != c {
+                        o[r * d + c] = Complex64::new(0.0, 0.0);
+                    }
+                }
+            }
+        }
+        let mps = self.evolve_for_analytic(&deferred, params)?;
+        Ok(mps.expectation_product(&ops))
+    }
+
     /// Record a trajectory's truncation stats, keeping the WORST seen since
     /// [`Self::reset_stats`].
     ///
@@ -230,12 +368,18 @@ impl MpsBackend {
         // discarded weight above rather than reporting a different trajectory.
         st.fidelity_estimate = st.fidelity_estimate.min(mps.fidelity_estimate);
         st.max_bond_reached = st.max_bond_reached.max(mps.max_bond_reached);
+        // Not a max or a min: there is one kernel per run, the one
+        // `evolve_once` installed on every trajectory's chain.
+        st.svd_kernel = self.svd_kernel;
     }
 
     /// Clear the worst-case accumulator, once per `execute`, so the stats
     /// describe THIS run and not a previous one on the same backend value.
     fn reset_stats(&self) {
-        *self.stats.lock().unwrap() = MpsRunStats::default();
+        *self.stats.lock().unwrap() = MpsRunStats {
+            svd_kernel: self.svd_kernel,
+            ..MpsRunStats::default()
+        };
     }
 
     /// Evolve |0…0⟩ through `circuit` once, returning the final chain and the
@@ -249,8 +393,10 @@ impl MpsBackend {
         config: &ExecConfig,
         rng: &mut StdRng,
     ) -> Result<(Mps, Vec<u8>)> {
-        let n = circuit.num_qubits as usize;
-        let mut mps = Mps::zero_state(n, self.max_bond_dim);
+        // Per-wire physical dimension from the IR (PLAN-QUDIT.md Q1): all 2 for
+        // a qubit circuit, which makes this `Mps::zero_state(n, χ)` exactly.
+        let dims = wire_dims_usize(circuit);
+        let mut mps = Mps::zero_state_dims(&dims, self.max_bond_dim);
         mps.set_svd_fn(self.svd_fn);
         if let Some(cf) = self.contract_fn {
             mps.set_contract_fn(cf);
@@ -288,6 +434,9 @@ impl MpsBackend {
                 GateKind::Measure => {
                     if config.mid_circuit_mode == MidCircuitMode::Collapse {
                         let q = op.qubits[0].0 as usize;
+                        // A DIGIT on a qudit wire. It reaches `classical_bits`
+                        // only when no condition reads that bit — see
+                        // `refuse_digit_into_a_read_cbit`, checked at the door.
                         let outcome = mps.measure_site(q, rng);
                         if let Some(cbit) = op.classical_bit {
                             if (cbit as usize) < classical_bits.len() {
@@ -337,10 +486,9 @@ impl MpsBackend {
                 "MPS backend does not support photonic circuits".into(),
             ));
         }
-        crate::capacity::check(circuit.num_qubits as usize, self.max_bond_dim)?;
-        if let Some(msg) =
-            crate::capacity::dense_is_cheaper(circuit.num_qubits as usize, self.max_bond_dim)
-        {
+        let dims = circuit.wire_dims();
+        crate::capacity::check_dims(&dims, self.max_bond_dim)?;
+        if let Some(msg) = crate::capacity::dense_is_cheaper_dims(&dims, self.max_bond_dim) {
             eprintln!("NOTE: {msg}");
         }
         self.reset_stats();
@@ -358,8 +506,14 @@ impl MpsBackend {
         Ok(mps)
     }
 
+    /// Install an UNNAMED bond-compression kernel — the CUDA `gesvdj` arm, or a
+    /// measurement shim. The certificate then reports
+    /// [`SvdKernel::Custom`]: this crate has no way to know what `f` is, and
+    /// inheriting the default's name would put the wrong kernel in the record.
+    /// For a kernel this crate does know, use [`Self::with_svd_kernel`].
     pub fn with_svd_fn(mut self, f: SvdFlatFn) -> Self {
         self.svd_fn = f;
+        self.svd_kernel = SvdKernel::Custom;
         self
     }
 
@@ -389,18 +543,33 @@ impl Backend for MpsBackend {
                 "MPS backend does not support photonic circuits".into(),
             ));
         }
+        // Qudit wires (PLAN-QUDIT.md Q3): evolved, not refused — except where
+        // the RESULT TYPE cannot hold the answer. `Counts` is keyed by bit
+        // strings, and a qutrit outcome is not one; encoding digits into bits
+        // is not part of Q3. Same line, same sentence as `quditsv`.
+        if config.shots.is_some() {
+            if let Some((reg, wire, d)) = circuit.first_qudit() {
+                return Err(mps_refuse(format!(
+                    "sampling a qudit circuit is not supported yet: register '{}' has \
+                     dimension {d} on wire {wire}, and `Counts` outcomes are bit strings. \
+                     Use `--statevector` for the exact distribution.",
+                    reg.name
+                )));
+            }
+        }
+        refuse_digit_into_a_read_cbit(circuit, config)?;
+        let dims = circuit.wire_dims();
         // Refuse before allocating tensors. The fourth unbounded allocator in
-        // the workspace: a site tensor is 32*chi^2 bytes, i.e. 33 MB per site
-        // at `mps:auto`'s default ceiling of 1024.
-        crate::capacity::check(circuit.num_qubits as usize, self.max_bond_dim)?;
+        // the workspace: a site tensor is 16*d*chi^2 bytes (32*chi^2 for a
+        // qubit), i.e. 33 MB per qubit site at `mps:auto`'s default ceiling of
+        // 1024.
+        crate::capacity::check_dims(&dims, self.max_bond_dim)?;
         // The truncation certificate refuses when chi is too SMALL. This is the
         // opposite end: chi so large that nothing is discarded, the certificate
         // is clean, and the run proceeds at maximum cost. B4 lived in that gap
         // — 158 s at 19 qubits against the dense path's 0.08 s. Advisory rather
         // than refusal; see `capacity::dense_is_cheaper`.
-        if let Some(msg) =
-            crate::capacity::dense_is_cheaper(circuit.num_qubits as usize, self.max_bond_dim)
-        {
+        if let Some(msg) = crate::capacity::dense_is_cheaper_dims(&dims, self.max_bond_dim) {
             eprintln!("NOTE: {msg}");
         }
         // Stats are worst-over-trajectory now, so they must start empty or a
@@ -533,9 +702,11 @@ impl Backend for MpsBackend {
 
         match config.shots {
             None => {
-                // The analytic path contracts to a DENSE 2^n vector, which the
-                // bond dimension does not bound. Refuse before allocating.
-                crate::capacity::check_dense(circuit.num_qubits)?;
+                // The analytic path contracts to a DENSE Π dᵢ vector (2^n for
+                // qubits), which the bond dimension does not bound. Refuse
+                // before allocating. Mixed radix, wire 0 least significant —
+                // the layout `quditsv` returns.
+                crate::capacity::check_dense_dims(&dims)?;
                 let sv = mps.to_statevector();
                 Ok(ExecResult::Statevector(sv))
             }
@@ -635,6 +806,10 @@ impl Backend for MpsBackend {
         reject_reset_in_analytic_mode(circuit)?;
         let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
         let mps = self.evolve_for_analytic(&deferred, params)?;
+        // A Pauli on a d != 2 wire is refused after evolution, in the order
+        // `quditsv` does it, so a circuit wrong on both counts is refused for
+        // the same reason by both engines.
+        refuse_paulis_on_qudits(&mps.dims, &observable)?;
         let norm_sq = mps.state_norm_sqr_contracted();
         Ok(expectation_from_mps(&mps, &observable, norm_sq))
     }
@@ -662,6 +837,9 @@ impl Backend for MpsBackend {
             return Ok(Vec::new());
         }
         let mps = self.evolve_for_analytic(&deferred, params)?;
+        for obs in &dephased {
+            refuse_paulis_on_qudits(&mps.dims, obs)?;
+        }
         // Hoisted out of the loop: the norm is a property of the STATE, so
         // recomputing it per observable (and, inside `expectation_from_mps`,
         // per TERM) is the same per-observable rework the dense readout was
@@ -690,6 +868,11 @@ impl Backend for MpsBackend {
 pub struct NoisyMpsBackend {
     pub max_bond_dim: usize,
     svd_fn: SvdFlatFn,
+    /// The name of `svd_fn` — see [`MpsBackend::svd_kernel`]. Noise does not
+    /// change which kernel compresses the bonds, so the certificate names it
+    /// here too; a `--noise` run that said nothing would be the one place the
+    /// field went missing.
+    svd_kernel: SvdKernel,
     contract_fn: Option<Contract2qFn>,
     model: NoiseModel,
     /// Same ceiling as [`MpsBackend`]. It was absent, so adding `--noise`
@@ -707,12 +890,33 @@ impl NoisyMpsBackend {
     pub fn with_model(max_bond_dim: usize, model: NoiseModel) -> Self {
         Self {
             max_bond_dim,
-            svd_fn: truncated_svd_flat,
+            svd_fn: crate::default_svd_flat_fn(),
+            svd_kernel: default_svd_kernel(),
             contract_fn: None,
             model,
             max_discarded_weight: DEFAULT_MAX_DISCARDED_WEIGHT,
             stats: Mutex::new(MpsRunStats::default()),
         }
+    }
+
+    /// Install a NAMED bond-compression kernel — see
+    /// [`MpsBackend::with_svd_kernel`], which this mirrors, including the panic
+    /// on a kernel the target cannot build.
+    pub fn with_svd_kernel(mut self, kernel: SvdKernel) -> Self {
+        let f = kernel.svd_flat_fn().unwrap_or_else(|| {
+            panic!(
+                "SVD kernel {} is not available on this target",
+                kernel.as_str()
+            )
+        });
+        self.svd_fn = f;
+        self.svd_kernel = kernel;
+        self
+    }
+
+    /// Which bond-compression kernel this backend will run.
+    pub fn svd_kernel(&self) -> SvdKernel {
+        self.svd_kernel
     }
 
     /// Raise (or lower) the discarded-weight ceiling — see
@@ -738,12 +942,17 @@ impl NoisyMpsBackend {
         // discarded weight above rather than reporting a different trajectory.
         st.fidelity_estimate = st.fidelity_estimate.min(mps.fidelity_estimate);
         st.max_bond_reached = st.max_bond_reached.max(mps.max_bond_reached);
+        // One kernel per run, as on the exact backend.
+        st.svd_kernel = self.svd_kernel;
     }
 
     /// Clear the worst-case accumulator, once per `execute`, so the stats
     /// describe THIS run and not a previous one on the same backend value.
     fn reset_stats(&self) {
-        *self.stats.lock().unwrap() = MpsRunStats::default();
+        *self.stats.lock().unwrap() = MpsRunStats {
+            svd_kernel: self.svd_kernel,
+            ..MpsRunStats::default()
+        };
     }
 
     fn check_truncation(&self) -> Result<()> {
@@ -761,9 +970,11 @@ impl NoisyMpsBackend {
     }
 
     /// Route bond-compression SVDs through `f` (e.g. the CUDA `gesvdj`
-    /// accelerator); composes with the noise trajectories.
+    /// accelerator); composes with the noise trajectories. The certificate
+    /// reports [`SvdKernel::Custom`] — see [`MpsBackend::with_svd_fn`].
     pub fn with_svd_fn(mut self, f: SvdFlatFn) -> Self {
         self.svd_fn = f;
+        self.svd_kernel = SvdKernel::Custom;
         self
     }
 
@@ -866,6 +1077,7 @@ impl Backend for NoisyMpsBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> Result<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         if circuit.circuit_type == CircuitType::Photonic {
             return Err(OmegaError::Unsupported(
                 "MPS backend does not support photonic circuits".into(),
@@ -934,7 +1146,7 @@ impl Backend for NoisyMpsBackend {
                     self.evolve(circuit, params, &config_skip_shots(config), &mut rng)?;
                 self.record_stats(&mps);
                 self.check_truncation()?;
-                crate::capacity::check_dense(circuit.num_qubits)?;
+                crate::capacity::check_dense_dims(&circuit.wire_dims())?;
                 Ok(ExecResult::Statevector(mps.to_statevector()))
             }
             // Per-trajectory when a channel acts during evolution OR when
@@ -1212,6 +1424,84 @@ fn apply_gate_mps(
         .map(|p| params.resolve(p))
         .collect::<Result<Vec<_>>>()?;
 
+    // ---- qudit dispatch (PLAN-QUDIT.md Q3) ---------------------------------
+    //
+    // The line is `quditsv`'s, drawn in the same places with the same
+    // sentences: H/X/Z generalise (Fourier / shift / clock) on any d, Rxy and
+    // CSum are the qudit gates, every other unitary is a qubit gate and is
+    // refused on a d != 2 wire, and a Custom gate on such a wire is refused as
+    // unreadable. On a d = 2 wire H/X/Z stay on THIS crate's qubit matrices
+    // (`gates::h/x/z` through `apply_1q`), not `fourier(2)`/`shift(2)`/
+    // `clock(2)`: those agree to 1e-12 but not bit for bit (F_2's entries are
+    // `1/√2` computed as `1/2.sqrt()` and `ω = e^{iπ}` carries a 1.2e-16
+    // imaginary part), and the qubit path must not move.
+    let w: Vec<usize> = op.qubits.iter().map(|q| q.0 as usize).collect();
+    let dim = |i: usize| mps.dims[w[i]];
+    match &op.gate {
+        GateKind::H if dim(0) != 2 => {
+            mps.apply_1(w[0], &qg::fourier(dim(0)).m);
+            return Ok(());
+        }
+        GateKind::X if dim(0) != 2 => {
+            mps.apply_1(w[0], &qg::shift(dim(0)).m);
+            return Ok(());
+        }
+        GateKind::Z if dim(0) != 2 => {
+            mps.apply_1(w[0], &qg::clock(dim(0)).m);
+            return Ok(());
+        }
+        GateKind::Rxy => {
+            let dd = dim(0);
+            let (i, j) = (
+                rxy_level(resolved[0], "i", dd)?,
+                rxy_level(resolved[1], "j", dd)?,
+            );
+            if i >= j {
+                return Err(mps_refuse(format!(
+                    "rxy: levels must satisfy i < j, got ({i}, {j}); the sign of φ \
+                     depends on the order, so it is not silently swapped"
+                )));
+            }
+            mps.apply_1(w[0], &qg::rxy(dd, i, j, resolved[2], resolved[3]).m);
+            return Ok(());
+        }
+        GateKind::CSum => {
+            if w[0] == w[1] {
+                return Err(mps_refuse("csum needs two distinct wires".into()));
+            }
+            // Control first: the matrix's more significant index is w[0], the
+            // convention `apply_2_distant` takes (it SWAPs for distance and
+            // re-orients for order).
+            mps.apply_2_distant(w[0], w[1], &qg::csum(dim(0), dim(1)).m);
+            return Ok(());
+        }
+        GateKind::Custom(_) if w.iter().any(|&wi| mps.dims[wi] != 2) => {
+            return Err(mps_refuse(
+                "Custom gates carry no matrix this engine can read".into(),
+            ));
+        }
+        // Reset is a channel on any d (see `apply_reset_mps`); Measure,
+        // Barrier and Id do not act on the state here.
+        GateKind::H
+        | GateKind::X
+        | GateKind::Z
+        | GateKind::Custom(_)
+        | GateKind::Reset
+        | GateKind::Measure
+        | GateKind::Barrier
+        | GateKind::Id => {}
+        g => {
+            if let Some(&wi) = w.iter().find(|&&wi| mps.dims[wi] != 2) {
+                return Err(mps_refuse(format!(
+                    "{g:?} is a qubit gate and wire {wi} has dimension {}; on a qudit \
+                     wire the generalised gates are h (Fourier), x (shift), z (clock), \
+                     rxy(i, j, θ, φ) and csum — the rest have no d > 2 meaning here",
+                    mps.dims[wi]
+                )));
+            }
+        }
+    }
+
     match &op.gate {
         // Single-qubit gates (no params)
         GateKind::H => mps.apply_1q(op.qubits[0].0 as usize, &gates::h()),
@@ -1317,12 +1607,118 @@ fn apply_gate_mps(
 /// (⟨X₁⟩ = +1 instead of 0), and on a qubit in |−⟩ the amplitudes cancelled to
 /// zero so the reset qubit sampled as |1⟩ every shot. Pinned by
 /// `tests/reset_channel.rs`.
+///
+/// On a qudit site the same channel: the drawn level `k` is returned to `|0⟩`
+/// by the transposition `|0⟩ ↔ |k⟩` (at `d = 2`, `k = 1`, that is X — and
+/// the qubit branch below is kept verbatim so the qubit path does not move).
 fn apply_reset_mps(mps: &mut Mps, q: usize, rng: &mut impl Rng) {
-    if mps.measure_site(q, rng) == 1 {
-        let zero = Complex64::new(0.0, 0.0);
-        let one = Complex64::new(1.0, 0.0);
-        mps.apply_1q(q, &[zero, one, one, zero]); // X
+    let d = mps.dims[q];
+    let k = mps.measure_site(q, rng) as usize;
+    if d == 2 {
+        if k == 1 {
+            let zero = Complex64::new(0.0, 0.0);
+            let one = Complex64::new(1.0, 0.0);
+            mps.apply_1q(q, &[zero, one, one, zero]); // X
+        }
+    } else if k != 0 {
+        let mut perm = vec![Complex64::new(0.0, 0.0); d * d];
+        for s in 0..d {
+            let t = if s == 0 {
+                k
+            } else if s == k {
+                0
+            } else {
+                s
+            };
+            perm[t * d + s] = Complex64::new(1.0, 0.0);
+        }
+        mps.apply_1(q, &perm);
     }
+}
+
+/// `CircuitIR::wire_dims` as the `usize` dims the MPS is built over.
+fn wire_dims_usize(circuit: &CircuitIR) -> Vec<usize> {
+    circuit
+        .wire_dims()
+        .into_iter()
+        .map(|d| d as usize)
+        .collect()
+}
+
+/// A qudit-path refusal, prefixed with the engine name the way `quditsv`
+/// prefixes its own, so the two engines' sentences differ only in that word.
+fn mps_refuse(msg: String) -> OmegaError {
+    OmegaError::Unsupported(format!("mps: {msg}"))
+}
+
+/// An `rxy` level parameter: an integer in `0..d`, refused otherwise (the
+/// wording is `quditsv`'s).
+fn rxy_level(v: f64, what: &str, d: usize) -> Result<usize> {
+    if v.fract() != 0.0 || v < 0.0 || v >= d as f64 {
+        return Err(mps_refuse(format!(
+            "rxy: {what} = {v} is not a level of a d = {d} wire (integers 0..{d} only)"
+        )));
+    }
+    Ok(v as usize)
+}
+
+/// Refuse a Pauli observable on a `d != 2` wire — `Z` has no meaning on a
+/// qutrit. Identity entries are allowed anywhere. `quditsv`'s sentence.
+fn refuse_paulis_on_qudits(dims: &[usize], observable: &Observable) -> Result<()> {
+    for (_, paulis) in &observable.terms {
+        for (q, p) in paulis {
+            if !matches!(p, PauliOp::I) && dims[*q as usize] != 2 {
+                return Err(mps_refuse(format!(
+                    "observable {p:?}{q} names wire {q}, which has dimension {}; Pauli \
+                     observables are defined on d = 2 wires only",
+                    dims[*q as usize]
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse, in `Collapse` mode, a measurement of a `d != 2` wire into a
+/// classical bit that some condition READS.
+///
+/// `measure_site` returns a digit, and on a qudit wire that digit can be
+/// `>= 2`. A classical bit holds 0 or 1, and `GateOp::condition_satisfied`
+/// reads `bit & 1` — so a stored `2` would be read as `0` and the conditioned
+/// gate would fire (or not) on a value nobody measured. Where no condition
+/// reads the bit, the digit goes nowhere (a qudit circuit's classical register
+/// is never reported: sampling it is refused) and the collapse itself is the
+/// whole effect, so that case runs.
+fn refuse_digit_into_a_read_cbit(circuit: &CircuitIR, config: &ExecConfig) -> Result<()> {
+    if config.mid_circuit_mode != MidCircuitMode::Collapse || circuit.first_qudit().is_none() {
+        return Ok(());
+    }
+    for op in &circuit.ops {
+        if !matches!(op.gate, GateKind::Measure) {
+            continue;
+        }
+        let (Some(c), Some(q)) = (op.classical_bit, op.qubits.first()) else {
+            continue;
+        };
+        let d = circuit.wire_dim(q.0);
+        if d == 2 {
+            continue;
+        }
+        let read = circuit.ops.iter().any(|o| {
+            o.condition
+                .is_some_and(|(start, len, _)| c >= start && c < start.saturating_add(len))
+        });
+        if read {
+            return Err(mps_refuse(format!(
+                "mid-circuit measurement of wire {} (dimension {d}) into classical bit \
+                 {c}, which a condition reads: the outcome is a digit 0..{d} and a \
+                 classical bit holds 0 or 1, so the condition would test a value \
+                 nobody measured",
+                q.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Compute ⟨ψ|ψ⟩ for the MPS via transfer-matrix contraction.
@@ -1453,18 +1849,47 @@ fn pauli_site_ops(n: usize, paulis: &[(u32, PauliOp)]) -> Vec<[Complex64; 4]> {
 /// densified — so the numbers this used to return were right, and any
 /// cross-check built on them stays valid. What was wrong was the cost of
 /// getting them.
+///
+/// On a mixed-radix chain the Pauli sites are qubits (a Pauli on a `d != 2`
+/// wire is refused before this — `refuse_paulis_on_qudits`) and every other
+/// site carries its own `d×d` identity. An all-qubit chain takes the qubit
+/// `[Complex64; 4]` operators unchanged.
 fn expectation_from_mps(mps: &Mps, observable: &Observable, norm_sq: f64) -> f64 {
+    let qubit_only = mps.is_qubit_only();
     observable
         .terms
         .iter()
         .map(|(coeff, pauli_string)| {
-            coeff
-                * crate::mps::normalize_expectation(
-                    mps.contract_product_operator(&pauli_site_ops(mps.n, pauli_string)),
-                    norm_sq,
-                )
+            let raw = if qubit_only {
+                mps.contract_product_operator(&pauli_site_ops(mps.n, pauli_string))
+            } else {
+                mps.contract_product_operator(&pauli_site_ops_dims(&mps.dims, pauli_string))
+            };
+            coeff * crate::mps::normalize_expectation(raw, norm_sq)
         })
         .sum()
+}
+
+/// [`pauli_site_ops`] over a mixed-radix chain: the qubit operators on the
+/// `d = 2` sites (composed in list order exactly as there), the `d×d`
+/// identity on every other site. The caller has refused a non-identity Pauli
+/// on a `d != 2` site.
+fn pauli_site_ops_dims(dims: &[usize], paulis: &[(u32, PauliOp)]) -> Vec<Vec<Complex64>> {
+    let qubit_ops = pauli_site_ops(dims.len(), paulis);
+    dims.iter()
+        .zip(qubit_ops)
+        .map(|(&d, op)| {
+            if d == 2 {
+                op.to_vec()
+            } else {
+                let mut m = vec![Complex64::new(0.0, 0.0); d * d];
+                for s in 0..d {
+                    m[s * d + s] = Complex64::new(1.0, 0.0);
+                }
+                m
+            }
+        })
+        .collect()
 }
 
 /// Compute <psi|P|psi> for a single Pauli string, over a DENSE statevector.
@@ -1549,6 +1974,8 @@ mod tests {
             circuit_type: CircuitType::GateBased,
             symbols: Default::default(),
             custom_gates: Default::default(),
+            qudit_registers: Vec::new(),
+            fermionic_registers: Vec::new(),
         }
     }
 

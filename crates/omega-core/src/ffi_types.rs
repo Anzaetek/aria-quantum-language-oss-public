@@ -19,6 +19,10 @@ pub const OMEGA_BACKEND_ABI_VERSION: u32 = 2;
 pub enum FfiCircuitType {
     GateBased = 0,
     Photonic = 1,
+    /// Jordan–Wigner occupation circuit. Discriminant appended; 0 and 1
+    /// are unchanged, so this is not an ABI break for existing plugins.
+    /// A plugin that does not recognise it does not claim to run it.
+    Fermionic = 2,
 }
 
 /// A flattened gate operation for C ABI.
@@ -236,6 +240,10 @@ impl FfiCircuitType {
         match ct {
             crate::circuit::CircuitType::GateBased => FfiCircuitType::GateBased,
             crate::circuit::CircuitType::Photonic => FfiCircuitType::Photonic,
+            // Same qubit gates as GateBased. The discriminant stays distinct
+            // so a plugin can refuse the lane by name instead of being told
+            // the circuit was gate-based.
+            crate::circuit::CircuitType::Fermionic => FfiCircuitType::Fermionic,
         }
     }
 }

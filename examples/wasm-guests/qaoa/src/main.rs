@@ -33,6 +33,13 @@
 
 use serde::Deserialize;
 
+// The host registers these under the `env` module
+// (`omega-wasm-runtime/src/runtime.rs`, every `func_wrap("env", …)`), and from
+// rustc 1.99 the wasm linker rejects an undefined symbol instead of leaving it
+// for the host to supply at instantiation. Naming the module is what it always
+// should have said: a bare `extern "C"` block left the import module implicit
+// and only worked because the linker was lenient.
+#[link(wasm_import_module = "env")]
 extern "C" {
     fn omega_execute(circuit_id: i32, params_ptr: *const f64, num_params: i32, observable_id: i32) -> f64;
     fn omega_gradient(circuit_id: i32, params_ptr: *const f64, num_params: i32, observable_id: i32, grad_out_ptr: *mut f64);

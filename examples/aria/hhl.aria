@@ -1,28 +1,66 @@
 -- HHL (Harrow–Hassidim–Lloyd) — quantum linear-system solver.
 -- Rust harness: crates/apps/forward/src/lib.rs  (cargo run -p aria-verify -- hhl)
+-- Semantic check: crates/apps/forward/tests/hhl_is_really_hhl.rs
 -- VERIFIED: omega forward ⟨Z_q⟩ profile vs an independent in-tree statevector oracle on the same lowered IR, |Δ| ≤ 1e-9.
+-- That line is a TRANSPORT check — both sides run this same lowered circuit,
+-- so it says nothing about whether the circuit is HHL. The semantic check
+-- above is the one that does, and it compares against closed forms.
 --
--- Solves A x = b for Hermitian A. The diagonal A = diag(1, 2),
--- b = |1⟩ case (analytic solution x = |1⟩/2) is the smoke test
--- driven from the Rust side; this Aria template generalizes it
--- across the counting-register width parameter `n`.
+-- Solves A x = b for Hermitian A. This is the circuit form of
+-- `proofs/lean4/QuantumProofs/HHL.lean`, at a concrete instantiation of it.
+-- `A` is that file's own `lam2`; `C` and `b` are chosen here (the theorem is
+-- general in both, and `b = ![1, 1]` of the Lean numeric section would be too
+-- symmetric to catch a swap of the two eigencomponents):
+--
+--     A = diag(lam0, lam1) = diag(1, 2)   `HHL.diagA` at `lam = ![1, 2]`
+--     C = 1/2                             the inverse-rotation constant
+--     b = RY(b_angle)|0>                  `beta`, deliberately NOT an eigenvector
+--
+-- Post-selecting ancilla = |1> leaves the system qubit holding `HHL.hhl_output`,
+-- and `HHL.hhl_solves_system` states that output `o` satisfies `A·o = C·b`.
+--
+-- `b` used to be `|1>`, which is an eigenvector of a diagonal `A`. That makes
+-- the defining property untestable: one eigenvalue is populated, so the
+-- answer's DIRECTION is |1> whatever the rotation angle is, and the 1/lam
+-- weighting never appears. A superposition of both eigenvectors is the
+-- smallest input that can tell `A^{-1}b` from any other vector.
 
 @assert unitary
-@prove "hhl_recovers_inverse" equiv { encodes A^{-1} b in ancilla=|1> branch }
+@prove "hhl_recovers_inverse" equiv { ancilla=|1> branch holds C A^{-1} b, A = diag(1,2) }
 @bound counting_qubits = n
 
 circuit Hhl(n: int) {
-    qreg q[5]            -- worst-case width: 3 counting + 1 system + 1 ancilla
+    -- Layout: counting q[0..n-1], system q[n], ancilla q[n+1], work q[n+2].
+    qreg q[n + 3]
     creg c[1]
 
-    -- Step 1: prepare |b⟩ on system qubit (index n).
-    apply X on q[n]
+    let lam0 = 1
+    let lam1 = 2
+    -- `controlled_inv_rotation` needs |C/lam| <= 1, so C <= lam_min = 1.
+    let cscale = 0.5
+    let b_angle = 0.8
 
-    -- Step 2: QPE on the counting register.
+    -- WIDTH GUARD. Valid widths are 2 and 3, for two independent reasons:
+    -- the counting register must be able to hold lam_max = 2 (so n >= 2), and
+    -- Step 4 needs an n-controlled X, which one work qubit only reaches at
+    -- n <= 3. Outside that range every `when` arm in Step 4 would miss, the
+    -- rotation would quietly become the identity, and the circuit would run
+    -- and return a confident zero. Reaching past the register instead makes
+    -- instantiation fail with `unknown qubit`.
+    when n < 2 { apply X on q[n + 3] }
+    when n > 3 { apply X on q[n + 3] }
+
+    -- Step 1: prepare |b> on the system qubit (index n).
+    apply RY(b_angle) on q[n]
+
+    -- Step 2: QPE on the counting register, for U = exp(i·A·t), t = 2π/2^n.
+    -- That choice of `t` makes the eigenphase of lam_j exactly lam_j / 2^n, so
+    -- the counting register reads back the INTEGER lam_j — which is what makes
+    -- Step 4 able to key on the eigenvalue rather than on a qubit index.
     --
     -- `repeat … to B` is INCLUSIVE (GRAMMAR.md:93), and the system qubit is
     -- index n — so `0 to n` ran over the counting register PLUS the system
-    -- qubit. That put an H on q[n] immediately after the X that prepares |b⟩,
+    -- qubit. That put an H on q[n] immediately after the X that prepares |b>,
     -- destroying the state being solved for, and made the k = n iteration
     -- below `CP on q[n], q[n]`: a phase gate controlling itself. The backend
     -- accepted that and aliased its way to a confident wrong answer.
@@ -30,42 +68,140 @@ circuit Hhl(n: int) {
         apply H on q[i]
     }
     repeat k from 0 to n - 1 {
-        -- controlled-U^{2^k}: phase 2π · 2^k / 2^n on system qubit.
-        let angle = 2 * pi * 2^k / 2^n
-        apply CP(angle) on q[k], q[n]
+        -- controlled-U^{2^k}. U = diag(e^{i·lam0·t}, e^{i·lam1·t}) is NOT a
+        -- bare CP: its lam0 factor multiplies BOTH system states, so under
+        -- control it is a phase on the counting qubit alone. Dropping it is
+        -- the same error this repo settled for the photonic `hwp` and for
+        -- `GateKind::Sx` — a global phase on a sub-block becomes a RELATIVE
+        -- phase once the block is controlled. Omitting the P here loads
+        -- lam0 = 0 instead of lam0 = 1, and the |0> eigencomponent then has no
+        -- inverse at all: measured, it erases the |0> component of the answer
+        -- outright (P(ancilla=1) 0.221566 -> 0.037912, and the |0> amplitude
+        -- of the post-selected branch goes to 0).
+        let scale = 2 * pi * 2^k / 2^n
+        apply P(scale * lam0) on q[k]
+        apply CP(scale * (lam1 - lam0)) on q[k], q[n]
     }
 
-    -- Step 3: inverse QFT on counting register (manual, for clarity).
-    repeat i from 0 to n - 1 {
+    -- Step 3: inverse QFT on the counting register.
+    --
+    -- This was H on each qubit and nothing else. A one-qubit inverse QFT IS
+    -- just H, so n = 1 was right and the defect only showed from n = 2 — which
+    -- is the width the Rust harness runs. Measured on an independent dense
+    -- simulator: with the H-only version the probability of the CORRECT phase
+    -- is 0.000000 at n = 2 and at n = 3. Not imprecise — zero.
+    --
+    -- The bit-reversal goes AFTER the phase sweep here, not before it as in
+    -- `qft.aria`'s IQFT. Step 2 gives counting qubit k the phase 2^k, so q[0]
+    -- is the LSB; `qft.aria`'s QFT ends with its bit reversal, so its adjoint
+    -- begins with one and expects the opposite convention. Pasting that IQFT
+    -- in verbatim scores P(|1>) = 0.500000 at n = 2 and 0.410533 at n = 4 —
+    -- closer than H-only and still wrong, which is the dangerous kind.
+    -- With the reversal at this end it is 1.000000 at every n tested.
+    repeat i from n - 1 to 0 step -1 {
+        repeat j from n - 1 to i + 1 step -1 {
+            apply CP(-pi / (2.0 ^ (j - i))) on q[j], q[i]
+        }
         apply H on q[i]
     }
+    repeat i from 0 to (n / 2) - 1 {
+        apply SWAP on q[i], q[n - 1 - i]
+    }
 
-    -- Step 4: controlled rotation encoding 1/λ on the ancilla. HHL needs a
-    -- controlled-RY here — rotate the fresh |0⟩ ancilla by ~C/λ so that
-    -- post-selecting ancilla = |1⟩ yields the 1/λ-weighted A⁻¹|b⟩ amplitude.
-    -- A controlled-PHASE (the previous version) is diagonal, so on a |0⟩ ancilla
-    -- it is a no-op: the ancilla never leaves |0⟩ and the solution branch is
-    -- empty for every input. Aria has no native CRY, so decompose
-    -- CRY(φ) = RY(φ/2)·CX·RY(-φ/2)·CX (φ = C/λ, eigenvalue proxy λ = k + 1).
-    repeat k from 0 to n - 1 {
-        let theta = 0.5 / (k + 1)
+    -- Step 4: controlled rotation encoding 1/lam on the ancilla, keyed to the
+    -- VALUE the counting register holds.
+    --
+    -- The register now holds the integer eigenvalue lam (Step 2), so the
+    -- rotation that HHL's correctness argument asks for is a single
+    -- RY(2·arcsin(C/lam)) conditioned on the register reading exactly `lam` —
+    -- `HHL.controlled_inv_rotation`, which puts amplitude exactly C/lam on the
+    -- ancilla's |1>. That is one FULL-WIDTH pattern match per value, not one
+    -- rotation per counting qubit.
+    --
+    -- The previous version was `theta = 0.5 / (k + 1)` on a single control
+    -- q[k], an "eigenvalue proxy lam = k + 1" keyed to the qubit INDEX. It is
+    -- not the same operator, and no per-qubit scheme can be: a product of
+    -- singly-controlled rotations gives RY(sum of the set bits' angles), which
+    -- is ADDITIVE in the bits, while 2·arcsin(C/lam) is not. Fixing the n
+    -- one-hot values therefore fixes every other one, and they come out wrong
+    -- — at n = 2 the only free choice already misses m = 3 by a factor 4.6.
+    -- The shipped proxy missed even the one-hot values: it put sin(theta/2) on
+    -- the ancilla where the amplitude must be C/lam, so lam = 1 got 0.247404
+    -- instead of 0.5. Measured against the closed form on this exact
+    -- system, the proxy returns a post-selected branch of
+    -- (0.227874, 0.048551) where C·A^{-1}b is (0.460530, 0.097355): every
+    -- amplitude about half of what it should be, yet the RATIO is 0.213059
+    -- against a true 0.211397 — 0.8% off. A test that only checked the
+    -- direction of the answer would have passed.
+    --
+    -- Aria has no CRY and no multi-controlled RY, so each term is
+    -- CRY(theta) = RY(theta/2)·MCX·RY(-theta/2)·MCX, using X·RY(-a)·X = RY(a),
+    -- with the zero bits of `m` conjugated by X so the match is on all n bits.
+    --
+    -- The leading RY is emitted BEFORE the X mask, not inside it. The two act
+    -- on disjoint qubits and commute exactly, and putting the ancilla first
+    -- makes "the first operation touching q[n+1]" a well-defined marker for
+    -- the end of Step 3 — which is how `hhl_is_really_hhl.rs` reads the QPE
+    -- register without re-deriving the circuit.
+    repeat m from 1 to 2^n - 1 {
+        let theta = 2 * asin(cscale / m)
         apply RY(theta / 2) on q[n + 1]
-        apply CX on q[k], q[n + 1]
+        repeat j from 0 to n - 1 {
+            when bit(m, j) == 0 { apply X on q[j] }
+        }
+        -- MCX: counting register (all n qubits) -> ancilla.
+        when n == 2 {
+            apply CCX on q[0], q[1], q[n + 1]
+        }
+        when n == 3 {
+            -- C^3X through one clean work qubit; the outer pair restores it.
+            apply CCX on q[0], q[1], q[n + 2]
+            apply CCX on q[n + 2], q[2], q[n + 1]
+            apply CCX on q[0], q[1], q[n + 2]
+        }
         apply RY(-theta / 2) on q[n + 1]
-        apply CX on q[k], q[n + 1]
+        when n == 2 {
+            apply CCX on q[0], q[1], q[n + 1]
+        }
+        when n == 3 {
+            apply CCX on q[0], q[1], q[n + 2]
+            apply CCX on q[n + 2], q[2], q[n + 1]
+            apply CCX on q[0], q[1], q[n + 2]
+        }
+        repeat j from 0 to n - 1 {
+            when bit(m, j) == 0 { apply X on q[j] }
+        }
     }
 
     -- Step 5: uncompute QPE. Same inclusive-bound correction as Step 2 — and
     -- an uncompute that ranged over a different set than the compute would not
     -- have uncomputed anything.
+    --
+    -- The forward QFT below is the adjoint of Step 3 and was MISSING: the old
+    -- Step 5 undid Step 2 but never undid Step 3, so the counting register was
+    -- left entangled with the answer. Measured fraction of the ancilla = |1>
+    -- branch with the counting register actually returned to |0..0>: 0.500 at
+    -- n = 1, 0.097 at n = 2, 0.011 at n = 3. With this layer restored it is
+    -- 1.000000000, with P(ancilla = 1) independent of n — which is what an
+    -- exactly-representable spectrum must give.
+    repeat i from 0 to (n / 2) - 1 {
+        apply SWAP on q[i], q[n - 1 - i]
+    }
+    repeat i from 0 to n - 1 {
+        apply H on q[i]
+        repeat j from i + 1 to n - 1 {
+            apply CP(pi / (2.0 ^ (j - i))) on q[j], q[i]
+        }
+    }
     repeat k from 0 to n - 1 {
-        let angle = -2 * pi * 2^k / 2^n
-        apply CP(angle) on q[k], q[n]
+        let scale = -2 * pi * 2^k / 2^n
+        apply P(scale * lam0) on q[k]
+        apply CP(scale * (lam1 - lam0)) on q[k], q[n]
     }
     repeat i from 0 to n - 1 {
         apply H on q[i]
     }
 
-    -- Measure ancilla; post-select on |1⟩ for the solution branch.
+    -- Measure ancilla; post-select on |1> for the solution branch.
     measure q[n + 1] -> c[0]
 }

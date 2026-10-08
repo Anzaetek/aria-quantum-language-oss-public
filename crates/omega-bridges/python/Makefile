@@ -11,7 +11,9 @@
 #   make bloqade-venv     # create .venv-bloqade and install Bloqade (QuEra Aquila)
 #   make tsim-venv        # create .venv-tsim and install bloqade-tsim (QuEra)
 #   make ppvm-venv        # create .venv-ppvm and install ppvm (QuEra, git)
-#   make all              # all five
+#   make ffsim-venv       # create .venv-ffsim and install ffsim (IBM, fermionic anchor)
+#   make quimb-venv       # create .venv-quimb and install quimb (MPS competitor)
+#   make all              # all six
 #   make clean            # remove all venvs
 #
 # tsim and ppvm both require Python >= 3.10, which the macOS system
@@ -27,6 +29,14 @@
 # to know about virtualenvs.
 
 PY ?= python3
+
+# Behind a TLS-intercepting proxy (pxpipe on this host) pip fails with
+# CERTIFICATE_VERIFY_FAILED unless it is handed the proxy's CA. Node is told
+# through NODE_EXTRA_CA_CERTS; give pip the same file. Verification stays on —
+# this is the CA, not --trusted-host.
+ifdef NODE_EXTRA_CA_CERTS
+export PIP_CERT ?= $(NODE_EXTRA_CA_CERTS)
+endif
 
 # Guard: every bridge venv except qiskit needs Python >= 3.10.
 #
@@ -51,10 +61,10 @@ define REQUIRE_PY310
 		exit 1; }
 endef
 
-.PHONY: all qiskit-venv perceval-venv bloqade-venv tsim-venv ppvm-venv clean \
+.PHONY: all qiskit-venv perceval-venv bloqade-venv tsim-venv ppvm-venv mqt-venv quickqudits-venv quimb-venv clean \
 	check-env check-qiskit check-perceval check-bloqade check-tsim check-ppvm
 
-all: qiskit-venv perceval-venv bloqade-venv tsim-venv ppvm-venv
+all: qiskit-venv perceval-venv bloqade-venv tsim-venv ppvm-venv ffsim-venv
 
 qiskit-venv: .venv-qiskit/.installed
 
@@ -68,6 +78,57 @@ qiskit-venv: .venv-qiskit/.installed
 	# silently skip.
 	./.venv-qiskit/bin/pip install pytest
 	@touch .venv-qiskit/.installed
+
+# ffsim (IBM) — the fermionic differential anchor, expectation-only over QPY.
+# Its own venv: it pins a qiskit it is built against, and the anchor must not
+# share an interpreter with the thing it anchors.
+ffsim-venv: .venv-ffsim/.installed
+
+.venv-ffsim/.installed: requirements-ffsim.txt
+	$(PY) -m venv .venv-ffsim
+	./.venv-ffsim/bin/pip install --upgrade pip
+	./.venv-ffsim/bin/pip install -r requirements-ffsim.txt
+	./.venv-ffsim/bin/pip install pytest
+	@touch .venv-ffsim/.installed
+
+# OpenFermion-FQE — the JW-free fermionic oracle behind fqe_runner.py and
+# tests/fqe_vs_statevector.rs. Test-only; no product backend.
+# Not $(PY): FQE 0.3.0 is a 2023 Cython sdist that builds on 3.11 (3.12 at
+# most), needs numpy<2, and declares deps the runner never imports
+# (cirq-google, jupyter, a pyasn1 pin). uv supplies the interpreter; the
+# sdist is installed --no-deps on top of requirements-fqe.txt.
+PY_FQE ?= 3.11
+fqe-venv: .venv-fqe/.installed
+
+.venv-fqe/.installed: requirements-fqe.txt
+	uv venv --native-tls -p $(PY_FQE) .venv-fqe
+	uv pip install --native-tls -p .venv-fqe/bin/python -r requirements-fqe.txt
+	uv pip install --native-tls -p .venv-fqe/bin/python --no-deps --no-build-isolation fqe==0.3.0
+	@touch .venv-fqe/.installed
+
+# MQT Qudits — the DITQASM reference (PLAN-FERMIONIC-QUDIT Q0). Not a bridge
+# runner: ci.sh uses it to re-parse crates/omega-parser/tests/fixtures/ditqasm/
+# under the library that wrote them (tools/ditqasm_xcheck/). The pin lives in
+# requirements-mqt.txt; the fixtures are that version's bytes.
+mqt-venv: .venv-mqt/.installed
+
+.venv-mqt/.installed: requirements-mqt.txt
+	$(REQUIRE_PY310)
+	$(PY) -m venv .venv-mqt
+	./.venv-mqt/bin/pip install --upgrade pip
+	./.venv-mqt/bin/pip install -r requirements-mqt.txt
+	@touch .venv-mqt/.installed
+
+# QuickQudits — external oracle for the qudit Clifford gates (PLAN-QUDIT.md
+# Q2, tools/quditsv_xcheck/). Apache-2.0. Python >= 3.10.
+quickqudits-venv: .venv-quickqudits/.installed
+
+.venv-quickqudits/.installed: requirements-quickqudits.txt
+	$(REQUIRE_PY310)
+	$(PY) -m venv .venv-quickqudits
+	./.venv-quickqudits/bin/pip install --upgrade pip
+	./.venv-quickqudits/bin/pip install -r requirements-quickqudits.txt
+	@touch .venv-quickqudits/.installed
 
 perceval-venv: .venv-perceval/.installed
 
@@ -114,6 +175,23 @@ ppvm-venv: .venv-ppvm/.installed
 	./.venv-ppvm/bin/pip install -r requirements-ppvm.txt
 	@touch .venv-ppvm/.installed
 
+# quimb — the MPS-lane competitor (CircuitMPS). Its own venv: it pins a
+# numpy/scipy/numba stack that must not share an interpreter with the
+# oracle venvs. The import below is the install check. A directory with
+# a `pyvenv.cfg` and no working `import quimb` is not a venv; `make`
+# must not stamp `.installed` for one.
+quimb-venv: .venv-quimb/.installed
+
+.venv-quimb/.installed: requirements-quimb.txt
+	@$(PY) -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' || { \
+		echo "ERROR: quimb-venv needs Python >= 3.11 (quimb 1.15), but PY=$(PY) is $$($(PY) -V 2>&1)."; \
+		exit 1; }
+	$(PY) -m venv .venv-quimb
+	./.venv-quimb/bin/pip install --upgrade pip
+	./.venv-quimb/bin/pip install -r requirements-quimb.txt
+	./.venv-quimb/bin/python -c 'import quimb, quimb.tensor as qtn; assert hasattr(qtn, "CircuitMPS")'
+	@touch .venv-quimb/.installed
+
 # Smoke check: round-trip a Bell-state QASM through the runner and
 # inspect the counts. Skips with a clear message if the venv is missing.
 # One table saying which arms this machine can actually run, and why not for
@@ -128,7 +206,7 @@ ppvm-venv: .venv-ppvm/.installed
 check-env:
 	@printf '%-10s %-9s %-8s %s\n' ARM VENV PYTHON STATUS
 	@printf '%-10s %-9s %-8s %s\n' ---------- --------- -------- ------
-	@for arm in qiskit perceval bloqade tsim ppvm; do \
+	@for arm in qiskit perceval bloqade tsim ppvm ffsim quimb; do \
 		py="./.venv-$$arm/bin/python"; \
 		if [ ! -x "$$py" ]; then \
 			printf '%-10s %-9s %-8s %s\n' "$$arm" "missing" "-" "run: make $$arm-venv PY=\$$(uv python find 3.12)"; \
@@ -141,6 +219,8 @@ check-env:
 			bloqade)  mod=bloqade ;; \
 			tsim)     mod=tsim ;; \
 			ppvm)     mod=ppvm ;; \
+			ffsim)    mod=ffsim ;; \
+			quimb)    mod=quimb ;; \
 		esac; \
 		if "$$py" -c "import $$mod" >/dev/null 2>&1; then \
 			printf '%-10s %-9s %-8s %s\n' "$$arm" "built" "$$ver" "ready"; \
@@ -197,4 +277,4 @@ check-ppvm:
 		| ./omega-bridge-ppvm-runner
 
 clean:
-	rm -rf .venv-qiskit .venv-perceval .venv-bloqade .venv-tsim .venv-ppvm
+	rm -rf .venv-qiskit .venv-perceval .venv-bloqade .venv-tsim .venv-ppvm .venv-ffsim .venv-mqt .venv-quickqudits .venv-quimb

@@ -14,7 +14,7 @@
 //! `cutoff = 8, n = 6`, against 4 MiB for the state itself. See
 //! [`crate::capacity`], which pins both numbers.
 //!
-//! [`MultiFockState::apply_single_mode`] is therefore the *only* way to apply a
+//! [`crate::multimode::MultiFockState::apply_single_mode`] is therefore the *only* way to apply a
 //! single-mode operator here, and its signature makes the padded dimension
 //! structurally incapable of entering the product: the callback is handed one
 //! **fiber** — the `cutoff` amplitudes along one mode's axis at fixed occupation
@@ -174,7 +174,7 @@ impl MultiFockState {
 
     /// Displace one mode by `alpha`, **mode-locally**.
     ///
-    /// Uses the same [`crate::displace_fiber`] the single-mode path uses — one
+    /// Uses the same `displace_fiber` the single-mode path uses — one
     /// implementation of the Miatto–Quesada recurrence, not two. The padded
     /// scratch lives inside the callback, so it is `cutoff + PAD` amplitudes
     /// once, never `(cutoff + PAD)^n_modes`.
@@ -229,7 +229,7 @@ impl MultiFockState {
     ///
     /// # No `PAD`, and that is a property of the physics rather than a shortcut
     ///
-    /// [`crate::PAD`] exists because displacement and squeezing do not conserve
+    /// `PAD` (in the crate root) exists because displacement and squeezing do not conserve
     /// photon number: they push amplitude up an unbounded ladder, so the exact
     /// operator has no finite matrix and the padding buys accuracy.
     ///

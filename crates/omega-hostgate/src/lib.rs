@@ -27,12 +27,13 @@
 //!
 //! # Off unless asked
 //!
-//! Nothing here runs unless an operator names a state file. Absence is a normal
-//! state, exactly as it is for [`omega_core::admission::Admission`]: an
+//! The ledger does nothing unless an operator names a state file. Absence is a
+//! normal state, exactly as it is for [`omega_core::admission::Admission`]: an
 //! unconfigured process performs no lock, no read and no syscall, and behaves
 //! byte-for-byte as it did before this crate existed. That is deliberate — a
 //! resource manager that changes behaviour by being linked is one nobody can
-//! adopt incrementally.
+//! adopt incrementally. `run --watch` is a separate opt-in on the CLI and does
+//! not run unless that flag is present, ledger or no ledger.
 //!
 //! # What it does not do
 //!
@@ -42,9 +43,44 @@
 //! queueing is specified elsewhere in this repository and belongs there, not in
 //! a file on disk.
 //!
-//! No cross-machine budget, no cgroup enforcement, no preemption, no priority
-//! classes. The threat model is **cooperative processes on one box**: this is
-//! accounting between programs that want to co-exist, not a sandbox.
+//! No cross-machine budget, no preemption, no priority classes. The threat
+//! model of the ledger is **cooperative processes on one box**: this is
+//! accounting between programs that want to co-exist, not a sandbox. The
+//! ledger does not install a cgroup limit and does not ask the kernel to kill
+//! a holder. A run that does not pass `--watch` is still only a declaration:
+//! `--host-bytes` reserves that many bytes in the shared file and never reads
+//! what the child actually allocates.
+//!
+//! Requiring `--watch` is not a mode this crate offers. Turning the flag on
+//! by default would change that sentence for every caller that already
+//! depends on it, and an environment variable that refuses an unwatched
+//! `run` only binds a caller who remembers the variable — the same caller
+//! who can pass the flag. The scripts that start the work decide which
+//! invocations are watched.
+//!
+//! ## `run --watch` is a poll, not a cap the kernel enforces
+//!
+//! Opt-in. After `run` spawns the child it sums resident memory across that
+//! child's process tree (macOS: one `ps` of the table, then the parent chain;
+//! Linux: `/proc/<pid>/stat` by ppid and RSS from `statm`, or `memory.current`
+//! when the child already sits in a cgroup v2 leaf whose members are exactly
+//! that tree). It does not create a cgroup and it does not write `memory.max`.
+//! When the sum exceeds the declared `--host-bytes` it SIGKILLs the tree —
+//! children first, then the root, so the walk is not chasing reparented
+//! pids — releases the grant, and exits 5. That code is not the command's
+//! own status. A census that did not run, complained, or could not read an
+//! entry is not a reading of zero: the tree is killed and the process exits
+//! 4, the same fail-closed code the gate uses when it cannot answer.
+//!
+//! **What the poll does not guarantee.** It samples. A process that passes
+//! the cap and is gone again inside one interval (default 250 ms) is not
+//! seen, and the run ends with the status the child already produced. The
+//! sum counts a shared page in every process that has it mapped, so it can
+//! sit above the number of unique resident bytes; that error is toward
+//! killing early. `--watch` is how a caller makes a declaration able to
+//! fire. It is not a sandbox, and a receipt that says the declaration held
+//! means every sample was inside it, not that the interval between samples
+//! was.
 //!
 //! # The contract lives in `PROTOCOL.md`
 //!
@@ -61,6 +97,7 @@ pub mod config;
 pub mod gate;
 pub mod identity;
 pub mod ledger;
+pub mod watch;
 
 use std::collections::BTreeMap;
 use std::fmt;

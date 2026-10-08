@@ -497,7 +497,7 @@ pub fn project_counts_onto_creg(
 }
 
 /// A Pauli operator for defining observables.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PauliOp {
     I,
     X,

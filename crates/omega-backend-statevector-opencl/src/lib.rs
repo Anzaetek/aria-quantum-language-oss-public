@@ -385,6 +385,7 @@ impl Backend for OpenClStatevectorBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> OmegaResult<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         #[cfg(feature = "opencl")]
         {
             execute::run(&self.handle, circuit, params, config)
@@ -402,6 +403,7 @@ impl Backend for OpenClStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<f64> {
+        circuit.refuse_qudits(self.name())?;
         #[cfg(feature = "opencl")]
         {
             // The device sweep skips `Measure`; defer first so what reaches it
@@ -424,6 +426,7 @@ impl Backend for OpenClStatevectorBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> OmegaResult<Vec<f64>> {
+        circuit.refuse_qudits(self.name())?;
         #[cfg(feature = "opencl")]
         {
             // The device sweep skips `Measure`; defer first so what reaches it
@@ -446,6 +449,7 @@ impl Backend for OpenClStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        circuit.refuse_qudits(self.name())?;
         #[cfg(feature = "opencl")]
         {
             // A gradient must obey the same contract as the expectation it
@@ -469,6 +473,7 @@ impl Backend for OpenClStatevectorBackend {
         _observables: &[Observable],
         _gradient_observable_factory: GradientObservableFactory<'_>,
     ) -> OmegaResult<ExpectationsAndGradient> {
+        _circuit.refuse_qudits(self.name())?;
         Err(OpenClError::Unavailable(
             "OpenCL expectation_multi_then_gradient path not yet implemented",
         )

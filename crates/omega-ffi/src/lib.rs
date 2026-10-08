@@ -184,16 +184,8 @@ pub unsafe extern "C" fn omega_execute(
         None => return ptr::null_mut(),
     };
 
-    // Bind parameters
-    let mut binding = ParameterBinding::new();
-    let param_slice = if !params.is_null() && num_params > 0 {
-        slice::from_raw_parts(params, num_params as usize)
-    } else {
-        &[]
-    };
-
-    let mut symbol_ids: Vec<u32> = circuit.symbols.keys().copied().collect();
-    symbol_ids.sort();
+    // Bind parameters.
+    //
     // The header's contract is "one per free symbol". The implementation padded
     // any shortfall with `0.0` and ignored any excess, so a caller passing the
     // wrong count silently got a DIFFERENT circuit with no error — the same
@@ -203,12 +195,22 @@ pub unsafe extern "C" fn omega_execute(
     // Refusing is a behaviour change to a published ABI, which is what
     // `omega_api_version` is for: it moves to 2, and the header documents the
     // difference so an embedder can detect it rather than discover it.
-    if param_slice.len() != symbol_ids.len() {
+    //
+    // The sort-and-bind plus the length check are `ParameterBinding::from_flat`
+    // in omega-core, so this entry point cannot drift from the CLI, the WASM
+    // host ABI or the verification harnesses about what "one per free symbol,
+    // in symbol-ID order" means. The typed `OmegaError::ParameterCount` it
+    // returns carries the names of the symbols a short array would have left
+    // unbound; a C ABI has no channel for that text, so it collapses to the
+    // null this entry point already uses for every other failure.
+    let param_slice = if !params.is_null() && num_params > 0 {
+        slice::from_raw_parts(params, num_params as usize)
+    } else {
+        &[]
+    };
+    let Ok(binding) = ParameterBinding::from_flat(circuit, param_slice) else {
         return ptr::null_mut();
-    }
-    for (i, &sym_id) in symbol_ids.iter().enumerate() {
-        binding.bind(sym_id, param_slice[i]);
-    }
+    };
 
     let config = ExecConfig {
         shots: if shots == 0 { None } else { Some(shots) },
@@ -218,7 +220,8 @@ pub unsafe extern "C" fn omega_execute(
 
     // Execute with appropriate backend
     let result = match circuit.circuit_type {
-        CircuitType::GateBased => {
+        // Fermionic ops are qubit gates; the statevector is the engine.
+        CircuitType::GateBased | CircuitType::Fermionic => {
             let backend = StatevectorBackend::new();
             backend.execute(circuit, &binding, &config)
         }
@@ -468,18 +471,14 @@ pub unsafe extern "C" fn omega_expectation(
     } else {
         &[]
     };
-    let mut symbol_ids: Vec<u32> = circuit.symbols.keys().copied().collect();
-    symbol_ids.sort();
-    // Same exact-count rule as `omega_execute`. Two entry points binding
-    // parameters by two different rules is the divergence this repository keeps
-    // finding; the check is duplicated in code but not in policy.
-    if param_slice.len() != symbol_ids.len() {
+    // Same exact-count rule as `omega_execute`, and now literally the same
+    // code: both go through `ParameterBinding::from_flat`. Two entry points
+    // binding parameters by two different rules is the divergence this
+    // repository keeps finding — the check used to be duplicated in code and
+    // shared only in policy, which is how such a pair drifts apart.
+    let Ok(binding) = ParameterBinding::from_flat(circuit, param_slice) else {
         return -5;
-    }
-    let mut binding = ParameterBinding::new();
-    for (i, &sym_id) in symbol_ids.iter().enumerate() {
-        binding.bind(sym_id, param_slice[i]);
-    }
+    };
 
     // Photonic circuits have no Pauli observable, so refuse rather than
     // answering with a gate-model number for a mode-model circuit.

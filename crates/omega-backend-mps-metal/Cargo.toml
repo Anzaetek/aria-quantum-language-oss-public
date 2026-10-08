@@ -26,6 +26,12 @@ metal = ["dep:metal", "dep:objc"]
 omega-backend-mps = { path = "../omega-backend-mps" }
 num-complex = { workspace = true }
 
+# No dev-dependencies. `omega-core` and `rayon` were here for
+# `accelerate_svd_share`, which drove whole circuits through
+# `MpsBackend::expectation`; it moved to `omega-backend-mps` with the kernel it
+# measures. The three θ-contraction benches left here build `Mps` tensors
+# directly and need neither.
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.33", optional = true }
 objc = { version = "0.2", optional = true }
@@ -33,3 +39,17 @@ objc = { version = "0.2", optional = true }
 [[example]]
 name = "contract_bench"
 path = "examples/contract_bench.rs"
+
+[[example]]
+name = "contract_bench_entangled"
+path = "examples/contract_bench_entangled.rs"
+
+[[example]]
+name = "certificate_divergence"
+path = "examples/certificate_divergence.rs"
+
+# The Accelerate `zgesdd` kernel and its two measurement harnesses were written
+# here — beside the Metal θ-contraction, because that is where STATUS.md §5.16
+# was being worked — and moved to `omega-backend-mps` on 2026-10-02 when it
+# became the default macOS kernel. Nothing Accelerate-shaped belongs in a crate
+# whose whole reason to exist is the optional `dep:metal`.

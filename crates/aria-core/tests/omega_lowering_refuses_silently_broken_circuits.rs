@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //! **`backends/omega.rs` must refuse what it cannot represent, not guess.**
 //!
-//! `PLAN-EXPORT-INTEGRITY.md` P6. Two silent corruptions, measured before the
+//! `PLAN-EXPORT-INTEGRITY.md` P6. Three silent corruptions, measured before the
 //! fix:
 //!
 //! ```text
 //!   x zz[7]  with only q[2] declared   ->  Ok, an X on QUBIT 0
 //!   gate conditioned on an unmapped
 //!   clbit                              ->  Ok, condition = None (unconditional)
+//!   rz(2*theta) with theta unbound     ->  Ok, params = [Concrete(0.0)]
 //! ```
 //!
-//! Neither produced a diagnostic. The first executes a **different circuit**;
-//! the second turns a gate that should fire on some shots into one that fires on
-//! every shot.
+//! None produced a diagnostic. The first and third execute a **different
+//! circuit**; the second turns a gate that should fire on some shots into one
+//! that fires on every shot.
 //!
 //! `aria-runtime/src/lower.rs` already returned errors for both, so this file
 //! was the odd one out inside its own crate family — the same construct, two
@@ -149,4 +150,89 @@ fn valid_circuits_still_lower() {
     assert_eq!(ir.ops.len(), 1);
     assert_eq!(ir.ops[0].condition, None);
     assert_eq!(ir.ops[0].qubits, vec![0]);
+}
+
+/// A compound expression over a free symbol (`2*theta`) has no wire form. It
+/// used to lower to `Concrete(0.0)` with no diagnostic — `rz(2*theta)` executed
+/// as `rz(0)`. A bare symbol still travels as a symbol; a bound expression still
+/// lowers to its value.
+#[test]
+fn an_unbound_compound_parameter_is_refused_not_zeroed() {
+    use aria_core::ast::ParamExpr;
+
+    let two_theta = ParamExpr::Mul(
+        Box::new(ParamExpr::Concrete(2.0)),
+        Box::new(ParamExpr::symbol("theta")),
+    );
+    let mut c = Circuit::new("c");
+    let q = c.qreg("q", 1);
+    c.apply(
+        GateDef::with_exprs(GateKind::RZ, vec![two_theta.clone()]),
+        vec![q[0].clone()],
+    );
+
+    let err = match try_to_omega_ir(&c) {
+        Ok(ir) => panic!(
+            "lowered with params {:?} — rz(2*theta) became rz(0), a DIFFERENT circuit, \
+             and nothing said so",
+            ir.ops[0].params
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("theta"),
+        "the error must name the symbol: {err}"
+    );
+    assert!(err.contains("RZ"), "and the gate: {err}");
+    assert!(
+        err.contains("bind"),
+        "and say what to do about it (bind before lowering): {err}"
+    );
+
+    // Guard the guard: a bare symbol still lowers AS a symbol …
+    let mut bare = Circuit::new("c");
+    let q = bare.qreg("q", 1);
+    bare.apply(
+        GateDef::with_exprs(GateKind::RZ, vec![ParamExpr::symbol("theta")]),
+        vec![q[0].clone()],
+    );
+    let ir = try_to_omega_ir(&bare).expect("a bare symbol has a wire form");
+    assert_eq!(ir.ops[0].params[0].symbol_name(), Some("theta"));
+
+    // … and the same compound expression, once bound, lowers to its value.
+    let bound = c
+        .bind_params(&[("theta".to_string(), 0.75)].into_iter().collect())
+        .expect("bind");
+    let ir = try_to_omega_ir(&bound).expect("a bound expression is concrete");
+    assert!(
+        (ir.ops[0].params[0].as_f64().unwrap() - 1.5).abs() < 1e-12,
+        "2*0.75 must lower to 1.5, got {:?}",
+        ir.ops[0].params[0]
+    );
+}
+
+/// A concrete expression that cannot be evaluated (`foo(1)`) took the same
+/// silent 0.0 path and must be refused with the evaluator's reason.
+#[test]
+fn an_unevaluable_concrete_parameter_is_refused_with_the_reason() {
+    use aria_core::ast::ParamExpr;
+
+    let mut c = Circuit::new("c");
+    let q = c.qreg("q", 1);
+    c.apply(
+        GateDef::with_exprs(
+            GateKind::RX,
+            vec![ParamExpr::FnCall(
+                "foo".into(),
+                vec![ParamExpr::Concrete(1.0)],
+            )],
+        ),
+        vec![q[0].clone()],
+    );
+    let err = try_to_omega_ir(&c).expect_err("`foo(1)` has no value");
+    assert!(err.contains("foo"), "must name the function: {err}");
+    assert!(
+        err.contains("unknown function"),
+        "must carry the evaluator's reason: {err}"
+    );
 }

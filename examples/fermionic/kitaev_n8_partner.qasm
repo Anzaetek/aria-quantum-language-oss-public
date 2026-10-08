@@ -1,0 +1,20 @@
+OPENQASM 2.0;
+include "qelib1.inc";
+// Kitaev sweet spot, N = 8. |-> on every mode (global parity of |+>^N).
+qreg q[8];
+h q[0];
+h q[1];
+h q[2];
+h q[3];
+h q[4];
+h q[5];
+h q[6];
+h q[7];
+z q[0];
+z q[1];
+z q[2];
+z q[3];
+z q[4];
+z q[5];
+z q[6];
+z q[7];

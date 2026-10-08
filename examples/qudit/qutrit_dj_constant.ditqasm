@@ -1,0 +1,23 @@
+DITQASM 2.0;
+// Qutrit Deutsch-Jozsa, constant oracle, 1 work qutrit.
+// q[0] is the work qutrit. q[1] is the oracle ancilla.
+// The ancilla is prepared in F^{-1}|1>, an eigenstate of the shift.
+// The constant oracle is z three times: Z_3^3 = I.
+// The inverse Fourier is h three times. F_3^4 = I, so F_3^3 = F_3^{-1}.
+// There is no hdg gate. The ancilla is then returned to |0>, so the
+// all-zeros index is the whole state, not a marginal.
+qreg q [2][3,3];
+x q[1];
+h q[1];
+h q[1];
+h q[1];
+h q[0];
+z q[0];
+z q[0];
+z q[0];
+h q[0];
+h q[0];
+h q[0];
+h q[1];
+x q[1];
+x q[1];

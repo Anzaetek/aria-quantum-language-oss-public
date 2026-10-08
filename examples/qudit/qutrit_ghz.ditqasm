@@ -1,0 +1,8 @@
+DITQASM 2.0;
+// Qutrit GHZ: F_3 on wire 0, then digit-copy onto wires 1 and 2.
+// (|000> + |111> + |222>)/sqrt(3). Little-endian indices 0, 13, 26.
+// Sampling is refused: Counts outcomes are bit strings, not digits.
+qreg q [3][3,3,3];
+h q[0];
+csum q[0],q[1];
+csum q[0],q[2];

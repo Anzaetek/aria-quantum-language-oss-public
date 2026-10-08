@@ -19,7 +19,7 @@ pub fn to_lean4(circuit: &Circuit) -> String {
         String::new(),
         format!("namespace Exported.{}", sanitize_lean(&circuit.name)),
         String::new(),
-        format!("open QuantumProofs.CircuitSemantics"),
+        "open QuantumProofs.CircuitSemantics".to_string(),
         String::new(),
     ];
 

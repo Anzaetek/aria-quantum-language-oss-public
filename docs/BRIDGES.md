@@ -32,6 +32,7 @@ rediscovered per fixture.
 | **ppvm** | **Pauli propagation** (Heisenberg) | **yes**, by branching | T-count |
 | perceval | dual-rail photonic (SLOS) | via generic 1-qubit unitaries | mode count |
 | bloqade | neutral-atom gate model (pyqrack) | native | 2^n |
+| **ffsim** | **fixed-particle-number** fermionic basis (IBM) | Hamming-weight-preserving gates only | C(n, k) memory |
 
 **tsim is not Stim.** Stim is Clifford-only; tsim is a stabilizer-*rank*
 sampler that consumes a Stim-derived instruction set **plus two tag extensions**
@@ -110,6 +111,50 @@ Verified against the in-process statevector backend on asymmetric observables
 (`Z0`, `Z1`, `Z2`, `Z0 Z2` on a circuit where all three qubits differ), which is
 what a qubit-order mistake would show up in.
 
+### ffsim — expectation over QPY, not QASM2
+
+ffsim is the **differential anchor for the fermionic surface** (`Rbs`,
+`CPhase`, Jordan–Wigner observables; `PLAN-OPEN-20260825.md` §3c.0e item 2) and
+is deliberately not on the QASM2 wire. `Rbs` has no QASM2 spelling, and lowering
+it to CX + rotations hands ffsim a circuit it either rejects or routes to a
+general simulator — the thing the anchor exists not to be. So
+`omega_bridges::ffsim::expectation(&CircuitIR, &[WireObservable])` serialises
+the circuit with the pure-Rust QPY writer, base64 inside the JSON request, and
+`Rbs(θ)` arrives as `XXPlusYYGate(−2θ, β = π/2)` on the same qargs. The sign and
+the β were both checked numerically against qiskit 2.5.2 (`qpy/write.rs::
+qiskit_params` carries the receipt; `tests/qpy_rbs_vs_qiskit.rs` pins it through
+Qiskit's own gate semantics on `⟨X0 X1⟩ = −sin 2θ`, which flips under either
+mistake). `CU3(0,0,λ)` is `CPhaseGate(λ)` exactly and is rewritten runner-side.
+
+The runner (`python/ffsim_runner.py`, testable half in `ffsim_prep.py`) turns
+the leading `x` layer into a Slater determinant, **refuses** anything not
+Hamming-weight preserving with `ffsim-unsupported-gate`, evolves in ffsim's
+number-conserving basis, and only then expands to a 2^n statevector so the
+observables go through the same `SparsePauliOp` path as `qiskit_runner.py`.
+The two anchors therefore differ only in the evolution engine. Counts mode and
+`expectation_qasm2(Backend::Ffsim, …)` are `CannotExpress`, with the message
+pointing at the real entry point.
+
+### OpenFermion-FQE — the JW-free oracle (test-only)
+
+ffsim and our statevector are read out through the **same** Jordan–Wigner
+observables, so a sign error in `jordan_wigner()` cancels out of that
+comparison. `python/fqe_runner.py` closes the hole: it takes the circuit as
+fermionic generators (`{"kind":"givens","p","q","theta"}` ≡
+`exp(θ(a†_p a_q − a†_q a_p))`, `{"kind":"cphase","p","q","phi"}` ≡
+`exp(iφ n_p n_q)`) and observables as ladder products
+(`[[re, im, [[mode, dagger], …]], …]`), evolves in FQE's FCI basis with a
+spinless register mapped to an all-alpha sector, and never touches a qubit.
+`tests/fqe_vs_statevector.rs` drives it against `omega-backend-statevector`
+with the mapper on our side only; agreement is at machine precision and the
+flipped-angle control moves by O(1).
+
+There is **no** `Backend::Fqe` and there must not be one — it is a reference,
+not a product surface. `make -C crates/omega-bridges/python fqe-venv` builds
+`.venv-fqe` on Python 3.11 through `uv` (FQE 0.3.0 is a 2023 Cython sdist:
+`numpy<2`, no 3.13, declared deps the runner never imports installed
+`--no-deps`). Without the venv the test skips out loud.
+
 ## Capability handshake
 
 Send `{"mode": "capabilities"}` to any runner and it answers without executing
@@ -140,7 +185,7 @@ noiseless distribution has no way to tell.
 | perceval | — | `perceval-noise-not-supported` |
 | bloqade | — | `bloqade-noise-not-supported` |
 | tsim | — | `tsim-noise-not-supported` |
-| ppvm | — | `ppvm-noise-not-supported` |
+| ppvm | `depolarizing` (all forms), `pauli`, `phase_damping`, symmetric `readout` / `readout_flip` — counts mode only | `ppvm-noise-not-supported` (`amplitude_damping`, asymmetric `readout`, unknown keys) |
 
 `perceval` and `bloqade` previously never read `noise` at all and returned a
 noiseless result — the same silent-drop defect `--noise` was fixed for
@@ -151,7 +196,47 @@ forms are refused rather than flattened to one uniform rate, which would be a
 different noise model from the one requested.
 
 For the full model — per-pair two-qubit rates, amplitude/phase damping, Pauli
-and readout error — use an in-process backend (`statevector`, `mps`).
+and readout error — use an in-process backend (`statevector`, `mps`); ppvm
+covers every part of it except amplitude damping and asymmetric readout.
+
+### ppvm: omega's noise as Stim noise instructions (2026-09-30)
+
+**What ppvm accepts** — established by handing raw text to
+`StimProgram.parse` + `sample_stim` (ppvm 0.1.0, the unpinned git install),
+not assumed: `DEPOLARIZE1`, `DEPOLARIZE2`, `X_ERROR`, `Y_ERROR`, `Z_ERROR`,
+`PAULI_CHANNEL_1`, `PAULI_CHANNEL_2` and the record-flip `M(p)` are accepted
+and sample correctly (`DEPOLARIZE1(0.3)` on `|0>` → P(1) = 0.200;
+`M(0.3) 0; M 0` → 0.300 then 0.000). `HERALDED_ERASE` ("unsupported
+instruction") and `E` ("unknown instruction") are rejected at parse time.
+
+**The mapping** (`python/stim_noise.py`) reproduces omega's placement, not
+Stim's idioms. After every gate application — including `id` and each qubit of
+a `reset`, and once after a whole `swap`/`ccx` expansion — each touched qubit
+`q` gets, in omega's order:
+
+| omega key | emitted | rate |
+|---|---|---|
+| `depolarizing` | `DEPOLARIZE1(p) q` — per qubit, **also after a 2q gate** | `NoiseModel::at_gate(q, gate)`: 1q → `1q`; 2q → its `"i,j"` pair entry, else `2q`/`default` at `q` |
+| `pauli` | `PAULI_CHANNEL_1(px,py,pz) q` | per-qubit `X`/`Y`/`Z` |
+| `phase_damping` λ | `Z_ERROR(λ/2) q` | omega unravels it as Z w.p. λ/2 |
+| `readout` / `readout_flip` (symmetric) | `M(p) q` in place of `M q` | per qubit |
+
+Two obvious spellings are wrong, and `tests/ppvm_noise.rs` has a fixture that
+catches each: `DEPOLARIZE2` is the uniform 15-Pauli channel, whereas omega
+kicks each qubit of a 2q gate independently (Bell TVD 0.040 against our noisy
+statevector when mutated in); and `X_ERROR` before `M` flips the *qubit*,
+whereas omega flips only the *record* — two `measure`s of one qubit tell them
+apart (TVD 0.122).
+
+**Refused**, as `ppvm-noise-not-supported` → `CannotExpress`, naming the key:
+`amplitude_damping` (non-unital, not a Pauli channel — ppvm's tableau carries
+Pauli noise only, and a twirled substitute is a different channel; an all-zero
+rate is accepted as the no-op it is) and asymmetric `readout` (`p10 != p01`;
+`M(p)` flips with one probability whatever the true bit). Atom loss stays out:
+`bits_to_counts` hard-errors on a `LOST` outcome, and giving it a place in the
+counts shape is a protocol change, not a mapping. The expectation mode takes no
+noise (the CLI refuses `--bridge --expectation --noise`; the runner refuses it
+too for a direct caller).
 
 ## Discovery
 

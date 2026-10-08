@@ -1,0 +1,12 @@
+# Dense CPU lane (E4) — both competitor arms and the Aer CPU oracle, pinned.
+# Install on akilles through the pxpipe CA bundle (§6):
+#   PIP_CERT=<bundle incl. ~/.config/pxpipe/mitm-ca.pem> pip install -r requirements-compare-dense.txt
+qulacs==0.6.14
+qsimcirq==0.22.1
+cirq-core==1.7.0
+qiskit==2.5.2
+qiskit-aer==0.17.2
+numpy==2.5.3
+scipy==1.18.1
+sympy==1.14.0
+ply==3.11

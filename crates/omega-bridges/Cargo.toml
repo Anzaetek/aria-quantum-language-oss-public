@@ -26,6 +26,10 @@ bridge-ppvm = []
 # QuEra tsim — ZX stabilizer-rank sampler. New capability; note the bridge
 # carries QASM2 + counts only, so detector/observable sampling is out of reach.
 bridge-tsim = []
+# IBM ffsim — fermionic simulation in the fixed-particle-number basis. Present
+# as the DIFFERENTIAL ANCHOR for the fermionic surface (Rbs / CPhase / JW),
+# expectation-only, fed over QPY rather than QASM2. See `src/ffsim.rs`.
+bridge-ffsim = []
 # Reserved for follow-ups so PRs can land each backend as a self-contained
 # commit once the dispatch surface is in place.
 bridge-cirq = []
@@ -49,7 +53,9 @@ tempfile = "3.10"
 # aria-core and the lowering in omega-parser, neither of which this crate needs
 # at runtime.
 aria-core = { path = "../aria-core" }
-omega-parser = { path = "../omega-parser" }
+# `f4-tunnel-theta-hook` is the F4.3 sign flip. The integration test is a
+# separate crate, so `cfg(test)` on omega-parser is off when this links it.
+omega-parser = { path = "../omega-parser", features = ["f4-tunnel-theta-hook"] }
 # Test-only: `pauliprop_vs_ppvm.rs` compares OUR Pauli-propagation backend
 # against ppvm's independent implementation of the same algorithm. The existing
 # ppvm test anchors ppvm against qiskit; nothing put our own backend on that
@@ -60,3 +66,12 @@ omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
 # Above ~30 qubits there is no dense oracle to be the second opinion.
 omega-backend-mps = { path = "../omega-backend-mps" }
 omega-backend-photonics = { path = "../omega-backend-photonics" }
+# Test-only: `ffsim_vs_statevector.rs` runs the SAME `CircuitIR` through
+# ffsim (fermionic basis, over QPY) and OUR statevector backend, read out
+# through the SAME Jordan–Wigner observables — the differential anchor
+# `PLAN-OPEN-20260825.md` §3c.0e item 2 exists for. The closed-form fixtures
+# in `ffsim_expectation.rs` check ffsim; this checks T1's mapper against it.
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+# Test-only, same file: the current operator i(a†a − h.c.) needs a complex
+# coefficient to construct.
+num-complex = { workspace = true }

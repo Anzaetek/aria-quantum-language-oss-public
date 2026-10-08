@@ -76,6 +76,10 @@ omega-backend-photonics = { path = "../omega-backend-photonics" }
 omega-backend-mps = { path = "../omega-backend-mps" }
 omega-backend-pauli = { path = "../omega-backend-pauli" }
 omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }
+omega-backend-majoranaprop = { path = "../omega-backend-majoranaprop" }
+omega-backend-stabrank = { path = "../omega-backend-stabrank" }
+omega-backend-sector = { path = "../omega-backend-sector" }
+omega-backend-quditsv = { path = "../omega-backend-quditsv" }
 omega-bridges = { path = "../omega-bridges" }
 serde_json = { workspace = true }
 rayon = { workspace = true }

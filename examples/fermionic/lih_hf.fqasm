@@ -1,0 +1,8 @@
+// LiH / STO-3G at R = 1.6 Angstrom. Hartree-Fock determinant.
+// mode m[6] spin: modes 0..5 spin-up, 6..11 spin-down, PySCF MO order.
+// Four electrons in the two lowest spatial orbitals.
+// This is the RHF state. It is not the FCI state. The Hamiltonian is
+// examples/fermionic/lih_sto3g.fcidump, passed with --hamiltonian.
+FERMIONICQASM 1.0;
+mode m[6] spin;
+load m[0], m[1], m[6], m[7];

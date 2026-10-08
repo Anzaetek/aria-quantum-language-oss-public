@@ -440,6 +440,26 @@ Rules, taken from `omega-server`'s `limits.rs` so an operator learns one set:
   pod peaked at 80% of its limit while one container inside it peaked at exactly
   100% of its own.
 
+* **With no absolute, no fraction and no profile, the host cap is the ceiling
+  minus a reserve, not the ceiling itself.** The ceiling is the cgroup limit
+  when that is tighter, otherwise the host. The reserve is one eighth of the
+  ceiling, raised to 4 GiB when an eighth is smaller, and lowered to 8 GiB
+  when an eighth is larger. The 4 GiB floor is itself capped at a quarter of
+  the ceiling, so a container smaller than 16 GiB is not asked for 4 GiB
+  (a 2 GiB pod keeps 1.5 GiB). The result is reported as `default`, or
+  `default, of cgroup` when the ceiling was the container's — never as
+  `detected` or `cgroup`, because those name the ceiling and the cap is not
+  the ceiling. Slots have no such reserve: an unset slot cap is the detected
+  core count.
+  `OMEGA_HOSTGATE_MAX_MEM`, `OMEGA_HOSTGATE_MEM_FRACTION` and
+  `OMEGA_HOSTGATE_PROFILE` replace this reserve entirely. An absolute is still
+  clamped to the ceiling (the whole machine, or the whole cgroup), not to the
+  reserve.
+  Above 80 GiB the reserve has stopped at 8 GiB, so this default is a larger
+  share than `greedy` (90%). The profile is a share of the ceiling; it is not
+  a request to exceed the default. On a 16 GiB machine the default is 12 GiB
+  and `greedy` is still the larger of the two.
+
 `advisory` records but never refuses, and its records MUST be excluded from the
 enforcing total: a process that is not honouring the budget must not be able to
 spend it on behalf of the processes that are.
@@ -451,6 +471,17 @@ spend it on behalf of the processes that are.
 No queue, no fairness guarantee, no cross-machine budget, no cgroup
 *enforcement* (limits are read, never created), no preemption, no priority
 classes, no per-user accounting, and no persistence across reboot.
+
+`omega-hostgate run --watch` is not part of this protocol. It is an opt-in
+poll in the CLI: it sums resident memory across the child process tree and
+SIGKILLs that tree when the sum exceeds the declared `--host-bytes`, exiting
+5. It does not write `memory.max`. A sample that cannot be taken exits 4
+(the same fail-closed code as an unanswerable gate) rather than being read
+as zero. The poll can miss a spike that starts and ends inside one interval.
+A run that does not pass `--watch` is unchanged: the ledger records the
+declaration and does not observe the child. The protocol does not grow a
+variable that refuses that form. Whether a given invocation is watched is
+the caller's decision.
 
 **A known limit, stated rather than discovered:** a stream of small requests can
 starve a large one indefinitely. `omega-server` publishes the same limit for the

@@ -3,6 +3,16 @@
 // on the SVD path vs other operations. Was the empirical basis for
 // deferring the MPS-SVD-on-Metal item — see TODO.md "MPS SVD on Metal
 // — DEFERRED 2026-05-12".
+//
+// READ THIS BEFORE QUOTING ITS NUMBERS (2026-09-23). It times `execute` with
+// `shots: None`, which ends in a dense 2^n `to_statevector` — NOT MPS
+// evolution, and not anything an SVD accelerator would touch. At 14q ×
+// depth-4 the whole evolution is 0.60 ms inside a 4.8-9.1 ms `execute`; at
+// 20q it is 254 ms inside 10.8 s. The "wallclock is flat across χ" reading
+// this harness produced is that reconstruction, which does not depend on χ.
+// For the per-stage split (SVD is 90-96% of evolution at depth ≥ 12) use
+// `mps_stage_profile.rs`, which intercepts the production `SvdFlatFn` hook.
+// STATUS.md §5.16 carries the table.
 
 use omega_backend_mps::MpsBackend;
 use omega_core::circuit::{CircuitIR, CircuitType, GateKind, GateOp, ParamExpr, Qubit};

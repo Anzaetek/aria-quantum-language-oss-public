@@ -338,7 +338,41 @@ fn one_sided_jacobi(
     // round are independent, so serial-vs-parallel is bit-identical by
     // construction (the thread-count test pins 1 thread ≡ 8 threads, which
     // includes "inline" as a special case).
-    let par = cols >= 128;
+    //
+    // The column threshold was 128 until 2026-09-24, and that was too high by
+    // exactly one doubling. `mps_stage_profile` showed the SVD is 90-97% of
+    // MPS evolution; `mps_thread_scaling` then showed the kernel was SERIAL
+    // while spending it. The θ blocks reach 64 columns at χ=32 and 120 at
+    // χ=128 on the common shapes — both under 128 — and because the line
+    // above is true (most gates run at small χ), even rows peaking at 256
+    // were serial for most CALLS. Baseline SVD time was flat to under 1%
+    // from 1 to 32 threads, which is what a never-entered parallel path looks
+    // like from the outside.
+    //
+    // At 64 the win is 1.17× at the default pool and 1.28× at its optimum of
+    // 4 workers (akilles, 32 cores, χ=32, four shapes). Going lower is not
+    // free: 64 columns is 4 blocks, so 2 disjoint pairs per round, and the
+    // available width is ~2×, not the thread count. That is also why the
+    // thread-count term is here rather than just `cols >= 64` — with a
+    // single worker `par_iter` still pays split-and-join, measured 1.31×
+    // SLOWER than the sequential path, and this restores it exactly.
+    //
+    // Oversubscription is the one case that still loses, and it is the
+    // caller's to avoid: on a 10-core M4 driven with 32 rayon workers the
+    // same change measured 1.4× slower, while 32 workers on 32 real cores
+    // measured 1.19× faster. The gate deliberately does NOT try to detect
+    // that — rayon's default pool is already sized to available parallelism,
+    // and a rule keyed on physical cores would make the schedule depend on
+    // the host.
+    //
+    // Result-safety, verified rather than assumed: an order-independent XOR
+    // fingerprint over every `discarded_weight` the kernel returns, plus the
+    // expectation value at 17 significant digits, is identical across the old
+    // and new gates at 1/2/4/8/16/32 threads. That matters because the
+    // discarded weight feeds a truncation certificate which is a BOUND, not
+    // an estimate. (Fingerprints are stable within a host but not portable
+    // across ISAs — compare a gate change on one box, never across two.)
+    let par = cols >= 64 && rayon::current_num_threads() > 1;
     for _sweep in 0..60 {
         let mut rotated = false;
         for tasks in &rounds {

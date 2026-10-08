@@ -462,7 +462,10 @@ fn run_qaoa_qubo(args: &[String]) -> ExitCode {
         n: qubo.n,
     };
 
-    print_tail(&header, &opt, &tail, common, /* native */ false);
+    if let Err(e) = print_tail(&header, &opt, &tail, common, /* native */ false) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 
@@ -852,15 +855,11 @@ fn build_initial_params(init: Option<&str>, n_params: usize) -> Result<Vec<f64>,
 
 /// Build a `ParameterBinding` from a flat parameter vector aligned with
 /// the circuit's symbol-id sort order — same convention used by both the
-/// host and the WASM guest path.
-fn binding_from_flat(circuit: &CircuitIR, params: &[f64]) -> ParameterBinding {
-    let mut binding = ParameterBinding::new();
-    let mut sym_ids: Vec<SymbolId> = circuit.symbols.keys().copied().collect();
-    sym_ids.sort();
-    for (idx, &sym) in sym_ids.iter().enumerate() {
-        binding.bind(sym, params.get(idx).copied().unwrap_or(0.0));
-    }
-    binding
+/// host and the WASM guest path. A length mismatch is refused (see
+/// `ParameterBinding::from_flat`); this used to bind the missing symbols
+/// to 0.0, which turns a short vector into a plausible wrong energy.
+fn binding_from_flat(circuit: &CircuitIR, params: &[f64]) -> Result<ParameterBinding, String> {
+    ParameterBinding::from_flat(circuit, params).map_err(|e| e.to_string())
 }
 
 /// Reorder gradient pairs into a flat Vec aligned with the sorted-symbol
@@ -1000,7 +999,10 @@ fn execute_wasm(wasm_path: &Path, common: CommonOpts, header: Value, tail: AlgoT
         progress,
     };
 
-    print_tail(&header, &opt, &tail, common, /* native */ false);
+    if let Err(e) = print_tail(&header, &opt, &tail, common, /* native */ false) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 
@@ -1030,14 +1032,29 @@ fn execute_native(common: CommonOpts, header: Value, tail: AlgoTail) -> ExitCode
     let backend = StatevectorBackend::new();
     let grad_method = common.gradient.into_method();
 
+    // The optimizer keeps the dimension `build_initial_params` gave it, so
+    // the binding cannot fail here in practice; if it ever does, NaN is the
+    // closure's only way to refuse, and the message on stderr says why.
     let cost = |params: &[f64]| -> f64 {
-        let binding = binding_from_flat(&circuit, params);
+        let binding = match binding_from_flat(&circuit, params) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[host] {e}");
+                return f64::NAN;
+            }
+        };
         backend
             .expectation(&circuit, &binding, &observable)
             .unwrap_or(f64::NAN)
     };
     let grad = |params: &[f64]| -> Vec<f64> {
-        let binding = binding_from_flat(&circuit, params);
+        let binding = match binding_from_flat(&circuit, params) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[host] {e}");
+                return vec![f64::NAN; params.len()];
+            }
+        };
         match compute_gradient(&backend, &circuit, &binding, &observable, &grad_method) {
             Ok(pairs) => gradient_to_flat(&circuit, &pairs),
             Err(e) => {
@@ -1076,7 +1093,10 @@ fn execute_native(common: CommonOpts, header: Value, tail: AlgoTail) -> ExitCode
         }
     };
 
-    print_tail(&header, &opt, &tail, common, /* native */ true);
+    if let Err(e) = print_tail(&header, &opt, &tail, common, /* native */ true) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 
@@ -1096,7 +1116,7 @@ fn print_tail(
     tail: &AlgoTail,
     common: CommonOpts,
     native: bool,
-) {
+) -> Result<(), String> {
     match tail {
         AlgoTail::Vqe { .. } => print_vqe_tail(header, res, common, native),
         AlgoTail::Qaoa {
@@ -1105,10 +1125,11 @@ fn print_tail(
             n,
             ..
         } => {
-            let samples = sample_circuit(circuit, &res.optimal_params, *n);
+            let samples = sample_circuit(circuit, &res.optimal_params, *n)?;
             print_qaoa_tail(header, res, &samples, *ising_offset, common, native);
         }
     }
+    Ok(())
 }
 
 fn print_vqe_tail(header: &Value, res: &OptimizationResult, common: CommonOpts, native: bool) {
@@ -1247,13 +1268,16 @@ fn print_qaoa_tail(
     }
 }
 
-fn sample_circuit(circuit: &CircuitIR, params: &[f64], _n_vars: usize) -> Vec<(u64, u32)> {
-    let mut binding = ParameterBinding::new();
-    let mut sym_ids: Vec<SymbolId> = circuit.symbols.keys().copied().collect();
-    sym_ids.sort();
-    for (idx, &sym) in sym_ids.iter().enumerate() {
-        binding.bind(sym, params.get(idx).copied().unwrap_or(0.0));
-    }
+/// Sample the optimised circuit for the QAOA tail. Refuses a params vector
+/// of the wrong length (this used to zero-pad, so a truncated optimum would
+/// have sampled a different circuit from the one whose energy was printed)
+/// and a non-counts result, instead of printing an empty sample table.
+fn sample_circuit(
+    circuit: &CircuitIR,
+    params: &[f64],
+    _n_vars: usize,
+) -> Result<Vec<(u64, u32)>, String> {
+    let binding = binding_from_flat(circuit, params)?;
     let cfg = ExecConfig {
         shots: Some(SAMPLE_SHOTS),
         seed: Some(SAMPLE_SEED),
@@ -1267,9 +1291,10 @@ fn sample_circuit(circuit: &CircuitIR, params: &[f64], _n_vars: usize) -> Vec<(u
                 .filter_map(|(o, n)| o.as_u64().map(|k| (k, n)))
                 .collect();
             v.sort_by_key(|b| std::cmp::Reverse(b.1));
-            v
+            Ok(v)
         }
-        _ => Vec::new(),
+        Ok(_) => Err("sampling returned a non-counts result".to_string()),
+        Err(e) => Err(format!("sampling failed: {e}")),
     }
 }
 
@@ -1673,7 +1698,7 @@ mod tests {
             .unwrap()
             .join("examples/circuits/qaoa_maxcut_triangle_p1.qasm");
         let circuit = load_circuit(&path).unwrap();
-        let samples = sample_circuit(&circuit, &[0.0, 0.0], 3);
+        let samples = sample_circuit(&circuit, &[0.0, 0.0], 3).unwrap();
         let total: u32 = samples.iter().map(|&(_, c)| c).sum();
         assert_eq!(total, SAMPLE_SHOTS);
         // 8 outcomes for 3 qubits; with seed=0x51517E5 each should appear
@@ -1684,6 +1709,22 @@ mod tests {
             let dev = (c as f64 - expected).abs() / expected;
             assert!(dev < 0.25, "outcome count {c} far from uniform {expected}");
         }
+    }
+
+    #[test]
+    fn sample_circuit_refuses_missing_param() {
+        // Two free parameters (gamma, beta); one value used to sample the
+        // circuit at beta=0 and print it as if it were the optimum.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("examples/circuits/qaoa_maxcut_triangle_p1.qasm");
+        let circuit = load_circuit(&path).unwrap();
+        let err = sample_circuit(&circuit, &[0.0], 3).unwrap_err();
+        assert!(err.contains("got 1 value(s)"), "{err}");
+        assert!(err.contains("2 free parameter(s)"), "{err}");
     }
 
     // ---- native optimizer end-to-end (#2 + #3 fixes) ----
@@ -1711,14 +1752,14 @@ mod tests {
         let c1 = circuit.clone();
         let o1 = observable.clone();
         let cost = move |p: &[f64]| -> f64 {
-            let b = binding_from_flat(&c1, p);
+            let b = binding_from_flat(&c1, p).expect("complete binding");
             backend.expectation(&c1, &b, &o1).unwrap_or(f64::NAN)
         };
         let backend2 = StatevectorBackend::new();
         let c2 = circuit;
         let o2 = observable;
         let grad = move |p: &[f64]| -> Vec<f64> {
-            let b = binding_from_flat(&c2, p);
+            let b = binding_from_flat(&c2, p).expect("complete binding");
             let pairs = compute_gradient(&backend2, &c2, &b, &o2, &GradMethod::Adjoint).unwrap();
             gradient_to_flat(&c2, &pairs)
         };
@@ -1751,10 +1792,25 @@ mod tests {
         let mut c = CircuitIR::new(2, CircuitType::GateBased);
         c.symbols.insert(7, "b".into());
         c.symbols.insert(3, "a".into());
-        let b = binding_from_flat(&c, &[1.5, 2.5]);
+        let b = binding_from_flat(&c, &[1.5, 2.5]).unwrap();
         // Sorted: id=3 → 1.5, id=7 → 2.5
         assert!((b.get(3).unwrap() - 1.5).abs() < 1e-12);
         assert!((b.get(7).unwrap() - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn binding_from_flat_refuses_length_mismatch() {
+        // Two symbols, one value: `b` (id=7) used to be bound to 0.0
+        // silently. Now the refusal names it and the expected count.
+        let mut c = CircuitIR::new(2, CircuitType::GateBased);
+        c.symbols.insert(7, "b".into());
+        c.symbols.insert(3, "a".into());
+        let err = binding_from_flat(&c, &[1.5]).unwrap_err();
+        assert!(err.contains("got 1 value(s)"), "{err}");
+        assert!(err.contains("2 free parameter(s)"), "{err}");
+        assert!(err.contains("[b]"), "{err}");
+        // Extras would be dropped: refused as well.
+        assert!(binding_from_flat(&c, &[1.0, 2.0, 3.0]).is_err());
     }
 
     #[test]
@@ -1832,18 +1888,12 @@ mod tests {
         // at the initial values, producing a higher floor. Sanity-check
         // by running a 2-param-only Adam and comparing.
         let trunc_observable = parse_observable("0.5*Z0+0.3*Z1Z2+0.2*X2X3").unwrap();
-        let trunc_circuit = {
-            let mut c = circuit.clone();
-            // Pretend symbols 2,3 don't exist for the optimizer (mimics
-            // the WASM guest's NUM_PARAMS=2 truncation: bind them at
-            // their initial values inside the cost closure).
-            c.symbols.remove(&2);
-            c.symbols.remove(&3);
-            c
-        };
-        // The trunc circuit's cost still uses the full circuit at the
-        // sealed initial values for theta2/theta3 — equivalent to
-        // NUM_PARAMS=2 padding.
+        // Truncation is modelled by holding theta2/theta3 at their initial
+        // values against the FULL circuit — equivalent to a NUM_PARAMS=2
+        // guest. (This used to also bind against a copy with symbols 2,3
+        // deleted from the table, which left them unresolvable and made the
+        // finite-difference gradient below NaN; binding_from_flat now
+        // refuses a symbol table that lies about the circuit's arity.)
         let trunc_cost_full =
             cost_with_fixed_tail(circuit.clone(), trunc_observable.clone(), vec![-0.2, 0.4]);
         let r_trunc = optimizers::run_adam(
@@ -1854,7 +1904,7 @@ mod tests {
                 // this comparison is the *floor*, not the trajectory, so
                 // a finite-diff is fine.
                 let cost = cost_with_fixed_tail(
-                    trunc_circuit.clone(),
+                    circuit.clone(),
                     trunc_observable.clone(),
                     vec![-0.2, 0.4],
                 );
@@ -1889,7 +1939,7 @@ mod tests {
         move |head: &[f64]| -> f64 {
             let mut all = head.to_vec();
             all.extend_from_slice(&fixed_tail);
-            let b = binding_from_flat(&circuit, &all);
+            let b = binding_from_flat(&circuit, &all).expect("complete binding");
             backend
                 .expectation(&circuit, &b, &observable)
                 .unwrap_or(f64::NAN)

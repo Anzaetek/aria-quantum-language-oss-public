@@ -1,0 +1,3 @@
+# Pauliprop lane (E7): monoprop, pinned. Install on akilles with PIP_CERT (sec 6).
+monoprop==0.9.0
+numpy==2.5.3

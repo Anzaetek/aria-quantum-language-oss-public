@@ -98,6 +98,16 @@ fn a_run_whose_budget_excludes_nothing_is_refused() {
         cert.dropped_mass,
         cert.observable_range
     );
+    // A vacuous budget means mass was dropped, so this run is the one place in
+    // the crate's own tests where `is_exact()` must answer FALSE. Every other
+    // use asserts it true, and an `is_exact` that always answered true passed
+    // them all (cargo-mutants).
+    assert!(
+        !cert.is_exact(),
+        "premise: the budget is vacuous, so mass was dropped and the run is not \
+         exact — dropped_mass {:.4e}",
+        cert.dropped_mass
+    );
     assert!(
         value.abs() <= cert.observable_range + 1e-9,
         "sanity: the value itself is in range even though the bound is not"

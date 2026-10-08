@@ -9,118 +9,44 @@ FOR is unchanged: only re-running piquasso live can catch a fixture
 regenerated to match a drifted convention on our side.
 """
 
-import json
-import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
+sys.path.insert(0, str(REPO / "tools"))
+from xcheck_drift import run  # noqa: E402
+
 FIXTURE = HERE / "piquasso_loss_fixture.jsonl"
 GENERATOR = HERE / "piquasso_loss_ref.py"
+CANDIDATE_PYTHONS = [
+    REPO / ".venv-piquasso" / "bin" / "python",
+    HERE / ".venv" / "bin" / "python",
+]
 TOL = 1e-12
 
 
-def pick_python():
-    for cand in (
-        Path.cwd() / ".venv-piquasso/bin/python",
-        HERE / ".venv/bin/python",
-    ):
-        if cand.exists():
-            return str(cand)
-    return sys.executable
-
-
-def load(lines):
-    meta, cases = {}, {}
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        d = json.loads(line)
-        if "meta" in d:
-            meta = d["meta"]
-            continue
-        cases[d["case"]] = d
-    return meta, cases
-
-
-def main():
-    if not FIXTURE.exists():
-        print(f"FAIL: no committed fixture at {FIXTURE}", file=sys.stderr)
-        return 1
-    try:
-        proc = subprocess.run(
-            [pick_python(), str(GENERATOR)],
-            capture_output=True, text=True, check=True,
-        )
-    except FileNotFoundError:
-        print("SKIP: python not available", file=sys.stderr)
-        return 1
-    except subprocess.CalledProcessError as exc:
-        print("FAIL: loss piquasso generator did not run.", file=sys.stderr)
-        print(exc.stderr or exc.stdout, file=sys.stderr)
-        return 1
-
-    live_meta, live = load(proc.stdout.splitlines())
-    disk_meta, disk = load(FIXTURE.read_text().splitlines())
-
-    if live_meta != disk_meta:
-        print(f"NOTE: fixture generated with {disk_meta}, running {live_meta}")
-
-    missing = sorted(set(disk) - set(live))
-    added = sorted(set(live) - set(disk))
-    if missing:
-        print(f"FAIL: cases in fixture but not regenerated: {missing}", file=sys.stderr)
-    if added:
-        print(f"FAIL: cases regenerated but absent from fixture: {added}", file=sys.stderr)
-    if missing or added:
-        return 1
-
-    worst_name, worst = None, 0.0
-    for name, d in sorted(disk.items()):
-        lv = live[name]
-        if d["ops"] != lv["ops"] or d["prep"] != lv["prep"]:
-            print(f"FAIL: {name}: the recipe itself changed", file=sys.stderr)
-            return 1
-        # An occupation appearing on one side only is drift, not a rounding
-        # difference — checked before the numeric comparison so it cannot be
-        # reported as a tiny delta.
-        if set(d["probs"]) != set(lv["probs"]):
-            only_disk = sorted(set(d["probs"]) - set(lv["probs"]))
-            only_live = sorted(set(lv["probs"]) - set(d["probs"]))
-            print(
-                f"FAIL: {name}: occupation set changed "
-                f"(fixture-only {only_disk}, live-only {only_live})",
-                file=sys.stderr,
-            )
-            return 1
-        for occ, p in d["probs"].items():
-            diff = abs(p - lv["probs"][occ])
-            if diff > worst:
-                worst_name, worst = f"{name}[{occ}]", diff
-        # The mean_n column is a compared oracle too; a fixture whose means
-        # were regenerated to match drifted code would pass the probs check
-        # (probs and means can drift independently near the cutoff).
-        for mode, m in enumerate(d.get("mean_n", [])):
-            diff = abs(m - lv["mean_n"][mode])
-            if diff > worst:
-                worst_name, worst = f"{name}<n_{mode}>", diff
-
-    if worst > TOL:
-        print(
-            f"FAIL: committed loss fixture has DRIFTED from live piquasso — "
-            f"worst {worst:.3e} at {worst_name} (tolerance {TOL:.1e}).\n"
-            f"      Either piquasso changed, or the fixture was regenerated to "
-            f"match a change in our own code. The second is the dangerous one.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(f"OK: loss fixture matches live piquasso "
-          f"{live_meta.get('piquasso')} across {len(disk)} cases "
-          f"(worst {worst:.3e})")
-    return 0
+def compare_case(name, d, lv):
+    """`probs` keyed by occupation string, plus a `mean_n` column per mode."""
+    # An occupation appearing on one side only is drift, not a rounding
+    # difference — checked before the numeric comparison so it cannot be
+    # reported as a tiny delta.
+    if set(d["probs"]) != set(lv["probs"]):
+        only_disk = sorted(set(d["probs"]) - set(lv["probs"]))
+        only_live = sorted(set(lv["probs"]) - set(d["probs"]))
+        return f"occupation set changed (fixture-only {only_disk}, live-only {only_live})"
+    out = [(f"{name}[{occ}]", abs(p - lv["probs"][occ])) for occ, p in d["probs"].items()]
+    # The mean_n column is a compared oracle too; a fixture whose means were
+    # regenerated to match drifted code would pass the probs check (probs and
+    # means can drift independently near the cutoff).
+    out += [(f"{name}<n_{mode}>", abs(m - lv["mean_n"][mode]))
+            for mode, m in enumerate(d.get("mean_n", []))]
+    return out
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run(
+        fixture=FIXTURE, generator=GENERATOR, candidates=CANDIDATE_PYTHONS,
+        oracle="piquasso", recipe_fields=("ops", "prep"),
+        compare_case=compare_case, tol=TOL, label="loss",
+    ))

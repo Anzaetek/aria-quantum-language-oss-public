@@ -1,0 +1,11 @@
+# LiH / STO-3G, R = 1.6 Angstrom.
+# PySCF 2.14.0: scf.RHF, then fci.FCI on that mean field.
+# Spin-orbital FCIDUMP from pyscf.tools.fcidump.from_integrals,
+# blocked alpha then beta. The circuit is the RHF determinant
+# (modes 0, 1, 6, 7), so it reproduces E_HF and not E_FCI.
+E_HF -7.861864769808647
+E_FCI -7.882324378883495
+R_Angstrom 1.6
+n_spatial 6
+n_modes 12
+nelec 4

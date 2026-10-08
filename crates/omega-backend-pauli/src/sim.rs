@@ -45,6 +45,7 @@ impl Backend for PauliBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> Result<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         if circuit.circuit_type == CircuitType::Photonic {
             return Err(OmegaError::Unsupported(
                 "Pauli backend does not support photonic circuits".into(),
@@ -249,6 +250,7 @@ impl Backend for PauliBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        circuit.refuse_qudits(self.name())?;
         // `stabilizer_expectation` indexes the tableau by the observable's
         // qubit and panics past the register. See `Observable::validate_qubits`.
         observable.validate_qubits(circuit.num_qubits)?;
@@ -273,6 +275,7 @@ impl Backend for PauliBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> Result<Vec<f64>> {
+        circuit.refuse_qudits(self.name())?;
         for o in observables {
             o.validate_qubits(circuit.num_qubits)?;
         }
@@ -1056,6 +1059,8 @@ mod tests {
             circuit_type: CircuitType::GateBased,
             symbols: Default::default(),
             custom_gates: Default::default(),
+            qudit_registers: Vec::new(),
+            fermionic_registers: Vec::new(),
         }
     }
 

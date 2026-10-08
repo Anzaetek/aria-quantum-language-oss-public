@@ -317,6 +317,16 @@ fn apply_op_dagger(
                 op.gate
             )));
         }
+
+        // Qudit gates (PLAN-QUDIT.md Q2): refused at the engine door for
+        // d ≠ 2, and without a CUDA kernel on d = 2 — named, not wildcarded.
+        GateKind::Rxy | GateKind::CSum => {
+            return Err(OmegaError::Unsupported(format!(
+                "cuda adjoint dagger: {:?} is a qudit gate with no CUDA kernel; on qubit \
+                 wires use rx/ry (for rxy) or cx (for csum)",
+                op.gate
+            )));
+        }
     };
     res.map_err(OmegaError::from)
 }

@@ -3,82 +3,59 @@
 //! Computes all parameter gradients in a single forward + backward pass,
 //! giving O(1) cost in the number of parameters (vs O(2p) for parameter-shift).
 //!
-//! ## Formal verification cross-reference
+//! ## What verifies this, corrected 2026-09-04
 //!
-//! Each step of the algorithm is ratified by a Lean 4 theorem in
-//! `verification/Verification/Adjoint/`:
+//! This section previously read "Each step of the algorithm is ratified by a
+//! Lean 4 theorem in `verification/Verification/Adjoint/`" and listed ~25
+//! theorem names across ten modules (`ParamShift*`, `ChainRule`,
+//! `Composition`, `Linearity`, `PauliExpectation`, `HermitianReal`,
+//! `Conjugation`, `UnitaryInvariance`). It closed by stating that `ci.sh`
+//! runs `lake build` over an umbrella importing them all, so that "removing
+//! or breaking any cited theorem fails CI".
 //!
-//! * Per-gate matrix derivatives (`apply_gate_derivative` reaches into
-//!   `gates::drx` / `gates::dcrz` / `gates::du3_dp` / `gates::du3_dl`):
-//!   * Rx → `ParamShiftRx.drx_eq_neg_half_i_x_rx`
-//!   * Ry → `ParamShiftRy.dry_eq_neg_half_i_y_ry`
-//!   * Rz → `ParamShiftRz.drz_eq_neg_half_i_z_rz`
-//!   * U1 → `ParamShiftU1.du1_dlambda_eq_i_u1_p1`
-//!   * U2 (φ, λ) → specialisation of `ParamShiftU3` at θ = π/2;
-//!     `gates::du2_dp` / `gates::du2_dl` directly call the U3
-//!     derivative path, so the U3 theorems apply unchanged.
-//!   * CRz → `ParamShiftCRz.dcrz_eq_neg_half_i_m_crz`
-//!   * U3 (φ, λ slots) → `ParamShiftU3.du3_dphi_eq_i_p1_u3`,
-//!     `ParamShiftU3.du3_dlambda_eq_i_u3_p1`
-//!   * U3 (θ slot) → `ParamShiftU3.du3_dtheta_eq_half_u3_shifted`
-//!     (parameter-shift form: `dU3/dθ = (1/2)·U3(θ+π)`) plus the
-//!     adjoint-step corollary
-//!     `ParamShiftU3.u3_theta_adjoint_step_eq_param_shift`. The
-//!     "single-generator Hermitian form" matrix identity stays open
-//!     as a future refinement; not load-bearing for the
-//!     parameter-shift derivation `Adjoint/AdjointEqShift.lean`
-//!     will use.
-//!   * CU3 (φ, λ, θ slots) → `ParamShiftCU3.dcu3_dphi_eq_i_p11_cu3`,
-//!     `ParamShiftCU3.dcu3_dlambda_eq_i_cu3_p11`,
-//!     `ParamShiftCU3.dcu3_dtheta_eq_half_q_ctl_cu3_shifted`.
-//!     The φ / λ slots use the `P11 = |11⟩⟨11|` projector
-//!     (controlled lift of U3's `P₁ = diag(0, 1)`); the θ slot
-//!     uses the wider `Q_ctl = diag(0, 0, 1, 1)` projector
-//!     because the upper-left identity block of CU3(θ+π) needs
-//!     to be zeroed.
-//! * Symbolic chain rule (`params.rs::ParamExpr::differentiate`,
-//!   called via `resolve_derivative`):
-//!   `ChainRule.differentiate_correct` /
-//!   `ChainRule.deriv_evaluate_eq`.
-//! * Composition through an outer real-valued function — the
-//!   gate-angle → expectation chain that `apply_gate_derivative`
-//!   materialises by multiplying the gate-derivative inner product
-//!   by the chain factor `params.resolve_derivative(expr, sym)`:
-//!   `Composition.composition_correct` /
-//!   `Composition.deriv_composition_eq`.
-//! * Linearity in the operator argument (used by
-//!   `apply_observable` + the gradient accumulation across
-//!   `observable.terms`):
-//!   `Linearity.expVal_linear` / `Linearity.expVal_finset_sum`.
-//! * Single-qubit Pauli expectation closed forms (used by every
-//!   per-qubit step inside `apply_observable` and `pauli`):
-//!   `PauliExpectation.expV_{Z,X,Y,I}` plus the four
-//!   `σ?_hermitian` witnesses.
-//! * Hermitian-implies-real-expectation (justifies the `2·Re(...)`
-//!   projection in the gradient accumulator below — for Hermitian
-//!   observables the imaginary part the algorithm discards is
-//!   round-off, not signal):
-//!   `HermitianReal.expVal_real_of_hermitian` /
-//!   `HermitianReal.im_expVal_zero_of_hermitian`.
-//! * Conjugation preserves Hermiticity — `U† O U` is Hermitian
-//!   whenever `O` is, so the "effective observable" the backward
-//!   sweep carries through every step is itself a valid input
-//!   to the real-expectation lemma above:
-//!   `Conjugation.conjugation_preserves_hermitian` /
-//!   `Conjugation.adjoint_state_observable_hermitian`.
-//! * Unitary invariance of inner products — `⟨Uψ|Uφ⟩ = ⟨ψ|φ⟩`
-//!   when `U†U = I`. The forward sweep doesn't re-normalise
-//!   between gates because every standard gate ships as a
-//!   unitary by construction; this lemma is the algebraic
-//!   warrant for that:
-//!   `UnitaryInvariance.inner_invariant_under_unitary` /
-//!   `UnitaryInvariance.norm_sq_invariant_under_unitary`.
+//! **None of that was true.** There is no `Verification/Adjoint/` directory
+//! in this repository, and the private monorepo was grepped for every cited
+//! theorem name with zero matches under any path. `ci.sh`'s Lean stage runs
+//! `lake` in `proofs/lean4/`, is opt-in, and skips entirely when `lake` is
+//! absent — it never referenced `verification/` at all. So the paragraph
+//! claiming CI enforcement described a gate that does not exist.
 //!
-//! `ci.sh` runs `lake build` against the umbrella
-//! `verification/Verification.lean` which transitively imports
-//! every file under `Verification/Adjoint/`. Removing or breaking
-//! any cited theorem fails CI before the Rust adjoint code can
-//! merge.
+//! The near-miss that likely seeded it: `proofs/lean4/QuantumProofs/Adjoint.lean`
+//! is real and sorry-free, but it proves properties of circuit **daggers**
+//! (`U†`), not of **derivatives** (`∂U/∂θ`).
+//!
+//! ### What actually checks the algorithm
+//!
+//! Numerics, not proofs: `tests/parallel_shift_integration.rs::test_parallel_matches_serial_and_adjoint`
+//! computes the gradient by Adjoint AD and by the parameter-shift rule
+//! independently and requires them to agree. That is a real and useful check
+//! — it is agreement on sampled parameters, not a theorem.
+//!
+//! ### The obligations the algorithm still rests on
+//!
+//! Kept because they are the right list, and a reader who wants to prove or
+//! re-derive any step needs it — now stated as obligations rather than as
+//! citations of proofs that do not exist:
+//!
+//! * per-gate matrix derivatives for Rx, Ry, Rz, U1, U2 (as U3 at θ = π/2),
+//!   U3 (θ, φ, λ slots), CRz, CU3 (the φ/λ slots lift U3's `P₁ = diag(0,1)`
+//!   to `P11 = |11⟩⟨11|`; the θ slot needs the wider
+//!   `Q_ctl = diag(0,0,1,1)` because CU3(θ+π)'s upper-left identity block
+//!   must be zeroed);
+//! * the symbolic chain rule in `params.rs::ParamExpr::differentiate`,
+//!   reached via `resolve_derivative`;
+//! * composition through the outer real-valued function — the
+//!   gate-angle → expectation chain;
+//! * linearity in the operator argument, used by `apply_observable` and by
+//!   the accumulation across `observable.terms`;
+//! * the single-qubit Pauli expectation closed forms;
+//! * Hermitian ⇒ real expectation, which is what justifies the `2·Re(...)`
+//!   projection below (for Hermitian observables the discarded imaginary
+//!   part is round-off, not signal);
+//! * conjugation preserves Hermiticity, so the effective observable the
+//!   backward sweep carries stays a valid input to the previous item;
+//! * unitary invariance of inner products, the warrant for not
+//!   re-normalising between gates.
 
 use std::collections::HashMap;
 

@@ -63,6 +63,20 @@ pub fn term_ceiling() -> u64 {
 /// The zero rows are load-bearing, not padding. With `None => cap` as the
 /// fallback, omitting the Cliffords would price a Bell pair (`H; CX`) at the
 /// cap and make the whole bound useless.
+///
+/// # The `CX·Rz·CX` peephole does not disturb this table
+///
+/// `propagate` folds an adjacent `CX(a,b); Rz(θ) b; CX(a,b)` into ONE
+/// conjugation by `Z⊗Z` (see `match_zz_triple` in `sim.rs`). That is three ops
+/// replaced by one `branch` call — and the three they replace are priced at
+/// `0 + 1 + 0 = 1` here, so the per-circuit total is unchanged and the bound
+/// stays exact rather than merely safe. Nothing to add, and this note exists so
+/// the next reader does not conclude the shadow has drifted. It is pinned by
+/// `folding_does_not_change_what_the_bound_prices` in `tests/term_bound.rs`.
+///
+/// If a future peephole ever folds ops whose priced sum is LESS than the
+/// branch calls it makes, this table must grow a compensating row — that is the
+/// direction that under-prices, and under-pricing ends in an OOM.
 pub fn branch_calls(gate: &GateKind) -> Option<u32> {
     use GateKind::*;
     Some(match gate {
@@ -71,10 +85,11 @@ pub fn branch_calls(gate: &GateKind) -> Option<u32> {
         H | X | Y | Z | S | Sdg | Sx | Sxdg | CX | CZ | CY | Swap | Id | Barrier | Measure => 0,
         // One rotation, one branch.
         Rz | Rx | Ry | U1 | T | Tdg => 1,
-        // Controlled phase: two generators.
-        CRz => 2,
-        // Euler decomposition: z, y, z.
-        U3 | CU3 => 3,
+        // Controlled phase: two generators. Rbs: two commuting generators
+        // (Y⊗X and X⊗Y), one branch each.
+        CRz | Rbs => 2,
+        // Euler decomposition: z, y, z. U2 is U3 with θ = π/2, same arm.
+        U3 | U2 | CU3 => 3,
         // CCZ over the seven non-empty subsets of {a, b, t}. CSwap is
         // CX · CCX · CX, so it pays the same seven.
         CCX | CSwap => 7,

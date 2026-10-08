@@ -28,7 +28,7 @@
 //! That is the allocation that takes a machine down, and it is reachable by
 //! writing the *natural* extension of code that is correct in one mode. The
 //! padded dimension must stay an **inner summation index**, never a factor in
-//! the product — see [`mode_local_temp_amplitudes`].
+//! the product — see [`crate::capacity::mode_local_temp_amplitudes`].
 //!
 //! # Why this module has no host-memory probe
 //!

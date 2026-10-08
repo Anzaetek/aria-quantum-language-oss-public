@@ -55,7 +55,17 @@ fn omega_run(args: &[&str]) -> (String, String, bool) {
 fn ccx_circuit() -> String {
     let src = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[3];\n\
                x q[0];\nx q[1];\nccx q[0], q[1], q[2];\n";
-    let path = std::env::temp_dir().join("multi_control_notice_ccx.qasm");
+    // One file per call, not one shared path: the tests in this binary run on
+    // parallel threads and each rewrites its fixture, so a shared path is a
+    // race — a reader can open the file mid-truncate and see an empty circuit.
+    // (Observed as a one-off failure that passed on rerun.) The pid separates
+    // concurrent `cargo test` processes; the counter separates threads.
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "multi_control_notice_ccx_{}_{n}.qasm",
+        std::process::id()
+    ));
     std::fs::write(&path, src).expect("write fixture");
     path.to_string_lossy().into_owned()
 }

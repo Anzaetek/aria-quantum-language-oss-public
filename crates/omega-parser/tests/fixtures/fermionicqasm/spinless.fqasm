@@ -1,0 +1,10 @@
+// In-house FermionicQASM 1.0. No authority of a standard.
+FERMIONICQASM 1.0;
+mode m[4];
+creg c[4];
+load m[0], m[1];
+num(0.7) m[0];
+numnum(0.7) m[0], m[1];
+givens(0.7) m[0], m[1];
+tunnel(0.7) m[1], m[2];
+measure m[3] -> c[3];

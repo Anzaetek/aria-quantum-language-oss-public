@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "omega-emu-compare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Row schema and JSON-lines writer for the emulator comparison (docs/EMULATOR-COMPARISON.md): one shape for every lane, and a row without its witnesses does not serialize"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+omega-core = { path = "../omega-core" }
+omega-parser = { path = "../omega-parser" }
+sha2 = { workspace = true }

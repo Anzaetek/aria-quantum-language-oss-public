@@ -98,6 +98,13 @@ pub fn create_router(state: SharedState, ws_state: Option<WsSharedState>) -> Rou
         .route("/v1/invocations/:id", get(get_invocation))
         // Quantum-core bridge: execute an OmegaCircuitIR wire document and
         // dispatch by its `backend` field (Auto/Statevector/Mps/Stabilizer/Photonic).
+        // What would this cost, and would admission refuse it? Same decision
+        // as the route named in the body, then the reservation is dropped —
+        // asking must not hold the budget the question is about.
+        .route(
+            "/v1/quantum/admission",
+            post(quantum_bridge::admission_quantum_route),
+        )
         .route(
             "/v1/quantum/execute",
             post(quantum_bridge::execute_quantum_route),
@@ -593,8 +600,21 @@ async fn invoke_function(
                 .registry
                 .fail_invocation(&invocation.id, &e.to_string());
 
+            // A wrong-length `params` is the caller's mistake, not the
+            // server's, so it is a 400 like every other malformed-body
+            // rejection in this module (`create_circuit`, `create_function`)
+            // rather than the blanket 500 this arm used to return for
+            // everything. It matters more than the status line: before
+            // `execute_circuit` refused, a short `params` was padded with 0.0
+            // and came back 200 with a plausible histogram, so a client had no
+            // signal at all. Now it gets the typed refusal, which names the
+            // symbols it left unbound.
+            let status = match e {
+                omega_core::error::OmegaError::ParameterCount { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 Json(serde_json::json!({
                     "invocation_id": invocation.id,
                     "status": "failed",

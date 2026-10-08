@@ -26,6 +26,10 @@ already uses for the rest of its HTTP, and inventing a policy here would be
 guessing. A 429 is surfaced as a typed error carrying the server's message so the
 caller can implement its own backoff — see `Busy`.
 
+`admission` asks the server whether a circuit would be admitted and what it
+would cost. It does not price the circuit itself — the server's governor is
+the only copy of that decision.
+
 Refused scope per the plan and absent here: per-row cancellation, durable
 batches, cluster manager.
 """
@@ -188,6 +192,47 @@ class OmegaClient:
                     f"{len(params)}",
                 )
         return grads
+
+    def admission(
+        self,
+        route: str,
+        circuit: dict | None = None,
+        *,
+        circuits: Sequence[dict] | None = None,
+        shots: int | None = None,
+        observable: str | None = None,
+    ) -> dict:
+        """Ask whether `route` would admit this circuit, and what it would cost.
+
+        `route` is ``execute``, ``expectation`` or ``gradient``. The price
+        depends on which one: an expectation densifies, a gradient holds a
+        second state, and an execute with no `shots` ships the statevector
+        back. This does not estimate. The server runs the same admission the
+        route runs and releases the reservation before answering, so a client
+        that recomputed the cost locally could disagree with the host in the
+        direction that gets the job killed.
+
+        The return is the server's JSON. ``admitted`` is the answer. HTTP 200
+        means the question was answered, including when the answer is no —
+        ``error`` is then the refusal the route itself would return.
+        """
+        body: dict[str, Any] = {"route": route}
+        if circuit is not None:
+            body["circuit"] = circuit
+        if circuits is not None:
+            body["circuits"] = [dict(c) for c in circuits]
+        if shots is not None:
+            body["shots"] = shots
+        if observable is not None:
+            body["observable"] = observable
+        out = self._post("/v1/quantum/admission", body)
+        if "admitted" not in out:
+            raise OmegaError(
+                200,
+                "admission response has no `admitted` field — the server did not "
+                "answer the question",
+            )
+        return out
 
 
 def ry_ansatz(n: int, layers: int) -> tuple[dict, list[str]]:

@@ -59,6 +59,55 @@ fn a_wide_clifford_circuit_routes_to_the_exact_stabilizer_backend() {
     );
 }
 
+/// **The stabilizer backend serves `--expectation`, and `auto` uses it.** A
+/// Clifford circuit far too wide for a dense state must route to `pauli` in
+/// expectation mode too — the mode it was steered away from because the CLI's
+/// expectation dispatch had no `pauli` arm and the gap was misread as the
+/// backend having no expectation at all. The Bell-like chain here has
+/// <Z0 Z1> = 1 exactly, so the value is checked as well as the route.
+#[test]
+fn a_wide_clifford_circuit_takes_its_expectation_on_the_stabilizer_backend() {
+    let mut src = String::from("OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[120];\n");
+    src.push_str("h q[0];\n");
+    for i in 0..119 {
+        src.push_str(&format!("cx q[{i}], q[{}];\n", i + 1));
+    }
+    let path = write("auto_clifford120_expectation.qasm", &src);
+    let (out, err, ok) = omega_run(&[&path, "--backend", "auto", "--expectation", "Z0 Z1"]);
+    assert!(
+        ok,
+        "a 120-qubit Clifford expectation must run under auto:\n{err}"
+    );
+    assert!(
+        err.contains("-> pauli"),
+        "auto must report that it chose the stabilizer backend:\n{err}"
+    );
+    assert!(
+        out.contains("<O> = 1.0000000000"),
+        "<Z0 Z1> on a GHZ chain is exactly 1:\n{out}"
+    );
+    // The arm is reachable by name as well, not only through auto.
+    let (out, err, ok) = omega_run(&[&path, "--backend", "pauli", "--expectation", "Z0 Z1"]);
+    assert!(ok, "--backend pauli --expectation must run:\n{err}");
+    assert!(out.contains("<O> = 1.0000000000"), "{out}");
+}
+
+/// A gradient has no stabilizer arm, so there `auto` still says so and goes
+/// to the statevector when the circuit fits.
+#[test]
+fn a_clifford_gradient_is_not_sent_to_the_stabilizer_backend() {
+    let path = write(
+        "auto_clifford_gradient.qasm",
+        "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\nh q[0];\ncx q[0], q[1];\n",
+    );
+    let (_out, err, ok) = omega_run(&[&path, "--backend", "auto", "--gradient", "Z0"]);
+    assert!(ok, "a small Clifford gradient must run:\n{err}");
+    assert!(
+        err.contains("-> statevector") && err.contains("gradient"),
+        "auto must say it went to the statevector because of the gradient mode:\n{err}"
+    );
+}
+
 /// A small non-Clifford circuit goes to the dense statevector, which is exact.
 #[test]
 fn a_small_non_clifford_circuit_routes_to_the_statevector() {

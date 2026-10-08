@@ -1,0 +1,17 @@
+[package]
+name = "omega-backend-majoranaprop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Majorana propagation: Heisenberg back-propagation of Majorana monomials for JW-encoded fermionic circuits, with length truncation and a dropped-mass certificate"
+
+[dependencies]
+omega-core = { path = "../omega-core" }
+num-complex = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+ndarray = { workspace = true }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-pauliprop = { path = "../omega-backend-pauliprop" }

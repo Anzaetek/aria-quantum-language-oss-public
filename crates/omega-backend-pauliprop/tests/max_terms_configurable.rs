@@ -155,3 +155,91 @@ fn raising_the_ceiling_reports_no_dropped_mass() {
          error budget, or a caller cannot tell it apart from `--truncate`"
     );
 }
+
+/// The ceiling is INCLUSIVE: a sum that peaks at exactly `max_terms` is not
+/// refused; one that must go a single term past it is.
+///
+/// Every other test of this knob asserts a refusal, and all of them pass under
+/// a ceiling that fires one term early (`>=` for `>` at any of the three
+/// sites — cargo-mutants). `Z` through one `RY(θ)` is `cos θ·Z + sin θ·X`:
+/// exactly two terms and nothing that can cancel, so the peak is known rather
+/// than measured.
+#[test]
+fn the_ceiling_is_inclusive() {
+    let theta = 0.7_f64;
+    let mut c = CircuitIR::new(1, CircuitType::GateBased);
+    c.ops.push(op(GateKind::Ry, &[0], &[theta]));
+    let params = ParameterBinding::new();
+
+    let (value, cert) = PauliPropBackend::new()
+        .with_max_terms(Some(2))
+        .expectation_with_certificate(&c, &params, &z0())
+        .expect("a sum that peaks AT the ceiling must not be refused");
+    assert_eq!(
+        cert.peak_terms, 2,
+        "premise: the sum peaks at exactly two terms"
+    );
+    assert!(
+        (value - theta.cos()).abs() <= 1e-12,
+        "⟨Z⟩ of RY(θ)|0⟩ is cos θ; got {value}"
+    );
+
+    let err = match PauliPropBackend::new()
+        .with_max_terms(Some(1))
+        .expectation_with_certificate(&c, &params, &z0())
+    {
+        Ok((v, _)) => panic!("one term past the ceiling must be refused; got {v}"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reached 2 terms, past the 1 ceiling"),
+        "the refusal must be the ceiling's own, naming both numbers: {msg}"
+    );
+}
+
+#[test]
+fn the_ceiling_holds_on_the_commuting_path_too() {
+    // `the_ceiling_is_inclusive` drives the boundary through an anticommuting
+    // rotation: RY on a Z term splits it, and the split is what crosses the
+    // cap. A rotation that commutes with every term takes the other path
+    // through the drain loop — each term is copied across unchanged, and the
+    // cap is checked after each copy. Under that check alone `>` could become
+    // `>=` or `==` and nothing above noticed (cargo-mutants, 2 survivors).
+    // Two Z terms under RZ: both commute, both cross, the sum peaks at
+    // exactly two. Cap 2 passes with the exact value; cap 1 refuses, naming
+    // both numbers.
+    let theta = 0.7_f64;
+    let mut c = CircuitIR::new(2, CircuitType::GateBased);
+    c.ops.push(op(GateKind::Rz, &[0], &[theta]));
+    let params = ParameterBinding::new();
+    let z0_plus_z1 = Observable {
+        terms: vec![(1.0, vec![(0, PauliOp::Z)]), (1.0, vec![(1, PauliOp::Z)])],
+    };
+
+    let (value, cert) = PauliPropBackend::new()
+        .with_max_terms(Some(2))
+        .expectation_with_certificate(&c, &params, &z0_plus_z1)
+        .expect("two commuting terms under a cap of two must not be refused");
+    assert_eq!(
+        cert.peak_terms, 2,
+        "premise: the sum peaks at exactly two terms"
+    );
+    assert!(
+        (value - 2.0).abs() <= 1e-12,
+        "⟨Z0 + Z1⟩ on |00⟩ is 2 whatever RZ does to the phase; got {value}"
+    );
+
+    let err = match PauliPropBackend::new()
+        .with_max_terms(Some(1))
+        .expectation_with_certificate(&c, &params, &z0_plus_z1)
+    {
+        Ok((v, _)) => panic!("two commuting terms past a cap of one must be refused; got {v}"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reached 2 terms, past the 1 ceiling"),
+        "the refusal must be the ceiling's own, naming both numbers: {msg}"
+    );
+}

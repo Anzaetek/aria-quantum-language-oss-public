@@ -1,12 +1,12 @@
 use aria_core::ast::{Circuit, CircuitBuilder};
 
-/// Result of a syndrome measurement.
-#[derive(Debug, Clone)]
-pub struct SyndromeResult {
-    pub syndrome: Vec<u8>,
-    pub error_detected: bool,
-    pub correction: Option<Vec<usize>>,
-}
+// `SyndromeResult` lived here until 2026-09-04 (plan §A1 finding 1). It was
+// declared once and never constructed or read anywhere in the tree — a
+// "Result of a syndrome measurement" carrying `error_detected` that nothing
+// produced. Deleted rather than wired: the real syndrome path returns
+// `mwpm::Correction`, and a second unused result type only invites a reader to
+// believe detection is reported when it is not. Removed, not deprecated,
+// because nothing could hold one.
 
 /// Trait for quantum error correcting codes.
 pub trait QECCode {

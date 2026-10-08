@@ -241,14 +241,6 @@ fn make_tch() -> Result<Box<dyn Backend>, String> {
     )
 }
 
-/// Construct the MPS backend. Under a `cuda` build its bond-compression SVD is
-/// routed through the cuSOLVER `gesvdj` accelerator (`omega-backend-mps-cuda`),
-/// which itself falls back to the CPU Jacobi SVD when no CUDA device is present
-/// — so `--backend mps` transparently uses the GPU when one is available and
-/// the same code is exact-identical otherwise. Under a `metal` build the
-/// two-site θ-contraction is routed to the GPU instead (SVD stays on CPU —
-/// Apple has no native f64, so on-GPU Jacobi SVD is deferred; see
-/// GPU_BACKEND_PLAN.md), engaging only above the bond-dim threshold.
 /// Process-wide ceiling on an MPS run's truncation certificate.
 ///
 /// Stored as `f64` bits so a front end can set it once, before any run.
@@ -282,6 +274,77 @@ pub fn mps_discard_ceiling() -> f64 {
     }
 }
 
+/// `MPS_METAL_CONTRACT=1` (or `true` / `yes`) opts into the f32 Metal two-site
+/// contraction. Unset is the production default. Same predicate as `omega-run`.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn mps_metal_contract_opt_in() -> bool {
+    match std::env::var("MPS_METAL_CONTRACT") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
+}
+
+/// The two MPS samplers take one Metal policy, so `make_noisy_mps` cannot
+/// drift from `make_mps`. The f32 contraction is not installed: on a quantity
+/// documented as a bound, occasionally-low is not a bound (`STATUS.md` §5
+/// item 3). `not(cuda)` because a dual-vendor build keeps CUDA's native-f64
+/// SVD. The opt-in warns; unset is silent, because this constructor has no
+/// device request to answer.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+trait InstallMetalContract: Sized {
+    fn install_metal_contract(self, f: omega_backend_mps::Contract2qFn) -> Self;
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl InstallMetalContract for MpsBackend {
+    fn install_metal_contract(self, f: omega_backend_mps::Contract2qFn) -> Self {
+        self.with_contract_fn(f)
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+impl InstallMetalContract for NoisyMpsBackend {
+    fn install_metal_contract(self, f: omega_backend_mps::Contract2qFn) -> Self {
+        self.with_contract_fn(f)
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn apply_mps_metal_contract<B: InstallMetalContract>(backend: B) -> B {
+    if mps_metal_contract_opt_in() {
+        // Loud on purpose. The opt-in exists so the kernel can still be
+        // measured; it must not look like a normal run.
+        eprintln!(
+            "WARNING: MPS_METAL_CONTRACT is set, so the MPS two-site contraction \
+             is routed through Metal (f32 above the bond threshold). \
+             discarded_weight can come out SMALLER than the exact-f64 CPU value. \
+             On this run the truncation certificate is NOT a bound."
+        );
+        backend.install_metal_contract(omega_backend_mps_metal::metal_contract_2q)
+    } else {
+        backend
+    }
+}
+
+#[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+fn apply_mps_metal_contract<B>(backend: B) -> B {
+    backend
+}
+
+/// Construct the MPS backend.
+///
+/// Under a `cuda` build the bond-compression SVD goes through cuSOLVER
+/// `gesvdj`, which falls back to the CPU Jacobi SVD when no device is present.
+/// That path is native f64, so the certificate is unchanged.
+///
+/// Under a `metal` build the two-site contraction stays on exact f64. The
+/// Metal kernel is f32 — Apple GPUs have no f64 — and `discarded_weight` can
+/// come back smaller than the CPU value, which is not a bound. SVD stays on
+/// the CPU either way. `MPS_METAL_CONTRACT=1` opts into the f32 kernel and
+/// warns; that is the same variable `omega-run` honours.
 fn make_mps(chi: usize) -> MpsBackend {
     // Every MPS backend built in this crate carries the ceiling, so the gate
     // applies on every path — run, train, tune, predict, and library callers —
@@ -289,15 +352,7 @@ fn make_mps(chi: usize) -> MpsBackend {
     let backend = MpsBackend::new(chi).with_max_discarded_weight(mps_discard_ceiling());
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
-    // Metal arm: the two-site θ-contraction runs on the GPU (SVD stays on CPU —
-    // Apple has no native f64, so on-GPU Jacobi SVD is deferred; see
-    // GPU_BACKEND_PLAN.md). Only engages above the bond-dim threshold; below it,
-    // and when no device is present, `--backend mps` is exact-f64 as before.
-    // `not(cuda)` so a (hypothetical) dual-vendor build keeps CUDA's native-f64
-    // gesvdj SVD rather than the f32 Metal contraction.
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let backend = backend.with_contract_fn(omega_backend_mps_metal::metal_contract_2q);
-    backend
+    apply_mps_metal_contract(backend)
 }
 
 /// Construct the compiled-in GPU statevector backend, falling back to the
@@ -469,9 +524,9 @@ pub fn run_counts_noisy(
             MidCircuitMode::Skip
         },
     };
-    // Both trajectory samplers apply the same shared model. MPS composes with
-    // whatever GPU accelerators this build wired (Metal θ-contraction / CUDA
-    // SVD) — the channels are CPU-side, the heavy contraction stays on device.
+    // Both trajectory samplers apply the same shared model. CUDA's native-f64
+    // SVD hook is wired when this build has it. The Metal f32 contraction is
+    // not: see [`make_mps`]. Channels stay on the CPU either way.
     let backend: Box<dyn Backend> = match sel {
         BackendSel::Sim => Box::new(NoisyStatevectorBackend::with_model(model.clone(), seed)),
         BackendSel::Mps { chi } => Box::new(make_noisy_mps(chi, model.clone())),
@@ -504,22 +559,18 @@ pub fn run_counts_noisy(
     project_counts_onto_creg(res, &measure_pairs(&low))
 }
 
-/// Construct the noisy MPS trajectory backend with the same GPU accelerators as
-/// [`make_mps`] — noise composes with them (see [`NoisyMpsBackend`]). The
-/// channels run on the CPU (f64, exact); the heavy two-qubit contraction / bond
-/// SVD stays on the device.
+/// Construct the noisy MPS trajectory backend with the same accelerators as
+/// [`make_mps`]. Noise does not make an under-reported `discarded_weight` into
+/// a bound, so the Metal f32 contraction stays off unless `MPS_METAL_CONTRACT`
+/// is set — the same policy, the same warning.
 ///
 /// NOTE(cuda): the CUDA SVD arm is compiled and wired identically to
-/// [`make_mps`], but — unlike the Metal arm, which is exercised on macOS in this
-/// repo's tests — it is not executed on the CI host (no NVIDIA device). Its
-/// composition with noise is code-identical to the verified Metal path.
+/// [`make_mps`]. It is not executed on the CI host (no NVIDIA device).
 fn make_noisy_mps(chi: usize, model: NoiseModel) -> NoisyMpsBackend {
     let backend = NoisyMpsBackend::with_model(chi, model);
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let backend = backend.with_contract_fn(omega_backend_mps_metal::metal_contract_2q);
-    backend
+    apply_mps_metal_contract(backend)
 }
 
 /// Expectation value under a noise model. Only the Pauli-propagation backend
@@ -765,5 +816,202 @@ mod tests {
         assert!(BackendSel::parse("mps:auto:0").is_err());
         assert!(BackendSel::parse("mps:auto:xyz").is_err());
         assert!(BackendSel::parse("wat").is_err());
+    }
+}
+
+/// Production Metal policy for both MPS constructors. Re-adding
+/// `with_contract_fn(metal_contract_2q)` at either site reddens the test that
+/// calls it: `discarded_weight` stops matching the bare CPU backend, and the
+/// Metal dispatch counter moves.
+///
+/// The two tests share one lock. `MPS_METAL_CONTRACT` and the discard ceiling
+/// are process-wide, and cargo runs tests in this binary in parallel.
+#[cfg(all(test, feature = "metal", not(feature = "cuda")))]
+mod mps_metal_certificate {
+    use super::{make_mps, make_noisy_mps, set_mps_discard_ceiling};
+    use omega_backend_mps::{MpsBackend, NoisyMpsBackend};
+    use omega_core::executor::{Backend, ExecConfig, MidCircuitMode};
+    use omega_core::noise::NoiseModel;
+    use omega_core::params::ParameterBinding;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A failed sibling must not poison the others: the mutation check is
+        // which assertion fired, and a poisoned lock turns every later test
+        // into the same panic.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Brickwall deep enough that the middle bond saturates χ = 32 and the
+    /// run truncates. Below the Metal threshold, or with nothing discarded,
+    /// reinstalling the f32 hook would leave `discarded_weight` unchanged and
+    /// these tests could not go red.
+    fn truncating_brickwall() -> omega_core::circuit::CircuitIR {
+        let n = 12usize;
+        let depth = 12usize;
+        let mut src = format!("circuit BW() {{\n  qreg q[{n}]\n");
+        for q in 0..n {
+            src.push_str(&format!("  apply H on q[{q}]\n"));
+        }
+        for d in 0..depth {
+            for q in 0..n {
+                let ang = 0.17 + 0.01 * (q + d * n) as f64;
+                src.push_str(&format!("  apply RY({ang}) on q[{q}]\n"));
+                src.push_str(&format!("  apply RZ(0.23) on q[{q}]\n"));
+            }
+            let mut q = d % 2;
+            while q + 1 < n {
+                src.push_str(&format!("  apply CX on q[{q}], q[{}]\n", q + 1));
+                q += 2;
+            }
+        }
+        src.push_str("}\n");
+        let circ = aria_core::ast::parse_aria(&src)
+            .expect("parse")
+            .instantiate("BW", &[])
+            .expect("instantiate");
+        crate::lower::lower(&circ).expect("lower").ir
+    }
+
+    fn production_env() {
+        // SAFETY: test-only. `ENV_LOCK` is held by every test that touches
+        // these, and no other test in this harness reads them.
+        unsafe {
+            std::env::remove_var("MPS_METAL_CONTRACT");
+            std::env::remove_var("MPS_METAL_MIN_BOND");
+        }
+        set_mps_discard_ceiling(f64::INFINITY);
+    }
+
+    fn discarded_bits_mps(circuit: &omega_core::circuit::CircuitIR) -> (u64, f64, usize, u64) {
+        let before = omega_backend_mps_metal::metal_contraction_count();
+        let backend = make_mps(32);
+        let obs = omega_core::executor::Observable::parse("Z0").expect("Z0");
+        backend
+            .expectation(circuit, &ParameterBinding::new(), &obs)
+            .expect("mps expectation");
+        let st = backend.last_run_stats();
+        let ran = omega_backend_mps_metal::metal_contraction_count() - before;
+        (
+            st.discarded_weight.to_bits(),
+            st.discarded_weight,
+            st.max_bond_reached,
+            ran,
+        )
+    }
+
+    #[test]
+    fn make_mps_discarded_weight_matches_bare_cpu() {
+        let _guard = env_lock();
+        production_env();
+        let circuit = truncating_brickwall();
+
+        let bare = MpsBackend::new(32).with_max_discarded_weight(f64::INFINITY);
+        let obs = omega_core::executor::Observable::parse("Z0").expect("Z0");
+        bare.expectation(&circuit, &ParameterBinding::new(), &obs)
+            .expect("bare mps expectation");
+        let bare_st = bare.last_run_stats();
+
+        let (bits, dw, bond, ran) = discarded_bits_mps(&circuit);
+        assert!(
+            bare_st.max_bond_reached >= 32,
+            "fixture max_bond_reached={} never reached MIN_BOND_DIM_FOR_METAL; \
+             reinstalling the f32 hook would not change discarded_weight",
+            bare_st.max_bond_reached
+        );
+        assert!(
+            bare_st.discarded_weight > 0.0,
+            "fixture discarded nothing ({}); both paths report zero and the hook \
+             would not redden this test",
+            bare_st.discarded_weight
+        );
+        assert_eq!(
+            ran, 0,
+            "make_mps dispatched {ran} Metal contractions; the f32 hook is installed"
+        );
+        assert_eq!(
+            bits,
+            bare_st.discarded_weight.to_bits(),
+            "make_mps discarded_weight {dw} != bare CPU {} (bond {bond}, cpu {}). \
+             The f32 contraction hook is on the production path, and a smaller \
+             certificate is not a bound.",
+            bare_st.discarded_weight,
+            bare_st.max_bond_reached
+        );
+    }
+
+    #[test]
+    fn make_noisy_mps_discarded_weight_matches_bare_cpu() {
+        let _guard = env_lock();
+        production_env();
+        let circuit = truncating_brickwall();
+        let cfg = ExecConfig {
+            shots: None,
+            seed: Some(1),
+            mid_circuit_mode: MidCircuitMode::Skip,
+        };
+        let model = NoiseModel::default();
+
+        let bare =
+            NoisyMpsBackend::with_model(32, model.clone()).with_max_discarded_weight(f64::INFINITY);
+        bare.execute(&circuit, &ParameterBinding::new(), &cfg)
+            .expect("bare noisy mps");
+        let bare_st = bare.last_run_stats();
+
+        let before = omega_backend_mps_metal::metal_contraction_count();
+        // The ceiling is applied inside `make_mps` only. Raise it after the
+        // hook decision so a truncating fixture can finish and report.
+        let hooked = make_noisy_mps(32, model).with_max_discarded_weight(f64::INFINITY);
+        hooked
+            .execute(&circuit, &ParameterBinding::new(), &cfg)
+            .expect("noisy mps");
+        let ran = omega_backend_mps_metal::metal_contraction_count() - before;
+        let st = hooked.last_run_stats();
+
+        assert!(
+            bare_st.max_bond_reached >= 32 && bare_st.discarded_weight > 0.0,
+            "noisy fixture did not truncate (bond {}, discarded {}); the hook \
+             would not redden this test",
+            bare_st.max_bond_reached,
+            bare_st.discarded_weight
+        );
+        assert_eq!(
+            ran, 0,
+            "make_noisy_mps dispatched {ran} Metal contractions; the f32 hook is installed"
+        );
+        assert_eq!(
+            st.discarded_weight.to_bits(),
+            bare_st.discarded_weight.to_bits(),
+            "make_noisy_mps discarded_weight {} != bare CPU {} (bond {}, cpu {}). \
+             The f32 contraction hook is on the noisy production path, and a \
+             smaller certificate is not a bound.",
+            st.discarded_weight,
+            bare_st.discarded_weight,
+            st.max_bond_reached,
+            bare_st.max_bond_reached
+        );
+    }
+
+    #[test]
+    fn mps_metal_contract_opt_in_dispatches() {
+        let _guard = env_lock();
+        production_env();
+        // SAFETY: same lock as the production tests. Restored before return.
+        unsafe { std::env::set_var("MPS_METAL_CONTRACT", "1") };
+        let circuit = truncating_brickwall();
+        let before = omega_backend_mps_metal::metal_contraction_count();
+        let backend = make_mps(32);
+        let obs = omega_core::executor::Observable::parse("Z0").expect("Z0");
+        backend
+            .expectation(&circuit, &ParameterBinding::new(), &obs)
+            .expect("opt-in mps expectation");
+        let ran = omega_backend_mps_metal::metal_contraction_count() - before;
+        unsafe { std::env::remove_var("MPS_METAL_CONTRACT") };
+        assert!(
+            ran > 0,
+            "MPS_METAL_CONTRACT=1 dispatched no Metal contraction; the opt-in is a no-op"
+        );
     }
 }

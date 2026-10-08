@@ -26,20 +26,55 @@ fn err(msg: impl Into<String>) -> PyErr {
     PyValueError::new_err(msg.into())
 }
 
+/// `MPS_METAL_CONTRACT=1` (or `true` / `yes`). Same predicate as `omega-run`
+/// and `aria-runtime`. Unset does not install the f32 contraction.
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn mps_metal_contract_opt_in() -> bool {
+    match std::env::var("MPS_METAL_CONTRACT") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+fn apply_mps_metal_contract(backend: MpsBackend) -> MpsBackend {
+    if mps_metal_contract_opt_in() {
+        // Loud on purpose, same sentence as the runtime and the CLI. This
+        // binding returns a number a caller will treat as a bound.
+        eprintln!(
+            "WARNING: MPS_METAL_CONTRACT is set, so the MPS two-site contraction \
+             is routed through Metal (f32 above the bond threshold). \
+             discarded_weight can come out SMALLER than the exact-f64 CPU value. \
+             On this run the truncation certificate is NOT a bound."
+        );
+        backend.with_contract_fn(omega_backend_mps_metal::metal_contract_2q)
+    } else {
+        backend
+    }
+}
+
+#[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+fn apply_mps_metal_contract(backend: MpsBackend) -> MpsBackend {
+    backend
+}
+
 /// Build the MPS backend, routing its bond-compression SVD through cuSOLVER
 /// `gesvdj` under a `cuda` build (mirrors `aria_runtime::run::make_mps`). The
 /// accelerator itself falls back to the CPU Jacobi SVD when no device is
-/// present, so the result is exact-identical either way.
+/// present, so that arm is exact-identical either way.
+///
+/// The f32 Metal contraction is not installed. It can under-report
+/// `discarded_weight`, and this module returns that number with no device
+/// field attached. `MPS_METAL_CONTRACT=1` opts in and warns — the same
+/// variable `omega-run` and `aria-runtime` honour, not a silent one.
 fn make_mps(chi: usize) -> MpsBackend {
     let backend = MpsBackend::new(chi);
     #[cfg(feature = "cuda")]
     let backend = backend.with_svd_fn(omega_backend_mps_cuda::cuda_svd_flat);
-    // Metal arm: the two-site θ-contraction on the GPU, SVD on the CPU. `not(cuda)`
-    // for the same reason the runtime has it — a dual-vendor build keeps CUDA's
-    // native-f64 gesvdj over the f32 Metal contraction.
-    #[cfg(all(feature = "metal", not(feature = "cuda")))]
-    let backend = backend.with_contract_fn(omega_backend_mps_metal::metal_contract_2q);
-    backend
+    apply_mps_metal_contract(backend)
 }
 
 /// Build the Pauli-propagation backend, installing the CUDA branch-expansion
@@ -78,10 +113,9 @@ const ACCELERATOR: Option<&str> = if cfg!(feature = "metal") {
 ///
 /// Errors — never falls back to the CPU — when the device is unusable. A silent
 /// fallback here would make a "GPU" benchmark quietly measure the CPU, which is
-/// how misleading numbers get published. `mps` and `pauliprop` behave the other
-/// way on purpose (see `make_mps` / `make_pauliprop`): there the accelerator
-/// speeds up one step inside an otherwise-identical algorithm, so falling back
-/// changes speed, not semantics.
+/// how misleading numbers get published. `mps` does not use this device for the
+/// two-site contraction: the f32 Metal kernel is not installed (`make_mps`).
+/// `pauliprop`'s branch hook is one exact step inside a CPU algorithm.
 #[allow(unreachable_code, unused_variables)]
 fn make_gpu(pin: Option<&str>) -> PyResult<Box<dyn Backend + Send + Sync>> {
     if let (Some(want), Some(have)) = (pin, ACCELERATOR) {
@@ -124,9 +158,9 @@ fn make_gpu(pin: Option<&str>) -> PyResult<Box<dyn Backend + Send + Sync>> {
 ///
 /// These are the same names `aria_runtime::run::BackendSel` accepts, so a script
 /// does not change when it moves between an NVIDIA box and an Apple one: the
-/// accelerator is chosen at build time and applied inside the spec. `mps` and
-/// `pauliprop` need no GPU variant — their accelerator (the SVD, the branch
-/// expansion) is transparent and wired in by the same cfg the runtime uses.
+/// accelerator is chosen at build time and applied inside the spec. `mps` has
+/// no GPU variant: the f32 Metal contraction is not installed (see `make_mps`).
+/// `pauliprop`'s branch expansion is wired by the same cfg the runtime uses.
 ///
 /// For deliberately benchmarking one arm, pin it: `"gpu:cuda"`, `"gpu:metal"`,
 /// `"gpu:opencl"`. A pin this wheel was not built with is an error naming what
@@ -240,12 +274,14 @@ impl PyBackend {
     /// Which accelerator this backend actually runs on: the compiled-in one for
     /// a `gpu` spec, `"cpu"` for everything else.
     ///
-    /// `mps` and `pauliprop` report `"cpu"` even on an accelerated wheel, and
-    /// that is the considered answer rather than an oversight: the algorithm
-    /// runs on the CPU and the device accelerates one step inside it (a
-    /// bond-compression SVD, a branch expansion), transparently and with a
-    /// per-operation fallback. Reporting `"cuda"` there would imply the whole
-    /// engine moved.
+    /// `mps` reports `"cpu"` on every wheel, including a metal one. The f32
+    /// two-site contraction is not installed, so an MPS run is not a Metal
+    /// run. `MPS_METAL_CONTRACT=1` opts into that kernel and warns on stderr;
+    /// this getter still returns `"cpu"`, because the engine did not move and
+    /// the value is not a bound under the opt-in. There is no device field on
+    /// the `f64` this module returns. `pauliprop` also reports `"cpu"`: its
+    /// branch hook is one step inside a CPU algorithm. Reporting `"cuda"` or
+    /// `"metal"` for either would imply the whole engine moved.
     ///
     /// An earlier version keyed off the spec STRING and so contradicted itself:
     /// `mps:cuda` said `"cuda"` while `mps:cuda:16` and plain `mps` said
@@ -504,9 +540,10 @@ fn load_source(source: &str, circuit: &str, ints: Option<Vec<(String, i64)>>) ->
     })
 }
 
-/// The GPU accelerator this wheel was built with: `"cuda"`, `"metal"`,
+/// The GPU statevector this wheel was built with: `"cuda"`, `"metal"`,
 /// `"opencl"`, or `None` for a pure-CPU wheel.
 ///
+/// This is the `gpu` spec, not a claim that an MPS run used that device.
 /// Branch on this rather than on a vendor spec string — the point of the
 /// neutral `gpu` spec is that the same code runs on either machine.
 #[pyfunction]

@@ -1,52 +1,49 @@
-//! cuSOLVER complex SVD wrapper. Primary path: `Zgesvda`
-//! (randomized approximate SVD) with `Zgesvdj` (Jacobi) as fallback.
+//! cuSOLVER complex SVD wrapper: the EXACT thin SVD `cusolverDnZgesvd`
+//! (Householder bidiagonalisation + implicit-shift QR), computed in full on the
+//! device and truncated on the host by the CPU kernel's own rule.
 //!
-//! # Why `Zgesvda` is the default
+//! The module keeps its historical name (`gesvdj`); it has not called the
+//! Jacobi solver for a long time, and until 2026-09-30 it did not call an exact
+//! solver at all.
 //!
-//! For our use case — MPS bond compression where we truncate to χ on
-//! each call and the smallest *kept* singular value is well above
-//! 1e-7 — the approximate-SVD trade-off is one-sided: we throw away
-//! the trailing singular vectors anyway. On the canonical bench
-//! shape (256×256 complex, rank 128) `Zgesvda` runs ~25× faster than
-//! `Zgesvdj` and ~5× faster than `Zgesvd` on synthetic inputs (see
-//! `examples/svd_microbench.rs`). On real MPS matrices the ratio is
-//! smaller but still material — `Zgesvdj` happens to be unusually
-//! fast on the spectra MPS produces, but `Zgesvda` is faster still.
+//! # Why not `Zgesvda` (the defect this replaces)
 //!
-//! On failure (cuSOLVER returns `info != 0`) the caller automatically
-//! falls back to the CPU Jacobi SVD — no separate `Zgesvdj` fallback
-//! on-device is wired up.
+//! This file used to call `cusolverDnZgesvdaStridedBatched` — cuSOLVER's
+//! *approximate*, rank-limited SVD — asking it for only
+//! `rank = min(max_rank, k)` singular triplets. Its rank-r output is not the
+//! exact top-r SVD ("accuracy is bounded by the implicit randomized
+//! projection", as the old comment here put it), so it agreed with the CPU
+//! Jacobi kernel only when nothing was truncated and diverged whenever
+//! something was. Measured (`STATUS.md` §5.16, 14 qubits, depth 24, χ = 32):
+//! `⟨Z⟩` = −1.9921e-9 through gesvda against −4.1442e-15 on the CPU, with the
+//! exact χ ≥ 128 rows agreeing at 1e-15; and the per-run `discarded_weight`
+//! off by 8% relative at depth 12, χ = 32. The truncation certificate is a
+//! bound and must be fed identically whatever SVD runs, so an approximate
+//! solver is the wrong tool here regardless of its speed.
 //!
-//! # Truncation certificate (`discarded_weight`)
+//! # Truncation and the certificate (`discarded_weight`)
 //!
-//! `SvdResultFlat` now carries `discarded_weight` = Σσ² over the singular
-//! values dropped by truncation (the MPS fidelity proxy). gesvda only returns
-//! `rank = min(max_rank, k)` singular values — not the truncated tail — so this
-//! device path computes the weight as ‖A‖²_F − Σσ²_kept (the Frobenius
-//! identity), which is exact regardless of how many σ the solver returned.
+//! gesvd returns all `k = min(m, n)` singular values, so the host applies
+//! exactly `omega_backend_mps::svd::truncated_svd_flat`'s rule — order the σ
+//! largest-first, keep at most `max_rank` strictly above `threshold`, never
+//! fewer than 1 — and the certificate is that kernel's quantity too: Σσ² over
+//! the σ it dropped. (The gesvda path had to use ‖A‖²_F − Σσ²_kept because
+//! the tail was never fetched; that identity is now a `debug_assert!`, not the
+//! formula. It was also noise-dominated when nothing was truncated: 1.26e-14
+//! against the CPU's 1.07e-28 at χ = 128.)
+//!
 //! Because CUDA only swaps the *SVD* (via `MpsBackend::with_svd_fn`) and leaves
 //! the split/accumulation in `Mps::apply_2q_with_svd_flat`, the per-run
 //! accumulation onto `Mps::discarded_weight` works automatically once this
 //! field is correct — there is NO CUDA analogue of the Metal
 //! `mps_apply_2q_metal` bypass to patch.
 //!
-//! ## TODO — validate on CUDA hardware (RTX 6000 Pro machine)
+//! # Failure → CPU fallback, with a reason
 //!
-//! These changes compile on the CPU-fallback path but the device numbers are
-//! unverified here. On a CUDA box, run and confirm:
-//!   1. `cargo test -p omega-backend-mps-cuda --features cuda` (existing SVD
-//!      parity tests — must still pass; U/V from `Zgesvda`/`Zgesvdj` stay the
-//!      returned orthonormal factors, so no kernel-correctness change).
-//!   2. Add/run a device parity check that `discarded_weight` from the CUDA
-//!      `truncated_svd_flat` matches the CPU `omega_backend_mps::svd::
-//!      truncated_svd_flat` to ~1e-9 on the same truncating matrix (e.g. the
-//!      128×96 / diagonal-spectrum cases from the CPU unit tests).
-//!   3. `ci.sh` gates CUDA behind `ARIA_CUDA=1` — run `ARIA_CUDA=1 ./ci.sh`
-//!      there so `gpu_cuda_agrees_with_sim` / `gpu_mps_cuda_agrees` exercise the
-//!      new field end to end.
-//!
-//! The one-sided-Jacobi CPU rewrite does not touch this file's device kernels,
-//! so only the `discarded_weight` plumbing (2 construction sites) is new here.
+//! Every failure returns a [`SvdFallback`] reason instead of a bare `None`, so
+//! `cuda_svd_flat` can count it (`crate::cuda_svd_dispatch`). `info != 0`
+//! (non-convergence of the bidiagonal QR, or a bad argument) is a fallback,
+//! not a result.
 //!
 //! # Matrix layout
 //!
@@ -54,43 +51,49 @@
 //! is a flat row-major `&[Complex64]` (m, n, stride) — what the MPS
 //! `Theta'` reshape produces directly. We transpose into a flat
 //! `Vec<f64>` (interleaved re/im) when copying to device. On the way
-//! back, U comes out column-major; we convert to row-major
-//! `Vec<Complex64>` for the [`SvdResultFlat`] output. V comes out
-//! column-major and we conjugate-transpose into `vt` (row-major).
+//! back, U (m×k, ld m) and Vᴴ (k×n, ld k) come out column-major; we
+//! convert to row-major `Vec<Complex64>` for the [`SvdResultFlat`] output.
 //!
 //! # m vs n
 //!
-//! `gesvda` (like `gesvdj`) requires `m >= n`. When the host matrix
-//! has `m < n`, we SVD `A^H` instead (which is m'=n, n'=m so
-//! m' >= n'), then swap the roles of U and V in the result:
+//! `gesvd` requires `m >= n`. When the host matrix has `m < n`, we SVD `A^H`
+//! instead (which is m'=n, n'=m so m' >= n'), then swap the roles of U and V:
 //!
 //!   A = U Σ V^H  ⇒  A^H = V Σ U^H
 //!
-//! So if `gesvda(A^H) = U' Σ V'^H`, then `U_A = V'`, `V_A = U'`.
-//!
-//! # Truncation
-//!
-//! `gesvda` takes the target `rank` as input and returns at most that
-//! many singular values pre-sorted in descending order. We pass
-//! `rank = min(max_rank, min(m, n))` and let the caller's threshold
-//! filter trim further.
+//! So if `gesvd(A^H) = U' Σ V'^H`, then `U_A = (V'^H)^H` and `V_A^H = U'^H`.
 //!
 //! # Per-shape buffer cache
 //!
 //! Per-shape device-buffer reuse is the main host-side amortisation:
 //! a brickwall MPS circuit at constant χ runs hundreds of SVDs of
 //! identical (m, n) — we don't want to alloc / dealloc the device
-//! buffers + workspace per call. That's what [`ShapeCache`] does.
+//! buffers + workspace per call. That's what [`ShapeCache`] does; it is keyed
+//! on (m, n) alone because the full thin SVD does not depend on `max_rank`.
 
 use std::cell::RefCell;
 use std::sync::Arc;
 
 use cudarc::cusolver::{safe::DnHandle, sys as cusolver_sys};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtrMut};
 use num_complex::Complex64;
 
 use omega_backend_mps::mps::Mps;
 use omega_backend_mps::svd::{SvdResult, SvdResultFlat};
+
+/// Why a device SVD did not produce a result, so the CPU fallback that follows
+/// can be counted and named (`crate::CudaSvdDispatch::last_fallback`).
+pub(crate) type SvdFallback = &'static str;
+
+/// A device allocation (matrix, factors, workspace or `info`) failed.
+pub(crate) const FALLBACK_ALLOC: SvdFallback = "device allocation failed";
+/// A host↔device copy, or the stream synchronize that completes it, failed.
+pub(crate) const FALLBACK_MEMCPY: SvdFallback = "host/device memcpy failed";
+/// `cusolverDnZgesvd` or its `_bufferSize` query returned a non-success status.
+pub(crate) const FALLBACK_SOLVER_STATUS: SvdFallback = "cuSOLVER gesvd returned an error status";
+/// The solve ran but reported `info != 0`: the bidiagonal QR did not converge
+/// (`info > 0`) or an argument was rejected (`info < 0`).
+pub(crate) const FALLBACK_INFO: SvdFallback = "cuSOLVER gesvd reported info != 0 (non-convergence)";
 
 /// Reusable cuSOLVER + driver context for repeated SVD calls.
 ///
@@ -106,18 +109,20 @@ pub struct CudaSvdContext {
     cache: RefCell<Option<ShapeCache>>,
 }
 
-/// Per-shape buffer pool. Reused when the same (m, n, rank) recurs,
-/// which dominates a brickwall MPS circuit at constant χ.
+/// Per-shape buffer pool, reused when the same solver shape (m, n) recurs,
+/// which dominates a brickwall MPS circuit at constant χ. `k = min(m, n) = n`
+/// singular triplets are always computed (the full thin SVD).
 struct ShapeCache {
     m: usize,
     n: usize,
-    rank: usize,
+    k: usize,
     lwork: i32,
     a: CudaSlice<f64>,
     s: CudaSlice<f64>,
     u: CudaSlice<f64>,
-    v: CudaSlice<f64>,
+    vt: CudaSlice<f64>,
     work: CudaSlice<f64>,
+    rwork: CudaSlice<f64>,
     info: CudaSlice<i32>,
 }
 
@@ -184,80 +189,58 @@ impl CudaSvdContext {
         }
     }
 
-    /// Build (or reuse) the per-shape buffer + workspace cache. After
-    /// this returns successfully, `self.cache` holds a `ShapeCache`
-    /// for `(m, n, rank)` ready for `Zgesvda`. Returns `None` and
-    /// leaves the previous cache untouched if any allocation / FFI
-    /// step fails.
-    fn ensure_cache(&self, m: usize, n: usize, rank: usize) -> Option<()> {
+    /// Build (or reuse) the per-shape buffer + workspace cache for the solver
+    /// shape `(m, n)`, `m >= n`. After this returns `Ok`, `self.cache` holds a
+    /// `ShapeCache` ready for `Zgesvd`. On failure the previous cache is left
+    /// untouched and the reason is returned.
+    fn ensure_cache(&self, m: usize, n: usize) -> Result<(), SvdFallback> {
+        debug_assert!(m >= n);
         let mut slot = self.cache.borrow_mut();
         if let Some(c) = slot.as_ref() {
-            if c.m == m && c.n == n && c.rank == rank {
-                return Some(());
+            if c.m == m && c.n == n {
+                return Ok(());
             }
         }
         // Different shape (or first call) — rebuild.
+        let k = n; // min(m, n), since m >= n
         let stream = &self.stream;
-        let a = stream.alloc_zeros::<f64>(2 * m * n).ok()?;
-        let s = stream.alloc_zeros::<f64>(rank).ok()?;
-        let u = stream.alloc_zeros::<f64>(2 * m * rank).ok()?;
-        let v = stream.alloc_zeros::<f64>(2 * n * rank).ok()?;
-        let info = stream.alloc_zeros::<i32>(1).ok()?;
+        let alloc = |len: usize| stream.alloc_zeros::<f64>(len).map_err(|_| FALLBACK_ALLOC);
+        let a = alloc(2 * m * n)?;
+        let s = alloc(k)?;
+        let u = alloc(2 * m * k)?;
+        let vt = alloc(2 * k * n)?;
+        // `rwork` holds the unconverged superdiagonal: min(m, n) − 1 reals.
+        let rwork = alloc(k.max(2) - 1)?;
+        let info = stream.alloc_zeros::<i32>(1).map_err(|_| FALLBACK_ALLOC)?;
 
-        let jobz = cusolver_sys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR;
-        let lda = m as i32;
-        let ldu = m as i32;
-        let ldv = n as i32;
-        let stride_a = (m * n) as i64;
-        let stride_s = rank as i64;
-        let stride_u = (m * rank) as i64;
-        let stride_v = (n * rank) as i64;
         let mut lwork: i32 = 0;
-        {
-            let (a_ptr, _a_sync) = a.device_ptr(stream);
-            let (s_ptr, _s_sync) = s.device_ptr(stream);
-            let (u_ptr, _u_sync) = u.device_ptr(stream);
-            let (v_ptr, _v_sync) = v.device_ptr(stream);
-            unsafe {
-                cusolver_sys::cusolverDnZgesvdaStridedBatched_bufferSize(
-                    self.handle.cu(),
-                    jobz,
-                    rank as i32,
-                    m as i32,
-                    n as i32,
-                    a_ptr as *const _,
-                    lda,
-                    stride_a,
-                    s_ptr as *const _,
-                    stride_s,
-                    u_ptr as *const _,
-                    ldu,
-                    stride_u,
-                    v_ptr as *const _,
-                    ldv,
-                    stride_v,
-                    &mut lwork as *mut _,
-                    1,
-                )
-                .result()
-                .ok()?;
-            }
+        unsafe {
+            cusolver_sys::cusolverDnZgesvd_bufferSize(
+                self.handle.cu(),
+                m as i32,
+                n as i32,
+                &mut lwork as *mut _,
+            )
+            .result()
+            .map_err(|_| FALLBACK_SOLVER_STATUS)?;
         }
-        let work = stream.alloc_zeros::<f64>(2 * lwork.max(1) as usize).ok()?;
+        // `lwork` is in cuDoubleComplex elements: two f64 each.
+        let work = alloc(2 * lwork.max(1) as usize)?;
 
         *slot = Some(ShapeCache {
             m,
             n,
-            rank,
+            k,
             lwork,
             a,
             s,
             u,
-            v,
+            vt,
             work,
+            rwork,
             info,
         });
-        Some(())
+        Ok(())
     }
 
     /// Apply a two-qubit gate at site `q` of `mps`, routing the bond
@@ -265,27 +248,43 @@ impl CudaSvdContext {
     /// cuSOLVER handle across many calls — the hot-path entry point
     /// for the MPS GPU bench.
     ///
-    /// Falls back transparently to the CPU SVD when the GPU SVD
-    /// returns `None` (e.g. an OOM / convergence-failed solve), so
-    /// callers don't need to handle the failure mode.
+    /// Falls back to the CPU SVD when the GPU SVD fails (e.g. an OOM /
+    /// convergence-failed solve). Each split is counted in
+    /// [`crate::cuda_svd_dispatch`] — on the GPU, or as a fallback with its
+    /// reason — so the fallback is transparent to the result but not
+    /// invisible.
     pub fn apply_2q(&self, mps: &mut Mps, q: usize, gate: &[Complex64; 16]) {
-        mps.apply_2q_with_svd_flat(q, gate, |matrix, m, n, stride, max_rank, threshold| {
-            self.truncated_svd_flat(matrix, m, n, stride, max_rank, threshold)
-                .unwrap_or_else(|| {
+        mps.apply_2q_with_svd_flat(
+            q,
+            gate,
+            |matrix, m, n, stride, max_rank, threshold| match self
+                .truncated_svd_flat_reasoned(matrix, m, n, stride, max_rank, threshold)
+            {
+                Ok(out) => {
+                    crate::note_gpu_call();
+                    out
+                }
+                Err(reason) => {
+                    crate::note_cpu_fallback(reason);
                     omega_backend_mps::svd::truncated_svd_flat(
                         matrix, m, n, stride, max_rank, threshold,
                     )
-                })
-        });
+                }
+            },
+        );
     }
 
-    /// Compute the truncated SVD of `matrix` via cuSOLVER `Zgesvdj`.
+    /// Compute the truncated SVD of `matrix` via cuSOLVER `Zgesvd` (exact).
     /// Input is row-major flat (`matrix[i * stride + j]`); output is
     /// row-major flat ([`SvdResultFlat`]).
     ///
     /// Truncation matches `omega_backend_mps::svd::truncated_svd_flat`:
     /// keep at most `max_rank` singular values strictly above
-    /// `threshold`, never returning fewer than 1.
+    /// `threshold`, never returning fewer than 1; `discarded_weight` is
+    /// Σσ² over the dropped singular values.
+    ///
+    /// `None` on any device failure. [`crate::cuda_svd_flat`] uses the
+    /// reasoned form of this call so the failure is counted and named.
     pub fn truncated_svd_flat(
         &self,
         matrix: &[Complex64],
@@ -295,8 +294,22 @@ impl CudaSvdContext {
         max_rank: usize,
         threshold: f64,
     ) -> Option<SvdResultFlat> {
+        self.truncated_svd_flat_reasoned(matrix, m_host, n_host, stride, max_rank, threshold)
+            .ok()
+    }
+
+    /// [`Self::truncated_svd_flat`], returning WHY the device path failed.
+    pub(crate) fn truncated_svd_flat_reasoned(
+        &self,
+        matrix: &[Complex64],
+        m_host: usize,
+        n_host: usize,
+        stride: usize,
+        max_rank: usize,
+        threshold: f64,
+    ) -> Result<SvdResultFlat, SvdFallback> {
         if m_host == 0 || n_host == 0 {
-            return Some(SvdResultFlat {
+            return Ok(SvdResultFlat {
                 u: vec![],
                 s: vec![],
                 vt: vec![],
@@ -307,7 +320,7 @@ impl CudaSvdContext {
         }
         debug_assert!(stride >= n_host);
 
-        // cuSOLVER `gesvdj` requires m >= n. If the host matrix is
+        // cuSOLVER `gesvd` requires m >= n. If the host matrix is
         // wide, we SVD A^H instead and swap U/V at the end.
         let transpose = m_host < n_host;
         let (m, n) = if transpose {
@@ -335,154 +348,135 @@ impl CudaSvdContext {
             }
         }
 
-        // Acquire (or rebuild) the per-shape buffer cache. When
-        // (m, n, rank) matches the previous call, this is a no-op —
-        // the same device buffers and `lwork` workspace are reused.
-        let k = m.min(n); // == n, because m >= n
-        let rank = max_rank.min(k).max(1);
+        // Acquire (or rebuild) the per-shape buffer cache. When (m, n)
+        // matches the previous call, this is a no-op — the same device
+        // buffers and `lwork` workspace are reused.
         let stream = &self.stream;
-        self.ensure_cache(m, n, rank)?;
+        self.ensure_cache(m, n)?;
 
         let mut cache_ref = self.cache.borrow_mut();
         let cache = cache_ref.as_mut().expect("ensure_cache populated");
-        // Threshold is the caller's truncation tolerance; gesvda has
-        // no tunable tolerance — accuracy is bounded by the implicit
-        // randomized projection. We rely on the post-filter
-        // `sv > threshold` to drop residual noise singular values.
-        let _ = threshold;
+        let k = cache.k;
 
-        stream.memcpy_htod(&a_host, &mut cache.a).ok()?;
+        stream
+            .memcpy_htod(&a_host, &mut cache.a)
+            .map_err(|_| FALLBACK_MEMCPY)?;
 
-        let jobz = cusolver_sys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR;
-        let lda = m as i32;
-        let ldu = m as i32;
-        let ldv = n as i32;
-        let stride_a = (m * n) as i64;
-        let stride_s = rank as i64;
-        let stride_u = (m * rank) as i64;
-        let stride_v = (n * rank) as i64;
-        let mut r_nrm_f = [0.0f64; 1];
-
+        // Thin SVD: U is m×k, Vᴴ is k×n.
+        let job_thin = b'S' as core::ffi::c_schar;
         {
             let (a_ptr, _a_sync) = cache.a.device_ptr_mut(stream);
             let (s_ptr, _s_sync) = cache.s.device_ptr_mut(stream);
             let (u_ptr, _u_sync) = cache.u.device_ptr_mut(stream);
-            let (v_ptr, _v_sync) = cache.v.device_ptr_mut(stream);
+            let (vt_ptr, _vt_sync) = cache.vt.device_ptr_mut(stream);
             let (work_ptr, _work_sync) = cache.work.device_ptr_mut(stream);
+            let (rwork_ptr, _rwork_sync) = cache.rwork.device_ptr_mut(stream);
             let (info_ptr, _info_sync) = cache.info.device_ptr_mut(stream);
 
             unsafe {
-                cusolver_sys::cusolverDnZgesvdaStridedBatched(
+                cusolver_sys::cusolverDnZgesvd(
                     self.handle.cu(),
-                    jobz,
-                    rank as i32,
+                    job_thin,
+                    job_thin,
                     m as i32,
                     n as i32,
-                    a_ptr as *const _,
-                    lda,
-                    stride_a,
+                    a_ptr as *mut _,
+                    m as i32,
                     s_ptr as *mut _,
-                    stride_s,
                     u_ptr as *mut _,
-                    ldu,
-                    stride_u,
-                    v_ptr as *mut _,
-                    ldv,
-                    stride_v,
+                    m as i32,
+                    vt_ptr as *mut _,
+                    k as i32,
                     work_ptr as *mut _,
                     cache.lwork,
+                    rwork_ptr as *mut _,
                     info_ptr as *mut _,
-                    r_nrm_f.as_mut_ptr(),
-                    1,
                 )
                 .result()
-                .ok()?;
+                .map_err(|_| FALLBACK_SOLVER_STATUS)?;
             }
         }
 
-        // Pull S, U, V back to host. Buffers are sized for `rank`
-        // singular vectors, not the full `k = min(m, n)` thin SVD.
-        let mut s_host = vec![0.0f64; rank];
-        let mut u_host = vec![0.0f64; 2 * m * rank];
-        let mut v_host = vec![0.0f64; 2 * n * rank];
+        // Pull all k singular triplets back to host.
+        let mut s_host = vec![0.0f64; k];
+        let mut u_host = vec![0.0f64; 2 * m * k];
+        let mut vt_host = vec![0.0f64; 2 * k * n];
         let mut info_host = [0i32; 1];
-        stream.memcpy_dtoh(&cache.s, &mut s_host).ok()?;
-        stream.memcpy_dtoh(&cache.u, &mut u_host).ok()?;
-        stream.memcpy_dtoh(&cache.v, &mut v_host).ok()?;
-        stream.memcpy_dtoh(&cache.info, &mut info_host).ok()?;
-        stream.synchronize().ok()?;
+        let copied = stream
+            .memcpy_dtoh(&cache.s, &mut s_host)
+            .and_then(|_| stream.memcpy_dtoh(&cache.u, &mut u_host))
+            .and_then(|_| stream.memcpy_dtoh(&cache.vt, &mut vt_host))
+            .and_then(|_| stream.memcpy_dtoh(&cache.info, &mut info_host))
+            .and_then(|_| stream.synchronize());
         drop(cache_ref);
+        copied.map_err(|_| FALLBACK_MEMCPY)?;
 
         // info != 0 → solve failed; fall back to CPU. Positive
         // info means non-convergence; negative means a bad argument.
         if info_host[0] != 0 {
-            return None;
+            return Err(FALLBACK_INFO);
         }
 
-        // Singular values are descending; pick the post-filter rank
-        // (≤ the gesvda-requested `rank`). Shadows the outer `rank`.
-        let kept = s_host
+        // Truncate exactly as the CPU kernel does. gesvd already returns σ
+        // descending; the explicit ordering is the CPU kernel's own, kept so a
+        // tie or a NaN is handled identically rather than "probably the same".
+        let mut order: Vec<usize> = (0..k).collect();
+        order.sort_by(|&i, &j| s_host[j].total_cmp(&s_host[i]));
+        let kept = order
             .iter()
             .take(max_rank)
-            .take_while(|&&sv| sv > threshold)
+            .take_while(|&&i| s_host[i] > threshold)
             .count()
             .max(1);
+        // Truncation certificate: Σσ² over exactly the σ dropped — the CPU
+        // kernel's quantity, now computable because all k σ were fetched.
+        let discarded_weight: f64 = order[kept..].iter().map(|&i| s_host[i] * s_host[i]).sum();
+        let s_out: Vec<f64> = order[..kept].iter().map(|&i| s_host[i]).collect();
 
-        let s_out: Vec<f64> = s_host[..kept].to_vec();
-        // Truncation certificate: the dropped singular-value weight. We CANNOT
-        // sum `s_host[kept..]` — gesvda was asked for only `rank = min(max_rank,
-        // k)` singular values, so when the bond is saturated (`kept == rank`,
-        // i.e. every truncating split) that tail is empty and the σ beyond
-        // `rank` were never fetched. Use the Frobenius identity instead:
-        // Σσ²_all = ‖A‖²_F, so discarded = ‖A‖²_F − Σσ²_kept. Exact regardless
-        // of how many σ the solver returned, and it keeps kept+discarded == the
-        // caller's `total` so the split's unitarity assert holds.
-        let frob_sq: f64 = {
-            let mut acc = 0.0;
+        // Cross-check against the Frobenius identity Σσ²_all = ‖A‖²_F, which
+        // is what the gesvda path had to use as its formula.
+        #[cfg(debug_assertions)]
+        {
+            let mut frob_sq = 0.0;
             for row_h in 0..m_host {
                 let base = row_h * stride;
                 for col_h in 0..n_host {
-                    acc += matrix[base + col_h].norm_sqr();
+                    frob_sq += matrix[base + col_h].norm_sqr();
                 }
             }
-            acc
-        };
-        let kept_sq: f64 = s_out.iter().map(|&sv| sv * sv).sum();
-        let discarded_weight: f64 = (frob_sq - kept_sq).max(0.0);
+            let kept_sq: f64 = s_out.iter().map(|&sv| sv * sv).sum();
+            debug_assert!(
+                (kept_sq + discarded_weight - frob_sq).abs() <= 1e-9 * frob_sq.max(1e-300),
+                "gesvd not norm-preserving: kept {kept_sq} + dropped {discarded_weight} \
+                 vs ‖A‖²_F {frob_sq}"
+            );
+        }
 
-        // Build U (m_host × kept) and Vt (kept × n_host) in row-major
-        // flat. When we transposed:
-        //   A = U Σ V^H, U_host[i, k] / Vt_host[k, j]
-        //   if !transpose: U_host = U_solver, Vt_host[k, j] = conj(V_solver[j, k])
-        //   if transpose:  U_host = V_solver, Vt_host[k, j] = conj(U_solver[j, k])
-        // Note `left_dev` / `right_dev` are sized for the gesvda
-        // request rank, with leading dim `m`/`n` respectively.
-        let (left_dev, left_dim, right_dev, right_dim) = if transpose {
-            (&v_host, n, &u_host, m)
-        } else {
-            (&u_host, m, &v_host, n)
-        };
-        debug_assert_eq!(left_dim, m_host);
-        debug_assert_eq!(right_dim, n_host);
-
+        // Solver factors, column-major: U_s[r, c] at (c*m + r), Vᴴ_s[r, c] at
+        // (c*k + r). Host A = U Σ Vᴴ:
+        //   !transpose: U[i, c] = U_s[i, c],        Vᴴ[c, j] = Vᴴ_s[c, j]
+        //    transpose: U[i, c] = conj(Vᴴ_s[c, i]), Vᴴ[c, j] = conj(U_s[j, c])
+        let at = |buf: &[f64], idx: usize| Complex64::new(buf[2 * idx], buf[2 * idx + 1]);
         let mut u_out = vec![Complex64::new(0.0, 0.0); m_host * kept];
-        for col in 0..kept {
-            for row in 0..m_host {
-                let idx = (col * left_dim + row) * 2;
-                u_out[row * kept + col] = Complex64::new(left_dev[idx], left_dev[idx + 1]);
-            }
-        }
-
         let mut vt_out = vec![Complex64::new(0.0, 0.0); kept * n_host];
-        for kidx in 0..kept {
+        for (col, &src) in order[..kept].iter().enumerate() {
+            for row in 0..m_host {
+                u_out[row * kept + col] = if transpose {
+                    at(&vt_host, row * k + src).conj()
+                } else {
+                    at(&u_host, src * m + row)
+                };
+            }
             for j in 0..n_host {
-                let idx = (kidx * right_dim + j) * 2;
-                let v_jk = Complex64::new(right_dev[idx], right_dev[idx + 1]);
-                vt_out[kidx * n_host + j] = v_jk.conj();
+                vt_out[col * n_host + j] = if transpose {
+                    at(&u_host, src * m + j).conj()
+                } else {
+                    at(&vt_host, j * k + src)
+                };
             }
         }
 
-        Some(SvdResultFlat {
+        Ok(SvdResultFlat {
             u: u_out,
             s: s_out,
             vt: vt_out,

@@ -1,0 +1,10 @@
+DITQASM 2.0;
+qreg matter [2][3,3];
+qreg field [1][7];
+creg meas[3];
+h matter[0];
+csum matter[1], field[0];
+x field[0];
+measure matter[0] -> meas[0];
+measure matter[1] -> meas[1];
+measure field[0] -> meas[2];

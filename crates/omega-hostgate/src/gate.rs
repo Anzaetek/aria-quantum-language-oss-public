@@ -59,7 +59,14 @@ use crate::{Amounts, Axis, Mode, Refusal, Request};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AxisReport {
     pub axis: Axis,
+    /// The cap actually in force — the one in the ledger, which a request is
+    /// priced against.
     pub cap: u64,
+    /// The cap this process's configuration computes. Equal to `cap` in the
+    /// ordinary case; different when the ledger is holding grants admitted
+    /// under an older number, which is the case a caller must be able to see
+    /// rather than infer. See [`reconcile_caps`].
+    pub configured: u64,
     pub charged: u64,
     pub holders: usize,
 }
@@ -147,6 +154,11 @@ impl HostGate {
         let outcome = store.with_lock(&inner.instance, &inner.caps, |ledger| {
             // The failsafe, first and unconditionally.
             prune(ledger);
+            // A request must be priced against the caps this box is configured
+            // for, not against whichever ones the ledger happened to be created
+            // with — when adopting them is honest, which is when nothing is
+            // held.
+            reconcile_caps(ledger, &inner.caps);
 
             if !advisory {
                 if let Some(refusal) = price(ledger, req) {
@@ -196,16 +208,21 @@ impl HostGate {
         let snapshot = store.with_lock(&inner.instance, &inner.caps, |ledger| {
             let before = ledger.holders.len();
             prune(ledger);
-            // Rewrite only when the prune actually reclaimed something: an
-            // inspection must not be a write load on the file every acquire on
-            // the box has to lock.
-            let changed = ledger.holders.len() != before;
+            // Prune first: a cap change is adoptable exactly when nothing is
+            // held, and a dead holder must not be what keeps the old number in
+            // force.
+            let adopted = reconcile_caps(ledger, &inner.caps);
+            // Rewrite only when the prune actually reclaimed something or the
+            // caps moved: an inspection must not be a write load on the file
+            // every acquire on the box has to lock.
+            let changed = ledger.holders.len() != before || adopted;
             let report: Vec<AxisReport> = inner
                 .caps
                 .keys()
                 .map(|axis| AxisReport {
                     axis: axis.clone(),
                     cap: ledger.cap(axis),
+                    configured: inner.caps.get(axis).copied().unwrap_or(0),
                     charged: charged_enforcing(ledger, axis),
                     holders: ledger.holders.iter().filter(|r| r.amount(axis) > 0).count(),
                 })
@@ -368,6 +385,54 @@ impl Drop for Grant {
 /// `Liveness::Unknown` counts as held — an unreadable probe must never evict a
 /// live holder, because handing its memory to the next request is strictly
 /// worse than leaving a stale record for one more scan.
+/// Bring the ledger's caps up to date with this process's configuration, when
+/// that can be done without lying about what is already held.
+///
+/// A ledger records the caps it was created with, and for the rest of the boot
+/// every later process read those numbers and ignored its own. That made every
+/// budget knob inert on a box whose ledger already existed: setting
+/// `OMEGA_HOSTGATE_MAX_MEM=8G` on a machine whose ledger was created at 16 G
+/// left the cap at 16 G, while `status` printed the new variable's name in the
+/// "cap from" column — the one place an operator checks, reporting a source
+/// that was not in force.
+///
+/// Adopting the new caps unconditionally is not the fix: a grant already
+/// outstanding was priced against the old number, and lowering the cap
+/// underneath it would put `charged` above `cap`, a state the ledger has no way
+/// to represent honestly. So the new caps are adopted exactly when **nothing is
+/// held** — which is the state the operator who just changed the budget is
+/// almost always in — and otherwise the old ones stay in force and the
+/// divergence is reported, never hidden.
+///
+/// Returns whether the ledger was changed.
+fn reconcile_caps(ledger: &mut Ledger, configured: &Amounts) -> bool {
+    let same = configured
+        .iter()
+        .all(|(axis, want)| ledger.cap(axis) == *want)
+        && ledger.caps.len() == configured.len();
+    if same {
+        return false;
+    }
+    if !ledger.holders.is_empty() {
+        for (axis, want) in configured {
+            let have = ledger.cap(axis);
+            if have != *want {
+                eprintln!(
+                    "[hostgate] {axis}: {} grant(s) are held under a cap of {have}; \
+                     the configured cap {want} takes effect once they are released",
+                    ledger.holders.len()
+                );
+            }
+        }
+        return false;
+    }
+    ledger.caps = configured
+        .iter()
+        .map(|(a, v)| (a.to_string(), *v))
+        .collect();
+    true
+}
+
 fn prune(ledger: &mut Ledger) {
     let pids: Vec<u32> = ledger.holders.iter().map(|r| r.pid).collect();
     if pids.is_empty() {

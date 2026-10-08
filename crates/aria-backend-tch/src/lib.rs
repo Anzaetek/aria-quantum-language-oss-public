@@ -349,6 +349,7 @@ impl Backend for TchBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> Result<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         let st = self.evolve(circuit, params)?;
         match config.shots {
             None => Ok(ExecResult::Statevector(st.amps_vec())),
@@ -383,6 +384,7 @@ impl Backend for TchBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        circuit.refuse_qudits(self.name())?;
         // `evolve` skips `Measure`, which answers the circuit-with-the-measurement-
         // deleted rather than the circuit. Defer first; see
         // `omega_core::defer_measure` for why an inert measurement is elided while

@@ -56,3 +56,7 @@ required-features = ["metal"]
 name = "qml_train_bench"
 harness = false
 required-features = ["metal"]
+
+[[example]]
+name = "reset_shots_probe"
+path = "examples/reset_shots_probe.rs"

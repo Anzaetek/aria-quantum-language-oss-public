@@ -305,19 +305,27 @@ pub fn to_qasm(circuit: &Circuit) -> Result<String, String> {
                     // operation — the export silently became a different
                     // circuit. Measured: a HalfWavePlate exported as
                     // `// unsupported gate: HalfWavePlate` and nothing else.
+                    let where_ = inst
+                        .qubits
+                        .iter()
+                        .map(|q| q.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if matches!(inst.gate.kind, GateKind::Tunnel | GateKind::Load) {
+                        return Err(format!(
+                            "QASM2 cannot represent `{:?}` (on {where_}). It is a \
+                             FermionicQASM statement — use `to_fermionicqasm`.",
+                            inst.gate.kind
+                        ));
+                    }
                     return Err(format!(
-                        "QASM2 cannot represent `{:?}` (on {}). The photonic gates \
+                        "QASM2 cannot represent `{:?}` (on {where_}). The photonic gates \
                          (BeamSplitter, PhaseShifter, Squeezing, Displacement, Kerr, \
                          HalfWavePlate, PolarizingBeamSplitter) belong to the OPTICQASM \
                          lane — use `to_opticqasm`. Previously this was emitted as an \
                          `// unsupported gate:` comment, which re-imported as a circuit \
                          silently missing the operation.",
-                        inst.gate.kind,
-                        inst.qubits
-                            .iter()
-                            .map(|q| q.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        inst.gate.kind
                     ));
                 }
             }
@@ -699,9 +707,9 @@ fn gate_qubit_arity(kind: GateKind) -> Option<usize> {
     use GateKind::*;
     Some(match kind {
         I | X | Y | Z | H | S | Sdg | T | Tdg | SX | RX | RY | RZ | P | U => 1,
-        CX | CY | CZ | SWAP | RXX | RYY | RZZ | CP | CRz | RBS => 2,
+        CX | CY | CZ | SWAP | RXX | RYY | RZZ | CP | CRz | RBS | Tunnel => 2,
         CCX | CSWAP => 3,
-        Barrier | Reset | Measure => return None,
+        Barrier | Reset | Measure | Load => return None,
         BeamSplitter
         | PhaseShifter
         | Squeezing

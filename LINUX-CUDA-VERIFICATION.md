@@ -70,13 +70,15 @@ usize`/`as u64` on a key, `for &k in`, `{k}` in a format string,
 `from_str_radix`. No further sites. (The count has gone 5 → 6 → 8 across three
 passes, each time because the compiler was never asked.)
 
-**STILL OPEN — this section is NOT fully closed.** The "width note that
-deserves a second opinion" about `lib.rs:858` — whether the collapse arm should
-key on `circuit.num_qubits` or the creg width — is a **semantic** question and
-a compiler cannot answer it. The CPU has
-`omega-cli/tests/collapse_counts_use_the_creg_width.rs`; **CUDA has no
-equivalent**, and `ci.sh`'s CUDA stage never exercises `MidCircuitMode::Collapse`.
-Until that test exists, this item is *compiled*, not *answered*.
+~~**STILL OPEN — this section is NOT fully closed.**~~ **ANSWERED 2026-10-02
+on an RTX PRO 6000** (x86_64, sm_120, CUDA 12.9). The equivalent of
+`omega-cli/tests/collapse_counts_use_the_creg_width.rs` is
+`omega-backend-statevector-cuda/tests/counts_width_and_collapse.rs`, and
+`ci.sh`'s CUDA stage runs it with `MidCircuitMode::Collapse`. There is no
+collapse arm to key wrongly; the qubit-register width is correct for every
+path CUDA answers. The audit did find a separate defect, a collapse-mode
+circuit with no `Measure` answered at the wrong width, and fixed it. Details
+and mutation evidence are in `STATUS.md` §5 item 2.
 
 ## 2. CUDA f64 — RESOLVED, and it is exact
 

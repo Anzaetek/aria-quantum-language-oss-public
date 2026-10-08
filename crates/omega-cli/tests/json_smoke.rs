@@ -206,3 +206,55 @@ fn qpy_input_decodes_via_pure_rust_reader_to_bell_counts() {
         );
     }
 }
+
+/// A truncating MPS `--expectation` run must carry its certificate in the JSON,
+/// not only on stderr.
+///
+/// The counts path attached `mps_truncation`; the expectation path did not,
+/// because its arm built the backend, called `expectation`, and dropped it in
+/// one expression — and the certificate lives on the backend, reachable only
+/// after the run. So a machine consumer of a *truncated* expectation got a
+/// number with no indication it had been truncated at all, while the identical
+/// circuit in counts mode told them. Two lanes found this independently from
+/// opposite directions, which is what makes it worth a test rather than a fix.
+///
+/// The shape matters: 14q depth-24 HEA at χ=32 truncates (`discarded_weight`
+/// ≈ 8.0e-7, bond 32 reached) and stays under the backend's 1e-6 refusal
+/// ceiling. At χ=8 and χ=16 the same circuit is refused outright, which is the
+/// backend working — so this test also pins that a *non-zero* certificate is
+/// reachable, and would fail if the chosen shape stopped truncating.
+///
+/// DOES NOT CATCH: a wrong value next to a right certificate. The certificate
+/// says the run was truncated; the value gate is a different test.
+#[test]
+fn a_truncating_mps_expectation_carries_its_certificate_in_json() {
+    if !have_jq() {
+        eprintln!("SKIP: jq not on PATH");
+        return;
+    }
+    let dw = run_pipe_jq(
+        &[
+            "tools/emu_compare/qasm/hea_14q_d24.qasm",
+            "--backend",
+            "mps:32",
+            "--expectation",
+            "Z0",
+            "--format",
+            "json",
+        ],
+        ".mps_truncation.discarded_weight",
+    );
+    let dw: f64 = dw
+        .parse()
+        .unwrap_or_else(|_| panic!("no mps_truncation.discarded_weight in the JSON, got {dw:?}"));
+    assert!(
+        dw > 0.0,
+        "the chosen shape stopped truncating, so this test no longer proves the \
+         certificate is reachable: discarded_weight = {dw}"
+    );
+    assert!(
+        dw < 1e-6,
+        "discarded_weight {dw} is at or above the backend's refusal ceiling, so \
+         this run would be refused rather than certified"
+    );
+}

@@ -96,6 +96,24 @@ impl PhotonicsBackend {
     }
 }
 
+/// `Ok(())` only for a photonic circuit. A fermionic circuit is named in
+/// the refusal: its wires are Jordan–Wigner occupation qubits, and running
+/// them as optical modes would return a Fock distribution for a different
+/// system. A gate-based circuit keeps the older sentence.
+fn require_photonic(circuit: &CircuitIR) -> Result<()> {
+    match circuit.circuit_type {
+        CircuitType::Photonic => Ok(()),
+        CircuitType::Fermionic => Err(OmegaError::InvalidCircuit(
+            "photonics backend refuses a Fermionic circuit: fermionic modes are \
+             Jordan–Wigner occupation wires, not optical modes"
+                .into(),
+        )),
+        CircuitType::GateBased => Err(OmegaError::InvalidCircuit(
+            "photonics backend requires a Photonic circuit".into(),
+        )),
+    }
+}
+
 impl Backend for PhotonicsBackend {
     fn name(&self) -> &str {
         "photonics"
@@ -107,11 +125,8 @@ impl Backend for PhotonicsBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> Result<ExecResult> {
-        if circuit.circuit_type != CircuitType::Photonic {
-            return Err(OmegaError::InvalidCircuit(
-                "photonics backend requires a Photonic circuit".into(),
-            ));
-        }
+        circuit.refuse_qudits(self.name())?;
+        require_photonic(circuit)?;
 
         let num_modes = circuit.num_qubits as usize;
         let ops = Self::extract_ops(circuit, params)?;
@@ -187,8 +202,14 @@ impl Backend for PhotonicsBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<Option<Vec<(omega_core::circuit::SymbolId, f64)>>> {
-        if circuit.circuit_type != CircuitType::Photonic {
-            return Ok(None);
+        circuit.refuse_qudits(self.name())?;
+        match circuit.circuit_type {
+            CircuitType::Photonic => {}
+            // A qubit circuit is not this backend's job; the caller falls
+            // back. A fermionic circuit is refused by name, same sentence
+            // as `execute`, rather than declined into that fallback.
+            CircuitType::GateBased => return Ok(None),
+            CircuitType::Fermionic => return require_photonic(circuit).map(|()| None),
         }
         // Collect the symbols this circuit depends on. We only support
         // directly-bound single-symbol parameters for now (no compound
@@ -217,7 +238,7 @@ impl Backend for PhotonicsBackend {
         for sym in direct_symbols {
             let base = params.get(sym).ok_or_else(|| OmegaError::UnboundSymbol {
                 id: sym,
-                name: format!("sym_{sym}"),
+                name: fallback_symbol_name(sym),
             })?;
 
             let mut p_plus = params.clone();
@@ -240,11 +261,8 @@ impl Backend for PhotonicsBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
-        if circuit.circuit_type != CircuitType::Photonic {
-            return Err(OmegaError::InvalidCircuit(
-                "photonics backend requires a Photonic circuit".into(),
-            ));
-        }
+        circuit.refuse_qudits(self.name())?;
+        require_photonic(circuit)?;
 
         let num_modes = circuit.num_qubits as usize;
         let ops = Self::extract_ops(circuit, params)?;
@@ -264,6 +282,7 @@ impl Backend for PhotonicsBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> Result<Vec<f64>> {
+        circuit.refuse_qudits(self.name())?;
         // Build the M×M Reck unitary and run SLOS once, then evaluate
         // each observable against the cached Fock-state distribution.
         // Both `build_unitary` and `slos::slos_full` are O(M³) /
@@ -273,11 +292,7 @@ impl Backend for PhotonicsBackend {
         if observables.is_empty() {
             return Ok(Vec::new());
         }
-        if circuit.circuit_type != CircuitType::Photonic {
-            return Err(OmegaError::InvalidCircuit(
-                "photonics backend requires a Photonic circuit".into(),
-            ));
-        }
+        require_photonic(circuit)?;
         let num_modes = circuit.num_qubits as usize;
         let ops = Self::extract_ops(circuit, params)?;
         let unitary = components::build_unitary(num_modes, &ops);

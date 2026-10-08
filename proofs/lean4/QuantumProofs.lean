@@ -36,3 +36,5 @@ import QuantumProofs.QSP
 import QuantumProofs.HadamardLayer
 import QuantumProofs.Grover
 import QuantumProofs.GroverCircuit
+import QuantumProofs.ResetModel
+import QuantumProofs.StabilizerModel

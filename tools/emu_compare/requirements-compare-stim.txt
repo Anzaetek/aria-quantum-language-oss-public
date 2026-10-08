@@ -1,0 +1,4 @@
+# Stabilizer lane (E2). Installed into tools/qec_cross_check/.venv,
+# the venv the plan already pins for Stim. Numpy is Stim's dependency;
+# the row records the resolved version, this file pins the competitor.
+stim==1.16.0

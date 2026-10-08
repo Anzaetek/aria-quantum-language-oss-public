@@ -135,7 +135,76 @@ impl SymbolLookup {
     }
 }
 
+/// Reader half of the writer's `Rbs → XXPlusYYGate(−2θ, π/2)` spelling
+/// (`write::qiskit_params` holds the numeric receipt).
+///
+/// Accepted ONLY when β is concrete and equal to π/2 (to 1e-12). Any other
+/// β — including Qiskit's default of 0 — is a different unitary that omega
+/// has no `GateKind` for, so it is refused as `Unsupported` rather than
+/// rounded to the nearest `Rbs`. The caller can still fall back to the
+/// `qpy_to_qasm2` subprocess, where Qiskit decomposes it exactly.
+fn xx_plus_yy_to_rbs(
+    inst: &super::instruction::DecodedInstruction<'_>,
+    symbols: &mut std::collections::HashMap<omega_core::circuit::SymbolId, String>,
+    sym_lookup: &mut SymbolLookup,
+    condition: Option<(u32, u32, u64)>,
+) -> Result<GateOp, QpyError> {
+    if inst.params.len() != 2 {
+        return Err(QpyError::Unsupported {
+            what: "XXPlusYYGate with a parameter count other than 2",
+            detail: "Qiskit's XXPlusYYGate takes (theta, beta); the producer wrote something else",
+        });
+    }
+    if inst.num_qargs != 2 || inst.args.len() != 2 {
+        return Err(QpyError::Unsupported {
+            what: "XXPlusYYGate with an argument count other than 2 qargs",
+            detail: "XXPlusYYGate is a two-qubit gate with no classical args",
+        });
+    }
+    let theta = param_to_expr(&inst.params[0], symbols, sym_lookup)?;
+    let beta = param_to_expr(&inst.params[1], symbols, sym_lookup)?;
+    match beta {
+        ParamExpr::Concrete(b) if (b - super::write::RBS_XX_PLUS_YY_BETA).abs() <= 1e-12 => {}
+        _ => {
+            return Err(QpyError::Unsupported {
+                what: "XXPlusYYGate with beta != pi/2",
+                detail: "only beta = pi/2 is omega's Rbs (RBS(θ) = XXPlusYYGate(−2θ, π/2)); \
+                         any other beta is a different unitary — fall back to qpy_to_qasm2",
+            });
+        }
+    }
+    let mut qubits: SmallVec<[Qubit; 3]> = SmallVec::new();
+    for (i, a) in inst.args.iter().enumerate() {
+        match a {
+            InstructionArg::Qubit(q) => qubits.push(Qubit(*q)),
+            _ => {
+                return Err(QpyError::InstructionArgKindMismatch {
+                    expected_kind: 'q',
+                    position: i,
+                })
+            }
+        }
+    }
+    let rbs_theta = match theta {
+        ParamExpr::Concrete(v) => ParamExpr::Concrete(-0.5 * v),
+        sym => ParamExpr::Mul(Box::new(sym), Box::new(ParamExpr::Concrete(-0.5))),
+    };
+    let mut params: SmallVec<[ParamExpr; 3]> = SmallVec::new();
+    params.push(rbs_theta);
+    Ok(GateOp {
+        gate: GateKind::Rbs,
+        qubits,
+        params,
+        classical_bit: None,
+        condition,
+    })
+}
+
 /// Map a Qiskit gate class name to omega's `GateKind`.
+///
+/// `XXPlusYYGate` is deliberately absent: whether it is an `Rbs` depends
+/// on its β parameter, which a name-only map cannot see. See
+/// [`xx_plus_yy_to_rbs`].
 pub fn gate_name_to_kind(name: &str) -> Result<GateKind, QpyError> {
     Ok(match name {
         "HGate" => GateKind::H,
@@ -195,6 +264,12 @@ fn decoded_to_gate_op(
     // `gate_name_to_kind`.
     if let Some(gate_op) = decompose_known_alias(inst)? {
         return Ok(gate_op);
+    }
+    // The writer spells `Rbs` as `XXPlusYYGate(−2θ, π/2)`; this is the
+    // inverse, and it needs the params, which `gate_name_to_kind` does
+    // not see.
+    if inst.name == "XXPlusYYGate" {
+        return xx_plus_yy_to_rbs(inst, symbols, sym_lookup, omega_condition);
     }
 
     let gate = gate_name_to_kind(inst.name)?;

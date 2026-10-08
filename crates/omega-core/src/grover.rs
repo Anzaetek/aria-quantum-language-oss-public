@@ -348,6 +348,8 @@ pub fn grover_circuit(
         circuit_type: CircuitType::GateBased,
         symbols: HashMap::new(),
         custom_gates: HashMap::new(),
+        qudit_registers: Vec::new(),
+        fermionic_registers: Vec::new(),
     }
 }
 
@@ -424,6 +426,8 @@ pub fn amplitude_amplification(
         circuit_type: CircuitType::GateBased,
         symbols: HashMap::new(),
         custom_gates: HashMap::new(),
+        qudit_registers: Vec::new(),
+        fermionic_registers: Vec::new(),
     }
 }
 

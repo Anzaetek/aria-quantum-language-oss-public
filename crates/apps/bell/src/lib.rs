@@ -21,7 +21,9 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
     let (payload, _) =
         harness::execute_report(transport, lowered.ir, harness::AppMode::Statevector, &[])?;
     let probs: Vec<f64> = payload
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| c[0] * c[0] + c[1] * c[1])
         .collect();
 

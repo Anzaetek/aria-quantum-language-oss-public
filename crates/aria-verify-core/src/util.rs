@@ -26,8 +26,15 @@ pub fn interleave(sv: &[Complex64]) -> Vec<f64> {
 
 /// Decode the `omega_app` counts payload `[bits0, count0, bits1, count1, ...]`.
 pub fn counts_from_payload(payload: &[f64]) -> Vec<(u64, u64)> {
+    // `as_chunks::<2>` rather than `chunks_exact(2)`: the array form gives the
+    // closure a `&[f64; 2]`, so the pair is indexed at compile time instead of
+    // bounds-checked twice per outcome. `.0` drops the remainder, which is the
+    // same silent-truncation behaviour `chunks_exact` had — a payload of odd
+    // length was already ignoring its last element.
     payload
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| (c[0] as u64, c[1] as u64))
         .collect()
 }

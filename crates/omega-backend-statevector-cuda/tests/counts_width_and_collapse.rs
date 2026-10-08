@@ -135,3 +135,81 @@ fn skip_mode_counts_key_on_the_qubit_register_width() {
         );
     }
 }
+
+/// 3 qubits, a 1-bit creg, a gate conditioned on that creg, and NO `Measure`.
+/// `needs_collapse` is true for this shape (any conditioned gate), so every
+/// caller that follows the shared predicate runs it in `Collapse` mode.
+fn conditioned_without_measure_circuit() -> CircuitIR {
+    let mut c = CircuitIR::new(3, CircuitType::GateBased);
+    c.num_classical_bits = 1;
+    let mut x = op(GateKind::X, &[0], &[], None);
+    // `if (c == 0) x q[0];` — the creg is never written, so the gate fires.
+    x.condition = Some((0, 1, 0));
+    c.ops = vec![op(GateKind::H, &[1], &[], None), x];
+    c
+}
+
+/// **Collapse mode must not be answered differently from the CPU when the
+/// circuit has no `Measure`.**
+///
+/// The refusal above only looks for a `Measure`. A circuit whose collapse is
+/// forced by a classically conditioned gate alone passes that check and is
+/// answered by the qubit-register sampler, while the CPU keys the same run on
+/// the classical register (the qiskit shape: an unwritten `creg c[1]` reads
+/// `0`). The two backends then disagree on the key width AND the key value,
+/// and a caller that renders at `counts_outcome_width(c, true)` mislabels
+/// the CUDA result.
+#[test]
+fn collapse_without_a_measure_agrees_with_the_cpu() {
+    let Some(cuda) = backend() else { return };
+    let c = conditioned_without_measure_circuit();
+    assert!(
+        omega_core::executor::needs_collapse(&c),
+        "fixture sanity: a conditioned gate forces collapse"
+    );
+    let cfg = ExecConfig {
+        shots: Some(64),
+        seed: Some(5),
+        mid_circuit_mode: MidCircuitMode::Collapse,
+    };
+    let cpu = omega_backend_statevector::StatevectorBackend::new()
+        .execute(&c, &ParameterBinding::new(), &cfg)
+        .expect("cpu runs collapse mode");
+    let ExecResult::Counts(cpu) = cpu else {
+        panic!("cpu shots run must return Counts");
+    };
+    let want = counts_outcome_width(&c, true);
+    for k in cpu.keys() {
+        assert_eq!(
+            k.width() as usize,
+            want,
+            "fixture sanity: cpu keys on the creg"
+        );
+    }
+
+    match cuda.execute(&c, &ParameterBinding::new(), &cfg) {
+        // Refusing is an acceptable answer: the caller routes to the CPU.
+        Err(e) => assert!(
+            {
+                let m = format!("{e}");
+                m.contains("collapse mode") || m.contains("mid-circuit measurement")
+            },
+            "a refusal must name what is unsupported; got: {e}"
+        ),
+        Ok(ExecResult::Counts(got)) => {
+            let render = |m: &std::collections::HashMap<omega_core::outcome::Outcome, u32>| {
+                let mut v: Vec<(String, u32)> =
+                    m.iter().map(|(k, n)| (k.to_bitstring(), *n)).collect();
+                v.sort();
+                v
+            };
+            assert_eq!(
+                render(&got),
+                render(&cpu),
+                "CUDA answered collapse mode differently from the CPU on a \
+                 circuit with no Measure"
+            );
+        }
+        Ok(other) => panic!("shots run returned a non-Counts result: {other:?}"),
+    }
+}

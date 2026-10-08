@@ -30,7 +30,12 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
     let lowered = harness::load_lowered("taylor_lcu.aria", "TaylorLcu", &[])?;
     let (flat, _) =
         harness::execute_report(transport, lowered.ir, harness::AppMode::Statevector, &[])?;
-    let amp: Vec<C> = flat.chunks_exact(2).map(|c| C::new(c[0], c[1])).collect();
+    let amp: Vec<C> = flat
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| C::new(c[0], c[1]))
+        .collect();
     if amp.len() != 4 {
         return Err(format!("expected 4 amplitudes, got {}", amp.len()));
     }

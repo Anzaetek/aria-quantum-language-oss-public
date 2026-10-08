@@ -219,7 +219,9 @@ fn metal_path(
 
     // Lift back to f64 Complex64.
     let theta_prime: Vec<Complex64> = theta_prime_f32
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| Complex64::new(p[0] as f64, p[1] as f64))
         .collect();
 

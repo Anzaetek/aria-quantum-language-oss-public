@@ -1,0 +1,6 @@
+# One Kitaev bond, modes 10 and 11, sweet spot t = Delta = 1.
+# Lowers to -X10 X11. Observable range R = 1.
+-1 [10^ 11] +
+-1 [11^ 10] +
+1 [10 11] +
+1 [11^ 10^]

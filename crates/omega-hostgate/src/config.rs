@@ -27,6 +27,22 @@
 //!    process on a 64 GB node inside a 2 GB pod believes it has 64 GB, admits a
 //!    job that fits the node and not the pod, and the kernel OOM-kills it — the
 //!    exact inversion of this crate's contract, which is to refuse.
+//!
+//! 5. **An unset host cap is not the whole ceiling.** With no absolute, no
+//!    fraction and no profile, a reserve is held back for the OS and for every
+//!    process that will never take a grant: one eighth of the ceiling, at least
+//!    4 GiB where the ceiling can spare it, and never more than 8 GiB. A
+//!    fraction that leaves 4 GiB on a 16 GiB machine leaves 32 GiB on a 128 GiB
+//!    one, which is headroom the OS does not need; the 8 GiB bound is what
+//!    stops that. The number is reported as `default`, not `detected` —
+//!    detection produced the ceiling, and the cap is not the ceiling. This
+//!    diverges from `omega-server`, which treats an unset profile as `balanced`
+//!    and labels that result `detected`. Copying the label would name a source
+//!    that did not produce the cap.
+//!
+//!    Slots are not given the same reserve. The recorded failure was a memory
+//!    cap, and a machine one core short degrades where a machine one byte short
+//!    is killed.
 
 use std::path::{Path, PathBuf};
 
@@ -40,7 +56,23 @@ pub enum Provenance {
     Profile,
     Detected,
     Cgroup,
-    Default,
+    /// The built-in host-memory reserve ([`default_host_bytes`]). Not
+    /// [`Detected`] or [`Cgroup`]: those name the ceiling the reserve was
+    /// subtracted from, and the cap is not that ceiling. `ceiling` is kept so
+    /// `status` can say a cgroup was involved without claiming the printed
+    /// number is the cgroup's limit.
+    Default {
+        ceiling: DefaultCeiling,
+    },
+}
+
+/// What a [`Provenance::Default`] reserve was subtracted from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultCeiling {
+    /// Host memory, when no tighter cgroup is in force.
+    Host,
+    /// The cgroup memory limit, when it is lower than the host.
+    Cgroup,
 }
 
 impl Provenance {
@@ -50,8 +82,73 @@ impl Provenance {
             Provenance::Profile => "profile".into(),
             Provenance::Detected => "detected".into(),
             Provenance::Cgroup => "cgroup".into(),
-            Provenance::Default => "default".into(),
+            Provenance::Default { ceiling } => match ceiling {
+                DefaultCeiling::Host => "default".into(),
+                DefaultCeiling::Cgroup => "default, of cgroup".into(),
+            },
         }
+    }
+}
+
+/// Minimum bytes held back from an unset host cap, when the ceiling can spare
+/// them. 4 GiB is the floor because a 16 GiB machine's kernel already wires on
+/// the order of a couple of GiB before any admitted job runs; a smaller reserve
+/// is the "whole machine" cap with a thinner remainder.
+pub const DEFAULT_MEM_RESERVE_FLOOR: u64 = 4 << 30;
+
+/// The reserve stops growing here. One eighth of 128 GiB is 16 GiB, and that
+/// is a laptop's fraction applied to a machine that does not need it.
+pub const DEFAULT_MEM_RESERVE_CEILING: u64 = 8 << 30;
+
+/// Default host-memory cap for `ceiling` bytes — the host, or the cgroup when
+/// that is tighter.
+///
+/// The reserve is `ceiling / 8`, clamped into `[floor, 8 GiB]`, where `floor`
+/// is [`DEFAULT_MEM_RESERVE_FLOOR`] but never more than `ceiling / 4`. The
+/// quarter bound is what keeps a 2 GiB pod from being asked to reserve more
+/// than it has: it gives up 512 MiB and keeps 1.5 GiB.
+///
+/// | ceiling | reserve | cap |
+/// |---|---|---|
+/// | 16 GiB | 4 GiB (the floor; an eighth is only 2) | 12 GiB |
+/// | 48 GiB | 6 GiB (the eighth, between the two bounds) | 42 GiB |
+/// | 128 GiB | 8 GiB (the bound; an eighth is 16) | 120 GiB |
+/// | 2 GiB | 512 MiB (a quarter; the floor does not fit) | 1.5 GiB |
+///
+/// Above 80 GiB the reserve has stopped at 8 GiB, so this cap is a larger
+/// *share* than [`Profile::Greedy`] (90%). That is deliberate. A profile is a
+/// share of the ceiling and, like an absolute or a fraction, it replaces this
+/// function entirely; it is not a request to be given more than the default.
+/// On a 16 GiB machine the names still line up: this default is 12 GiB and
+/// greedy is 90% of 16.
+pub fn default_host_bytes(ceiling: u64) -> u64 {
+    if ceiling <= 1 {
+        return ceiling;
+    }
+    let proportional = ceiling / 8;
+    let quarter = ceiling / 4;
+    // `clamp` panics if the low bound exceeds the high one. The floor constant
+    // is 4 GiB and the ceiling constant is 8 GiB; the quarter cap can only
+    // make the floor smaller.
+    let floor = DEFAULT_MEM_RESERVE_FLOOR.min(quarter).max(1);
+    let reserve = proportional.clamp(floor, DEFAULT_MEM_RESERVE_CEILING);
+    // One byte, never the whole ceiling: the same direction `scale` takes when
+    // a fraction rounds to nothing. A zero cap refuses every request as
+    // `TooLarge`, which reads as a broken gate.
+    ceiling.saturating_sub(reserve).max(1)
+}
+
+/// Memory's fallback. Slots do not use this — see the module docs.
+fn host_memory_default(ceiling: u64, from: Provenance) -> Limit {
+    Limit {
+        value: default_host_bytes(ceiling),
+        from: Provenance::Default {
+            ceiling: if matches!(from, Provenance::Cgroup) {
+                DefaultCeiling::Cgroup
+            } else {
+                DefaultCeiling::Host
+            },
+        },
     }
 }
 
@@ -212,6 +309,7 @@ impl Config {
             },
             mem_source,
             parse_bytes,
+            host_memory_default,
         )?;
         let slots = resolve_axis(
             &get,
@@ -229,6 +327,9 @@ impl Config {
                     .parse::<u64>()
                     .map_err(|_| format!("{s:?} is not a whole number of slots"))
             },
+            // No reserve. The failure was a memory cap; a short core count
+            // degrades, it does not OOM the box.
+            |total, from| Limit { value: total, from },
         )?;
 
         let mut caps = Amounts::new();
@@ -263,7 +364,12 @@ impl Config {
     }
 }
 
-/// Absolute, then fraction, then profile, then the whole detected amount.
+/// Absolute, then fraction, then profile, then `fallback`.
+///
+/// Memory's fallback is [`host_memory_default`]. Slots' fallback is the whole
+/// detected count. An absolute is clamped to the detected ceiling — the whole
+/// machine, or the whole cgroup — and not to the reserve: an operator who
+/// names the ceiling asked for it.
 #[allow(clippy::too_many_arguments)]
 fn resolve_axis(
     get: &impl Fn(&str) -> Option<String>,
@@ -273,6 +379,7 @@ fn resolve_axis(
     detected: Option<u64>,
     detected_from: Provenance,
     parse_abs: impl Fn(&str) -> Result<u64, String>,
+    fallback: impl Fn(u64, Provenance) -> Limit,
 ) -> Result<Limit, String> {
     if let Some(v) = get(abs_key) {
         let value = parse_abs(&v).map_err(|e| format!("{abs_key}: {e}"))?;
@@ -313,10 +420,7 @@ fn resolve_axis(
             from: Provenance::Profile,
         });
     }
-    Ok(Limit {
-        value: detected,
-        from: detected_from,
-    })
+    Ok(fallback(detected, detected_from))
 }
 
 fn scale(total: u64, f: f64) -> u64 {
@@ -569,6 +673,7 @@ fn detect_cgroup_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Refusal, Request};
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -579,11 +684,28 @@ mod tests {
         move |k: &str| m.get(k).cloned()
     }
 
+    fn host_label(c: &Config) -> String {
+        c.provenance
+            .iter()
+            .find(|(a, _)| *a == Axis::HostBytes)
+            .unwrap()
+            .1
+            .label()
+    }
+
     fn machine() -> Detected {
+        box_of_cores(64 << 30, 16)
+    }
+
+    fn box_of(host_bytes: u64) -> Detected {
+        box_of_cores(host_bytes, 8)
+    }
+
+    fn box_of_cores(host_bytes: u64, cores: u64) -> Detected {
         Detected {
-            host_bytes: 64 << 30,
+            host_bytes,
             cgroup_bytes: None,
-            cores: 16,
+            cores,
             boot_identified: true,
         }
     }
@@ -607,7 +729,12 @@ mod tests {
     fn naming_a_ledger_enforces_by_default() {
         let c = Config::resolve(env(&[(ENV_PATH, "/run/gate.json")]), machine()).unwrap();
         assert_eq!(c.mode, Mode::Enforce);
-        assert_eq!(c.caps.get(&Axis::HostBytes), Some(&(64 << 30)));
+        // 64 GiB minus the 8 GiB reserve bound. The pin against "the whole
+        // ceiling" is `the_default_host_cap_is_not_the_whole_machine`, on the
+        // 16 GiB size the bug was reported at — this assertion only keeps the
+        // old "64 GiB, because that is what was detected" from surviving here.
+        assert_eq!(c.caps.get(&Axis::HostBytes), Some(&(56 << 30)));
+        assert_eq!(host_label(&c), "default");
         assert_eq!(c.caps.get(&Axis::Slots), Some(&16));
     }
 
@@ -652,13 +779,13 @@ mod tests {
             boot_identified: true,
         };
         let c = Config::resolve(env(&[(ENV_PATH, "/run/g")]), m).unwrap();
-        assert_eq!(c.caps.get(&Axis::HostBytes), Some(&(2 << 30)));
-        let (_, from) = c
-            .provenance
-            .iter()
-            .find(|(a, _)| *a == Axis::HostBytes)
-            .unwrap();
-        assert_eq!(from.label(), "cgroup");
+        // 2 GiB minus a quarter. The floor is 4 GiB and does not fit in the
+        // pod; subtracting it would leave nothing, which is not a budget.
+        assert_eq!(c.caps.get(&Axis::HostBytes), Some(&(3 << 29)));
+        assert_ne!(c.caps.get(&Axis::HostBytes), Some(&(64 << 30)));
+        // Not "cgroup". That label would mean the cap is the cgroup's own
+        // limit, and 1.5 GiB is not 2 GiB.
+        assert_eq!(host_label(&c), "default, of cgroup");
     }
 
     #[test]
@@ -670,7 +797,10 @@ mod tests {
             boot_identified: true,
         };
         let c = Config::resolve(env(&[(ENV_PATH, "/run/g")]), m).unwrap();
-        assert_eq!(c.caps.get(&Axis::HostBytes), Some(&(8 << 30)));
+        // The host's 8 GiB, not the cgroup's 64, and then the reserve: a
+        // quarter of 8 GiB is 2 GiB, which caps the 4 GiB floor.
+        assert_eq!(c.caps.get(&Axis::HostBytes), Some(&(6 << 30)));
+        assert_eq!(host_label(&c), "default");
     }
 
     #[test]
@@ -860,5 +990,120 @@ mod tests {
             "expected to detect more than 1 GiB on this host, saw {}",
             d.host_bytes
         );
+    }
+
+    #[test]
+    fn the_default_host_cap_is_not_the_whole_machine() {
+        // 16 GiB is the box the bug was measured on: the whole ceiling admits
+        // two 8 GiB lanes and leaves the OS nothing. The expected cap is a
+        // literal. Comparing against `default_host_bytes` would stay green if
+        // that function started returning the ceiling — both sides would move.
+        let sixteen = 16 << 30;
+        let c = Config::resolve(env(&[(ENV_PATH, "/run/g")]), box_of(sixteen)).unwrap();
+        let cap = *c.caps.get(&Axis::HostBytes).unwrap();
+        assert_eq!(cap, 12 << 30, "16 GiB keeps a 4 GiB reserve, cap was {cap}");
+        assert!(cap < sixteen);
+        assert_eq!(host_label(&c), "default");
+        assert_ne!(host_label(&c), "detected");
+        assert_eq!(c.caps.get(&Axis::Slots), Some(&8));
+
+        let path = std::env::temp_dir().join(format!(
+            "omega-hostgate-default-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let resolved =
+            Config::resolve(env(&[(ENV_PATH, path.to_str().unwrap())]), box_of(sixteen)).unwrap();
+        assert_eq!(resolved.caps.get(&Axis::HostBytes), Some(&(12 << 30)));
+        let gate = resolved.into_gate();
+        let host = gate
+            .capacity()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.axis == Axis::HostBytes)
+            .expect("host_bytes");
+        assert_eq!(host.cap, 12 << 30);
+        assert_eq!(
+            host.configured, host.cap,
+            "an idle ledger adopts the reserve; status may print a source \
+             beside a cap only when the two numbers are the same"
+        );
+
+        // Held across the second acquire on purpose. Dropping it first returns
+        // the 8 GiB, the second lane is admitted, and the assertion below stays
+        // green while the cap is the whole machine.
+        let held = gate
+            .try_acquire(&Request::new("lane-a").want(Axis::HostBytes, 8 << 30))
+            .expect("the first 8 GiB lane fits in 12 GiB");
+        let second = gate.try_acquire(&Request::new("lane-b").want(Axis::HostBytes, 8 << 30));
+        match second {
+            Err(Refusal::Busy {
+                axis: Axis::HostBytes,
+                required,
+                available,
+            }) => {
+                assert_eq!(required, 8 << 30);
+                assert!(available < required, "available {available}");
+            }
+            other => panic!("the second 8 GiB lane was not refused as busy: {other:?}"),
+        }
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+    }
+
+    #[test]
+    fn the_default_reserve_does_not_grow_without_a_bound() {
+        // 48 GiB: an eighth is 6 GiB, strictly between the 4 GiB floor and the
+        // 8 GiB bound. A step from the floor straight to the bound is 44 or 40,
+        // not 42. Three quarters — also 12 GiB on a 16 GiB box — is 36.
+        let mid = Config::resolve(env(&[(ENV_PATH, "/run/g")]), box_of(48 << 30)).unwrap();
+        assert_eq!(mid.caps.get(&Axis::HostBytes), Some(&(42 << 30)));
+        assert_eq!(host_label(&mid), "default");
+
+        // 128 GiB: an eighth is 16 GiB and a quarter is 32. The bound keeps 8,
+        // so the cap is 120 GiB and not 112 or 96.
+        let big = Config::resolve(env(&[(ENV_PATH, "/run/g")]), box_of(128 << 30)).unwrap();
+        assert_eq!(big.caps.get(&Axis::HostBytes), Some(&(120 << 30)));
+        assert_ne!(big.caps.get(&Axis::HostBytes), Some(&(96 << 30)));
+        assert_ne!(big.caps.get(&Axis::HostBytes), Some(&(112 << 30)));
+        assert_eq!(host_label(&big), "default");
+    }
+
+    #[test]
+    fn an_explicit_memory_setting_replaces_the_reserve_entirely() {
+        let m = box_of(16 << 30);
+        // The whole machine, asked for by name. The reserve must not second-guess it.
+        let whole = Config::resolve(env(&[(ENV_PATH, "/run/g"), (ENV_MAX_MEM, "16G")]), m).unwrap();
+        assert_eq!(whole.caps.get(&Axis::HostBytes), Some(&(16 << 30)));
+        assert_eq!(host_label(&whole), "env:OMEGA_HOSTGATE_MAX_MEM");
+
+        let frac =
+            Config::resolve(env(&[(ENV_PATH, "/run/g"), (ENV_MEM_FRACTION, "1")]), m).unwrap();
+        assert_eq!(frac.caps.get(&Axis::HostBytes), Some(&(16 << 30)));
+        assert_eq!(host_label(&frac), "env:OMEGA_HOSTGATE_MEM_FRACTION");
+
+        let balanced =
+            Config::resolve(env(&[(ENV_PATH, "/run/g"), (ENV_PROFILE, "balanced")]), m).unwrap();
+        assert_eq!(balanced.caps.get(&Axis::HostBytes), Some(&(8 << 30)));
+        assert_eq!(host_label(&balanced), "profile");
+    }
+
+    #[test]
+    fn default_host_bytes_worked_examples() {
+        // These pin the arithmetic. They do not pin that `Config::resolve`
+        // calls the function — `the_default_host_cap_is_not_the_whole_machine`
+        // does, because it goes through resolve and never calls this.
+        assert_eq!(default_host_bytes(16 << 30), 12 << 30);
+        assert_eq!(default_host_bytes(48 << 30), 42 << 30);
+        assert_eq!(default_host_bytes(128 << 30), 120 << 30);
+        assert_eq!(default_host_bytes(2 << 30), 3 << 29);
+        assert_eq!(default_host_bytes(8 << 30), 6 << 30);
+        assert_eq!(default_host_bytes(3), 2);
+        assert_eq!(default_host_bytes(1), 1);
     }
 }

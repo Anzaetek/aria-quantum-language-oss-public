@@ -1,12 +1,23 @@
 #![allow(clippy::needless_range_loop)]
 
+/// The DEFAULT macOS bond-compression SVD: Accelerate LAPACK `zgesdd` in f64,
+/// above a measured size gate, with the Jacobi kernel below it and on decline.
+///
+/// `cfg(target_os = "macos")` and nothing else, because Accelerate is in the
+/// base macOS SDK: no optional dependency, no device to probe, no feature to
+/// opt into. It spent its first week behind `omega-cli`'s `metal` feature by
+/// living in `omega-backend-mps-metal`, which withheld it from every default
+/// macOS build for a reason — "keep a stock `cargo build` GPU-crate-free" —
+/// that was never about it. See `STATUS.md` §5 item 16.
+#[cfg(target_os = "macos")]
+pub mod accelerate;
 pub mod capacity;
 pub mod gates;
 pub mod mps;
 mod sim;
 pub mod svd;
 
-pub use mps::{Contract2qFn, SvdFlatFn};
+pub use mps::{default_svd_flat_fn, default_svd_kernel, Contract2qFn, SvdFlatFn, SvdKernel};
 pub use sim::{MpsBackend, MpsRunStats, NoisyMpsBackend, DEFAULT_MAX_DISCARDED_WEIGHT};
 
 /// How `--backend mps…` is spelled, parsed in ONE place.
@@ -30,7 +41,10 @@ pub mod select {
     ///
     /// Kept beside the grammar it belongs to. `aria-runtime` has its own copy
     /// (`MPS_AUTO_EPS`) predating this module; the two must agree, which is
-    /// pinned by `both_front_ends_use_the_same_auto_epsilon` in aria-runtime.
+    /// pinned by `both_front_ends_use_the_same_defaults` in aria-runtime
+    /// (`tests/mps_selector_agrees_with_backend.rs`), which asserts this
+    /// constant alongside the chi and ceiling defaults rather than in a
+    /// per-constant test — the name it was cited under here never existed.
     pub const AUTO_EPS: f64 = 1e-10;
 
     /// A parsed MPS backend selector.

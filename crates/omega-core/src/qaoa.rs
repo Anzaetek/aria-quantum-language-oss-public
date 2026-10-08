@@ -124,6 +124,8 @@ pub fn qaoa_circuit(ising: &IsingModel, p: usize) -> CircuitIR {
         circuit_type: CircuitType::GateBased,
         symbols,
         custom_gates: HashMap::new(),
+        qudit_registers: Vec::new(),
+        fermionic_registers: Vec::new(),
     }
 }
 

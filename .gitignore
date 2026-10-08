@@ -36,3 +36,6 @@ tools/tla/tla2tools.jar
 # Cross-build target dir used by the tch/libtorch pass (CARGO_BUILD_TARGET splits
 # host and target artifacts, so cargo puts them here).
 /target-tch
+
+# cargo-mutants scratch output (A2 audit runs)
+mutants.out/

@@ -226,6 +226,18 @@ fn max_freq_truncation_stays_within_budget_and_converges() {
             err <= dropped + 1e-9,
             "max_freq={max_freq}: error {err} exceeded dropped-mass budget {dropped}"
         );
+        // The tightest cap must actually bite. Both bounds above are satisfied
+        // trivially by a budget that never fires (every row exact, every error
+        // zero) — which is exactly what a split counter that stops counting
+        // produces. So the frequency-1 row must have dropped something: this
+        // circuit has paths two rotations deep.
+        if max_freq == 1 {
+            assert!(
+                !cert.is_exact(),
+                "max_freq=1 dropped nothing on a circuit with two-deep paths: \
+                 the split-frequency budget never fired"
+            );
+        }
         assert!(
             err <= prev_err + 1e-9,
             "max_freq={max_freq}: error {err} worse than tighter cap's {prev_err}"
@@ -779,6 +791,114 @@ fn noise_pauli_channel_x_flips_z_sign_fraction() {
     .expectation(&c, &ParameterBinding::new(), &o)
     .unwrap();
     assert!((got - (1.0 - 2.0 * px)).abs() <= 1e-12, "pauli-X ⟨Z⟩ {got}");
+}
+
+#[test]
+fn noise_pauli_channel_a_single_nonzero_rate_opens_the_gate() {
+    // The channel is skipped when all three rates are zero. That guard is a
+    // sum, p_x + p_y + p_z > 0, and no test put a rate in the last position
+    // alone — so a guard that mis-adds the third rate (p_x + p_y − p_z,
+    // p_x + p_y·p_z; cargo-mutants, 2 survivors) skips a pure-Z channel and
+    // reports the noiseless value. One nonzero rate in each position, read on
+    // the axis it flips: pure X reads ⟨Z⟩ on |0⟩ = 1 − 2p_x; pure Y and pure Z
+    // read ⟨X⟩ on |+⟩ = 1 − 2p_y, 1 − 2p_z. A value of 1 means "skipped".
+    let p = 0.2_f64;
+    let want = 1.0 - 2.0 * p;
+    let cases: [(&str, PauliChannel, GateKind, PauliOp); 3] = [
+        (
+            "x",
+            PauliChannel {
+                x: p.into(),
+                ..Default::default()
+            },
+            GateKind::Id,
+            PauliOp::Z,
+        ),
+        (
+            "y",
+            PauliChannel {
+                y: p.into(),
+                ..Default::default()
+            },
+            GateKind::H,
+            PauliOp::X,
+        ),
+        (
+            "z",
+            PauliChannel {
+                z: p.into(),
+                ..Default::default()
+            },
+            GateKind::H,
+            PauliOp::X,
+        ),
+    ];
+    for (name, chan, gate, read) in cases {
+        let c = circuit(1, vec![op(gate, &[0], &[])]);
+        let o = obs(vec![(0, read)]);
+        let got = noisy(NoiseModel {
+            pauli: Some(chan),
+            ..Default::default()
+        })
+        .expectation(&c, &ParameterBinding::new(), &o)
+        .unwrap();
+        assert!(
+            (got - want).abs() <= 1e-12,
+            "pure-{name} channel: want {want}, got {got} (1 means the channel was skipped)"
+        );
+    }
+}
+
+#[test]
+fn noise_pauli_channel_each_row_sees_all_three_rates() {
+    // The test above fires a pure-X channel and reads ⟨Z⟩: one row of the
+    // transfer matrix, one nonzero rate. Under it every sign on p_y and p_z in
+    // all three rows survived mutation (cargo-mutants, 21 survivors in the
+    // channel block). Three distinct rates, each row read against its own
+    // preparation. Bloch picture, channel after every gate:
+    //   λ_X = 1−2(p_y+p_z)   λ_Y = 1−2(p_x+p_z)   λ_Z = 1−2(p_x+p_y)
+    //   Id on |0⟩, read Z       → λ_Z
+    //   H  on |0⟩, read X       → λ_X            (fires once, after H)
+    //   H, S on |0⟩, read Y     → λ_X·λ_Y        (x scaled after H, carried to
+    //                                             y by S, y scaled after S)
+    // p_y > p_x + p_z on purpose: the "any rate nonzero" guard is a sum, and
+    // that ordering is what distinguishes it from a sign-flipped one.
+    let (px, py, pz) = (0.05_f64, 0.3_f64, 0.1_f64);
+    let (lx, ly, lz) = (
+        1.0 - 2.0 * (py + pz),
+        1.0 - 2.0 * (px + pz),
+        1.0 - 2.0 * (px + py),
+    );
+    let model = || NoiseModel {
+        pauli: Some(PauliChannel {
+            x: px.into(),
+            y: py.into(),
+            z: pz.into(),
+        }),
+        ..Default::default()
+    };
+    let read = |ops: Vec<GateOp>, p: PauliOp| -> f64 {
+        noisy(model())
+            .expectation(
+                &circuit(1, ops),
+                &ParameterBinding::new(),
+                &obs(vec![(0, p)]),
+            )
+            .unwrap()
+    };
+    let z = read(vec![op(GateKind::Id, &[0], &[])], PauliOp::Z);
+    let x = read(vec![op(GateKind::H, &[0], &[])], PauliOp::X);
+    let y = read(
+        vec![op(GateKind::H, &[0], &[]), op(GateKind::S, &[0], &[])],
+        PauliOp::Y,
+    );
+    assert!((z - lz).abs() <= 1e-12, "Z row: got {z}, want λ_Z = {lz}");
+    assert!((x - lx).abs() <= 1e-12, "X row: got {x}, want λ_X = {lx}");
+    assert!(
+        (y - lx * ly).abs() <= 1e-12,
+        "Y row: got {y}, want λ_X·λ_Y = {}",
+        lx * ly
+    );
 }
 
 #[test]

@@ -36,12 +36,14 @@ fn feedforward(creg_name: &str, creg_size: usize) -> Circuit {
         size: 2,
         kind: RegisterKind::Quantum,
         polarized: false,
+        spin: false,
     });
     c.registers.push(RegisterDecl {
         name: creg_name.into(),
         size: creg_size,
         kind: RegisterKind::Classical,
         polarized: false,
+        spin: false,
     });
     let q = |i: usize| Qubit::new("q", i);
     let cb = Clbit::new(creg_name, 0);
@@ -259,9 +261,9 @@ fn the_aria_emitter_carries_the_guard_too() {
 /// **The Aria emitter's output must RE-PARSE**, not merely contain the right
 /// substring.
 ///
-/// `the_aria_emitter_carries_the_guard_too` is a substring check — the exact
-/// standard its sibling `an_exported_guard_survives_reparsing` states three
-/// lines away, and it could not see either of these:
+/// `the_aria_emitter_carries_the_guard_too` is a substring check — a weaker
+/// standard than the round trip THIS test performs, and it could not see
+/// either of these:
 ///
 /// 1. `RESET` was emitted as `-- reset q[0]`, a comment, so a channel that
 ///    changes measurement statistics vanished on round trip.

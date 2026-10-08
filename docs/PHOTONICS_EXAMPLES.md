@@ -14,6 +14,11 @@ configurations. CV is a single mode's Fock ladder under displacement, squeezing
 and Kerr. They share the word "photonic" and almost nothing else, so they are
 documented separately rather than forced into a parallel table.
 
+**OPTICQASM is an in-house format.** It carries no authority of a standard.
+The grammar in `crates/omega-parser/src/opticqasm.pest` is this repository's
+dialect. The same sentence, and the search that found no fermionic QASM to
+adopt instead, is in [`FERMIONICQASM.md`](FERMIONICQASM.md).
+
 | modality | Aria surface | reference | status |
 |---|---|---|---|
 | **DV** (discrete, mode mesh) | `OPTICQASM` + `omega-run --backend photonics` | **Perceval** (Quandela) | runnable end to end |

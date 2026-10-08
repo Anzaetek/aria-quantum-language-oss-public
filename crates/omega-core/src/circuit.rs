@@ -8,6 +8,13 @@ pub struct Qubit(pub u32);
 /// Unique identifier for a symbol (parameter name).
 pub type SymbolId = u32;
 
+/// The name a free symbol is reported under when no declared name is known
+/// for it. One spelling, shared by every message that mentions a symbol, so
+/// a parameter-count refusal and an `UnboundSymbol` error agree.
+pub fn fallback_symbol_name(id: SymbolId) -> String {
+    format!("sym_{id}")
+}
+
 /// Unique identifier for a custom gate definition.
 pub type CustomGateId = u32;
 
@@ -101,6 +108,19 @@ pub enum GateKind {
     PhaseShifter,   // ps: 1 param (phi)
     BeamSplitterRx, // bs_rx: 2 params (theta, phi_tr)
 
+    // Qudit gates (DITQASM, PLAN-QUDIT.md Q2). The generalised one-wire
+    // gates keep their qubit names — on a `d > 2` wire `H` is the Fourier
+    // gate, `X` the cyclic shift, `Z` the clock (mqt.qudits' semantics,
+    // verified in Q0; each is the qubit gate at d = 2). These two have no
+    // qubit spelling at all.
+    /// `rxy(i, j, θ, φ)`: `exp(−iθ/2 (cos φ X + sin φ Y))` on the two-level
+    /// subspace `{|i⟩, |j⟩}` of one wire, identity on every other level.
+    /// Params: `i`, `j` (integers, `i < j < d`), `θ`, `φ`.
+    Rxy,
+    /// `csum a, b`: `|c⟩|t⟩ → |c⟩|t + c mod d_b⟩` — the generalised CX
+    /// (control first). Equal to `CX` at `d = 2`.
+    CSum,
+
     // Custom gate
     Custom(CustomGateId),
 
@@ -136,6 +156,7 @@ impl GateKind {
             | GateKind::U2
             | GateKind::U1
             | GateKind::PhaseShifter
+            | GateKind::Rxy
             | GateKind::Reset => 1,
 
             GateKind::CX
@@ -145,6 +166,7 @@ impl GateKind {
             | GateKind::CRz
             | GateKind::CU3
             | GateKind::Rbs
+            | GateKind::CSum
             | GateKind::BeamSplitterRx => 2,
 
             GateKind::CCX | GateKind::CSwap => 3,
@@ -165,6 +187,7 @@ impl GateKind {
             | GateKind::Rbs => 1,
             GateKind::U2 | GateKind::BeamSplitterRx => 2,
             GateKind::U3 | GateKind::CU3 => 3,
+            GateKind::Rxy => 4,
             GateKind::PhaseShifter => 1,
             GateKind::Custom(_) => 0, // variable, checked at use site
             _ => 0,
@@ -236,11 +259,53 @@ impl GateOp {
     }
 }
 
-/// Whether this circuit is gate-based (qubit) or photonic.
+/// Whether this circuit is gate-based (qubit), photonic, or fermionic.
+///
+/// `Fermionic` is a Jordan–Wigner occupation circuit. Its ops are ordinary
+/// qubit gates — the same ones `GateBased` carries — and
+/// [`CircuitIR::fermionic_registers`] records the `mode` declaration the
+/// file made. Engines that evolve qubit gates accept it. Photonics refuses
+/// it by name: a fermionic mode is not an optical mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CircuitType {
     GateBased,
     Photonic,
+    Fermionic,
+}
+
+/// A `mode` register from FermionicQASM, recorded by name so a refusal or a
+/// sector-native consumer can name the register and read its block structure.
+///
+/// `spatial` is the size written in `mode name[spatial]`. When `spin` is
+/// false the register occupies wires `start .. start + spatial`. When `spin`
+/// is true it occupies `2 * spatial` wires in blocks: `start .. start +
+/// spatial` spin-up (alpha), then the next `spatial` wires spin-down
+/// (beta). That is the sequential layout pinned in
+/// `conventions.json` (`spin_ordering`, qiskit-cold-atom at
+/// `ad8893f`), not OPTICQASM `pol`'s interleaved `(s, p) -> 2s + p` map,
+/// and not that backend's `norb - 1 - orb` orbital reversal — the fixture
+/// records the reversal and leaves it unapplied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FermionicRegister {
+    pub name: String,
+    pub start: u32,
+    pub spatial: u32,
+    pub spin: bool,
+}
+
+/// A register declared with a DITQASM dimension group — `qreg q [3][3,2,5];`
+/// — recorded by name so a refusal can say *which* register asked for a
+/// qudit, not just that one did.
+///
+/// `dims[i]` is the local dimension of wire `start + i`. A group of all 2s
+/// (`qreg q [2][2,2];`, which is how `mqt.qudits` re-emits a bare `qreg`)
+/// is still recorded here: the declaration was explicit, and hiding it would
+/// make the IR lie about its source. Only a dimension ≠ 2 is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuditRegister {
+    pub name: String,
+    pub start: u32,
+    pub dims: Vec<u32>,
 }
 
 /// The circuit intermediate representation.
@@ -254,6 +319,20 @@ pub struct CircuitIR {
     pub symbols: HashMap<SymbolId, String>,
     /// Custom gate definitions: id -> (param_symbol_ids, sub-circuit).
     pub custom_gates: HashMap<CustomGateId, CustomGateDef>,
+    /// Registers declared with an explicit per-wire dimension (DITQASM).
+    /// Empty for every circuit built by [`CircuitIR::new`] and for every
+    /// OPENQASM source — a wire not covered by an entry here is a qubit.
+    /// See [`CircuitIR::wire_dim`] and [`CircuitIR::refuse_qudits`]: no
+    /// engine in this workspace evolves a `d ≠ 2` wire (PLAN-QUDIT.md Q1),
+    /// and each one says so at its own door rather than running the
+    /// circuit as qubits and returning a plausible number.
+    pub qudit_registers: Vec<QuditRegister>,
+    /// FermionicQASM `mode` declarations, in source order. Empty for every
+    /// other lane, including a qubit circuit that happens to contain `Rbs`.
+    /// A fermionic mode under Jordan–Wigner is a two-level occupation wire:
+    /// this is block structure over qubits, not a qudit dimension, and
+    /// [`CircuitIR::wire_dim`] stays 2 for every wire it covers.
+    pub fermionic_registers: Vec<FermionicRegister>,
 }
 
 /// A custom gate definition with bound parameter symbols.
@@ -273,11 +352,81 @@ impl CircuitIR {
             circuit_type,
             symbols: HashMap::new(),
             custom_gates: HashMap::new(),
+            qudit_registers: Vec::new(),
+            fermionic_registers: Vec::new(),
+        }
+    }
+
+    /// Local dimension of `wire`: 2 unless a DITQASM register declared it
+    /// otherwise.
+    pub fn wire_dim(&self, wire: u32) -> u32 {
+        self.qudit_registers
+            .iter()
+            .find_map(|r| {
+                let i = wire.checked_sub(r.start)? as usize;
+                r.dims.get(i).copied()
+            })
+            .unwrap_or(2)
+    }
+
+    /// Every wire's local dimension, in wire order.
+    pub fn wire_dims(&self) -> Vec<u32> {
+        (0..self.num_qubits).map(|w| self.wire_dim(w)).collect()
+    }
+
+    /// The first wire whose dimension is not 2, with its register — `None`
+    /// for a qubit circuit.
+    pub fn first_qudit(&self) -> Option<(&QuditRegister, u32, u32)> {
+        self.qudit_registers.iter().find_map(|r| {
+            r.dims
+                .iter()
+                .enumerate()
+                .find(|(_, &d)| d != 2)
+                .map(|(i, &d)| (r, r.start + i as u32, d))
+        })
+    }
+
+    /// `Ok(())` for a qubit circuit; otherwise the refusal every engine
+    /// returns from its door, naming the engine, the register, the wire
+    /// and the dimension. One spelling so the CLI tests and the
+    /// backend-level tests assert the same sentence.
+    ///
+    /// This exists because the failure it prevents is silent: a d = 3
+    /// register run through a qubit engine does not crash, it evolves
+    /// `2^n` amplitudes with the wrong `n`, exits 0 and prints a number.
+    pub fn refuse_qudits(&self, engine: &str) -> crate::error::Result<()> {
+        match self.first_qudit() {
+            None => Ok(()),
+            Some((reg, wire, d)) => Err(crate::error::OmegaError::Unsupported(format!(
+                "{engine}: register '{}' declares dimension {d} on wire {wire}; \
+                 this engine is qubit-only (d = 2) and a qudit circuit run as \
+                 qubits would return a plausible wrong number, so it is refused \
+                 instead. The engines that evolve qudits are `quditsv` (exact, \
+                 dense) and `mps` (PLAN-QUDIT.md Q1–Q3)",
+                reg.name
+            ))),
         }
     }
 
     pub fn num_free_symbols(&self) -> usize {
         self.symbols.len()
+    }
+
+    /// The free symbol IDs in ascending order: the order a flat parameter
+    /// vector binds them in (`ParameterBinding::from_flat`, the CLI's
+    /// `--params`, the WASM host ABI).
+    pub fn sorted_symbol_ids(&self) -> Vec<SymbolId> {
+        let mut ids: Vec<SymbolId> = self.symbols.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Display name for a symbol: its declared name, else `sym_{id}`.
+    pub fn symbol_name(&self, id: SymbolId) -> String {
+        self.symbols
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| fallback_symbol_name(id))
     }
 
     pub fn add_op(&mut self, op: GateOp) {

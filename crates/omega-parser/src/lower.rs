@@ -40,7 +40,9 @@ pub enum Qasm2Dialect {
     /// contains the first two and not the third.
     #[default]
     Legacy,
-    /// Accept a bare `rxx`, `ryy` **and** `rzz`. No Qiskit reader does this, so
+    /// Accept a bare `rxx`, `ryy` **and** `rzz`, plus this workspace's native
+    /// `rbs(θ) a,b` (kept as one `GateKind::Rbs` op — the spelling the
+    /// `sector` backend admits). No Qiskit reader does this, so
     /// a file relying on it is one this workspace can read and other toolchains
     /// cannot. Opt in deliberately; it is not the default for that reason.
     Lenient,
@@ -49,13 +51,17 @@ pub enum Qasm2Dialect {
 impl Qasm2Dialect {
     /// Is a *bare* (undeclared) `name` readable in this dialect?
     ///
-    /// Only ever consulted for the three two-qubit rotations; every other
-    /// spelling is resolved by `name_to_gate` as before.
+    /// Only ever consulted for the three two-qubit rotations and `rbs`; every
+    /// other spelling is resolved by `name_to_gate` as before.
     fn accepts_bare(self, name: &str) -> bool {
         match self {
             Qasm2Dialect::Strict => false,
             Qasm2Dialect::Legacy => matches!(name, "rxx" | "rzz"),
-            Qasm2Dialect::Lenient => matches!(name, "rxx" | "ryy" | "rzz"),
+            // `rbs` is this workspace's own Hamming-weight-preserving
+            // primitive (`GateKind::Rbs`), not a qelib1 or Qiskit spelling, so
+            // it is readable bare ONLY here — exactly the "we can read it,
+            // nobody else can" case Lenient exists to make deliberate.
+            Qasm2Dialect::Lenient => matches!(name, "rxx" | "ryy" | "rzz" | "rbs"),
         }
     }
 
@@ -86,6 +92,13 @@ fn dialect_refusal(name: &str, dialect: Qasm2Dialect) -> String {
             "no Qiskit reader accepts a bare `ryy` either \
                   (`from_qasm_str`: \"'ryy' is not defined in this scope\")"
         }
+        // Not a Qiskit spelling at all: this workspace's own Givens /
+        // beam-splitter primitive. Say so, or the user goes looking for a
+        // Qiskit gate that does not exist.
+        "rbs" => {
+            "`rbs` is this workspace's native hopping gate and no Qiskit \
+                  reader knows the name"
+        }
         _ => "Qiskit's strict `qasm2.loads` refuses it too",
     };
     format!(
@@ -100,7 +113,7 @@ fn dialect_refusal(name: &str, dialect: Qasm2Dialect) -> String {
             String::new()
         } else {
             format!(
-                " (`lenient` accepts all three bare; `legacy` accepts \
+                " (`lenient` accepts rxx/ryy/rzz/rbs bare; `legacy` accepts \
                  rxx/rzz; you are in `{}`)",
                 dialect.name()
             )
@@ -121,6 +134,7 @@ pub fn lower_qasm2_with_dialect(
 ) -> Result<CircuitIR, String> {
     let mut ctx = LowerCtx::new(CircuitType::GateBased);
     ctx.dialect = dialect;
+    ctx.ditqasm = prog.ditqasm;
 
     for stmt in &prog.statements {
         ctx.lower_qasm2_stmt(stmt)?;
@@ -147,8 +161,8 @@ pub fn lower_to_ir(source: &str) -> Result<CircuitIR, String> {
 
 /// Convenience: parse + lower in one step, in an explicit QASM2 dialect.
 ///
-/// The dialect is ignored for OPTICQASM input, which has no equivalent
-/// ambiguity — its gate set is defined by this workspace, not inherited.
+/// The dialect is ignored for OPTICQASM and FERMIONICQASM input. Neither
+/// inherited a QASM2 ambiguity: each gate set is defined by this workspace.
 pub fn lower_to_ir_with_dialect(source: &str, dialect: Qasm2Dialect) -> Result<CircuitIR, String> {
     // Skip leading comments and whitespace
     let trimmed = source
@@ -159,12 +173,17 @@ pub fn lower_to_ir_with_dialect(source: &str, dialect: Qasm2Dialect) -> Result<C
         })
         .unwrap_or("")
         .trim();
-    if trimmed.starts_with("OPENQASM") {
+    // `DITQASM 2.0;` (mqt.qudits) shares the QASM 2 grammar plus the `qreg`
+    // dimension group; it is not a third lane.
+    if trimmed.starts_with("OPENQASM") || trimmed.starts_with("DITQASM") {
         let ast = crate::qasm2::parse_qasm2(source)?;
         lower_qasm2_with_dialect(&ast, dialect)
     } else if trimmed.starts_with("OPTICQASM") {
         let ast = crate::opticqasm::parse_opticqasm(source)?;
         lower_opticqasm(&ast)
+    } else if trimmed.starts_with("FERMIONICQASM") {
+        let ast = crate::fermionicqasm::parse_fermionicqasm(source)?;
+        lower_fermionicqasm(&ast)
     } else {
         // No header. OpenQASM 3 makes the version statement OPTIONAL, and the
         // specification's own examples overwhelmingly omit it — 20 of the 21
@@ -184,7 +203,7 @@ pub fn lower_to_ir_with_dialect(source: &str, dialect: Qasm2Dialect) -> Result<C
         // headerless file was never going to be one.
         let ast = crate::qasm2::parse_qasm2(source).map_err(|e| {
             format!(
-                "no `OPENQASM` or `OPTICQASM` header found, so this was read as \
+                "no `OPENQASM`, `OPTICQASM`, or `FERMIONICQASM` header found, so this was read as \
                  OpenQASM 3 (where the version statement is optional) — and that \
                  failed: {e}"
             )
@@ -207,6 +226,13 @@ struct LowerCtx {
     num_qubits: u32,
     num_classical_bits: u32,
     ops: Vec<GateOp>,
+    /// DITQASM registers with an explicit dimension group, in declaration
+    /// order — carried to `CircuitIR::qudit_registers` so a refusal can
+    /// name the register.
+    qudit_registers: Vec<QuditRegister>,
+    /// The source declared `DITQASM`; only then is a `qreg` dimension
+    /// group legal.
+    ditqasm: bool,
     /// Gate definitions from QASM (name -> params, qubit_names, body)
     gate_defs: HashMap<String, GateDef>,
     /// OPTICQASM registers declared `pol`. Mode refs into these name a
@@ -229,6 +255,8 @@ impl LowerCtx {
             num_qubits: 0,
             num_classical_bits: 0,
             ops: Vec::new(),
+            qudit_registers: Vec::new(),
+            ditqasm: false,
             gate_defs: HashMap::new(),
             dialect: Qasm2Dialect::default(),
         }
@@ -242,6 +270,8 @@ impl LowerCtx {
             circuit_type: self.circuit_type.clone(),
             symbols: self.symbol_names,
             custom_gates: HashMap::new(),
+            qudit_registers: self.qudit_registers,
+            fermionic_registers: Vec::new(),
         }
     }
 
@@ -393,8 +423,45 @@ impl LowerCtx {
                 // We handle qelib1.inc gates natively
                 Ok(())
             }
-            Qasm2Stmt::QregDecl { name, size } => {
+            Qasm2Stmt::QregDecl { name, size, dims } => {
                 let start = self.num_qubits;
+                if let Some(dims) = dims {
+                    // DITQASM: `qreg q [3][3,2,5];`. The group is per wire,
+                    // so its length is the size or the declaration is
+                    // self-contradictory; and a dimension below 2 is not a
+                    // quantum system. Both are refused here, once, so no
+                    // engine has to re-check the shape of the IR.
+                    if !self.ditqasm {
+                        return Err(format!(
+                            "qreg {name}: a dimension group `[{}]` is DITQASM syntax and \
+                             needs the `DITQASM 2.0;` header; OpenQASM 2/3 registers \
+                             have no per-wire dimension",
+                            dims.iter()
+                                .map(|d| d.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ));
+                    }
+                    if dims.len() != *size as usize {
+                        return Err(format!(
+                            "qreg {name}: declared size {size} but the dimension \
+                             group lists {} entries ({dims:?}); DITQASM writes one \
+                             dimension per wire",
+                            dims.len()
+                        ));
+                    }
+                    if let Some(d) = dims.iter().find(|&&d| d < 2) {
+                        return Err(format!(
+                            "qreg {name}: dimension {d} is not a quantum system \
+                             (d >= 2 required)"
+                        ));
+                    }
+                    self.qudit_registers.push(QuditRegister {
+                        name: name.clone(),
+                        start,
+                        dims: dims.clone(),
+                    });
+                }
                 self.qregs.insert(name.clone(), (start, *size));
                 self.num_qubits += size;
                 Ok(())
@@ -565,6 +632,30 @@ impl LowerCtx {
         }
     }
 
+    /// DITQASM's gate spellings are legal under its header only, and one of
+    /// them is refused even there: `cx (l_a, l_b, ctrl, φ)` is mqt.qudits'
+    /// embedded two-level controlled gate (Q0), which Q2 does not lower —
+    /// `csum` is the generalised CX. Refusing by name here keeps the arity
+    /// checker's generic "takes 0 parameter(s), got 4" from being the only
+    /// thing a DITQASM user sees.
+    fn check_ditqasm_gate(&self, name: &str, n_params: usize) -> Result<(), String> {
+        match name {
+            "rxy" | "csum" if !self.ditqasm => Err(format!(
+                "`{name}` is a DITQASM gate and needs the `DITQASM 2.0;` header; under \
+                 OpenQASM it is not defined (rxy: two-level rotation on a qudit; csum: \
+                 the generalised CX)"
+            )),
+            "cx" | "CX" | "cnot" if self.ditqasm && n_params == 4 => Err(
+                "DITQASM's `cx (l_a, l_b, ctrl_level, phi)` is an embedded two-level \
+                 controlled gate, which this reader does not lower (PLAN-QUDIT.md Q2 — \
+                 level-controlled gates are costed separately); the generalised CX on \
+                 qudits is `csum a, b`"
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     fn lower_gate_app(
         &mut self,
         app: &GateApp,
@@ -710,6 +801,12 @@ impl LowerCtx {
                         app.name, body_app.name
                     ));
                 }
+                // Same dialect gate as the top-level path: a body may call
+                // `rbs` only where a bare top-level `rbs` would be read.
+                if body_app.name == "rbs" && !self.dialect.accepts_bare("rbs") {
+                    return Err(dialect_refusal("rbs", self.dialect));
+                }
+                self.check_ditqasm_gate(&body_app.name, body_app.params.len())?;
                 let gate = name_to_gate(&body_app.name)?;
                 let body_params = widen_cp_params(&body_app.name, body_params)?;
                 let body_qubits: smallvec::SmallVec<[Qubit; 3]> = body_qubits.into_iter().collect();
@@ -724,6 +821,13 @@ impl LowerCtx {
             }
             return Ok(());
         }
+
+        // Bare `rbs` is a native extension, readable only where the dialect
+        // says so. Undefined-in-this-file must not read as "unknown gate".
+        if app.name == "rbs" && !self.dialect.accepts_bare("rbs") {
+            return Err(dialect_refusal("rbs", self.dialect));
+        }
+        self.check_ditqasm_gate(&app.name, app.params.len())?;
 
         // Standard gate
         let gate = name_to_gate(&app.name)?;
@@ -1269,6 +1373,22 @@ fn invert_gate_with_params(
             }
             Ok((gate, out))
         }
+        // rxy(i, j, θ, φ)⁻¹ = rxy(i, j, −θ, φ): the levels and the axis stay.
+        GateKind::Rxy => {
+            if params.len() != 4 {
+                return Err(format!("inv @ rxy expects 4 params, got {}", params.len()));
+            }
+            let mut out = params.clone();
+            out[2] = negate(&params[2]);
+            Ok((gate, out))
+        }
+        // csum⁻¹ is csum^(d−1), which has no single-gate spelling and whose
+        // exponent depends on the target's dimension — not known here.
+        GateKind::CSum => Err(
+            "inv @ csum has no single-gate inverse (it is csum applied d−1 times, and d is \
+             the target wire's dimension); write the repetition out"
+                .to_string(),
+        ),
         GateKind::U3 => {
             if params.len() != 3 {
                 return Err(format!("inv @ u3 expects 3 params, got {}", params.len()));
@@ -1387,6 +1507,8 @@ fn gate_signature(gate: &GateKind) -> Option<(usize, usize)> {
         CU3 => Some((3, 2)),
         CRz => Some((1, 2)),
         Rbs => Some((1, 2)),
+        Rxy => Some((4, 1)),
+        CSum => Some((0, 2)),
         CCX | CSwap => Some((0, 3)),
         Barrier | Measure | Reset => None,
         PhaseShifter | BeamSplitterRx => None,
@@ -1437,6 +1559,18 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         "cy" => Ok(GateKind::CY),
         "cz" => Ok(GateKind::CZ),
         "swap" => Ok(GateKind::Swap),
+        // Native Givens / reconfigurable-beam-splitter rotation. Kept as ONE
+        // op rather than decomposed (unlike `rxx`/`rzz`) because it is the
+        // hopping primitive the sector backend admits: its `h/cz/ry`
+        // expansion contains `h`, which does not conserve particle number,
+        // so a decomposed `rbs` would be REFUSED by the one engine built for
+        // it. Dialect-gated at the call sites — see `Qasm2Dialect::Lenient`.
+        "rbs" => Ok(GateKind::Rbs),
+        // DITQASM's qudit gates (PLAN-QUDIT.md Q2). Header-gated at the call
+        // sites like `rbs` is dialect-gated: under `OPENQASM` these names are
+        // unknown, because no qubit reader has them.
+        "rxy" => Ok(GateKind::Rxy),
+        "csum" => Ok(GateKind::CSum),
         "crz" => Ok(GateKind::CRz),
         // qelib1's controlled-phase. CP(λ) == CU3(0, 0, λ) exactly; the
         // 1 -> 3 parameter widening happens in `lower_gate_app`.
@@ -1457,6 +1591,420 @@ fn name_to_gate(name: &str) -> Result<GateKind, String> {
         "barrier" => Ok(GateKind::Barrier),
         _ => Err(format!("unknown gate: {}", name)),
     }
+}
+
+/// Lower a FERMIONICQASM 1.0 program to [`CircuitIR`].
+///
+/// Every mapping is an exact operator identity under Jordan–Wigner. Signs
+/// are the ones `conventions.json` records for ffsim 0.0.84; this function
+/// does not derive a second convention. `givens` and the `Rbs` inside
+/// `tunnel` go through [`omega_core::fermion::givens_expr`], so the
+/// non-adjacent Z-string refusal has one source.
+pub fn lower_fermionicqasm(prog: &FermionicQasmProgram) -> Result<CircuitIR, String> {
+    let mut ctx = FermLower::new();
+    for stmt in &prog.statements {
+        ctx.lower_stmt(stmt)?;
+    }
+    Ok(ctx.finish())
+}
+
+struct ModeRec {
+    start: u32,
+    spatial: u32,
+    /// Wires occupied: `spatial`, or `2 * spatial` when `spin`.
+    wires: u32,
+    spin: bool,
+}
+
+struct FermLower {
+    modes: HashMap<String, ModeRec>,
+    cregs: HashMap<String, (u32, u32)>,
+    symbols: HashMap<String, SymbolId>,
+    next_symbol_id: SymbolId,
+    symbol_names: HashMap<SymbolId, String>,
+    num_qubits: u32,
+    num_classical_bits: u32,
+    ops: Vec<GateOp>,
+    registers: Vec<FermionicRegister>,
+    /// Wires already named by a `load`. A second load of the same wire is
+    /// refused: two `X`s would empty the mode and look like a successful prep.
+    loaded: std::collections::HashSet<u32>,
+    /// A gate has been lowered. `load` after that is refused.
+    seen_gate: bool,
+}
+
+impl FermLower {
+    fn new() -> Self {
+        Self {
+            modes: HashMap::new(),
+            cregs: HashMap::new(),
+            symbols: HashMap::new(),
+            next_symbol_id: 0,
+            symbol_names: HashMap::new(),
+            num_qubits: 0,
+            num_classical_bits: 0,
+            ops: Vec::new(),
+            registers: Vec::new(),
+            loaded: std::collections::HashSet::new(),
+            seen_gate: false,
+        }
+    }
+
+    fn finish(self) -> CircuitIR {
+        CircuitIR {
+            num_qubits: self.num_qubits,
+            num_classical_bits: self.num_classical_bits,
+            ops: self.ops,
+            circuit_type: CircuitType::Fermionic,
+            symbols: self.symbol_names,
+            custom_gates: HashMap::new(),
+            // A fermionic mode is an occupation wire, not a qudit. Nothing
+            // in this lowering writes a dimension group.
+            qudit_registers: Vec::new(),
+            fermionic_registers: self.registers,
+        }
+    }
+
+    fn symbol(&mut self, name: &str) -> SymbolId {
+        if let Some(&id) = self.symbols.get(name) {
+            return id;
+        }
+        let id = self.next_symbol_id;
+        self.next_symbol_id += 1;
+        self.symbols.insert(name.to_string(), id);
+        self.symbol_names.insert(id, name.to_string());
+        id
+    }
+
+    fn lower_stmt(&mut self, stmt: &FermionicQasmStmt) -> Result<(), String> {
+        match stmt {
+            FermionicQasmStmt::ModeDecl { name, size, spin } => self.mode_decl(name, *size, *spin),
+            FermionicQasmStmt::CregDecl { name, size } => self.creg_decl(name, *size),
+            FermionicQasmStmt::Load { modes } => self.load(modes),
+            FermionicQasmStmt::Measure { mode, cbit } => self.measure(mode, cbit),
+            FermionicQasmStmt::GateApp(app) => self.gate(app),
+        }
+    }
+
+    fn mode_decl(&mut self, name: &str, spatial: u32, spin: bool) -> Result<(), String> {
+        if self.modes.contains_key(name) {
+            return Err(format!("duplicate mode register: {name}"));
+        }
+        let wires = if spin {
+            spatial.checked_mul(2).ok_or_else(|| {
+                format!("mode {name}[{spatial}] spin: 2 * {spatial} does not fit in a wire index")
+            })?
+        } else {
+            spatial
+        };
+        let start = self.num_qubits;
+        self.num_qubits = self.num_qubits.checked_add(wires).ok_or_else(|| {
+            format!("mode {name}: adding {wires} wires overflows the register (start {start})")
+        })?;
+        self.modes.insert(
+            name.to_string(),
+            ModeRec {
+                start,
+                spatial,
+                wires,
+                spin,
+            },
+        );
+        self.registers.push(FermionicRegister {
+            name: name.to_string(),
+            start,
+            spatial,
+            spin,
+        });
+        Ok(())
+    }
+
+    fn creg_decl(&mut self, name: &str, size: u32) -> Result<(), String> {
+        if self.cregs.contains_key(name) {
+            return Err(format!("duplicate creg: {name}"));
+        }
+        let start = self.num_classical_bits;
+        self.num_classical_bits = self
+            .num_classical_bits
+            .checked_add(size)
+            .ok_or_else(|| format!("creg {name}: adding {size} bits overflows (start {start})"))?;
+        self.cregs.insert(name.to_string(), (start, size));
+        Ok(())
+    }
+
+    fn mode_wire(&self, m: &ModeRef) -> Result<u32, String> {
+        let rec = self
+            .modes
+            .get(&m.reg)
+            .ok_or_else(|| format!("undefined mode register: {}", m.reg))?;
+        if m.index >= rec.wires {
+            return Err(format!(
+                "mode index {} out of range for {} ({} wires{})",
+                m.index,
+                m.reg,
+                rec.wires,
+                if rec.spin {
+                    "; under spin the index is a wire, 0 .. 2N"
+                } else {
+                    ""
+                }
+            ));
+        }
+        // The index is already the wire. `spin` does not remap it through
+        // `pol`'s `(s, p) -> 2s + p`, and it does not apply `norb - 1 - orb`.
+        Ok(rec.start + m.index)
+    }
+
+    /// `None` for a spinless wire. `Some(species)` for a spin block:
+    /// 0 is the first block (alpha / spin-up), 1 the second (beta).
+    fn species(&self, wire: u32) -> Option<u32> {
+        for rec in self.modes.values() {
+            if wire >= rec.start && wire < rec.start + rec.wires {
+                return if rec.spin && rec.spatial > 0 {
+                    Some((wire - rec.start) / rec.spatial)
+                } else {
+                    None
+                };
+            }
+        }
+        None
+    }
+
+    /// Cross-spin `givens` / `tunnel` has no matrix in `conventions.json`.
+    /// ffsim's calls take one `Spin` and stay inside it. Same-spin and
+    /// spinless pairs are pinned and lower; a mixed pair is refused here
+    /// rather than given a matrix this phase would have had to invent.
+    fn refuse_cross_spin(&self, a: u32, b: u32, gate: &str) -> Result<(), String> {
+        let sa = self.species(a);
+        let sb = self.species(b);
+        if sa != sb {
+            return Err(format!(
+                "{gate} on wires {a} and {b}: cross-spin {gate} is unpinned. \
+                 conventions.json (`unpinned.cross_spin_givens_and_tunnel`, ffsim 0.0.84) \
+                 records that apply_givens_rotation and apply_tunneling_interaction take \
+                 one Spin and stay inside that species, so no matrix was pinned for a pair \
+                 whose wires sit in different spin blocks — including the adjacent pair \
+                 across the block boundary. This lowering refuses it rather than inventing one"
+            ));
+        }
+        Ok(())
+    }
+
+    fn load(&mut self, modes: &[ModeRef]) -> Result<(), String> {
+        if self.seen_gate {
+            let listed = modes
+                .iter()
+                .map(|m| format!("{}[{}]", m.reg, m.index))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "load {listed} after a gate: load prepares the occupation and must precede every gate"
+            ));
+        }
+        for m in modes {
+            let wire = self.mode_wire(m)?;
+            if !self.loaded.insert(wire) {
+                return Err(format!(
+                    "load {}[{}]: that mode is already loaded",
+                    m.reg, m.index
+                ));
+            }
+            self.ops.push(GateOp {
+                gate: GateKind::X,
+                qubits: smallvec::smallvec![Qubit(wire)],
+                params: smallvec::smallvec![],
+                classical_bit: None,
+                condition: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn measure(&mut self, mode: &ModeRef, cbit: &ModeRef) -> Result<(), String> {
+        let wire = self.mode_wire(mode)?;
+        let (start, size) = self
+            .cregs
+            .get(&cbit.reg)
+            .ok_or_else(|| format!("undefined creg: {}", cbit.reg))?;
+        if cbit.index >= *size {
+            return Err(format!(
+                "cbit index {} out of range for {} (size {})",
+                cbit.index, cbit.reg, size
+            ));
+        }
+        self.ops.push(GateOp {
+            gate: GateKind::Measure,
+            qubits: smallvec::smallvec![Qubit(wire)],
+            params: smallvec::smallvec![],
+            classical_bit: Some(start + cbit.index),
+            condition: None,
+        });
+        Ok(())
+    }
+
+    fn angle(&mut self, app: &FermionicGateApp) -> Result<ParamExpr, String> {
+        if app.params.len() != 1 {
+            return Err(format!(
+                "`{}` takes 1 parameter, got {}",
+                app.name,
+                app.params.len()
+            ));
+        }
+        Ok(match &app.params[0] {
+            FermionicParam::Num(v) => ParamExpr::Concrete(*v),
+            FermionicParam::Symbol(name) => ParamExpr::Symbol(self.symbol(name)),
+        })
+    }
+
+    fn wires(&self, app: &FermionicGateApp, n: usize) -> Result<Vec<u32>, String> {
+        if app.modes.len() != n {
+            return Err(format!(
+                "`{}` acts on {n} mode(s), got {}",
+                app.name,
+                app.modes.len()
+            ));
+        }
+        app.modes.iter().map(|m| self.mode_wire(m)).collect()
+    }
+
+    fn gate(&mut self, app: &FermionicGateApp) -> Result<(), String> {
+        // Set before emitting, so a `load` cannot sneak between the ops of
+        // a multi-op expansion (`tunnel` is three ops).
+        self.seen_gate = true;
+        match app.name.as_str() {
+            "num" => {
+                let theta = self.angle(app)?;
+                let w = self.wires(app, 1)?;
+                self.ops.push(u1_op(w[0], theta));
+            }
+            "numnum" => {
+                let theta = self.angle(app)?;
+                let w = self.wires(app, 2)?;
+                if w[0] == w[1] {
+                    return Err(format!(
+                        "numnum {}[{}], {}[{}]: the two modes are the same wire",
+                        app.modes[0].reg, app.modes[0].index, app.modes[1].reg, app.modes[1].index
+                    ));
+                }
+                // Number operators carry no Z string. Adjacency is not checked;
+                // `cphase_expr` is the constructor, for any pair including
+                // opposite spins (pinned as onsite / num_op_prod in conventions.json).
+                self.ops
+                    .push(omega_core::fermion::cphase_expr(w[0], w[1], theta));
+            }
+            "givens" => {
+                let theta = self.angle(app)?;
+                let w = self.wires(app, 2)?;
+                self.refuse_cross_spin(w[0], w[1], "givens")?;
+                let op = omega_core::fermion::givens_expr(w[0], w[1], theta)
+                    .map_err(|e| e.to_string())?;
+                self.ops.push(op);
+            }
+            "tunnel" => self.tunnel(app)?,
+            "orbrot" => {
+                return Err(
+                    "orbrot is not in FermionicQASM 1.0; decompose the orbital rotation \
+                     to givens before emission"
+                        .to_string(),
+                );
+            }
+            other => return Err(format!("unknown fermionic gate: {other}")),
+        }
+        Ok(())
+    }
+
+    /// `tunnel(θ) m[p], m[q]` lowers to `U1(+π/2)_q · Rbs(−θ) · U1(−π/2)_q`
+    /// (rightmost applied first). The other reading of that `±`,
+    /// `U1(−π/2) · Rbs(+θ) · U1(+π/2)`, matches the same matrices.
+    ///
+    /// Checked against `conventions.json` (ffsim 0.0.84, θ = 0.7), max |Δ|
+    /// 5e-13: `spinless_2/tunnel_0_1`, `spinless_2/tunnel_1_0`,
+    /// `spinful_2/tunnel_0_1_alpha`, `spinful_2/tunnel_0_1_beta`. The phase
+    /// is on the second mode, which is what makes both pair orders agree
+    /// with those two spinless matrices. Adjacent-only, because the `Rbs`
+    /// is [`omega_core::fermion::givens_expr`].
+    fn tunnel(&mut self, app: &FermionicGateApp) -> Result<(), String> {
+        let theta = self.angle(app)?;
+        let w = self.wires(app, 2)?;
+        let (p, q) = (w[0], w[1]);
+        self.refuse_cross_spin(p, q, "tunnel")?;
+        // Pinned sign: Rbs gets −θ. `tunnel_theta_hook` is the identity
+        // except under the F4.3 test hook, which negates θ first so the
+        // Rbs receives +θ. That is the mutation the ffsim comparison has
+        // to notice.
+        let rbs = omega_core::fermion::givens_expr(p, q, negate_param(tunnel_theta_hook(theta)))
+            .map_err(|e| e.to_string())?;
+        let half = std::f64::consts::FRAC_PI_2;
+        self.ops.push(u1_op(q, ParamExpr::Concrete(-half)));
+        self.ops.push(rbs);
+        self.ops.push(u1_op(q, ParamExpr::Concrete(half)));
+        Ok(())
+    }
+}
+
+fn u1_op(wire: u32, theta: ParamExpr) -> GateOp {
+    GateOp {
+        gate: GateKind::U1,
+        qubits: smallvec::smallvec![Qubit(wire)],
+        params: smallvec::smallvec![theta],
+        classical_bit: None,
+        condition: None,
+    }
+}
+
+fn negate_param(theta: ParamExpr) -> ParamExpr {
+    match theta {
+        ParamExpr::Concrete(v) => ParamExpr::Concrete(-v),
+        other => ParamExpr::Negate(Box::new(other)),
+    }
+}
+
+/// Identity, except when the F4.3 hook is set on this thread: then θ → −θ
+/// before the pinned `negate_param`, so `tunnel` lowers `Rbs(+θ)` instead
+/// of `Rbs(−θ)`.
+fn tunnel_theta_hook(theta: ParamExpr) -> ParamExpr {
+    #[cfg(any(test, feature = "f4-tunnel-theta-hook"))]
+    {
+        if tunnel_theta_sign_flipped() {
+            return negate_param(theta);
+        }
+    }
+    theta
+}
+
+#[cfg(any(test, feature = "f4-tunnel-theta-hook"))]
+thread_local! {
+    static TUNNEL_THETA_SIGN_FLIP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, feature = "f4-tunnel-theta-hook"))]
+fn tunnel_theta_sign_flipped() -> bool {
+    TUNNEL_THETA_SIGN_FLIP.with(|c| c.get())
+}
+
+/// Run `body` with the sign of `theta` flipped inside `tunnel`.
+///
+/// The pinned lowering is `Rbs(−θ)`. This hook makes that call `Rbs(+θ)`
+/// on the calling thread and restores the pinned sign afterwards, including
+/// when `body` panics. F4.3 lowers one `.fqasm` program under the hook and
+/// asserts ffsim disagrees: a comparison that still matches has no teeth.
+///
+/// `#[cfg(test)]` covers this crate's unit tests. The omega-bridges
+/// integration test is a different crate — `cfg(test)` is not set on this
+/// library when that crate links it — so the same items are also compiled
+/// under the `f4-tunnel-theta-hook` feature, which that test enables.
+/// Production builds have neither cfg, and there is no way to flip the sign.
+#[cfg(any(test, feature = "f4-tunnel-theta-hook"))]
+pub fn with_tunnel_theta_sign_flipped<R>(body: impl FnOnce() -> R) -> R {
+    let prev = TUNNEL_THETA_SIGN_FLIP.with(|c| c.replace(true));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TUNNEL_THETA_SIGN_FLIP.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(prev);
+    body()
 }
 
 #[cfg(test)]

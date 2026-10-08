@@ -3,6 +3,7 @@ pub mod aria;
 pub mod aria_emit;
 pub mod builder;
 pub mod expr;
+pub mod fermionicqasm;
 pub mod json;
 pub mod nodes;
 pub mod opticqasm;
@@ -13,6 +14,7 @@ pub use aria::{parse_aria, parse_aria_circuit, AriaProgram, CircuitTemplate, Obs
 pub use aria_emit::to_aria_source;
 pub use builder::CircuitBuilder;
 pub use expr::ParamExpr;
+pub use fermionicqasm::{from_fermionicqasm, to_fermionicqasm};
 pub use json::{from_json, to_json};
 pub use nodes::*;
 pub use opticqasm::{from_opticqasm, to_opticqasm};

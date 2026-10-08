@@ -841,7 +841,7 @@ Actions: `SubmitBatch` (with idempotency key), `StartChunk`, `CommitChunk`,
 Model at a small scale (≈5 rows, 2 chunks, ≥2 crashes) — exhaustive over that
 instance, which is where these bugs live, not at scale.
 
-#### Lean 4 — governor arithmetic (`proofs/lean4/QuantumProofs/Governor.lean`)
+#### Lean 4 — governor arithmetic (proposed: `proofs/lean4/QuantumProofs/Governor.lean`, not yet written)
 
 Small, permanent, and directly motivated: **I already shipped an off-by-one in
 `default_qubit_ceiling`**, which advertised a ceiling one qubit wider than the
@@ -1475,7 +1475,7 @@ Promoted from "only if separately prioritized" on explicit instruction. Today
 is no syntax for an input Fock state. Work items:
 
 1. **Grammar**: photonic arms in `gate_from_name` — `beamsplitter` / `bs_rx`,
-   `phaseshifter` / `ps`, and (once B1 lands) `squeeze`, `displace`, `kerr`.
+   `phaseshifter` / `ps`, and `squeeze`, `displace`, `kerr` (B1 has landed).
    Follow K15: `displace(a_re, a_im)` is **Cartesian**.
 2. **Input Fock state**: a way to declare `|1,1⟩`. HOM is meaningless without
    it, and the DV default for 2 modes is `|1,0⟩`
@@ -1579,8 +1579,17 @@ Where it lives: new crate `omega-backend-cv` rather than a mode inside
 mixing a dense CV qudit statevector into it would blur two different state
 representations behind one name. (Maintainers' call — flagging the choice.)
 
-**Timing.** B1–B6 are gated on the DGX search answering PR-AUC in CV's favour
-(0.9751 AUC but 0.466 PR-AUC today). **B0 is not gated on anything.**
+**Status (2026-09-29).** B1–B3 are **landed** — `omega-backend-cv` exists with
+`displace`, `squeeze`, `kerr`, `phase_shift` and the beamsplitter, per-mode
+`⟨n⟩`, and the lost-norm policy, with 70 tests including piquasso single-mode,
+multi-mode and loss transcripts (`tests/piquasso_*_xcheck.rs`, skipped cleanly
+without the fixtures per K13). They arrived through the public-tree merge
+`c12bf07`. **Open: B4 (gradients), B5 (batching + pyo3), B6 (conformance
+shapes).** The old gate — "B1–B6 wait on the DGX search answering PR-AUC in
+CV's favour (0.9751 AUC, 0.466 PR-AUC)" — was written for a DGX search that was
+never run and is dropped: the backend was built anyway and its correctness does
+not depend on a classifier's PR-AUC. B4–B6 are sequenced on demand, not on that
+search. **B0 was never gated on anything.**
 
 ---
 
@@ -1610,8 +1619,9 @@ So Part C splits:
   Mach–Zehnder phase sweep with `⟨n⟩` tracing `cos²(φ/2)`. K14 pins OPTICQASM
   import by extension, so this needs no language change.
 - **C2 — CV examples** (`cv_squeezed.oqasm`, `cv_displaced.oqasm`): the analytic
-  anchors `⟨n⟩ = sinh²r` and `⟨n⟩ = |α|²`, doubling as B1/B2 acceptance. Until
-  B1 lands they must **fail loudly** (B0) — worth pinning on its own.
+  anchors `⟨n⟩ = sinh²r` and `⟨n⟩ = |α|²`, doubling as B1/B2 acceptance. B1
+  has landed (see B-status above), so the "fail loudly until B1" clause no
+  longer applies; the examples themselves are still unwritten.
   **Convention:** K15 pins `displace(a_re, a_im)` as **Cartesian**
   (`opticqasm.rs:81-99`). `PLAN-CV-BACKEND.md:13` mis-states it as polar
   `displace(r, phi)`; B1's gate construction and this example must follow K15 or
@@ -1679,7 +1689,8 @@ C3, if ever done, moves both — and those numbers must be regenerated, not edit
 12. **A12** — optional cluster manager (same protocol, per-node resources,
     work stealing). After A9/A10, since rows are the stealable unit and the
     lease protocol is worth model-checking first.
-13. **B1–B6 + C2** — CV backend and its examples, gated on the DGX search
+13. **B4–B6 + C2** — CV gradients, batching, conformance shapes, and the CV
+    examples. B1–B3 landed; the DGX-search gate is dropped (see B-status).
 
 Constraints throughout: `./ci.sh` is the single source of truth and must stay
 green (K13), with external oracles optional and cleanly skipped; no stdout from

@@ -19,6 +19,14 @@ type SharedState = Arc<RwLock<AppState>>;
 
 /// Middleware that extracts and verifies the Bearer token.
 /// On success, inserts `TokenClaims` into request extensions.
+///
+/// `Result<Response, Response>` is axum's own middleware signature, and both
+/// variants are `axum::response::Response`, so `result_large_err` (new in
+/// clippy 1.99) fires on a type we do not define and cannot box without
+/// ceasing to be a valid axum middleware. Boxing the error alone would also
+/// make the two variants different types for no benefit: an auth rejection IS
+/// a response here, which is the point.
+#[allow(clippy::result_large_err)]
 pub async fn require_auth(
     State(state): State<SharedState>,
     mut req: Request<Body>,

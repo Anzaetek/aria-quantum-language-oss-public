@@ -495,6 +495,13 @@ fn gradient_shape(ir: &OmegaCircuitIR, batch: usize) -> JobShape {
     shape
 }
 
+fn gradient_shapes(circuits: &[OmegaCircuitIR]) -> Vec<JobShape> {
+    circuits
+        .iter()
+        .map(|ir| gradient_shape(ir, circuits.len()))
+        .collect()
+}
+
 /// Shape for `/execute`. `shots: None` ships every amplitude back (and so pays
 /// for the JSON encoding); a shot run samples and returns counts.
 fn execute_shape(ir: &OmegaCircuitIR, shots: Option<u32>) -> JobShape {
@@ -505,6 +512,26 @@ fn execute_shape(ir: &OmegaCircuitIR, shots: Option<u32>) -> JobShape {
         None => base.returning_statevector(),
         Some(_) => base.with_shots(),
     }
+}
+
+/// One shape per row, in order. [`admit_batch`] prices every one of these.
+fn batch_shapes(
+    circuits: &[OmegaCircuitIR],
+    densifies: bool,
+    obs: Option<&Observable>,
+) -> Vec<JobShape> {
+    circuits
+        .iter()
+        .map(|ir| {
+            shape_for(
+                ir,
+                densifies,
+                circuits.len(),
+                crate::worker::ExecTarget::Cpu,
+                obs,
+            )
+        })
+        .collect()
 }
 
 /// Reserve for a whole batch by pricing **every** row and taking the worst.
@@ -518,20 +545,7 @@ fn admit_batch(
     densifies: bool,
     obs: Option<&Observable>,
 ) -> Result<Admitted, Box<axum::response::Response>> {
-    admit_shapes(
-        &circuits
-            .iter()
-            .map(|ir| {
-                shape_for(
-                    ir,
-                    densifies,
-                    circuits.len(),
-                    crate::worker::ExecTarget::Cpu,
-                    obs,
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
+    admit_shapes(&batch_shapes(circuits, densifies, obs))
 }
 
 /// Reserve for a batch of already-built shapes.
@@ -566,6 +580,15 @@ fn admit_batch(
 /// reservation is the worst row we can actually price. A batch in which nothing
 /// is priceable keeps the old behaviour, which is the working plugin path.
 fn admit_shapes(shapes: &[JobShape]) -> Result<Admitted, Box<axum::response::Response>> {
+    match decide_shapes(shapes) {
+        Ok(hold) => Ok(hold.reservation),
+        Err(refusal) => Err(Box::new(refusal.into_response())),
+    }
+}
+
+/// Which row's price stands for the batch. Shared with the admission query so
+/// the question and the route cannot pick different rows.
+fn decide_shapes(shapes: &[JobShape]) -> Result<AdmissionHold, AdmissionRefusal> {
     debug_assert!(!shapes.is_empty(), "caller checked the batch is non-empty");
     let max_qubits = governor().config().max_qubits;
     if let Some(over) = shapes
@@ -574,16 +597,16 @@ fn admit_shapes(shapes: &[JobShape]) -> Result<Admitted, Box<axum::response::Res
     {
         // Refuse through `admit` so the body and status match every other
         // ceiling refusal rather than being spelled a second way here.
-        return admit_shape(over);
+        return decide_shape(over);
     }
     let worst = shapes
         .iter()
         .filter(|sh| crate::worker::estimate_peak_bytes(sh).is_some())
         .max_by_key(|sh| crate::worker::estimate_peak_bytes(sh).unwrap_or(0));
     match worst {
-        Some(sh) => admit_shape(sh),
+        Some(sh) => decide_shape(sh),
         // Every row unpriceable: the plugin/photonic path, unchanged.
-        None => admit_shape(&shapes[0]),
+        None => decide_shape(&shapes[0]),
     }
 }
 
@@ -616,13 +639,48 @@ fn hostgate() -> &'static Result<omega_hostgate::HostGate, String> {
     })
 }
 
+/// A successful admission, still holding its budget.
+struct AdmissionHold {
+    reservation: Admitted,
+    /// What the governor priced this shape at. `None` when the shape is
+    /// unpriceable by design (a plugin) — the same `None` `admit` reserves
+    /// nothing for.
+    peak_bytes: Option<u64>,
+}
+
+/// A refusal, still structured, so a query can report it without inventing a
+/// second spelling of the same decision.
+struct AdmissionRefusal {
+    status: StatusCode,
+    retry_after: Option<&'static str>,
+    body: serde_json::Value,
+    peak_bytes: Option<u64>,
+}
+
+impl AdmissionRefusal {
+    fn into_response(self) -> axum::response::Response {
+        let json = Json(self.body);
+        match self.retry_after {
+            Some(secs) => (self.status, [("Retry-After", secs)], json).into_response(),
+            None => (self.status, json).into_response(),
+        }
+    }
+}
+
 fn admit_shape(shape: &JobShape) -> Result<Admitted, Box<axum::response::Response>> {
+    match decide_shape(shape) {
+        Ok(hold) => Ok(hold.reservation),
+        Err(refusal) => Err(Box::new(refusal.into_response())),
+    }
+}
+
+fn decide_shape(shape: &JobShape) -> Result<AdmissionHold, AdmissionRefusal> {
+    let peak_bytes = estimate_peak_bytes(shape);
     // LOCAL FIRST, and the order is load-bearing. The governor is an in-process
     // semaphore: refusing here costs nothing. The host gate takes a file lock
     // that every process on the box contends for, so a job that was going to be
     // refused anyway must never reach it.
     let local = governor().admit(shape).map_err(|rej| {
-        // Boxed: an axum Response is large and this is the cold path.
         // Busy is the only refusal waiting can fix; everything else is a
         // property of the request and must not invite a retry storm.
         let (status, retry_after) = if rej.is_transient() {
@@ -630,15 +688,16 @@ fn admit_shape(shape: &JobShape) -> Result<Admitted, Box<axum::response::Respons
         } else {
             (StatusCode::PAYLOAD_TOO_LARGE, None)
         };
-        let body = Json(serde_json::json!({
-            "error": rej.message(),
-            "capacity_bytes": governor().config().capacity_bytes,
-            "available_bytes": governor().available_bytes(),
-        }));
-        Box::new(match retry_after {
-            Some(secs) => (status, [("Retry-After", secs)], body).into_response(),
-            None => (status, body).into_response(),
-        })
+        AdmissionRefusal {
+            status,
+            retry_after,
+            peak_bytes,
+            body: serde_json::json!({
+                "error": rej.message(),
+                "capacity_bytes": governor().config().capacity_bytes,
+                "available_bytes": governor().available_bytes(),
+            }),
+        }
     })?;
 
     // THEN the machine. If this refuses, `local` drops on the way out and the
@@ -647,12 +706,14 @@ fn admit_shape(shape: &JobShape) -> Result<Admitted, Box<axum::response::Respons
     let gate = match hostgate() {
         Ok(g) => g,
         Err(why) => {
-            let body = Json(serde_json::json!({
-                "error": format!("host budget is misconfigured: {why}"),
-            }));
-            return Err(Box::new(
-                (StatusCode::SERVICE_UNAVAILABLE, body).into_response(),
-            ));
+            return Err(AdmissionRefusal {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                retry_after: None,
+                peak_bytes,
+                body: serde_json::json!({
+                    "error": format!("host budget is misconfigured: {why}"),
+                }),
+            });
         }
     };
 
@@ -662,30 +723,33 @@ fn admit_shape(shape: &JobShape) -> Result<Admitted, Box<axum::response::Respons
     // are admissible, and inventing a figure here would be a guess with a
     // machine-wide budget behind it.
     let mut req = omega_hostgate::Request::new("omega-server");
-    if let Some(bytes) = estimate_peak_bytes(shape) {
+    if let Some(bytes) = peak_bytes {
         req = req.want(omega_hostgate::Axis::HostBytes, bytes);
     }
 
     match gate.try_acquire(&req) {
-        Ok(host) => Ok(Admitted {
-            _local: local,
-            _host: host,
+        Ok(host) => Ok(AdmissionHold {
+            reservation: Admitted {
+                _local: local,
+                _host: host,
+            },
+            peak_bytes,
         }),
         Err(refusal) => {
-            let status = if refusal.retryable() {
-                StatusCode::TOO_MANY_REQUESTS
+            let (status, retry_after) = if refusal.retryable() {
+                (StatusCode::TOO_MANY_REQUESTS, Some("1"))
             } else {
-                StatusCode::PAYLOAD_TOO_LARGE
+                (StatusCode::PAYLOAD_TOO_LARGE, None)
             };
-            let body = Json(serde_json::json!({
-                "error": format!("host budget: {refusal}"),
-                "scope": "machine",
-            }));
-            Err(Box::new(if refusal.retryable() {
-                (status, [("Retry-After", "1")], body).into_response()
-            } else {
-                (status, body).into_response()
-            }))
+            Err(AdmissionRefusal {
+                status,
+                retry_after,
+                peak_bytes,
+                body: serde_json::json!({
+                    "error": format!("host budget: {refusal}"),
+                    "scope": "machine",
+                }),
+            })
         }
     }
 }
@@ -1063,6 +1127,166 @@ pub struct QuantumExecuteReq {
     pub seed: Option<u64>,
 }
 
+/// Which executing route an admission question is about.
+///
+/// The price is a property of the route, not of the circuit alone. `/execute`
+/// with shots omitted ships every amplitude back; `/expectation` densifies and
+/// returns scalars; `/gradient` holds a second state. A question that did not
+/// name the route would answer for a different job than the one the caller
+/// is about to submit.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdmissionRoute {
+    Execute,
+    Expectation,
+    Gradient,
+}
+
+#[derive(Deserialize)]
+pub struct QuantumAdmissionReq {
+    pub route: AdmissionRoute,
+    #[serde(default)]
+    pub circuit: Option<OmegaCircuitIR>,
+    #[serde(default)]
+    pub circuits: Option<Vec<OmegaCircuitIR>>,
+    /// Meaningful for `route: execute`. Omitted means the analytic run, which
+    /// is the one that returns the statevector — the same default as
+    /// [`QuantumExecuteReq`].
+    #[serde(default)]
+    pub shots: Option<u32>,
+    /// Required for `expectation` and `gradient`. PauliProp's price depends on
+    /// it; the other backends parse it so a bad observable is a 400 here too,
+    /// rather than an admission answer for a request the route would reject.
+    #[serde(default)]
+    pub observable: Option<String>,
+}
+
+fn parse_admission_observable(observable: Option<&str>) -> Result<Observable, String> {
+    let Some(observable) = observable else {
+        return Err("expectation and gradient admission require `observable`".into());
+    };
+    Observable::parse(observable).map_err(|e| format!("bad observable '{observable}': {e}"))
+}
+
+fn one_or_many(
+    circuit: Option<OmegaCircuitIR>,
+    circuits: Option<Vec<OmegaCircuitIR>>,
+) -> Result<Vec<OmegaCircuitIR>, String> {
+    match (circuit, circuits) {
+        (Some(c), None) => Ok(vec![c]),
+        (None, Some(cs)) if !cs.is_empty() => Ok(cs),
+        (None, Some(_)) => Err("`circuits` is empty".into()),
+        (Some(_), Some(_)) => Err("provide either `circuit` or `circuits`, not both".into()),
+        (None, None) => Err("provide `circuit` or `circuits`".into()),
+    }
+}
+
+/// `POST /v1/quantum/admission` — the governor's answer, without the run.
+///
+/// Calls the same `decide_shape` / `decide_shapes` the named route calls, then
+/// drops the hold before writing the response. The snapshot can go stale: a
+/// later submit can still be refused because something else took the memory.
+/// That is a race between two questions to the governor. A price computed in
+/// the client is a second formula, and those two disagree in the direction
+/// that kills the host.
+///
+/// HTTP 200 means the question was answered. `admitted` is the answer.
+/// `status` is what the executing route would have returned for this refusal
+/// (413 or 429); it is absent when the circuit would be admitted. `error` is
+/// that route's refusal text, verbatim.
+pub async fn admission_quantum_route(
+    Extension(claims): Extension<TokenClaims>,
+    State(_state): State<SharedState>,
+    Json(req): Json<QuantumAdmissionReq>,
+) -> impl IntoResponse {
+    if let Err(resp) = check_rights(&claims, rights::EXECUTE) {
+        return resp;
+    }
+    let bad = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+
+    let route = req.route;
+    let decided = match route {
+        AdmissionRoute::Execute => {
+            let Some(circuit) = req.circuit else {
+                return bad("execute admission requires `circuit`".into());
+            };
+            decide_shape(&execute_shape(&circuit, req.shots))
+        }
+        AdmissionRoute::Expectation => {
+            let circuits = match one_or_many(req.circuit, req.circuits) {
+                Ok(cs) => cs,
+                Err(msg) => return bad(msg),
+            };
+            let observable = match parse_admission_observable(req.observable.as_deref()) {
+                Ok(o) => o,
+                Err(msg) => return bad(msg),
+            };
+            decide_shapes(&batch_shapes(&circuits, true, Some(&observable)))
+        }
+        AdmissionRoute::Gradient => {
+            let circuits = match one_or_many(req.circuit, req.circuits) {
+                Ok(cs) => cs,
+                Err(msg) => return bad(msg),
+            };
+            let observable = match parse_admission_observable(req.observable.as_deref()) {
+                Ok(o) => o,
+                Err(msg) => return bad(msg),
+            };
+            // Same pre-admission check as `/gradient`: a qubit index the
+            // circuit does not have is a 400, and it is checked before any
+            // reservation.
+            for (i, c) in circuits.iter().enumerate() {
+                if let Err(e) = observable.validate_qubits(c.num_qubits) {
+                    return bad(format!("circuit {i}: {e}"));
+                }
+            }
+            decide_shapes(&gradient_shapes(&circuits))
+        }
+    };
+    admission_reply(decided)
+}
+
+fn admission_reply(decided: Result<AdmissionHold, AdmissionRefusal>) -> axum::response::Response {
+    match decided {
+        Ok(hold) => {
+            // Release before reading `available_bytes`, or the answer charges
+            // the budget it is describing.
+            let peak_bytes = hold.peak_bytes;
+            drop(hold);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "admitted": true,
+                    "retryable": false,
+                    "peak_bytes": peak_bytes,
+                    "capacity_bytes": governor().config().capacity_bytes,
+                    "available_bytes": governor().available_bytes(),
+                })),
+            )
+                .into_response()
+        }
+        Err(refusal) => {
+            let status = refusal.status.as_u16();
+            let retryable = refusal.retry_after.is_some();
+            let peak_bytes = refusal.peak_bytes;
+            let mut body = refusal.body;
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("admitted".into(), serde_json::json!(false));
+                obj.insert("retryable".into(), serde_json::json!(retryable));
+                obj.insert("status".into(), serde_json::json!(status));
+                obj.insert("peak_bytes".into(), serde_json::json!(peak_bytes));
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
+    }
+}
+
 pub async fn execute_quantum_route(
     Extension(claims): Extension<TokenClaims>,
     State(_state): State<SharedState>,
@@ -1183,10 +1407,7 @@ pub async fn gradient_quantum_route(
     // here explained only the `gradient` flag, so pricing one row read as
     // deliberate. A `[4q, 30q]` batch was admitted on kilobytes and ran a
     // 30-qubit adjoint: forward and backward state, order 32 GiB.
-    let shapes: Vec<JobShape> = circuits
-        .iter()
-        .map(|ir| gradient_shape(ir, circuits.len()))
-        .collect();
+    let shapes = gradient_shapes(&circuits);
     let _reservation = match admit_shapes(&shapes) {
         Ok(r) => r,
         Err(resp) => return *resp,

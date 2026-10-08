@@ -1,0 +1,24 @@
+# quimb — MPS-lane competitor (PLAN emulator comparison, E3).
+#
+# Pinned on purpose. An unpinned competitor version is one of the
+# conditions that makes the comparison worthless: a later `pip install`
+# would silently re-time a different library and the row would still
+# look current. Direct dependencies are pinned to the releases resolved
+# on this machine (CPython 3.14, macOS arm64) on 2026-10-06. Transitive
+# pins are appended after `pip freeze` of that resolve; do not loosen
+# them back to ranges.
+#
+# quimb 1.15.0 requires Python >= 3.11 and, unlike the 2026-10-02 plan
+# note, lists cotengra and numba as required rather than optional.
+quimb==1.15.0
+numpy==2.5.3
+scipy==1.18.1
+numba==0.68.0
+autoray==0.11.0
+cotengra==0.8.2
+# Transitive closure of that resolve, pinned so a later pip cannot float them.
+llvmlite==0.50.0
+cytoolz==1.1.0
+toolz==1.1.0
+psutil==7.2.2
+tqdm==4.70.1

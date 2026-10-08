@@ -13,6 +13,7 @@ pub fn parse_qasm2(input: &str) -> Result<Qasm2Program, String> {
         Qasm2Parser::parse(Rule::program, input).map_err(|e| enrich_parse_error(input, &e))?;
 
     let mut version = String::new();
+    let mut ditqasm = false;
     let mut statements = Vec::new();
 
     for pair in pairs {
@@ -20,6 +21,7 @@ pub fn parse_qasm2(input: &str) -> Result<Qasm2Program, String> {
             for inner in pair.into_inner() {
                 match inner.as_rule() {
                     Rule::header => {
+                        ditqasm = inner.as_str().trim_start().starts_with("DITQASM");
                         for h in inner.into_inner() {
                             if h.as_rule() == Rule::version {
                                 version = h.as_str().to_string();
@@ -40,6 +42,7 @@ pub fn parse_qasm2(input: &str) -> Result<Qasm2Program, String> {
 
     Ok(Qasm2Program {
         version,
+        ditqasm,
         statements,
     })
 }
@@ -172,7 +175,15 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt
             let mut it = inner.into_inner();
             let name = it.next().unwrap().as_str().to_string();
             let size: u32 = it.next().unwrap().as_str().parse().unwrap();
-            Ok(Some(Qasm2Stmt::QregDecl { name, size }))
+            // DITQASM dimension group, if written. Length vs. size and
+            // `d >= 2` are checked in lowering, where the message can name
+            // the register.
+            let dims = it.next().map(|g| {
+                g.into_inner()
+                    .map(|d| d.as_str().parse::<u32>().unwrap_or(u32::MAX))
+                    .collect::<Vec<u32>>()
+            });
+            Ok(Some(Qasm2Stmt::QregDecl { name, size, dims }))
         }
         Rule::creg_decl => {
             let mut it = inner.into_inner();
@@ -185,7 +196,11 @@ fn parse_statement(pair: pest::iterators::Pair<Rule>) -> Result<Option<Qasm2Stmt
             // Lowers to QregDecl — same semantics as QASM 2's `qreg name[N];`,
             // arg order reversed.
             let (name, size) = decl_v3_parts(inner)?;
-            Ok(Some(Qasm2Stmt::QregDecl { name, size }))
+            Ok(Some(Qasm2Stmt::QregDecl {
+                name,
+                size,
+                dims: None,
+            }))
         }
         Rule::bit_decl_v3 => {
             // QASM 3: `bit[N] name;` or `bit name;`.

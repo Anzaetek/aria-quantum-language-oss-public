@@ -1,0 +1,4 @@
+# Aer-GPU sanity floor of the GPU lane (E5). qiskit-aer-gpu 0.15.1 is the newest
+# CUDA-12 build on PyPI and pins qiskit 1.x, so it needs a venv of its own.
+qiskit==1.4.6
+qiskit-aer-gpu==0.15.1

@@ -1,0 +1,118 @@
+{
+ "generator": "tools/ditqasm_xcheck/gen_fixtures.py",
+ "library": "mqt.qudits",
+ "version": "0.5.2",
+ "python": "3.12.3",
+ "files": {
+  "qutrit_h": {
+   "origin": "mqt.qudits QuantumCircuit.to_qasm()",
+   "dims": [
+    3
+   ],
+   "reparsed_dims": [
+    3
+   ],
+   "n_gates": 1,
+   "roundtrip_identical": true,
+   "note": "single qutrit, generalised Fourier H"
+  },
+  "mixed_325": {
+   "origin": "mqt.qudits QuantumCircuit.to_qasm()",
+   "dims": [
+    3,
+    2,
+    5
+   ],
+   "reparsed_dims": [
+    3,
+    2,
+    5
+   ],
+   "n_gates": 8,
+   "roundtrip_identical": false,
+   "note": "mixed radix [3,2,5]; parametrised rxy/rz \u2014 NOT round-trip identical, see defects.D2"
+  },
+  "two_regs": {
+   "origin": "mqt.qudits QuantumCircuit.to_qasm()",
+   "dims": [
+    3,
+    3,
+    7
+   ],
+   "reparsed_dims": [
+    3,
+    3,
+    7
+   ],
+   "n_gates": 3,
+   "roundtrip_identical": true,
+   "note": "two named registers; gates across them; creg is one flat `meas`"
+  },
+  "qubits_default": {
+   "origin": "mqt.qudits QuantumCircuit.to_qasm()",
+   "dims": [
+    2,
+    2
+   ],
+   "reparsed_dims": [
+    2,
+    2
+   ],
+   "n_gates": 2,
+   "roundtrip_identical": true,
+   "note": "no dimensions given \u2192 every wire is 2; `cx` is emitted WITH four params (an embedded two-level gate)"
+  },
+  "bare_qreg_input": {
+   "origin": "hand-written (MQT never emits the bare form)",
+   "parsed_num_qudits": 2,
+   "parsed_dims": [
+    2,
+    2
+   ],
+   "note": "`qreg matter [2];` = TWO qudits of dimension 2 (qasm.py parse_qreg: `qdims = [2] * nq`)"
+  },
+  "bare_qreg_reemitted": {
+   "origin": "mqt.qudits QuantumCircuit.to_qasm() of the parsed bare_qreg_input",
+   "note": "what MQT writes back for the bare form: `[2][2,2]` plus its auto-appended measures"
+  },
+  "ctl_writer_defect": {
+   "origin": "mqt.qudits QuantumCircuit.to_qasm()",
+   "dims": [
+    3,
+    2,
+    5
+   ],
+   "controls_requested": {
+    "indices": [
+     0,
+     2
+    ],
+    "ctrl_states": [
+     2,
+     1
+    ]
+   },
+   "reparse": "IndexError: Controls overlap with targets",
+   "note": "see defects.D1"
+  },
+  "ctl_hand_corrected": {
+   "origin": "hand-written (ctl_writer_defect with the control indices corrected by hand)",
+   "parsed_controls": {
+    "indices": [
+     0,
+     2
+    ],
+    "ctrl_states": [
+     2,
+     1
+    ]
+   },
+   "note": "level list after `ctl` pairs POSITIONALLY with the control-qudit list: q[0]\u2192level 2, q[2]\u2192level 1"
+  }
+ },
+ "defects": {
+  "D1": "to_qasm() writes the TARGET index for every control: `h q[1] ctl q[1] q[1] [2, 1];` for controls [0, 2]. from_qasm() of its own output raises IndexError('Controls overlap with targets').",
+  "D2": "from_qasm() drops the parameters of `rxy`/`rz`: the parser hands a tuple, the gate's validate_parameter accepts only a list, so `_params` is None and re-emission writes `rxy q[0];`. `cx` keeps its four params through the same path."
+ },
+ "header_lock": "parse_ditqasm2_str header regex is `(DITQASM\\s+2.0;)|(include\\s+\"qelib1.inc\";)`: `DITQASM 3.0;`, `DITQASM 2.1;` and `OPENQASM 2.0;` are SyntaxError."
+}

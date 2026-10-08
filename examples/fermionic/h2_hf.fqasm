@@ -1,0 +1,5 @@
+// Hartree-Fock for H2/STO-3G. Same occupation as h2_hf.qasm:
+// modes 0 and 1 filled, modes 2 and 3 empty.
+FERMIONICQASM 1.0;
+mode m[4];
+load m[0], m[1];

@@ -420,38 +420,31 @@ fn brickwork(n: usize, layers: usize) -> String {
 #[cfg(feature = "metal")]
 #[test]
 fn gpu_mps_metal_agrees_with_sim() {
-    // Under a metal build, `--backend mps` routes the two-site θ-contraction
-    // through the Metal GPU (SVD stays on CPU). It engages only above the
-    // bond-dim threshold (32), so we need a wide, fully-entangling circuit — a
-    // 12-qubit RY+CX brickwork drives the middle bond up to the 64 cap, well
-    // past 32, with no truncation (rank ≤ 2^6 = 64). The GPU contraction runs in
-    // f32 (Apple has no native f64), so the tolerance is the f32 accumulation
-    // floor — far tighter than any physically meaningful drift.
-    // Lower the GPU bond threshold so the Metal contraction engages on this
-    // moderate circuit deterministically (production keeps the tuned 32). The
-    // path still runs the real f32 kernel — this only changes *when* it's used.
-    unsafe { std::env::set_var("MPS_METAL_MIN_BOND", "4") };
+    // Production `--backend mps` does not install the f32 contraction. The
+    // certificate pin next to `make_mps` is what goes red if it comes back.
+    // This circuit does not truncate (middle rank ≤ 2^6 = 64), so amplitudes
+    // against the exact statevector are the f64 MPS, not an f32 floor.
+    // SAFETY: test-only. A set variable would measure the opt-in.
+    unsafe { std::env::remove_var("MPS_METAL_CONTRACT") };
     let src = brickwork(12, 8);
     let c = inline(&src, "BW");
     let before = omega_backend_mps_metal::metal_contraction_count();
     let cpu = statevector(&c, &no_binds(), BackendSel::Sim).unwrap();
     let mps = statevector(&c, &no_binds(), BackendSel::Mps { chi: 64 }).unwrap();
     let ran = omega_backend_mps_metal::metal_contraction_count() - before;
-    if ran == 0 {
-        eprintln!("skipping assertion: no Metal device (GPU contraction never ran)");
-        return;
-    }
-    eprintln!("metal contractions dispatched: {ran}");
+    assert_eq!(
+        ran, 0,
+        "production mps dispatched {ran} Metal contractions; the f32 hook is installed"
+    );
     assert_eq!(cpu.len(), mps.len());
     let max_diff = cpu
         .iter()
         .zip(mps.iter())
         .map(|(a, b)| (a - b).norm())
         .fold(0.0, f64::max);
-    eprintln!("max amplitude diff sim vs mps(metal): {max_diff:.3e}");
     assert!(
-        max_diff < 1e-3,
-        "sim vs mps(metal) max amplitude diff {max_diff:.3e} exceeds f32 floor"
+        max_diff < 1e-9,
+        "sim vs production mps max amplitude diff {max_diff:.3e} (exact-f64 path)"
     );
 }
 

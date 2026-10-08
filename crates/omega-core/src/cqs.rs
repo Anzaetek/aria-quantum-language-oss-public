@@ -23,6 +23,10 @@
 //! (hand-written Pauli matrices, no `apply_pauli` involved). Given that anchor,
 //! the primary correctness check is the residual `‖Ax − b‖ ≈ 0` (which does not
 //! use the linear solver at all); agreement with a dense solve is secondary.
+//! The residual is not only reported: [`cqs_solve`] refuses to return an `x`
+//! whose residual exceeds the caller's `max_residual`, so a truncated ansatz
+//! cannot hand back a solution nobody checked. There is no default ceiling —
+//! the tolerance is the caller's claim, stated at the call site.
 //!
 //! Self-contained (only `num_complex`) so the same file ships verbatim in OSS.
 
@@ -155,6 +159,7 @@ fn dense_solve(m_in: &[Vec<Complex64>], y_in: &[Complex64]) -> Result<Vec<Comple
 }
 
 /// Result of a CQS solve.
+#[derive(Debug)]
 pub struct CqsResult {
     /// Reconstructed solution `x = Σₖ αₖ·Pₖ|b⟩`.
     pub x: Vec<Complex64>,
@@ -165,8 +170,20 @@ pub struct CqsResult {
 }
 
 /// CQS solve of `A x = b` over the Pauli `ansatz` (each a length-`n` string).
-/// Returns `Err` if `Q` is singular (the ansatz is rank-deficient).
-pub fn cqs_solve(a: &PauliLcu, b: &[Complex64], ansatz: &[Vec<u8>]) -> Result<CqsResult, String> {
+///
+/// `max_residual` is the caller's ceiling on `‖A x − b‖₂`. A truncated ansatz
+/// is legitimate — its residual is the least-squares minimum over the span —
+/// but the caller must state how much residual it tolerates rather than
+/// receive an `x` it never checks. There is no default.
+///
+/// Returns `Err` if `Q` is singular (the ansatz is rank-deficient), or if the
+/// residual exceeds `max_residual` (or either side is NaN).
+pub fn cqs_solve(
+    a: &PauliLcu,
+    b: &[Complex64],
+    ansatz: &[Vec<u8>],
+    max_residual: f64,
+) -> Result<CqsResult, String> {
     let k = ansatz.len();
     let psi: Vec<Vec<Complex64>> = ansatz.iter().map(|p| apply_pauli(p, b)).collect();
     let apsi: Vec<Vec<Complex64>> = psi.iter().map(|s| a.apply(s)).collect();
@@ -185,11 +202,26 @@ pub fn cqs_solve(a: &PauliLcu, b: &[Complex64], ansatz: &[Vec<u8>]) -> Result<Cq
     for (v, bi) in ax_minus_b.iter_mut().zip(b) {
         *v -= bi;
     }
-    Ok(CqsResult {
+    let result = CqsResult {
         residual: norm(&ax_minus_b),
         x,
         alpha,
-    })
+    };
+    // The residual the caller would receive is checked before it is handed
+    // over. `partial_cmp`: `Greater` refuses, and so does `None` (NaN on
+    // either side) — an unordered comparison must not slip through as "not
+    // greater".
+    if !matches!(
+        result.residual.partial_cmp(&max_residual),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    ) {
+        return Err(format!(
+            "CQS residual {:.3e} exceeds max_residual {max_residual:.3e} \
+             ({k}-term ansatz): refused by the caller's ceiling",
+            result.residual
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -332,13 +364,22 @@ mod tests {
             let ansatz: Vec<Vec<u8>> = (0..dim)
                 .map(|mask| (0..n).map(|q| ((mask >> q) & 1) as u8).collect())
                 .collect();
-            if let Ok(res) = cqs_solve(&a, &b, &ansatz) {
-                assert!(
-                    res.residual < 1e-8,
-                    "fuzz residual {:.2e} (n={n})",
-                    res.residual
-                );
-                solved += 1;
+            match cqs_solve(&a, &b, &ansatz, 1e-8) {
+                Ok(res) => {
+                    assert!(
+                        res.residual < 1e-8,
+                        "fuzz residual {:.2e} (n={n})",
+                        res.residual
+                    );
+                    solved += 1;
+                }
+                // Only a singular Q may be refused here. A residual refusal
+                // would be a solver defect — the old `if let Ok` would have
+                // silently counted it as an unlucky singular draw.
+                Err(e) => assert!(
+                    e.contains("singular system"),
+                    "unexpected refusal (n={n}): {e}"
+                ),
             }
         }
         assert!(
@@ -366,7 +407,7 @@ mod tests {
         let a = synthetic_a();
         let b = e0(4);
         let ansatz = vec![vec![0, 0], vec![1, 0], vec![0, 1], vec![1, 1]];
-        let res = cqs_solve(&a, &b, &ansatz).unwrap();
+        let res = cqs_solve(&a, &b, &ansatz, 1e-10).unwrap();
         // Primary check: residual ‖Ax−b‖ ≈ 0 (uses apply, the anchored primitive;
         // does NOT use the linear solver).
         assert!(res.residual < 1e-10, "CQS residual {:.3e}", res.residual);
@@ -397,7 +438,7 @@ mod tests {
         let s = 1.0 / 2.0_f64.sqrt();
         let b = vec![c(s), c(0.0), c(0.0), Complex64::new(0.0, s)];
         let ansatz = vec![vec![0, 0], vec![1, 0], vec![0, 1], vec![1, 1]];
-        let res = cqs_solve(&a, &b, &ansatz).unwrap();
+        let res = cqs_solve(&a, &b, &ansatz, 1e-10).unwrap();
         assert!(res.residual < 1e-10, "residual {:.3e}", res.residual);
     }
 
@@ -407,9 +448,10 @@ mod tests {
         let a = synthetic_a();
         let b = e0(4);
         let dup = vec![vec![0, 0], vec![0, 0]]; // {II, II}
+        let err = cqs_solve(&a, &b, &dup, 1e-10).unwrap_err();
         assert!(
-            cqs_solve(&a, &b, &dup).is_err(),
-            "duplicate ansatz must error"
+            err.contains("singular system"),
+            "duplicate ansatz must be refused as singular, got: {err}"
         );
     }
 
@@ -424,7 +466,10 @@ mod tests {
         let full = [vec![0u8, 0], vec![1, 0], vec![0, 1], vec![1, 1]];
         let mut prev = f64::INFINITY;
         for size in 1..=4 {
-            let res = cqs_solve(&a, &b, &full[..size]).unwrap();
+            // Ceiling ∞: this test *measures* the residual at each truncation.
+            // The ceiling's refusal is exercised by
+            // `residual_above_callers_ceiling_is_refused`.
+            let res = cqs_solve(&a, &b, &full[..size], f64::INFINITY).unwrap();
             // independent least-squares residual: project b onto span{Aψ_k} and
             // measure the orthogonal remainder via the Gram normal equations,
             // re-derived here from the column vectors directly.
@@ -443,6 +488,43 @@ mod tests {
             prev = res.residual;
         }
         assert!(prev < 1e-10);
+    }
+
+    #[test]
+    fn residual_above_callers_ceiling_is_refused() {
+        // The ceiling must change the OUTCOME without changing the arithmetic:
+        // the truncated ansatz {II} leaves a nonzero least-squares residual r
+        // (computed independently below); a ceiling under r is refused, a
+        // ceiling over r returns the same residual, r itself is accepted
+        // (inclusive), and a NaN ceiling refuses — an unordered comparison
+        // must not pass as "not greater".
+        let a = synthetic_a();
+        let b = e0(4);
+        let truncated = [vec![0u8, 0]];
+        let cols = vec![a.apply(&apply_pauli(&truncated[0], &b))];
+        let r = least_squares_residual(&cols, &b);
+        assert!(
+            r > 1e-3,
+            "test premise: {{II}} must be genuinely truncated (r={r:.3e})"
+        );
+
+        let err = cqs_solve(&a, &b, &truncated, 0.5 * r).unwrap_err();
+        assert!(err.contains("exceeds max_residual"), "wrong refusal: {err}");
+
+        let res = cqs_solve(&a, &b, &truncated, 2.0 * r).unwrap();
+        assert!(
+            (res.residual - r).abs() < 1e-12,
+            "reported {:.3e} ≠ independent {r:.3e}",
+            res.residual
+        );
+        assert!(
+            cqs_solve(&a, &b, &truncated, res.residual).is_ok(),
+            "ceiling == residual is inclusive"
+        );
+        assert!(
+            cqs_solve(&a, &b, &truncated, f64::NAN).is_err(),
+            "NaN ceiling must refuse"
+        );
     }
 
     /// `‖b − P_span b‖` via the normal equations on the given columns —

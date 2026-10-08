@@ -86,3 +86,10 @@ aria-backend-tch = { path = "../aria-backend-tch", optional = true }
 # On non-macOS / default builds they compile to inert stubs.
 omega-backend-mps-metal = { path = "../omega-backend-mps-metal" }
 omega-backend-pauliprop-metal = { path = "../omega-backend-pauliprop-metal" }
+# Pin duplicated GPU-backend constants together (gpu_backend_constants_pinned.rs).
+# No features: without them every one of these compiles to a stub on any host,
+# but the constants — which is all the pin test reads — are always there.
+omega-backend-pauliprop-cuda = { path = "../omega-backend-pauliprop-cuda" }
+omega-backend-statevector-metal = { path = "../omega-backend-statevector-metal" }
+omega-backend-statevector-cuda = { path = "../omega-backend-statevector-cuda" }
+omega-backend-statevector-opencl = { path = "../omega-backend-statevector-opencl" }

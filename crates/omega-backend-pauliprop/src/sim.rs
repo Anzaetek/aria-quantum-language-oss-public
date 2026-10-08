@@ -113,6 +113,25 @@ pub type BranchHook = fn(
 /// branching than any exact run needs.
 pub const DEFAULT_MAX_TERMS: usize = 1 << 21;
 
+/// Term count below which a GPU device round-trip isn't worth it — small sums
+/// stay on the CPU. Lives here (not in the Metal/CUDA crates) so both
+/// accelerators share one spelling of the default *and* of the
+/// `PAULIPROP_GPU_MIN` override; the accelerator crates re-export it as their
+/// `DEFAULT_MIN_TERMS`.
+pub const DEFAULT_GPU_MIN_TERMS: usize = 256;
+
+/// The GPU-crossover threshold: `PAULIPROP_GPU_MIN` if set and parseable
+/// (mainly tests forcing the GPU path on tiny sums), else
+/// [`DEFAULT_GPU_MIN_TERMS`]. Unparseable values fall back to the default
+/// rather than erroring — same forgiving contract the accelerator crates
+/// shipped with.
+pub fn gpu_min_terms() -> usize {
+    std::env::var("PAULIPROP_GPU_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_GPU_MIN_TERMS)
+}
+
 thread_local! {
     /// Gates skipped because they act entirely outside the Pauli sum's support.
     ///
@@ -330,6 +349,11 @@ pub struct PauliPropBackend {
     /// the propagating observable — deterministically and exactly (no
     /// trajectories), which is the natural home for Pauli-Lindblad noise.
     noise: Option<NoiseModel>,
+    /// Recognise the `CX(a,b); Rz(θ) b; CX(a,b)` lowering of a two-qubit Pauli
+    /// rotation and conjugate by the single `Z⊗Z` generator instead. On by
+    /// default; see [`PauliPropBackend::with_zz_folding`] for what it buys and
+    /// why it is a switch at all.
+    fold_zz: bool,
 }
 
 impl Default for PauliPropBackend {
@@ -342,6 +366,7 @@ impl Default for PauliPropBackend {
             max_dropped_mass: None,
             branch_hook: None,
             noise: None,
+            fold_zz: true,
         }
     }
 }
@@ -353,15 +378,16 @@ impl PauliPropBackend {
     }
 
     /// Engine with coefficient-magnitude and Pauli-weight truncation.
+    ///
+    /// Spelled as an override of [`Default`] rather than a full literal: every
+    /// field it does not name is the default, and a fresh field (the most
+    /// recent being `fold_zz`) then reaches every constructor at once instead
+    /// of silently taking a different value here than in `new()`.
     pub fn with_truncation(coeff_min: f64, max_weight: Option<usize>) -> Self {
         Self {
             coeff_min,
             max_weight,
-            max_freq: None,
-            max_terms: Some(DEFAULT_MAX_TERMS),
-            max_dropped_mass: None,
-            branch_hook: None,
-            noise: None,
+            ..Self::default()
         }
     }
 
@@ -437,16 +463,31 @@ impl PauliPropBackend {
             coeff_min,
             max_weight,
             max_freq,
-            max_terms: Some(DEFAULT_MAX_TERMS),
-            max_dropped_mass: None,
-            branch_hook: None,
-            noise: None,
+            ..Self::default()
         }
     }
 
     /// Builder: set the split-frequency cap.
     pub fn max_freq(mut self, max_freq: Option<u32>) -> Self {
         self.max_freq = max_freq;
+        self
+    }
+
+    /// Turn the `CX·Rz·CX` → native `Z⊗Z` rotation peephole off (or back on).
+    ///
+    /// It is ON by default and the default is the one to use. The switch exists
+    /// because the fold is only *observably* different when truncation is on —
+    /// with no truncation the two paths are the same unitary conjugation and
+    /// produce the same terms — so measuring what it buys needs both arms of
+    /// the same run. `tests/zz_peephole.rs` is the caller; it is also the
+    /// escape hatch if the pattern match is ever suspected of a false positive.
+    ///
+    /// Not bit-identical, and the test says why at length: the readout sums the
+    /// same terms out of a `HashMap` built by a different insert sequence, and
+    /// float addition is not associative. Measured worst gap over 330 exact
+    /// comparisons: 1.110e-16, one ULP.
+    pub fn with_zz_folding(mut self, on: bool) -> Self {
+        self.fold_zz = on;
         self
     }
 
@@ -459,6 +500,7 @@ impl PauliPropBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<(f64, f64)> {
+        circuit.refuse_qudits(self.name())?;
         let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
         let circuit = &deferred;
         let observable = &observable;
@@ -486,6 +528,7 @@ impl PauliPropBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<(f64, PauliPropCertificate)> {
+        circuit.refuse_qudits(self.name())?;
         let (deferred, observable) = prepare_for_expectation(circuit, observable)?;
         let circuit = &deferred;
         let observable = &observable;
@@ -596,7 +639,57 @@ impl PauliPropBackend {
         if let Some(model) = &self.noise {
             self.apply_readout_adjoint(model, n, &mut sum)?;
         }
-        for op in circuit.ops.iter().rev() {
+        // The peephole below rewrites `CX(a,b); Rz(θ) b; CX(a,b)` into one
+        // conjugation by `exp(-i·θ/2·Z_a Z_b)`. Two conditions gate it:
+        //
+        //  * `fold_zz` — the switch the A/B test in `tests/zz_peephole.rs`
+        //    uses to measure the difference against itself.
+        //  * **no noise model.** Each of the three ops carries its own gate
+        //    channel, and folding them into one op would apply one channel
+        //    where the circuit specifies three — a different physical circuit,
+        //    answered silently. The fold is a statement about the *unitary*
+        //    only, so it is off the moment the run is not unitary.
+        let fold_zz = self.fold_zz && self.noise.is_none();
+        let ops = &circuit.ops[..];
+        // Index walk rather than `.iter().rev()` because the peephole consumes
+        // three ops at a time. The window is `ops[i-3..i]` in FORWARD order,
+        // which is what `match_zz_triple` reads; the reverse walk happens to
+        // see the same shape (the pattern is a palindrome in gate kinds), but
+        // matching on the forward slice is what makes "the `Rz` sits on the
+        // `CX` **target**" checkable at all — that is the asymmetric part, and
+        // reversing it by hand is how it would get written backwards.
+        let mut i = ops.len();
+        while i > 0 {
+            if fold_zz {
+                if let Some(t) = match_zz_triple(ops, i, n) {
+                    // Exactly `RZZ(θ) = CX·Rz(θ)·CX` (the parser's own
+                    // decomposition, verified there against Qiskit's matrix at
+                    // 0.000e+00), so with truncation off this produces the same
+                    // terms as running the three ops — measured against the
+                    // statevector backend on both arms, worst gap one ULP.
+                    //
+                    // With truncation on it is better, and that is the point:
+                    // the triple takes a term with `X` or `Y` on `b` through a
+                    // transient weight-`w+1` string that the first `CX` creates
+                    // and the second removes, so a `max_weight` cap biting
+                    // between the two is discarding an artefact of the lowering
+                    // rather than anything the rotation does. Measured on a
+                    // 4-qubit `rzz` ansatz at cap 2: the triple ends with 0
+                    // terms and a dropped mass of 1.0 (no information at all)
+                    // where the fold keeps 15 and lands 0.263 from the exact
+                    // answer. `tests/zz_peephole.rs`.
+                    let theta = resolve(t.theta, params)?;
+                    self.branch(&mut sum, &gen_zz(n, t.a, t.b), theta)?;
+                    if self.coeff_min > 0.0 || self.max_weight.is_some() || self.max_freq.is_some()
+                    {
+                        sum.truncate(self.coeff_min, self.max_weight, self.max_freq);
+                    }
+                    i -= 3;
+                    continue;
+                }
+            }
+            i -= 1;
+            let op = &ops[i];
             // A classically-conditioned gate is NOT a plain gate. Its action
             // depends on a measurement outcome, so the circuit is a classical
             // mixture over branches — not one unitary — and observable
@@ -746,6 +839,30 @@ impl PauliPropBackend {
         n: usize,
         sum: &mut PauliSum,
     ) -> Result<()> {
+        // REJECT a gate that names one qubit twice, or a qubit past the
+        // register, before any arm indexes it. Nothing upstream does:
+        // `CircuitIR::add_op` pushes unchecked and the parser checks arity
+        // only. The arms below would not panic on a duplicate — they would
+        // return a WRONG NUMBER: `Rbs(θ) q,q` collapses both generators to a
+        // bare `Y` and applies `R_Y(θ)·R_Y(−θ)` = identity, and `cx q,q` maps
+        // through a conjugation table that has no row for it. The statevector
+        // backend panics on the same input; a typed refusal is the answer both
+        // should give.
+        for (i, a) in op.qubits.iter().enumerate() {
+            if a.0 as usize >= n {
+                return Err(OmegaError::InvalidCircuit(format!(
+                    "pauliprop: gate {:?} names qubit {} but the circuit has {n} qubits",
+                    op.gate, a.0
+                )));
+            }
+            if op.qubits[..i].iter().any(|b| b.0 == a.0) {
+                return Err(OmegaError::InvalidCircuit(format!(
+                    "pauliprop: gate {:?} names qubit {} twice; a multi-qubit gate needs \
+                     distinct qubits",
+                    op.gate, a.0
+                )));
+            }
+        }
         let q = |i: usize| op.qubits[i].0 as usize;
         match op.gate {
             // ----- single-qubit Cliffords (one Pauli → one Pauli) -----
@@ -825,10 +942,24 @@ impl PauliPropBackend {
             // phase becomes physical the moment the result is controlled or
             // interfered — and would change what `to_qasm` re-emits. Same
             // reasoning the `U1` arm above already relies on.
-            GateKind::U3 => {
-                let theta = resolve(&op.params[0], params)?;
-                let phi = resolve(&op.params[1], params)?;
-                let lam = resolve(&op.params[2], params)?;
+            //
+            // `U2(φ,λ) = U3(π/2, φ, λ)` — the statevector backend's `gates::u2`
+            // is literally that call, so sharing the arm shares the oracle's
+            // definition rather than re-deriving one.
+            GateKind::U3 | GateKind::U2 => {
+                let (theta, phi, lam) = if matches!(op.gate, GateKind::U2) {
+                    (
+                        std::f64::consts::FRAC_PI_2,
+                        resolve(&op.params[0], params)?,
+                        resolve(&op.params[1], params)?,
+                    )
+                } else {
+                    (
+                        resolve(&op.params[0], params)?,
+                        resolve(&op.params[1], params)?,
+                        resolve(&op.params[2], params)?,
+                    )
+                };
                 // Order matters and is easy to reverse. With
                 // `U = Rz(φ)·Ry(θ)·Rz(λ)`,
                 //
@@ -873,6 +1004,30 @@ impl PauliPropBackend {
                 self.branch(sum, &gen_single(n, q(0), 'z'), lam / 2.0)?;
                 self.branch(sum, &gen_single(n, q(1), 'z'), lam / 2.0)?;
                 self.branch(sum, &gen_zz(n, q(0), q(1)), -lam / 2.0)?;
+            }
+
+            // Givens / reconfigurable beam splitter, `omega-core`'s definition:
+            //
+            //   RBS(θ) = exp(−i·θ/2·(Y_a⊗X_b − X_a⊗Y_b))
+            //
+            // `Y⊗X` and `X⊗Y` COMMUTE ((Y⊗X)(X⊗Y) = (YX)⊗(XY) = (−iZ)⊗(iZ) =
+            // Z⊗Z, and the other order gives the same), so the exponential of
+            // the difference is exactly the product of two Pauli rotations,
+            //
+            //   RBS(θ) = R_{YX}(θ) · R_{XY}(−θ),   R_P(α) = exp(−i·α/2·P)
+            //
+            // with no Trotter error and no ordering question. Two `branch`
+            // calls, like `CRz`. The gate is antisymmetric in its qubits
+            // (`RBS(θ)[b,a] = RBS(−θ)[a,b]`), so which qubit carries the `Y` in
+            // the first factor is the whole convention — `a = q(0)` here
+            // matches the statevector matrix (first qubit = MSB), and the
+            // cross-check test uses an XX observable on an asymmetric input,
+            // which is exactly what flips sign if this is backwards.
+            GateKind::Rbs => {
+                let theta = resolve(&op.params[0], params)?;
+                let (a, b) = (q(0), q(1));
+                self.branch(sum, &gen_product(n, &[(a, 'y'), (b, 'x')]), theta)?;
+                self.branch(sum, &gen_product(n, &[(a, 'x'), (b, 'y')]), -theta)?;
             }
 
             // CCX and CSwap, via CCZ.
@@ -960,7 +1115,8 @@ impl PauliPropBackend {
             ref other => {
                 return Err(OmegaError::Unsupported(format!(
                     "pauliprop: gate {other:?} not yet supported \
-                     (Clifford H/X/Y/Z/S/Sdg/CX/CZ/Swap + Rx/Ry/Rz/U1/T/Tdg/CRz)"
+                     (Clifford H/X/Y/Z/S/Sdg/Sx/Sxdg/CX/CY/CZ/Swap; rotations \
+                     Rx/Ry/Rz/T/Tdg/U1/U2/U3/CRz/CU3(0,0,λ)/Rbs; CCX/CSwap)"
                 )));
             }
         }
@@ -1163,9 +1319,14 @@ impl PauliPropBackend {
     /// refused, which is the one failure this ceiling exists to prevent.
     ///
     /// Per-branch, the worst case is one doubling past the cap (`2 · cap`),
-    /// since a single `branch` can at most double. Bounding it tighter would
-    /// mean testing inside the per-term loop, which is the hottest loop in the
-    /// engine; one comparison per branch call is free by comparison.
+    /// since a single `branch` can at most double. The per-term loop in
+    /// `branch` now compares on every insert as well (one integer compare per
+    /// anticommuting term — see the note there), so on the CPU path that fires
+    /// first and this is the backstop. The branch-hook path returns before
+    /// that loop, so there this is the check that fires.
+    ///
+    /// The ceiling is inclusive: a sum that peaks at exactly `cap` terms is
+    /// not refused. `tests/max_terms_configurable.rs` holds that boundary.
     fn check_cap(&self, sum: &PauliSum) -> Result<()> {
         if let Some(cap) = self.max_terms {
             if sum.terms.len() > cap {
@@ -1485,39 +1646,119 @@ fn zero_words(n: usize) -> Vec<u64> {
 
 /// Single-qubit rotation generator on qubit `q`: `'z'`→Z, `'x'`→X, `'y'`→Y.
 fn gen_single(n: usize, q: usize, axis: char) -> Gen {
-    let mut gx = zero_words(n);
-    let mut gz = zero_words(n);
-    let factor = match axis {
-        'z' => {
-            set_bit(&mut gz, q);
-            ONE
-        }
-        'x' => {
-            set_bit(&mut gx, q);
-            ONE
-        }
-        'y' => {
-            set_bit(&mut gx, q);
-            set_bit(&mut gz, q);
-            I // Y = i·XZ
-        }
-        _ => unreachable!("bad axis"),
-    };
-    Gen { gx, gz, n, factor }
+    gen_product(n, &[(q, axis)])
 }
 
 /// Two-qubit `Z⊗Z` generator on `(c, t)` (the entangling factor of `CRz`).
 fn gen_zz(n: usize, c: usize, t: usize) -> Gen {
-    let gx = zero_words(n);
-    let mut gz = zero_words(n);
-    set_bit(&mut gz, c);
-    set_bit(&mut gz, t);
-    Gen {
-        gx,
-        gz,
-        n,
-        factor: ONE,
+    gen_product(n, &[(c, 'z'), (t, 'z')])
+}
+
+/// One recognised `CX(a,b); Rz(θ) b; CX(a,b)` triple.
+struct ZzTriple<'a> {
+    a: usize,
+    b: usize,
+    theta: &'a ParamExpr,
+}
+
+/// Recognise a two-qubit `Z⊗Z` rotation in the three ops `ops[end-3..end]`.
+///
+/// # Why this is a peephole and not a gate
+///
+/// `rzz(θ)` reaches this backend already lowered: the parser decomposes it to
+/// `cx a,b; rz(θ) b; cx a,b` rather than adding a `GateKind`, deliberately —
+/// the spelling is interchange, not a new capability, and a new variant would
+/// cost every other backend an arm. `rxx`/`ryy` lower to the *same* triple
+/// wrapped in single-qubit basis changes (`h`, resp. `rx(±π/2)`), so this one
+/// pattern covers all three.
+///
+/// That lowering is exact but it is not free in the Heisenberg picture. The
+/// first `cx` maps `Z_a Z_b → Z_a Z_b`… but a term with `X` or `Y` on `b`
+/// grows: the `CX` image sends `X_b → X_a X_b`, so a weight-`w` term
+/// transiently reaches weight `w+1` *between* the two `cx`, and the second
+/// `cx` takes it back. A `max_weight` cap applied between gates therefore
+/// kills terms on the strength of a weight the rotation never actually
+/// produces. Conjugating by the single generator `Z_a Z_b` skips the
+/// excursion: `branch` produces `cos θ·P + i sin θ·(Z_a Z_b·P)` and nothing in
+/// between.
+///
+/// # What must NOT fold
+///
+/// Everything asymmetric about the pattern is checked, because every one of
+/// these is a different unitary and folding it would return a wrong number
+/// rather than an error:
+///
+/// * the `Rz` must sit on the CX **target** `b` — on the control it commutes
+///   with the CXs and is a plain `Rz`, not a `ZZ` rotation;
+/// * both `CX` must name the same ordered pair `(a, b)`;
+/// * the three ops must be **adjacent**, so anything acting in between (even
+///   a `barrier`, which is not a no-op for this purpose — it means the window
+///   is not the triple the parser emitted) blocks the fold;
+/// * none may be classically conditioned — `propagate` refuses those, and the
+///   refusal must not be skipped past;
+/// * the qubits must be distinct and in range, since the fold bypasses the
+///   validation `conjugate` does on the ops it dispatches.
+///
+/// Returns `None` on any of those, and the three ops then run individually —
+/// slower and lossier under a cap, but never wrong.
+fn match_zz_triple(ops: &[GateOp], end: usize, n: usize) -> Option<ZzTriple<'_>> {
+    let w = ops.get(end.checked_sub(3)?..end)?;
+    let (first, rot, last) = (&w[0], &w[1], &w[2]);
+    if first.condition.is_some() || rot.condition.is_some() || last.condition.is_some() {
+        return None;
     }
+    if !matches!(first.gate, GateKind::CX)
+        || !matches!(last.gate, GateKind::CX)
+        || !matches!(rot.gate, GateKind::Rz)
+    {
+        return None;
+    }
+    if first.qubits.len() != 2 || last.qubits.len() != 2 || rot.qubits.len() != 1 {
+        return None;
+    }
+    if rot.params.len() != 1 {
+        return None;
+    }
+    let (a, b) = (first.qubits[0].0, first.qubits[1].0);
+    if a == b || last.qubits[0].0 != a || last.qubits[1].0 != b || rot.qubits[0].0 != b {
+        return None;
+    }
+    let (a, b) = (a as usize, b as usize);
+    if a >= n || b >= n {
+        return None;
+    }
+    Some(ZzTriple {
+        a,
+        b,
+        theta: &rot.params[0],
+    })
+}
+
+/// A product of single-qubit Paulis on distinct qubits, as a rotation
+/// generator. The one builder: [`gen_single`], [`gen_zz`] and
+/// [`gen_z_product`] are wrappers over it.
+///
+/// The packed encoding stores each qubit's `Y` as the bit pair `(x=1, z=1)`,
+/// which is literally `X·Z = −i·Y`, so every `Y` in the product needs one
+/// compensating factor of `i`. Different qubits commute, so the factors just
+/// multiply; a product with no `Y` has factor `ONE`.
+fn gen_product(n: usize, paulis: &[(usize, char)]) -> Gen {
+    let mut gx = zero_words(n);
+    let mut gz = zero_words(n);
+    let mut factor = ONE;
+    for &(q, axis) in paulis {
+        match axis {
+            'z' => set_bit(&mut gz, q),
+            'x' => set_bit(&mut gx, q),
+            'y' => {
+                set_bit(&mut gx, q);
+                set_bit(&mut gz, q);
+                factor *= I;
+            }
+            _ => unreachable!("bad axis"),
+        }
+    }
+    Gen { gx, gz, n, factor }
 }
 
 /// A product of `Z` on an arbitrary set of qubits, as a rotation generator.
@@ -1526,17 +1767,8 @@ fn gen_zz(n: usize, c: usize, t: usize) -> Gen {
 /// gate decomposes into seven rotations whose generators are all products of
 /// `Z`, and products of `Z` all commute with one another.
 fn gen_z_product(n: usize, qubits: &[usize]) -> Gen {
-    let gx = zero_words(n);
-    let mut gz = zero_words(n);
-    for &q in qubits {
-        set_bit(&mut gz, q);
-    }
-    Gen {
-        gx,
-        gz,
-        n,
-        factor: ONE,
-    }
+    let paulis: Vec<(usize, char)> = qubits.iter().map(|&q| (q, 'z')).collect();
+    gen_product(n, &paulis)
 }
 
 /// Pack a per-qubit boolean vector into little-endian u64 words: qubit `i` is
@@ -1623,6 +1855,7 @@ impl Backend for PauliPropBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        circuit.refuse_qudits(self.name())?;
         self.expectation_with_budget(circuit, params, observable)
             .map(|(v, _)| v)
     }

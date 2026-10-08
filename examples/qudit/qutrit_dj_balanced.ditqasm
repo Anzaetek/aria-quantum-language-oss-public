@@ -1,0 +1,17 @@
+DITQASM 2.0;
+// Qutrit Deutsch-Jozsa, balanced oracle, 1 work qutrit.
+// Same preparation as the constant circuit. The oracle is csum:
+// f(x) = x, one hit on each output. Inverse Fourier is h three times.
+qreg q [2][3,3];
+x q[1];
+h q[1];
+h q[1];
+h q[1];
+h q[0];
+csum q[0],q[1];
+h q[0];
+h q[0];
+h q[0];
+h q[1];
+x q[1];
+x q[1];

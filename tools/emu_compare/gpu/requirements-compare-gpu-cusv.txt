@@ -1,0 +1,6 @@
+# cuStateVec arm of the GPU lane (E5): cuquantum-python driven directly.
+# custatevec-cu12 1.15.0 ships a native sm_120 cubin (checked with cuobjdump).
+cuquantum-python-cu12==26.9.0
+custatevec-cu12==1.15.0
+cupy-cuda12x==14.2.0
+numpy==2.5.3

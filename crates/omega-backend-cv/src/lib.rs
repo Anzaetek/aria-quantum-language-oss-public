@@ -21,15 +21,21 @@
 //!
 //! # What is here, and what is not
 //!
-//! Present: the Fock-space representation, photon-number readout, and the
-//! truncation policy — all verifiable *today* against closed-form states.
+//! Present: the Fock-space representation, photon-number readout, the
+//! truncation policy, and the gates — [`FockState::displace`],
+//! [`FockState::squeeze`], [`FockState::kerr`], [`FockState::phase_shift`] on
+//! one mode, and the beamsplitter on [`multimode::MultiFockState`]. The single-mode gates
+//! are checked against the closed-form anchors (displaced vacuum gives
+//! `⟨n⟩ = |α|²`, squeezed vacuum gives `⟨n⟩ = sinh²r`); the multi-mode path is
+//! cross-checked against piquasso transcripts under `tests/`. The truncation
+//! policy was built first, before the gates, on purpose: a truncated
+//! displacement or squeezing is not unitary, so the measuring stick had to
+//! exist before the thing being measured.
 //!
-//! Absent: the gates. `Displacement` and `Squeezing` on a truncated space are
-//! built from the Fréchet derivative of a matrix exponential of ladder
-//! operators, which is where a subtle sign or ordering error would hide. Those
-//! land next, and land against the anchors this module already checks:
-//! displaced vacuum gives `⟨n⟩ = |α|²`, squeezed vacuum gives `⟨n⟩ = sinh²r`.
-//! Building the measuring stick before the thing being measured is deliberate.
+//! Absent: parameter gradients (the Fréchet-derivative route through the
+//! matrix exponential — no adjoint trick and no parameter-shift rule exist on
+//! a truncated ladder) and any batching or Python exposure. Those are
+//! `FIXES_PLAN.md` B4–B5.
 
 use num_complex::Complex64;
 
@@ -563,7 +569,7 @@ impl FockState {
     ///
     /// Squeezing pushes population UP the ladder, so the cutoff bites harder
     /// here than for a phase rotation. The operator is applied into a
-    /// [`PAD`]-extended space and the mass above the cutoff is measured and
+    /// `PAD`-extended space and the mass above the cutoff is measured and
     /// added to [`Self::lost_norm`], on the same footing as
     /// [`Self::displace`] — including the incoming `√ε` term, for the reason
     /// given there: at `r = 0.5` the true amplitude error was measured at ~1700×

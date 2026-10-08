@@ -249,7 +249,10 @@ fn map_gate_kind(kind: GateKind) -> Option<OmegaGateKind> {
 /// executing the remainder returns confident wrong numbers; that is exactly the
 /// defect this split removes.
 pub fn to_omega_ir(circuit: &Circuit) -> OmegaCircuitIR {
-    try_to_omega_ir(circuit).expect("to_omega_ir: circuit contains a gate with no omega lowering")
+    try_to_omega_ir(circuit).expect(
+        "to_omega_ir: circuit was refused by try_to_omega_ir (unmapped gate, undeclared \
+         qubit/clbit, out-of-domain condition, or an unbound compound parameter)",
+    )
 }
 
 /// Convert a quantum-core Circuit to omega-functions CircuitIR, refusing any
@@ -342,17 +345,42 @@ pub fn try_to_omega_ir(circuit: &Circuit) -> Result<OmegaCircuitIR, String> {
             // 0.0 placeholder, which silently discarded the only information a
             // remote gradient needs and forced every batch row to re-send its
             // whole circuit.
-            let to_param = |p: &ParamExpr| match p.try_as_f64() {
-                Some(v) => OmegaParam::Concrete(v),
-                None => match p {
-                    ParamExpr::Symbol(name) => OmegaParam::Symbol {
+            //
+            // An expression that is neither concrete nor a bare symbol — `2*theta`,
+            // `sin(phi)`, `theta + pi/2` — has no wire form. It used to lower to
+            // `Concrete(0.0)` with no diagnostic, so `rz(2*theta)` executed as
+            // `rz(0)`: a different circuit, run confidently. A concrete expression
+            // that cannot be evaluated (`foo(1)`, `1/0`) took the same silent path.
+            // Both are refused here by name; the binding layer above lowering is
+            // where a symbol gets its value, and a caller that reaches this point
+            // with the symbol still free has skipped it.
+            let gate_kind = inst.gate.kind;
+            let to_param = |p: &ParamExpr| -> Result<OmegaParam, String> {
+                if let ParamExpr::Symbol(name) = p {
+                    return Ok(OmegaParam::Symbol {
                         symbol: name.clone(),
-                    },
-                    // An expression that is neither bound nor a bare symbol
-                    // (e.g. `2*theta`) has no wire form yet; keep the previous
-                    // behaviour rather than inventing one.
-                    _ => OmegaParam::Concrete(0.0),
-                },
+                    });
+                }
+                match p.eval(&std::collections::HashMap::new()) {
+                    Ok(v) => Ok(OmegaParam::Concrete(v)),
+                    Err(reason) if p.is_concrete() => Err(format!(
+                        "gate `{gate_kind:?}` has parameter `{p}` which cannot be \
+                         evaluated ({reason}); it was previously lowered to 0.0 without \
+                         a diagnostic, which silently changed the circuit"
+                    )),
+                    Err(_) => Err(format!(
+                        "gate `{gate_kind:?}` has parameter `{p}`, a compound expression \
+                         over free symbol(s) {:?}; the omega IR carries a bare symbol or \
+                         a concrete value, not an expression over one, so bind the \
+                         symbol(s) before lowering. It was previously lowered to 0.0 \
+                         without a diagnostic, which silently changed the circuit",
+                        {
+                            let mut s: Vec<String> = p.free_symbols().into_iter().collect();
+                            s.sort();
+                            s
+                        }
+                    )),
+                }
             };
             let params_f64: Vec<OmegaParam> = if inst.gate.kind == GateKind::CP {
                 // CP(λ) → CU3(0, 0, λ): controlled phase as controlled-U1.
@@ -360,11 +388,16 @@ pub fn try_to_omega_ir(circuit: &Circuit) -> Result<OmegaCircuitIR, String> {
                     .gate
                     .params
                     .first()
-                    .map(&to_param)
+                    .map(to_param)
+                    .transpose()?
                     .unwrap_or(OmegaParam::Concrete(0.0));
                 vec![OmegaParam::Concrete(0.0), OmegaParam::Concrete(0.0), lam]
             } else {
-                inst.gate.params.iter().map(&to_param).collect()
+                inst.gate
+                    .params
+                    .iter()
+                    .map(&to_param)
+                    .collect::<Result<_, String>>()?
             };
             // `.and_then` DROPPED the condition when the clbit was unmapped, so
             // a guarded gate silently became unconditional — it then executed on

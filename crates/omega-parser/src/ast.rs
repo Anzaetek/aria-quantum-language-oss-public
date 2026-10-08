@@ -9,6 +9,11 @@ pub enum SourceFormat {
 #[derive(Clone, Debug)]
 pub struct Qasm2Program {
     pub version: String,
+    /// `true` when the header token was `DITQASM` (mqt.qudits). The only
+    /// grammar it unlocks is the `qreg` dimension group; under an `OPENQASM`
+    /// header, or none, that group is refused in lowering rather than read
+    /// as a fourth dialect no other tool writes.
+    pub ditqasm: bool,
     pub statements: Vec<Qasm2Stmt>,
 }
 
@@ -18,6 +23,11 @@ pub enum Qasm2Stmt {
     QregDecl {
         name: String,
         size: u32,
+        /// DITQASM dimension group, `qreg q [3][3,2,5];` — one entry per
+        /// wire. `None` for QASM 2/3 declarations and for the bare DITQASM
+        /// form `qreg q [2];`, which `mqt.qudits` reads as all-qubit
+        /// (`tools/ditqasm_xcheck/README.md`, Q0).
+        dims: Option<Vec<u32>>,
     },
     CregDecl {
         name: String,
@@ -148,8 +158,64 @@ pub enum OpticParam {
     Num(f64),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModeRef {
     pub reg: String,
     pub index: u32,
+}
+
+/// AST for FERMIONICQASM 1.0.
+///
+/// In-house format. It carries no authority of a standard.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FermionicQasmProgram {
+    pub version: String,
+    pub statements: Vec<FermionicQasmStmt>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FermionicQasmStmt {
+    /// `mode m[N];` or `mode m[N] spin;`.
+    ModeDecl {
+        name: String,
+        /// Declared size. When `spin`, this counts **spatial** modes and the
+        /// register occupies `2 * size` wires in blocks: `0..size` spin-up
+        /// (alpha), then `size..2*size` spin-down (beta). Not `pol`'s
+        /// interleaved `(s, p) -> 2s + p` map — the lowering is not shared.
+        size: u32,
+        spin: bool,
+    },
+    /// `creg c[N];`. A statement of its own: under ordered choice a `creg`
+    /// line is otherwise a gate application named `creg`.
+    CregDecl {
+        name: String,
+        size: u32,
+    },
+    /// `load m[i], ...;` — which modes start occupied.
+    ///
+    /// A `load` after a gate, or two loads of one mode, is refused in
+    /// lowering. This phase only records the statement.
+    Load {
+        modes: Vec<ModeRef>,
+    },
+    /// `measure m[i] -> c[j];`.
+    Measure {
+        mode: ModeRef,
+        /// Classical bit. Same spelling as a mode reference; not a mode.
+        cbit: ModeRef,
+    },
+    GateApp(FermionicGateApp),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FermionicGateApp {
+    pub name: String,
+    pub params: Vec<FermionicParam>,
+    pub modes: Vec<ModeRef>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FermionicParam {
+    Symbol(String),
+    Num(f64),
 }

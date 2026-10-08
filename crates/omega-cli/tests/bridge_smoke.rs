@@ -134,3 +134,145 @@ fn bridge_rejects_unknown_backend_name() {
         "expected unknown-backend message, got: {stderr}"
     );
 }
+
+/// `--noise` with `--bridge --expectation` must be REFUSED, not dropped.
+///
+/// It was dropped, silently. The counts path parses `--noise` and hands it to
+/// the runner; the expectation path returns before reaching that code, and the
+/// in-process guard that catches the same mistake for statevector/mps sits
+/// ~400 lines further down, past the `return`. So this printed a noiseless
+/// expectation to stdout with nothing on stderr — the shape that matters,
+/// because `--format json > out.json` captured a plausible wrong number and no
+/// trace of the flag that had been ignored.
+///
+/// `omega_bridges::expectation_qasm2` takes no noise argument at all, so this
+/// is not a gap in one backend: no bridge can express it. The refusal is
+/// therefore placed before `Backend::parse`, which is also what lets this test
+/// run in the default feature set — it asserts the flag combination is
+/// rejected, not anything about a particular bridge being installed.
+#[test]
+fn bridge_expectation_refuses_noise_rather_than_ignoring_it() {
+    let path = fixture();
+    let output = run(&[
+        path.to_str().unwrap(),
+        "--bridge",
+        "qiskit",
+        "--expectation",
+        "Z0Z1",
+        "--noise",
+        r#"{"depolarizing":0.4}"#,
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "must not exit 0: {stdout}");
+    assert!(
+        stderr.contains("--noise cannot be combined with --bridge --expectation"),
+        "expected the noise refusal, got: {stderr}"
+    );
+    // The point of the bug was a NUMBER on stdout. Nothing may be emitted.
+    assert!(
+        !stdout.contains("<O> ="),
+        "an expectation value was printed despite the dropped noise model: {stdout}"
+    );
+}
+
+/// The neighbouring paths must keep working — the guard is scoped to the one
+/// combination that cannot be expressed, not to `--noise` or to `--bridge`.
+#[test]
+fn bridge_noise_guard_does_not_touch_the_counts_path() {
+    let path = fixture();
+    let output = run(&[
+        path.to_str().unwrap(),
+        "--bridge",
+        "qiskit",
+        "--shots",
+        "100",
+        "--noise",
+        r#"{"depolarizing":0.4}"#,
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Whatever this build does with the counts path (NotCompiled here, a real
+    // run with the feature on), it must NOT be the expectation guard.
+    assert!(
+        !stderr.contains("--noise cannot be combined"),
+        "the counts path must still accept --noise: {stderr}"
+    );
+}
+
+/// The ppvm runner wrapper, or `None` (with the reason printed) when the venv
+/// is absent — a missing venv is a SKIP, never a pass.
+#[cfg(feature = "bridge-ppvm")]
+fn ppvm_runner_or_skip() -> Option<PathBuf> {
+    let py = repo_root().join("crates/omega-bridges/python/.venv-ppvm/bin/python");
+    if !py.exists() {
+        eprintln!("ppvm venv missing at {} — skipping", py.display());
+        return None;
+    }
+    Some(repo_root().join("crates/omega-bridges/python/omega-bridge-ppvm-runner"))
+}
+
+#[cfg(feature = "bridge-ppvm")]
+fn run_ppvm(runner: &std::path::Path, noise: &str) -> std::process::Output {
+    Command::new(binary_path())
+        .args([
+            fixture().to_str().unwrap(),
+            "--bridge",
+            "ppvm",
+            "--shots",
+            "64",
+            "--noise",
+            noise,
+        ])
+        .env("OMEGA_BRIDGE_PPVM_CMD", runner)
+        .current_dir(repo_root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn omega-run")
+}
+
+/// `--bridge ppvm --noise` on the counts path: a mapped channel runs and
+/// prints counts (it used to be refused wholesale — STATUS §5 #12).
+#[cfg(feature = "bridge-ppvm")]
+#[test]
+fn bridge_ppvm_counts_accept_mapped_noise() {
+    let Some(runner) = ppvm_runner_or_skip() else {
+        return;
+    };
+    let out = run_ppvm(&runner, r#"{"depolarizing":0.05}"#);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "must exit 0: {stderr}");
+    let total: u64 = stdout
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix('|'))
+        .filter_map(|l| l.split_once(">:"))
+        .map(|(_, n)| n.trim().parse::<u64>().expect("count"))
+        .sum();
+    assert_eq!(total, 64, "expected 64 shots of counts on stdout: {stdout}");
+}
+
+/// ...and an unmappable channel is refused by NAME, as CannotExpress, with a
+/// non-zero exit — never a noiseless distribution.
+#[cfg(feature = "bridge-ppvm")]
+#[test]
+fn bridge_ppvm_counts_refuse_amplitude_damping_by_name() {
+    let Some(runner) = ppvm_runner_or_skip() else {
+        return;
+    };
+    let out = run_ppvm(&runner, r#"{"amplitude_damping":0.1}"#);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "must not exit 0: {stdout}");
+    assert!(
+        stderr.contains("cannot express this circuit")
+            && stderr.contains("ppvm-noise-not-supported")
+            && stderr.contains("`amplitude_damping`"),
+        "expected the CannotExpress sentence naming amplitude_damping, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Results:"),
+        "no counts may be printed: {stdout}"
+    );
+}

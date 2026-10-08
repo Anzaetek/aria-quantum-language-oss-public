@@ -15,9 +15,6 @@ APP_CRATES=(-p aria-app-qsvd -p aria-app-qft -p aria-app-vqe-ansatz \
   -p aria-app-qec-grover -p aria-app-qec-qft -p aria-app-qec-qpe -p aria-app-qec-memory)
 ARIA_CRATES=(-p aria-core -p aria-runtime -p aria-cli -p aria-verify-core \
   -p aria-qec -p aria-verify -p aria-tune "${APP_CRATES[@]}")
-# Crates we keep rustfmt-clean (aria-core is ported verbatim — left as-is).
-FMT_CRATES=(-p aria-runtime -p aria-cli -p aria-verify-core -p aria-qec -p aria-verify \
-  -p aria-tune "${APP_CRATES[@]}")
 # Pure-Rust omega crates the default Aria build links against.
 #
 # This list is a HAND-MAINTAINED GATE, and it had holes. `omega-backend-pauli`
@@ -35,7 +32,7 @@ FMT_CRATES=(-p aria-runtime -p aria-cli -p aria-verify-core -p aria-qec -p aria-
 OMEGA_CORE=(-p omega-core -p omega-backend-statevector -p omega-backend-mps \
   -p omega-backend-pauliprop -p omega-parser -p omega-backend-refplugin \
   -p omega-backend-pauli -p omega-backend-photonics -p omega-backend-cv \
-  -p omega-tensor)
+  -p omega-tensor -p omega-backend-quditsv)
 # WASM guests loaded into omega-wasm-runtime by the application harnesses.
 WASM_GUESTS=(vqe omega_app)
 
@@ -50,8 +47,22 @@ step() { printf '\n\033[1;34m== %s ==\033[0m\n' "$1"; }
 SKIPPED_STAGES=()
 skipped() { SKIPPED_STAGES+=("$1"); echo "  (skipping $1)"; }
 
-step "1/9  Format check (Aria crates)"
-cargo fmt "${FMT_CRATES[@]}" -- --check
+# Preflight: the summary above is only worth having if every skip actually
+# reaches it. Four did not — see the receipt in the audit script. This enforces
+# that there is exactly ONE way to announce a skip, and it runs FIRST because a
+# run that is going to under-report what it did should say so before spending
+# twenty minutes rather than after.
+step "0/9  Preflight: skip announcements register (audit A8)"
+./tools/audit/skip_announcements.sh ci.sh
+
+# The WHOLE workspace, not a hand-kept list. This stage used to check
+# FMT_CRATES — 35 of 72 crates — so 18 files across the omega crates drifted
+# out of rustfmt with CI green (found 2026-10-02, fixed in e1ebc7d). The same
+# lesson stage 2 records for clippy: a typed crate list is a gate with holes.
+step "1/9  Format check (whole workspace)"
+cargo fmt --all -- --check
+# bindings/aria-py is a separate cargo project, so `--all` cannot reach it.
+cargo fmt --manifest-path bindings/aria-py/Cargo.toml -- --check
 
 step "2/9  Clippy -D warnings (WHOLE WORKSPACE, all targets)"
 # `--workspace --all-targets`, NOT a typed crate list, and NOT lib targets only.
@@ -95,6 +106,26 @@ cargo build "${OMEGA_CORE[@]}"
 step "4/9  Build Aria crates"
 cargo build "${ARIA_CRATES[@]}"
 
+# The emu-compare lane tests (tools/emu_compare/{stim,fermionic}/tests/lane.rs)
+# run inside this stage and need a venv a clean checkout lacks. Without it they
+# print a SKIP and return; that skip is registered HERE, because the audit only
+# reads ci.sh. With it, the REQUIRE flag turns the skip back into a failure.
+# Both must happen before stage 5: an export after `cargo test --workspace`
+# reaches no test (the stim flag sat at the QEC stage, far below, and so never
+# applied).
+QEC_PY="tools/qec_cross_check/.venv/bin/python"
+if [ -x "$QEC_PY" ] && "$QEC_PY" -c "import stim" >/dev/null 2>&1; then
+  export EMU_STIM_REQUIRE=1
+else
+  skipped "emu-compare stim lane tests — no stim in $QEC_PY"
+fi
+EMU_FFSIM_PY="crates/omega-bridges/python/.venv-ffsim/bin/python"
+if [ -x "$EMU_FFSIM_PY" ] && "$EMU_FFSIM_PY" -c "import ffsim" >/dev/null 2>&1; then
+  export EMU_FFSIM_REQUIRE=1
+else
+  skipped "emu-compare fermionic lane test (ffsim arm) — no ffsim in $EMU_FFSIM_PY"
+fi
+
 step "5/9  Test the WHOLE WORKSPACE (numeric gates)"
 # `--workspace`, NOT a typed crate list.
 #
@@ -111,8 +142,9 @@ step "5/9  Test the WHOLE WORKSPACE (numeric gates)"
 # K9) -- which is why the typed list survived as long as it did. With those
 # fixtures restored the workspace is green: 227 targets, 0 failed.
 #
-# The crate arrays above are still used for `cargo build`, fmt and clippy,
-# where a curated set is the point rather than a gap.
+# The crate arrays above are still used for `cargo build`, where a curated
+# set is the point rather than a gap. fmt (stage 1) and clippy (stage 2) run
+# over the whole workspace.
 #
 # ARIA_TEST_RELEASE=1 runs this in release for iteration speed, and it is NOT
 # equivalent. Release drops every `debug_assert` in the tree — 34 of them — and
@@ -319,7 +351,7 @@ step "9/9  Socket transport (omega-server over HTTP) — best effort"
 # Sends the same Aria package to a live omega-server and cross-checks counts.
 # Skipped (not failed) if the server can't start, so CI stays green offline.
 if [ "${ARIA_SKIP_SOCKET:-0}" = "1" ]; then
-  echo "  skipped (ARIA_SKIP_SOCKET=1)"
+  skipped "Socket transport (omega-server over HTTP) — ARIA_SKIP_SOCKET=1"
 else
   TOK=$(mktemp)
   DB=$(mktemp -u)
@@ -346,7 +378,7 @@ else
       --url http://127.0.0.1:8899 --token "$(cat "$TOK")"
     echo "  OK: template routes verified through the client"
   else
-    echo "  SKIP: omega-server did not come up in time (see /tmp/omega-server-ci.log)"
+    skipped "Socket transport — omega-server did not come up in time (see /tmp/omega-server-ci.log)"
   fi
   kill $SRV 2>/dev/null || true
   trap - EXIT
@@ -361,6 +393,17 @@ fi
 #   3. tools/setup-libtorch.sh --no-verify (downloads ~67 MB, idempotent — it
 #      reuses an existing install, so this is a one-time cost per machine)
 # `ARIA_TCH=0 ./ci.sh` skips the stage.
+#
+# tch-env.sh EXPORTS RUSTFLAGS and CARGO_BUILD_TARGET, and on a CUDA libtorch
+# the RUSTFLAGS carry `--no-as-needed -ltorch_cuda -lc10_cuda`. Left exported,
+# every binary the REST of the run rebuilds links libtorch_cuda — and since the
+# loader paths are deliberately unset below, none of them can load it: the very
+# next stage (CUDA backends) dies at exec with exit 127. Latent on a CPU
+# libtorch (no torch_cuda in the flags), it fires after the CPU→CUDA dist swap.
+# So the build env is scoped to this stage: snapshot here, restore at the end
+# of the block. `${VAR+set}` distinguishes unset from empty.
+tch_saved_rustflags="${RUSTFLAGS-}"; tch_had_rustflags="${RUSTFLAGS+set}"
+tch_saved_cbt="${CARGO_BUILD_TARGET-}"; tch_had_cbt="${CARGO_BUILD_TARGET+set}"
 if [ "${ARIA_TCH:-1}" = "1" ]; then
   step "+   libtorch (tch) backend"
   # Source tch-env.sh when LIBTORCH is unset OR already points at the same dir it
@@ -381,7 +424,7 @@ if [ "${ARIA_TCH:-1}" = "1" ]; then
       # shellcheck disable=SC1091
       . ./tch-env.sh
     else
-      echo "  SKIP: could not install libtorch automatically on this platform."
+      echo "  note: could not install libtorch automatically on this platform."
       echo "        Grab the 2.7.0 CPU dist per INSTALL_LIBTORCH.md and re-run"
       echo "        with LIBTORCH=/path/to/libtorch."
     fi
@@ -443,6 +486,10 @@ else
   echo
   skipped "tch backend — ARIA_TCH=0"
 fi
+# Restore the pre-tch build env (see the note above the stage): the torch link
+# flags and the pinned build target must not leak into later stages' builds.
+if [ "$tch_had_rustflags" = "set" ]; then export RUSTFLAGS="$tch_saved_rustflags"; else unset RUSTFLAGS || true; fi
+if [ "$tch_had_cbt" = "set" ]; then export CARGO_BUILD_TARGET="$tch_saved_cbt"; else unset CARGO_BUILD_TARGET || true; fi
 
 # --- Mac GPU stages default ON -----------------------------------------------
 # Every Apple Silicon Mac has a GPU, so on macOS there is nothing to opt into:
@@ -685,7 +732,7 @@ fi
 
 step "+   aria-py bindings"
 if [ -z "$ARIA_PY_INTERP" ]; then
-  echo "  SKIP: no CPython <= 3.$PYO3_MAX_MINOR on this host (pyo3 cannot build against"
+  echo "  note: no CPython <= 3.$PYO3_MAX_MINOR on this host (pyo3 cannot build against"
   echo "        anything newer). Found python3 = 3.$(py_minor python3 || echo '?')."
   echo "        Remedy — either is fine:"
   echo "          python3.13 -m venv bindings/aria-py/.venv     # auto-detected next run"
@@ -745,7 +792,9 @@ fi
 # costs a second and removes the question.
 PYTEST_RAN=0
 for cand in crates/omega-bridges/python/.venv-qiskit/bin/python \
-            crates/omega-bridges/python/.venv-perceval/bin/python; do
+            crates/omega-bridges/python/.venv-perceval/bin/python \
+            crates/omega-bridges/python/.venv-ffsim/bin/python \
+            crates/omega-bridges/python/.venv-fqe/bin/python; do
   if [ -x "$cand" ] && "$cand" -c "import pytest" 2>/dev/null; then
     if [ "$PYTEST_RAN" -eq 0 ]; then
       step "+   Bridge runner python tests (protocol guard + conventions)"
@@ -782,9 +831,16 @@ if [ "${ARIA_BRIDGE_XCHECK:-0}" = "1" ]; then
   #    N-way expectation lane" whose "conventions have to be pinned harder than
   #    usual". Six targets were in that position. Dropping the flag runs them.
   cargo test -p omega-bridges \
-    --features bridge-qiskit,bridge-perceval,bridge-bloqade,bridge-tsim,bridge-ppvm \
+    --features bridge-qiskit,bridge-perceval,bridge-bloqade,bridge-tsim,bridge-ppvm,bridge-ffsim \
     -- --nocapture
   echo "  OK: bridge arms agree with Qiskit within L2 0.0025 (or skipped with a reason)"
+  # The CLI end of the ppvm noise mapping (STATUS §5 #12): `--bridge ppvm
+  # --noise` runs a mapped channel and refuses `amplitude_damping` BY NAME.
+  # These two tests are `cfg(feature = "bridge-ppvm")`, and the omega-cli
+  # arms below compile with `bridge-qiskit` only, so without this line they
+  # are cfg'd out of every CI run — the same hole items 1 and 2 above record.
+  cargo test -p omega-cli --features bridge-ppvm \
+    --test bridge_smoke -- --nocapture
 else
   skipped "bridge cross-checks — set ARIA_BRIDGE_XCHECK=1 with the backend venvs"
 fi
@@ -833,9 +889,167 @@ if [ "${ARIA_NWAY:-0}" = "1" ]; then
   # Clifford-only, EXACT (integer expectation values, no float slack).
   cargo test -p omega-bridges --features bridge-qiskit,bridge-tsim \
     --test stim_expectation -- --nocapture
-  echo "  OK: counts, expectations (1e-12), truncation bound, ppvm + stim same-algorithm anchors"
+  # The fermionic surface (PLAN-OPEN-20260825 §3c.0e item 2). Two legs:
+  # `qpy_rbs_vs_qiskit` pins the Rbs → XXPlusYYGate spelling through Qiskit's
+  # own gate semantics (qiskit venv only); `ffsim_expectation` is the
+  # independent anchor and skips out loud without python/.venv-ffsim.
+  # `fqe_vs_statevector` is the third leg: OpenFermion-FQE fed fermionic
+  # gates + ladder observables, so the JW mapper is on OUR side only
+  # (skips out loud without python/.venv-fqe).
+  cargo test -p omega-bridges --features bridge-qiskit,bridge-ffsim \
+    --test qpy_rbs_vs_qiskit --test ffsim_expectation --test fqe_vs_statevector -- --nocapture
+  echo "  OK: counts, expectations (1e-12), truncation bound, ppvm + stim same-algorithm anchors, fermionic Rbs spelling"
 else
   skipped "N-way counts matrix — set ARIA_NWAY=1 with the qiskit venv"
+fi
+
+# PLAN-QUDIT F1 leg (iii): the `FermionicOp` text spelling is
+# OpenFermion's `FermionOperator` string form, pinned against the library that
+# owns it — our `Display` through `openfermion.FermionOperator(...)` and its
+# `str()` through our parser, term-for-term. Legs (i) and (ii) are pure Rust
+# and run with the omega-core suite above; this leg needs a Python that
+# imports openfermion (the FQE venv has it), so it is a registered skip
+# without one rather than a silent pass.
+OF_PY="${OMEGA_OPENFERMION_PYTHON:-crates/omega-bridges/python/.venv-fqe/bin/python}"
+if [ -x "$OF_PY" ] && "$OF_PY" -c "import openfermion" 2>/dev/null; then
+  step "+   FermionicOp spelling vs openfermion.FermionOperator (F1 leg iii)"
+  OMEGA_OPENFERMION_PYTHON="$OF_PY" cargo test -p omega-core \
+    --test fermion_spelling openfermion -- --nocapture
+else
+  skipped "FermionicOp spelling vs openfermion — no python with openfermion (make -C crates/omega-bridges/python fqe-venv)"
+fi
+
+# H2/STO-3G and the 2-site Hubbard example. H2's operator is OpenFermion's
+# own str() of the MolecularData file it ships (H2_sto-3g_singlet_0.7414).
+# Hubbard's operator is fermi_hubbard(2, 1, t=1, U=4, periodic=False). The
+# script diffs both, and it requires the Hubbard circuit to hit the
+# two-electron energy 2 - 2*sqrt(2). It does not accept the unrestricted
+# eigenvalue -1. Registered skip without openfermion; never a silent pass.
+if [ -x "$OF_PY" ] && "$OF_PY" -c "import openfermion" 2>/dev/null; then
+  step "+   H2 and Hubbard examples vs OpenFermion"
+  "$OF_PY" tools/fermionic_examples/gen_h2_op.py --check
+else
+  skipped "H2 and Hubbard examples vs OpenFermion — no python with openfermion (make -C crates/omega-bridges/python fqe-venv)"
+fi
+
+# PLAN-QUDIT Q0: the DITQASM fixtures under
+# crates/omega-parser/tests/fixtures/ditqasm/ are bytes emitted by mqt.qudits
+# itself. This re-parses them under the library that wrote them and pins the
+# two upstream defects they document (tools/ditqasm_xcheck/README.md), so a
+# Q1 grammar is tested against the reference's reading, not our own. Needs a
+# Python that imports mqt.qudits; registered skip without one.
+MQT_PY="${OMEGA_MQT_PYTHON:-crates/omega-bridges/python/.venv-mqt/bin/python}"
+if [ -x "$MQT_PY" ] && "$MQT_PY" -c "import mqt.qudits" 2>/dev/null; then
+  step "+   DITQASM fixtures re-parse under mqt.qudits (Q0)"
+  "$MQT_PY" tools/ditqasm_xcheck/reparse.py
+else
+  skipped "DITQASM fixtures vs mqt.qudits — no python with mqt.qudits (make -C crates/omega-bridges/python mqt-venv)"
+fi
+
+# STATUS §5 #17 (emulator comparison): every engine the campaign compares must
+# read qubit 0 as the LOW bit, or a comparison reports clean agreement between
+# mirrored bitstrings. GHZ cannot catch it (reversal-symmetric), so this runs
+# each engine on a non-symmetric circuit against a state built from integers
+# and FAILS on any mismatch — and exits 2 if every engine skipped, since a
+# check that checked nothing is not a pass. Needs the comparison venv
+# (tools/emu_compare/ENGINES.md); registered skip otherwise.
+EMU_PY="${EMU_CMP_PY_CPU:-$HOME/work/agents/emu-compare-venv/bin/python}"
+if [ -x "$EMU_PY" ] && "$EMU_PY" -c "import numpy, qiskit" 2>/dev/null; then
+  step "+   Emulator comparison: every engine reads qubit 0 as the low bit"
+  if [ "${ARIA_CUDA:-0}" = "1" ]; then
+    cargo build -q --release -p omega-cli --features cuda
+  else
+    cargo build -q --release -p omega-cli
+  fi
+  OMEGA_RUN="$PWD/target/release/omega-run" "$EMU_PY" tools/emu_compare/test_bitorder.py
+  echo "  OK: no engine in the comparison reads a mirrored bit order"
+else
+  skipped "emulator bit-order check — no comparison venv (tools/emu_compare/ENGINES.md)"
+fi
+
+# PLAN-FERMIONICQASM F4.0: conventions.json is ffsim's own gate matrices.
+# Regenerating and diffing is the check — a hand-edited amplitude fails here,
+# which is what stops F4.2 from inventing a sign and then agreeing with itself.
+# Registered skip when the venv is absent; never a silent pass.
+FFSIM_PY="${OMEGA_FFSIM_PYTHON:-crates/omega-bridges/python/.venv-ffsim/bin/python}"
+if [ -x "$FFSIM_PY" ] && "$FFSIM_PY" -c "import ffsim" 2>/dev/null; then
+  step "+   FermionicQASM convention pins vs live ffsim (F4.0)"
+  "$FFSIM_PY" crates/omega-parser/tests/fixtures/fermionicqasm/gen_conventions.py --check
+else
+  skipped "FermionicQASM convention pins vs ffsim — no python with ffsim (make -C crates/omega-bridges/python ffsim-venv)"
+fi
+
+# H2 example, the other external leg: ffsim contracts the same fermion
+# operator on the Hartree–Fock state and on cos(θ)|HF⟩ + sin(θ)|doubles⟩.
+# Registered skip when the venv is absent.
+if [ -x "$FFSIM_PY" ] && "$FFSIM_PY" -c "import ffsim" 2>/dev/null; then
+  step "+   H2 example energy vs ffsim"
+  "$FFSIM_PY" tools/fermionic_examples/ffsim_h2.py
+else
+  skipped "H2 example vs ffsim — no python with ffsim (make -C crates/omega-bridges/python ffsim-venv)"
+fi
+
+# PLAN-FERMIONICQASM F4.3: the honesty gate. `.fqasm` text through our
+# lowering against live ffsim, every particle sector of 4 modes, plus
+# per-gate pins. Without the venv this stage must not look like agreement.
+if [ -x "$FFSIM_PY" ] && "$FFSIM_PY" -c "import ffsim" 2>/dev/null; then
+  step "+   FermionicQASM vs live ffsim (F4.3)"
+  cargo test -p omega-bridges --features bridge-ffsim \
+    --test ffsim_vs_fermionicqasm -- --nocapture
+else
+  skipped "FermionicQASM vs live ffsim (F4.3) — no python with ffsim (make -C crates/omega-bridges/python ffsim-venv)"
+fi
+
+# PLAN-QUDIT.md Q2 leg (iii): the exact mixed-radix engine (`quditsv`) against
+# two EXTERNAL qudit simulators — mqt.qudits (MIT; mixed dimensions and the
+# non-Clifford rxy) and QuickQudits (Apache-2.0; Clifford qudit gates) — on
+# the same DITQASM circuits, global phase aligned, 1e-9. Both oracles index
+# big-endian and omega little-endian; `--pin-order` makes the harness prove
+# its reindexing is not a no-op on an asymmetric circuit. Legs (i) and (ii)
+# are pure Rust and run with the workspace tests. Each oracle needs its own
+# Python; whichever is absent is a registered skip, never a silent pass.
+QQ_PY="${OMEGA_QUICKQUDITS_PYTHON:-crates/omega-bridges/python/.venv-quickqudits/bin/python}"
+Q2_RAN=0
+if [ -x "$MQT_PY" ] && "$MQT_PY" -c "import mqt.qudits" 2>/dev/null; then
+  step "+   quditsv vs mqt.qudits (Q2 leg iii, mixed radix + rxy)"
+  OMEGA_RUN="$OMEGA_RUN" "$MQT_PY" tools/quditsv_xcheck/xcheck.py --pin-order
+  Q2_RAN=1
+else
+  skipped "quditsv vs mqt.qudits — no python with mqt.qudits (make -C crates/omega-bridges/python mqt-venv)"
+fi
+if [ -x "$QQ_PY" ] && "$QQ_PY" -c "import quickqudits" 2>/dev/null; then
+  step "+   quditsv vs QuickQudits (Q2 leg iii, Clifford qudit gates)"
+  OMEGA_RUN="$OMEGA_RUN" "$QQ_PY" tools/quditsv_xcheck/xcheck.py --pin-order
+  Q2_RAN=1
+else
+  skipped "quditsv vs QuickQudits — no python with quickqudits (make -C crates/omega-bridges/python quickqudits-venv)"
+fi
+[ "$Q2_RAN" -eq 1 ] && echo "  OK: quditsv agrees with an external qudit oracle (see rows above)"
+
+# PLAN-QUDIT.md Q4: the qudit MPS measured on THIS box — qutrit brickwork
+# through `MpsBackend::expectation_site_operators` (never `to_statevector`),
+# wall + peak RSS + certificate per row, refused rows published as refusals.
+# The harness is its own A10 gate: it exits 2 on `--d 2`, 3 on a row without a
+# certificate. Then MQT Qudits' tensor-network backend runs the identical
+# circuits (built through its API — `from_qasm` drops rxy params, Q0 D2) and
+# must agree with quditsv at 1e-9 and with every certified MPS row at 1e-8;
+# registered skip without the venv. The `large` profile is not CI: it is the
+# 123 GB rows, run by hand on akilles under omega-hostgate (STATUS §4j).
+step "+   qudit MPS measured on this box (Q4, small profile)"
+cargo run -q --release -p omega-backend-mps --example qudit_chain_profile -- \
+  small --json /tmp/aria_q4_small.json
+if ! cargo run -q --release -p omega-backend-mps --example qudit_chain_profile -- \
+  small --d 2 >/dev/null 2>&1; then
+  echo "  OK: the Q4 harness refuses a qubit chain under its qudit label (A10)"
+else
+  echo "  FAIL: the Q4 harness accepted --d 2 — it would publish qubit rows as qudit rows"
+  exit 1
+fi
+if [ -x "$MQT_PY" ] && "$MQT_PY" -c "import mqt.qudits" 2>/dev/null; then
+  step "+   Q4 external leg: MQT Qudits tnsim on the same circuits"
+  "$MQT_PY" tools/qudit_chain_xcheck/tnsim_rows.py /tmp/aria_q4_small.json --as-limit-gib 8
+else
+  skipped "Q4 tnsim leg — no python with mqt.qudits (make -C crates/omega-bridges/python mqt-venv)"
 fi
 
 # Qiskit differential cross-check. MANDATORY in intent: it is the only
@@ -1034,6 +1248,50 @@ fi
 # Optional: Lean 4 proof tree (opt-in; needs a warm mathlib cache via elan/lake).
 # Makes `aria export --lean` self-contained and ships the proven circulant
 # correspondence + noise-deviation theorems.
+# `verification/` — the specification targets (STATUS §5 #4). Core Lean only,
+# no lake project, no Mathlib, so this runs wherever `lean` is on PATH, with or
+# without ARIA_LEAN; it is run from proofs/lean4 so elan picks the pinned
+# toolchain. The gate is the EXACT number of `declaration uses \`sorry\``
+# warnings per file: a target discharged, a target added, or a file that stops
+# elaborating all change it. A hand recount already drifted once (STATUS §5 #4
+# said 9 from 2026-09-26; the files have 4 + 3). PauliAlgebra.lean must be 0.
+if command -v lean >/dev/null 2>&1; then
+  step "+   verification/ specification targets elaborate (exact sorry count)"
+  lean_targets() { # $1 = file (repo-relative or absolute), $2 = expected `sorry` warnings
+    local file=$1 want=$2 p out rc=0 got
+    case $file in /*) p=$file ;; *) p=../../$file ;; esac
+    out=$(cd proofs/lean4 && lean "$p" 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "  FAIL: $file does not elaborate (exit $rc):"
+      printf '%s\n' "$out" | head -20
+      return 1
+    fi
+    got=$(printf '%s\n' "$out" | grep -c 'declaration uses `sorry`') || true
+    if [ "$got" -ne "$want" ]; then
+      echo "  FAIL: $file reports $got sorry target(s); STATUS §5 #4, verification/README.md and this gate say $want."
+      echo "        A target discharged or added must update all three together."
+      return 1
+    fi
+    echo "  OK: $file elaborates with exactly $got sorry target(s), as declared"
+  }
+  # The gate must be able to fail (A10): one extra top-level `sorry` appended
+  # to the proved file must be rejected by the same function before the real
+  # files are trusted to it.
+  neg=$(mktemp "${TMPDIR:-/tmp}/verif-neg-XXXXXX.lean")
+  { cat verification/Verification/Backend/PauliAlgebra.lean
+    printf '\ntheorem ci_negative_probe : True := by\n  sorry\n'; } >"$neg"
+  if lean_targets "$neg" 0 >/dev/null 2>&1; then
+    echo "  FAIL: the sorry-count gate accepted a file with one more sorry than declared"; rm -f "$neg"; exit 1
+  fi
+  rm -f "$neg"
+  echo "  OK: the sorry-count gate rejects an undeclared sorry"
+  lean_targets verification/Verification/Backend/PauliAlgebra.lean 0 || exit 1
+  lean_targets verification/Verification/Backend/Reset.lean 4 || exit 1
+  lean_targets verification/Verification/Backend/StabilizerExpectation.lean 3 || exit 1
+else
+  skipped "verification/ specification targets — 'lean' not found (install via elan)"
+fi
+
 if [ "${ARIA_LEAN:-0}" = "1" ]; then
   step "+   Optional: Lean 4 proof tree (mathlib)"
   # Assert a `#print axioms` batch is BOTH sorry-free AND actually ran.
@@ -1087,7 +1345,7 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
     fi
   }
   if ! command -v lake >/dev/null 2>&1; then
-    echo "  SKIP: 'lake' not found (install via elan)"
+    skipped "Lean proof tree — 'lake' not found (install via elan)"
   else
     if ( cd proofs/lean4 && lake exe cache get >/dev/null 2>&1 && \
          lake build QuantumProofs >/dev/null 2>&1 ); then
@@ -1118,6 +1376,21 @@ if [ "${ARIA_LEAN:-0}" = "1" ]; then
     lean_axioms "QSP theorems" 4 \
       'import QuantumProofs.QSP\nopen QuantumProofs.QSP\n#print axioms qsp_implements_poly\n#print axioms qsp_implements_poly_degree\n#print axioms qsp_gram_diag\n#print axioms qsp_converse\n'
     echo "  OK: QSP fundamental theorem (forward implements-poly + degree + Gram + converse up-to-global-phase) sorry-free"
+    # Reset semantics in a concrete statevector model: the four targets of
+    # verification/Verification/Backend/Reset.lean, proved where every symbol
+    # has a meaning, plus witnesses that each premise is inhabited. The
+    # abstract file's targets stay targets (its symbols are free axioms).
+    lean_axioms "Reset model theorems" 8 \
+      'import QuantumProofs.ResetModel\nopen QuantumProofs.ResetModel\n#print axioms reset_outcome_irrelevant\n#print axioms reset_yields_zero\n#print axioms fold_is_not_reset\n#print axioms entangled_reset_not_pure\n#print axioms witness_T1\n#print axioms witness_T2\n#print axioms witness_T4\n#print axioms reset_yields_zero_needs_possible\n'
+    echo "  OK: Reset model (outcome-irrelevant, lands in |0>, fold is not reset, entangled has no pure result) + premise witnesses + impossible-branch fixture sorry-free"
+    # Stabilizer expectation in a concrete operator model: the targets of
+    # verification/Verification/Backend/StabilizerExpectation.lean, proved where
+    # every symbol has a meaning. Group membership is combinatorial (a record
+    # equal to a signed product of generators), not an eigen-condition. The
+    # abstract file's targets stay targets (its symbols are free axioms).
+    lean_axioms "Stabilizer model theorems" 19 \
+      'import QuantumProofs.StabilizerModel\nopen QuantumProofs.StabilizerModel\n#print axioms expectation_trichotomy\n#print axioms anticommutes_iff_operators\n#print axioms act_mul\n#print axioms act_swap\n#print axioms inner_act_left\n#print axioms witness_T1\n#print axioms bell_YY_direct\n#print axioms zero_only_when_anticommuting\n#print axioms commuting_hermitian_in_group\n#print axioms genSpan_orthogonal\n#print axioms witness_T2\n#print axioms full_rank_needed\n#print axioms exhaustive\n#print axioms inGroup_hermitian\n#print axioms exhaustive_needs_hermitian\n#print axioms not_plus_and_minus\n#print axioms zeroState_independent\n#print axioms zeroState_Z\n#print axioms zeroState_X\n'
+    echo "  OK: Stabilizer model T1 (trichotomy, record product = operator product, symplectic = operator anticommutation) + T2 (0 only by anticommuting, centralizer = group up to sign, on full rank) + witnesses, incl. the dependent-generator counterexample; exhaustive on Hermitian Paulis (i*ZZ shows the hypothesis is needed), +/- branches disjoint, |0^n> full-rank inhabitant at every n, sorry-free"
     # Gate-model export obligation: the `aria export --gate-model` artefact for
     # Bell must build sorry-free (closed by QuantumProofs.BellPrep theorems).
     if ( cd proofs/lean4 && lake build QuantumProofs.Generated.GateModel.Bell_Spec >/dev/null 2>&1 ); then
@@ -1201,14 +1474,16 @@ fi
 # The distinction is the whole point of the policy. Without it, the machine that
 # CAN run the check and the machine that CANNOT produce identical output, and
 # the mandatory one silently degrades to the optional one.
-QEC_PY="tools/qec_cross_check/.venv/bin/python"
+# QEC_PY is set before stage 5, where the E2 stabilizer lane (which shares
+# this venv) exports EMU_STIM_REQUIRE: a box that HAS the venv CAN run the lane,
+# so there its skip is a failure — the degradation the policy above prevents.
 if [ "${ARIA_QEC_XCHECK:-0}" = "1" ]; then
   step "+   QEC demo cross-check vs Qiskit (MANDATORY where capable)"
   if command -v python3 >/dev/null 2>&1; then
     bash tools/qec_cross_check/run.sh
     echo "  OK: encoded grover/qft/qpe match Qiskit (+ stim); surface decoder matches PyMatching"
   else
-    echo "  SKIP: python3 not found (needed to build the qiskit venv)"
+    echo "  note: python3 not found (needed to build the qiskit venv)"
     skipped "QEC cross-check — no python3 on this host (INCAPABLE)"
   fi
 elif [ -x "$QEC_PY" ] && ! "$QEC_PY" -c "import pymatching" >/dev/null 2>&1; then
@@ -1263,10 +1538,30 @@ if [ "${ARIA_CV_XCHECK:-0}" = "1" ]; then
     # generator, same reasoning.
     "$CV_PY" tools/cv_cross_check/verify_loss_fixture.py
   else
-    echo "  SKIP: no piquasso venv (see PREREQUISITES.md)"
+    skipped "CV/piquasso drift check — ARIA_CV_XCHECK=1 but no piquasso venv (see PREREQUISITES.md)"
   fi
 else
   skipped "CV/piquasso drift check — set ARIA_CV_XCHECK=1 with the piquasso venv"
+fi
+
+# Optional: pauliprop backend vs monoprop, LIVE.
+#
+# Same shape as the piquasso stage. The committed fixture
+# (tools/pp_cross_check/monoprop_fixture.jsonl) is compared on every
+# `cargo test -p omega-backend-pauliprop` with no Python; this stage regenerates
+# it from monoprop and checks nothing drifted. monoprop is the Algorithmiq
+# Pauli/Majorana-propagation code (arXiv:2503.18939) — same algorithm family
+# as our backend, none of the code, which is what makes it an oracle.
+if [ "${ARIA_PP_XCHECK:-0}" = "1" ]; then
+  step "+   Optional: pauliprop backend vs monoprop (fixture drift)"
+  PP_PY=./tools/pp_cross_check/.venv/bin/python
+  if [ -x "$PP_PY" ]; then
+    "$PP_PY" tools/pp_cross_check/verify_fixture.py
+  else
+    skipped "pauliprop/monoprop drift check — ARIA_PP_XCHECK=1 but no monoprop venv (see PREREQUISITES.md)"
+  fi
+else
+  skipped "pauliprop/monoprop drift check — set ARIA_PP_XCHECK=1 with the monoprop venv"
 fi
 
 if [ -n "${QISKIT_XCHECK_SKIPPED:-}" ]; then

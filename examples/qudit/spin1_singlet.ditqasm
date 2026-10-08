@@ -1,0 +1,13 @@
+DITQASM 2.0;
+// Two spin-1 qutrits in the singlet (|02> - |11> + |20>)/sqrt(3).
+// Level 0,1,2 is m = +1, 0, -1. Little-endian index is q0 + 3*q1,
+// so those kets sit at 6, 4 and 2.
+// q0 is prepared in (|0> - |1> + |2>)/sqrt(3). Two shifts put q1 in |2>,
+// and csum twice adds 2*q0 (mod 3) onto it.
+qreg q [2][3,3];
+rxy (0, 1, 1.230959417340775, -1.5707963267948966) q[0];
+rxy (0, 2, 1.5707963267948966, 1.5707963267948966) q[0];
+x q[1];
+x q[1];
+csum q[0],q[1];
+csum q[0],q[1];

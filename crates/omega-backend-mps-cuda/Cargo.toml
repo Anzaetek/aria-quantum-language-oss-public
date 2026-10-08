@@ -2,7 +2,7 @@
 name = "omega-backend-mps-cuda"
 version = "0.1.0"
 edition = "2021"
-description = "CUDA-accelerated truncated SVD for omega-backend-mps bond compression via cuSOLVER `gesvdj`. Opt-in via the `cuda` feature; falls back to the CPU Jacobi SVD when the feature is off, the target isn't Linux/Windows, or the CUDA driver is unavailable."
+description = "CUDA-accelerated truncated SVD for omega-backend-mps bond compression via cuSOLVER `gesvd` (exact thin SVD, truncated on the host). Opt-in via the `cuda` feature; falls back to the CPU Jacobi SVD when the feature is off, the target isn't Linux/Windows, or the CUDA driver is unavailable."
 license = "MIT"
 publish = false
 
@@ -11,6 +11,9 @@ publish = false
 # f64 makes the 1e-10 forward tolerance reachable in a single pass and
 # sub-microsecond per-op dispatch makes Jacobi viable in a way Metal
 # couldn't. CUDA Graphs amortisation lands in a follow-up commit.
+# [2026-09-30: that plan is history. The shipped path called the approximate
+# `Zgesvda` and was ~6 orders less accurate under truncation; it now calls
+# the exact `cusolverDnZgesvd` — see `src/gesvdj.rs`.]
 
 [features]
 default = []
@@ -19,6 +22,10 @@ cuda = ["dep:cudarc"]
 [dependencies]
 omega-backend-mps = { path = "../omega-backend-mps" }
 num-complex = { workspace = true }
+
+[dev-dependencies]
+omega-core = { path = "../omega-core" }
+rayon = { workspace = true }
 
 # Target-gated to Linux/Windows. `cargo build --workspace --features cuda`
 # on macOS still compiles — the entry point routes to the CPU fallback
@@ -33,6 +40,10 @@ path = "examples/mps_chi128_bench.rs"
 [[example]]
 name = "cuda_profile"
 path = "examples/cuda_profile.rs"
+
+[[example]]
+name = "cuda_svd_share"
+path = "examples/cuda_svd_share.rs"
 
 [[example]]
 name = "svd_microbench"

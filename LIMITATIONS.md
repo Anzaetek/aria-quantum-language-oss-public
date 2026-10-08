@@ -15,14 +15,30 @@ end-to-end implementation, and which deeper features are deferred.
   the circuit cannot be lowered or run. It is excluded from `aria-verify` and
   labelled showcase in the verification table.
 
-- **`hhl.aria` and `qsvt_invert.aria` — structural templates.** These express
-  the *shape* of HHL / QSVT (QPE cascade + controlled rotation; alternating
-  signal-rotation / signal-processing blocks) with placeholder angles ("baked in
-  by host"). Their forward `⟨Z_q⟩` profile is numerically cross-checked
-  (differential oracle), but the `.aria` form is **not** a faithful solver. The
-  faithful, *proven* versions live in Lean — `proofs/lean4/QuantumProofs/HHL.lean`
-  and `QSVT.lean` (sorry-free, axiom-clean) — and in the pure-Rust kernels
-  `omega_core::solver` and `omega_core::chebyshev`.
+- **`qsvt_invert.aria` — structural template.** It expresses the *shape* of
+  QSVT (alternating signal-rotation / signal-processing blocks) with placeholder
+  angles ("baked in by host"). Its forward `⟨Z_q⟩` profile is numerically
+  cross-checked (differential oracle), but the `.aria` form is **not** a
+  faithful solver. The faithful, *proven* version lives in Lean —
+  `proofs/lean4/QuantumProofs/QSVT.lean` (sorry-free, axiom-clean) — and in the
+  pure-Rust kernel `omega_core::chebyshev`.
+
+- **`hhl.aria` — a faithful solver on a fixed 2×2 system, not a general one.**
+  It is no longer a shape-only template: it solves `A x = b` for
+  `A = diag(1, 2)`, `C = 1/2` and a `b` that is **not** an eigenvector, which is
+  exactly the instantiation `proofs/lean4/QuantumProofs/HHL.lean` proves. QPE
+  loads the integer eigenvalue (`P = 1.000000000`), the controlled rotation is
+  keyed to the **value** the counting register holds rather than to a qubit
+  index, and post-selecting `ancilla = |1⟩` yields `C·A⁻¹b` to `< 5e-16`
+  (`crates/apps/forward/tests/hhl_is_really_hhl.rs`, against closed forms).
+  What is **not** general:
+  - the spectrum is hard-coded, and the eigenvalues must be integers the
+    counting register can hold exactly — nothing here handles a non-dyadic
+    eigenphase, where QPE's leakage is the whole difficulty;
+  - the system register is one qubit (`N = 2`);
+  - the counting width is **2 or 3 only**. The eigenvalue-keyed rotation needs
+    a `C^n X` and the gate set tops out at `CCX`, so one work qubit reaches
+    `n = 3`. Other widths are refused at instantiation rather than run.
 
 ## Gate set / backends
 
@@ -343,8 +359,9 @@ the Metal two-site θ-contraction hook, once actually reachable from
 than CPU** on the deep χ=256 shape; and Apple's Metal has **no double-precision
 type at all**, so an exact-f64 MPS lane on that GPU is not a missing
 optimisation but a hardware impossibility — any Metal MPS path is f32 by
-construction, which is why the hook is opt-in behind an explicit
-`--device metal` and the CPU path stays exact-f64. The performance answer for
+construction, which is why the hook is not installed unless
+`MPS_METAL_CONTRACT=1` (it warns; `--device metal` alone stays on exact f64)
+on `omega-run`, `aria-runtime`, and `aria-py`. The performance answer for
 deep MPS on Apple hardware is the parallel CPU path (`8781ce3`), not the GPU.
 
 ### Metal: shots-mode `Reset` delegates to the CPU backend
@@ -379,7 +396,18 @@ issues GPU work *without waiting for completion*, so buffers accumulate until
 `commandBuffer()` blocks. `end_batch_if_open` ends the encoder; it does not wait
 for the GPU to retire the work.
 
-**The fix**, when this is re-opened: reuse ONE leased state across shots
-(re-initialising rather than re-leasing) and force completion each iteration —
-any call that reads back, e.g. `pauli_expectation`, waits — instead of leasing a
-fresh state per shot. Delegation stands until that is implemented and measured.
+**Measured 2026-09-30 on an Apple M4 (Metal 4, macOS 26.6.2), and not
+shipped.** The form above was built: one leased state, re-initialised in
+place, completion forced each shot, and — because a wait does not drop an
+autoreleased `MTLCommandBuffer` — an autorelease pool drained each
+iteration. That is what the adjoint sweep does, and without it the
+semaphore fills at ~64 outstanding buffers even after
+`wait_until_completed`. With the drain the loop did not stall at 32, 64,
+256, 1024 or 65536 shots, and the counts matched the CPU at every count.
+
+It is slower. Bell + `Reset q0`, release: 88.16 ms vs 0.03 ms at 32 shots,
+1084.78 ms vs 0.84 ms at 1024, 74.14 s vs 29.28 ms at 65536. About 1.1 ms
+per shot against a fraction of a microsecond on the CPU. The same circuit
+without `Reset` stayed at 0.33–0.93 ms. The delegation stands because it is
+the faster correct path. The loop is not in the tree. Numbers and the
+shot-by-shot table: `STATUS.md` §5 item 3.

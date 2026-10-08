@@ -141,7 +141,7 @@ fn every_dispatched_gate_is_priced() {
     use GateKind::*;
     for g in [
         H, X, Y, Z, S, Sdg, Sx, Sxdg, CX, CZ, CY, Swap, Id, Barrier, Measure, Rz, Rx, Ry, U1, T,
-        Tdg, CRz, U3, CU3, CCX, CSwap,
+        Tdg, CRz, U3, U2, CU3, CCX, CSwap, Rbs,
     ] {
         assert!(
             branch_calls(&g).is_some(),
@@ -176,6 +176,68 @@ fn the_branch_call_counts_are_the_ones_the_engine_makes() {
         Some(7),
         "CSwap is CX·CCX·CX and pays the SAME seven branchings — it was 6 in an \
          earlier draft, which under-priced every circuit using it by 2x"
+    );
+}
+
+/// **The `CX·Rz·CX` peephole leaves the pricing shadow exact.**
+///
+/// `propagate` folds an adjacent `CX(a,b); Rz(θ) b; CX(a,b)` into one `branch`
+/// over a `Z⊗Z` generator. `branch_calls` prices those three ops at
+/// `0 + 1 + 0 = 1`, which is exactly what the fold spends — so the table needs
+/// no compensating row and the bound stays a bound.
+///
+/// Asserted by running the same circuit both ways and checking the PEAK, which
+/// is what the governor reserves against. A peephole that spent more branch
+/// calls than the ops it replaced would under-price every circuit using it, and
+/// under-pricing ends in an OOM rather than a refusal.
+#[test]
+fn folding_does_not_change_what_the_bound_prices() {
+    // `rzz`, hand-lowered exactly as the parser emits it, three layers deep.
+    let mut c = CircuitIR::new(4, CircuitType::GateBased);
+    for q in 0..4 {
+        c.ops.push(op(GateKind::Ry, &[q], &[0.4 + 0.2 * q as f64]));
+    }
+    for l in 0..3 {
+        for a in 0..3u32 {
+            c.ops.push(op(GateKind::CX, &[a, a + 1], &[]));
+            c.ops
+                .push(op(GateKind::Rz, &[a + 1], &[0.3 + 0.1 * l as f64]));
+            c.ops.push(op(GateKind::CX, &[a, a + 1], &[]));
+        }
+        for q in 0..4 {
+            c.ops
+                .push(op(GateKind::Rx, &[q], &[0.25 + 0.05 * q as f64]));
+        }
+    }
+    let o = zz_obs();
+    let bound = term_upper_bound(&c, &o);
+
+    let mut peaks = Vec::new();
+    for fold in [false, true] {
+        reset_peak_terms();
+        let _ = PauliPropBackend::new()
+            .with_zz_folding(fold)
+            .expectation(&c, &ParameterBinding::new(), &o)
+            .expect("exact run");
+        peaks.push(peak_terms());
+    }
+    eprintln!(
+        "bound {bound}, peak unfolded {}, peak folded {}",
+        peaks[0], peaks[1]
+    );
+    for (fold, peak) in [false, true].iter().zip(&peaks) {
+        assert!(
+            (*peak as u64) <= bound,
+            "peak {peak} (folding {fold}) exceeds the priced bound {bound}"
+        );
+    }
+    assert!(
+        peaks[1] <= peaks[0],
+        "the fold peaked at {} against the triple's {} — it replaces three ops \
+         priced at 0+1+0 with one branch, so it cannot cost MORE. If it can, \
+         `branch_calls` needs a compensating row before this ships.",
+        peaks[1],
+        peaks[0]
     );
 }
 
@@ -267,12 +329,14 @@ fn a_saturating_run_refuses_without_blowing_past_the_cap() {
 /// would under-price, which is the unsafe direction.
 #[test]
 fn an_unknown_gate_prices_at_the_ceiling() {
+    // `Rbs` used to be the stand-in here; the engine grew it (and this test's
+    // premise went false), so use a gate the engine still refuses outright.
     assert!(
-        branch_calls(&GateKind::Rbs).is_none(),
-        "Rbs is not dispatched by pauliprop and must not be silently priced"
+        branch_calls(&GateKind::PhaseShifter).is_none(),
+        "PhaseShifter is not dispatched by pauliprop and must not be silently priced"
     );
     let mut c = brickwall(4, 1);
-    c.ops.push(op(GateKind::Rbs, &[0, 1], &[0.3]));
+    c.ops.push(op(GateKind::PhaseShifter, &[0], &[0.3]));
     let bound = term_upper_bound(&c, &zz_obs());
     assert!(
         bound >= DEFAULT_MAX_TERMS as u64,

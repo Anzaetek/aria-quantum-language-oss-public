@@ -133,12 +133,15 @@ impl Registry {
         let id = Uuid::new_v4().to_string();
         let source_format = if source.trim_start().starts_with("OPENQASM") {
             "qasm2"
+        } else if source.trim_start().starts_with("FERMIONICQASM") {
+            "fermionicqasm"
         } else {
             "opticqasm"
         };
         let circuit_type = match ir.circuit_type {
             omega_core::circuit::CircuitType::GateBased => "gate_based",
             omega_core::circuit::CircuitType::Photonic => "photonic",
+            omega_core::circuit::CircuitType::Fermionic => "fermionic",
         };
 
         self.conn.lock().unwrap()
@@ -357,6 +360,18 @@ impl Registry {
     }
 
     /// Execute a circuit directly (synchronous, for simple invocations).
+    ///
+    /// `params` must carry exactly one value per free symbol, in symbol-ID
+    /// order. This used to bind `params[i]` when `i` was in range and `0.0`
+    /// otherwise, so `POST /v1/functions/{id}/invoke` with `"params": []` on a
+    /// four-angle ansatz ran every angle at zero and returned a
+    /// well-formed-looking histogram for a circuit the caller never described.
+    /// Over HTTP that is the worst place for it: the caller sees a 200 and a
+    /// distribution, with nothing to compare it against.
+    ///
+    /// `ParameterBinding::from_flat` is the one implementation of that rule;
+    /// its `OmegaError::ParameterCount` names the symbols a short vector would
+    /// have left unbound, and `routes::invoke_function` maps it to 400.
     pub fn execute_circuit(
         &self,
         circuit_id: &str,
@@ -367,12 +382,7 @@ impl Registry {
         let source = self.get_circuit_source(circuit_id)?;
         let ir = lower_to_ir(&source).map_err(OmegaError::Parse)?;
 
-        let mut binding = omega_core::params::ParameterBinding::new();
-        let mut sym_ids: Vec<u32> = ir.symbols.keys().copied().collect();
-        sym_ids.sort();
-        for (i, &sym_id) in sym_ids.iter().enumerate() {
-            binding.bind(sym_id, if i < params.len() { params[i] } else { 0.0 });
-        }
+        let binding = omega_core::params::ParameterBinding::from_flat(&ir, params)?;
 
         let config = omega_core::executor::ExecConfig {
             shots: if shots == 0 { None } else { Some(shots) },
@@ -385,7 +395,10 @@ impl Registry {
         // unguarded door onto the same statevector allocation the /v1/quantum
         // routes are governed on.
         let kind = match ir.circuit_type {
-            omega_core::circuit::CircuitType::GateBased => {
+            // Fermionic wires are qubits under Jordan–Wigner, so the
+            // allocation is the dense 2^n state, not a Fock space.
+            omega_core::circuit::CircuitType::GateBased
+            | omega_core::circuit::CircuitType::Fermionic => {
                 crate::worker::CostKind::DenseStatevector
             }
             omega_core::circuit::CircuitType::Photonic => crate::worker::CostKind::Photonic,
@@ -403,7 +416,8 @@ impl Registry {
 
         use omega_core::executor::Backend;
         let result = match ir.circuit_type {
-            omega_core::circuit::CircuitType::GateBased => {
+            omega_core::circuit::CircuitType::GateBased
+            | omega_core::circuit::CircuitType::Fermionic => {
                 omega_backend_statevector::StatevectorBackend::new()
                     .execute(&ir, &binding, &config)?
             }
@@ -893,10 +907,12 @@ mod tests {
     }
 
     #[test]
-    fn execute_circuit_pads_missing_parameters_with_zero() {
-        // The execute path mirrors WasmRunner: extra symbols beyond
-        // the params length default to 0.0. Using Ry(theta)|0⟩ at
-        // θ=0 gives ⟨Z⟩=1, so sampling returns only |0⟩.
+    fn execute_circuit_accepts_an_empty_params_when_nothing_is_free() {
+        // A CONCRETE angle: `ry(0)` leaves no free symbol, so `params: []` is
+        // the exactly-right length, not a padded one. (This test used to be
+        // named `..._pads_missing_parameters_with_zero` and cited the padding
+        // as the contract, while the circuit it uses has nothing to pad — the
+        // padding was never covered, which is part of why it survived.)
         let r = fresh_registry();
         let src = "OPENQASM 2.0;\ngate ry(theta) q { ry(theta) q; }\nqreg q[1];\nry(0) q[0];\n";
         let circuit = r.register_circuit(src).unwrap();
@@ -908,5 +924,75 @@ mod tests {
         assert_eq!(counts.len(), 1);
         let c0 = counts.get("0").and_then(|c| c.as_u64()).unwrap();
         assert_eq!(c0, 1024);
+        // …and a value for a symbol that does not exist is still refused.
+        let err = r
+            .execute_circuit(&circuit.id, &[0.5], 1024, Some(7))
+            .expect_err("a value with no symbol to bind it to");
+        assert!(
+            matches!(
+                err,
+                OmegaError::ParameterCount {
+                    expected: 0,
+                    got: 1,
+                    ..
+                }
+            ),
+            "expected ParameterCount, got {err:?}"
+        );
+    }
+
+    /// **A wrong-length `params` is refused, not padded with 0.0.**
+    ///
+    /// `rx(theta)` with `theta` undeclared leaves one free symbol. Passing no
+    /// values used to bind it to 0.0 — `rx(0)` is the identity — so the caller
+    /// got a clean |0⟩ histogram back with a 200, indistinguishable from an
+    /// answer they had asked for. The refusal names the symbol it could not
+    /// bind so the caller can see which value is missing.
+    #[test]
+    fn execute_circuit_refuses_a_wrong_length_params() {
+        let r = fresh_registry();
+        let src =
+            "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[1];\ncreg c[1];\nrx(theta) q[0];\n";
+        let circuit = r.register_circuit(src).unwrap();
+
+        let err = r
+            .execute_circuit(&circuit.id, &[], 512, Some(7))
+            .expect_err("a short params must not be padded");
+        match &err {
+            OmegaError::ParameterCount {
+                expected,
+                got,
+                unbound,
+            } => {
+                assert_eq!((*expected, *got), (1, 0));
+                assert_eq!(unbound, &vec!["theta".to_string()]);
+            }
+            other => panic!("expected ParameterCount, got {other:?}"),
+        }
+
+        let err = r
+            .execute_circuit(&circuit.id, &[0.1, 0.2], 512, Some(7))
+            .expect_err("a long params must not drop the extra");
+        assert!(
+            matches!(
+                err,
+                OmegaError::ParameterCount {
+                    expected: 1,
+                    got: 2,
+                    ..
+                }
+            ),
+            "expected ParameterCount, got {err:?}"
+        );
+
+        // The right count still runs: rx(pi)|0⟩ = |1⟩ up to phase, so every
+        // shot lands on "1".
+        let v = r
+            .execute_circuit(&circuit.id, &[std::f64::consts::PI], 512, Some(7))
+            .expect("exactly one value must still execute");
+        assert_eq!(v["type"], "counts");
+        let counts = v["counts"].as_object().unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("1").and_then(|c| c.as_u64()), Some(512));
     }
 }

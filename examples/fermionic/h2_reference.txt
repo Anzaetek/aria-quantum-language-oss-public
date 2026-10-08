@@ -1,0 +1,6 @@
+# Printed by tools/fermionic_examples/gen_h2_op.py
+# from OpenFermion MolecularData H2_sto-3g_singlet_0.7414.
+E_HF -1.116684386906734
+E_FCI -1.137270174625328
+theta -0.11306813351297684
+nuclear_repulsion 0.71375399054491495

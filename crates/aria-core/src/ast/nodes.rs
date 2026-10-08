@@ -84,6 +84,18 @@ pub enum GateKind {
     ///
     /// Takes no parameters, unlike every other photonic gate here.
     PolarizingBeamSplitter,
+    /// `tunnel(θ)` between two fermionic modes.
+    ///
+    /// Not an omega IR primitive: lowering expands it to three
+    /// number-conserving ops, and that expansion cannot be folded back into
+    /// `tunnel`. The spelling lives here, the same way `hwp` lives here
+    /// rather than as the phase shifters and beam splitter it lowers to.
+    Tunnel,
+    /// `load` — which modes start occupied.
+    ///
+    /// A statement, not an `X`. Emitting the occupation layer as `x` would
+    /// be a different language, and the reader would not accept it.
+    Load,
 }
 
 impl GateKind {
@@ -98,7 +110,8 @@ impl GateKind {
             | Self::RZZ
             | Self::CP
             | Self::RBS
-            | Self::BeamSplitter => 2,
+            | Self::BeamSplitter
+            | Self::Tunnel => 2,
             Self::CCX | Self::CSWAP => 3,
             _ => 1,
         }
@@ -127,6 +140,7 @@ impl GateKind {
                 | Self::RYY
                 | Self::RZZ
                 | Self::RBS
+                | Self::Tunnel
         )
     }
 
@@ -325,12 +339,34 @@ pub struct RegisterDecl {
     /// and `photon q[N];` both parse, both refuse nothing, and every mode index
     /// means something different between them.
     pub polarized: bool,
+    /// Fermionic only: `mode name[size] spin`. `size` stays the spatial count
+    /// written in the brackets. The register occupies `2 * size` wires in
+    /// blocks — `0..size` spin-up, then `size..2*size` spin-down — and a gate
+    /// index is a wire, not a spatial mode. Not `polarized`'s interleaved map.
+    ///
+    /// A flag for the same reason as `polarized`: dropping it emits
+    /// `mode m[N];` for a circuit whose indices address `2N` wires, and the
+    /// file parses.
+    #[serde(default)]
+    pub spin: bool,
 }
 
 impl RegisterDecl {
     pub fn qubits(&self) -> Vec<Qubit> {
         assert_eq!(self.kind, RegisterKind::Quantum);
-        (0..self.size).map(|i| Qubit::new(&self.name, i)).collect()
+        (0..self.wire_count())
+            .map(|i| Qubit::new(&self.name, i))
+            .collect()
+    }
+
+    /// Wires this register occupies. Spin doubles the bracketed size; every
+    /// other register is one wire per declared slot.
+    pub fn wire_count(&self) -> usize {
+        if self.spin {
+            self.size * 2
+        } else {
+            self.size
+        }
     }
 
     pub fn clbits(&self) -> Vec<Clbit> {
@@ -430,7 +466,7 @@ impl Circuit {
 
     /// Add a quantum register and return its qubits.
     pub fn qreg(&mut self, name: &str, size: usize) -> Vec<Qubit> {
-        self.qreg_inner(name, size, false)
+        self.qreg_inner(name, size, false, false)
     }
 
     /// Add a POLARIZED photonic register: `size` spatial modes, each carrying
@@ -440,15 +476,25 @@ impl Circuit {
     /// that every existing caller keeps its meaning — a register that silently
     /// became polarized would reinterpret every mode index in the circuit.
     pub fn qreg_polarized(&mut self, name: &str, size: usize) -> Vec<Qubit> {
-        self.qreg_inner(name, size, true)
+        self.qreg_inner(name, size, true, false)
     }
 
-    fn qreg_inner(&mut self, name: &str, size: usize, polarized: bool) -> Vec<Qubit> {
+    /// A fermionic mode register: `mode name[spatial];` or, when `spin`,
+    /// `mode name[spatial] spin` with `2 * spatial` wires.
+    ///
+    /// The returned qubits are wires, indices `0 .. wire_count`. Under `spin`
+    /// that is `0..2*spatial`, not `0..spatial`.
+    pub fn mode_reg(&mut self, name: &str, spatial: usize, spin: bool) -> Vec<Qubit> {
+        self.qreg_inner(name, spatial, false, spin)
+    }
+
+    fn qreg_inner(&mut self, name: &str, size: usize, polarized: bool, spin: bool) -> Vec<Qubit> {
         let reg = RegisterDecl {
             name: name.to_string(),
             size,
             kind: RegisterKind::Quantum,
             polarized,
+            spin,
         };
         let qubits = reg.qubits();
         self.registers.push(reg);
@@ -462,6 +508,7 @@ impl Circuit {
             size,
             kind: RegisterKind::Classical,
             polarized: false,
+            spin: false,
         };
         let clbits = reg.clbits();
         self.registers.push(reg);
@@ -540,11 +587,14 @@ impl Circuit {
     }
 
     /// Total number of qubits.
+    ///
+    /// A spin mode register contributes `2 * size` wires. `size` remains the
+    /// number written in the brackets.
     pub fn n_qubits(&self) -> usize {
         self.registers
             .iter()
             .filter(|r| r.kind == RegisterKind::Quantum)
-            .map(|r| r.size)
+            .map(|r| r.wire_count())
             .sum()
     }
 
@@ -615,10 +665,11 @@ impl Circuit {
                 let new_reg = RegisterDecl {
                     name: new_name,
                     size: reg.size,
-                    // Carried, not defaulted: dropping it here would turn a
-                    // polarization circuit into a plain one on composition,
-                    // halving every mode's meaning with no diagnostic.
+                    // Carried, not defaulted: dropping either flag here would
+                    // turn the register into a different wire map on
+                    // composition, with no diagnostic.
                     polarized: reg.polarized,
+                    spin: reg.spin,
                     kind: RegisterKind::Quantum,
                 };
                 result.registers.push(new_reg);

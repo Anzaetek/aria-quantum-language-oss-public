@@ -1109,6 +1109,70 @@ impl MetalState {
 }
 
 // ---------------------------------------------------------------------
+// Shots-mode dispatch — which device actually ran `execute`
+// ---------------------------------------------------------------------
+
+thread_local! {
+    /// Shots-mode `execute` calls on this thread that contained a `Reset`
+    /// and were delegated to the CPU statevector backend.
+    ///
+    /// **Thread-local, deliberately.** Same reason as
+    /// `omega_backend_pauliprop::sim::GATES_SKIPPED`: `cargo test` runs this
+    /// crate's other shots execute (`backend_execute_with_shots_returns_counts`)
+    /// on a parallel thread, and a process-global `AtomicU64` before/after
+    /// would count that test's GPU sample as this call's. The first version
+    /// of `GATES_SKIPPED` was a global atomic and it reported 98 skips for a
+    /// run that performed none. `execute` records the choice on the calling
+    /// thread before it returns, so a thread-local count is the caller's.
+    ///
+    /// It exists because the delegation is otherwise unobservable: the counts
+    /// are correct either way, so a counts comparison passes whether or not
+    /// anyone can tell the GPU never ran.
+    static RESET_SHOTS_CPU_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Shots-mode `execute` calls on this thread whose outcomes were sampled
+    /// on the Metal GPU. Complement of `RESET_SHOTS_CPU_FALLBACKS`.
+    static METAL_SHOTS_EXECUTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Times this thread's [`Backend::execute`] delegated a shots-mode circuit
+/// containing `Reset` to the CPU statevector backend.
+///
+/// Metal's shot path evolves once and samples the final state. That is
+/// invalid for `Reset` — a channel, whose true result is a mixture over
+/// trajectories — so the delegation is the correct result. This counter is
+/// how a caller learns the GPU never ran. Read it, and
+/// [`metal_shots_execute_count`], before and after `execute`: a shots-mode
+/// call moves exactly one of them. `shots: None` moves neither; analytic
+/// execution is not this delegation.
+///
+/// Thread-local. See the static above for why it is not a process-global
+/// `AtomicU64` like `metal_contraction_count` in the MPS Metal crate.
+pub fn reset_shots_cpu_fallback_count() -> u64 {
+    RESET_SHOTS_CPU_FALLBACKS.with(|c| c.get())
+}
+
+/// Times this thread's [`Backend::execute`] sampled shots on the Metal GPU.
+///
+/// The complement of [`reset_shots_cpu_fallback_count`]. A shots-mode call
+/// moves exactly one of the two: this one when Metal produced the counts,
+/// that one when the CPU fallback did. Moves only after `sample_shots_gpu`
+/// returns, so a GPU sampling error is not reported as a Metal result.
+pub fn metal_shots_execute_count() -> u64 {
+    METAL_SHOTS_EXECUTES.with(|c| c.get())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn note_reset_shots_cpu_fallback() {
+    RESET_SHOTS_CPU_FALLBACKS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn note_metal_shots_execute() {
+    METAL_SHOTS_EXECUTES.with(|c| c.set(c.get() + 1));
+}
+
+// ---------------------------------------------------------------------
 // Backend trait — wires the metal handle into the workspace dispatch
 // ---------------------------------------------------------------------
 
@@ -1140,6 +1204,7 @@ impl Backend for MetalStatevectorBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> OmegaResult<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         let n = circuit.num_qubits;
         let state = self.lease(n)?;
 
@@ -1157,6 +1222,26 @@ impl Backend for MetalStatevectorBackend {
                     ));
                 }
             }
+        }
+        // A `Measure` is not the only thing that makes collapse mode differ.
+        // With shots and a declared creg the CPU keys every outcome on the
+        // CLASSICAL register even when no `Measure` writes it — a circuit
+        // forced into collapse by a conditioned gate alone reads 0 at the creg
+        // width. This backend holds only the qubit-register sampler, so
+        // answering that shape returns different keys at a different width.
+        // Measured on an M4 before this guard: {"001": 32, "011": 32} against
+        // the CPU's {"0": 64}, served by omega-server as HTTP 200. CUDA and
+        // OpenCL had the same defect from the same `Measure`-only shape.
+        // `tests/collapse_counts_agree_with_cpu.rs` pins the disagreement.
+        if config.mid_circuit_mode == MidCircuitMode::Collapse
+            && config.shots.is_some()
+            && circuit.num_classical_bits > 0
+        {
+            return Err(OmegaError::Unsupported(
+                "metal: collapse mode is not implemented here (counts key on the \
+                 classical register)"
+                    .into(),
+            ));
         }
 
         // Apply each gate via the fused walker. Conditions are
@@ -1187,12 +1272,20 @@ impl Backend for MetalStatevectorBackend {
         // Bell + `Reset q0` at 512 shots returned counts on the CPU and an
         // error on Metal, whose text advised "run with shots" — which is what
         // the caller was already doing.
+        //
+        // The delegation is observable on the calling thread.
+        // `reset_shots_cpu_fallback_count` moves here;
+        // `metal_shots_execute_count` moves on the GPU shot arm below. Not
+        // routed through `cpu_fallback()`: that hook is the QmlTrainer's
+        // allocation-refused rescue and records nothing itself — the stderr
+        // line lives in `QmlTrainer::fit`, and only for OOM.
         if config.shots.is_some()
             && circuit
                 .ops
                 .iter()
                 .any(|op| matches!(op.gate, GateKind::Reset))
         {
+            note_reset_shots_cpu_fallback();
             return omega_backend_statevector::StatevectorBackend::new()
                 .execute(circuit, params, config);
         }
@@ -1233,6 +1326,7 @@ impl Backend for MetalStatevectorBackend {
                     rng.random::<u64>()
                 });
                 let counts = state.sample_shots_gpu(shots, seed)?;
+                note_metal_shots_execute();
                 // Same keying as the CPU sampler's sample-from-final-state arm
                 // (`omega-backend-statevector/src/sim.rs:143`): the outcome is
                 // the full qubit register, so the width is `num_qubits`. The
@@ -1252,6 +1346,7 @@ impl Backend for MetalStatevectorBackend {
         _params: &ParameterBinding,
         _config: &ExecConfig,
     ) -> OmegaResult<ExecResult> {
+        _circuit.refuse_qudits(self.name())?;
         Err(OmegaError::Backend(
             "metal backend not available on this build (rebuild on macOS with --features metal)"
                 .into(),
@@ -1265,6 +1360,7 @@ impl Backend for MetalStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<f64> {
+        circuit.refuse_qudits(self.name())?;
         // GPU-side expectation: run forward, get |ψ⟩ resident on GPU,
         // then evaluate each Pauli term in *one* fused kernel
         // (`pauli_expectation`) that computes `⟨ψ|P|ψ⟩` directly
@@ -1316,6 +1412,7 @@ impl Backend for MetalStatevectorBackend {
         _params: &ParameterBinding,
         _observable: &Observable,
     ) -> OmegaResult<f64> {
+        _circuit.refuse_qudits(self.name())?;
         Err(OmegaError::Backend(
             "metal backend not available on this build (rebuild on macOS with --features metal)"
                 .into(),
@@ -1329,6 +1426,7 @@ impl Backend for MetalStatevectorBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> OmegaResult<Vec<f64>> {
+        circuit.refuse_qudits(self.name())?;
         // Single forward sweep, then evaluate every observable against
         // the resident on-device |ψ⟩ via the same fused
         // `pauli_expectation` reduction the per-observable path uses.
@@ -1373,6 +1471,7 @@ impl Backend for MetalStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        circuit.refuse_qudits(self.name())?;
         // Circuits with Reset are non-unitary — no adjoint. Decline (Ok(None))
         // so the runtime falls back to parameter-shift over the (now
         // reset-capable) forward `expectation`. Mirrors the CPU/CUDA backends.
@@ -1393,6 +1492,7 @@ impl Backend for MetalStatevectorBackend {
         _params: &ParameterBinding,
         _observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        _circuit.refuse_qudits(self.name())?;
         // No GPU build → no adjoint; caller falls back to param-shift.
         Ok(None)
     }
@@ -1405,6 +1505,7 @@ impl Backend for MetalStatevectorBackend {
         observables: &[Observable],
         gradient_observable_factory: GradientObservableFactory<'_>,
     ) -> OmegaResult<ExpectationsAndGradient> {
+        circuit.refuse_qudits(self.name())?;
         // Trainer hot path: compute predictions and gradient with a
         // *single* forward sweep on the GPU. Default trait impl does
         // two sweeps (one in `expectation_multi`, one inside
@@ -1495,6 +1596,7 @@ impl Backend for MetalStatevectorBackend {
         observables: &[Observable],
         gradient_observable_factory: GradientObservableFactory<'_>,
     ) -> OmegaResult<ExpectationsAndGradient> {
+        circuit.refuse_qudits(self.name())?;
         // No GPU build → defer to the default trait impl by calling
         // the constituent methods explicitly (default body inlined
         // since trait dispatch through `&dyn Backend` would be the
@@ -1598,9 +1700,16 @@ pub(crate) fn apply_op(
             )));
         }
 
-        // Photonic / custom — no native Metal kernel; the CPU statevector
-        // backend handles these. (RBS now runs natively via `apply_rbs`.)
-        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
+        // Photonic / qudit / custom — no native Metal kernel; the CPU
+        // statevector backend handles these. (RBS now runs natively via
+        // `apply_rbs`.) Rxy and CSum are qudit gates (PLAN-QUDIT); this
+        // backend is a qubit statevector and refuses them rather than
+        // leaving the match non-exhaustive.
+        GateKind::PhaseShifter
+        | GateKind::BeamSplitterRx
+        | GateKind::Rxy
+        | GateKind::CSum
+        | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "metal-statevector: gate {:?} is not supported on this backend",
                 op.gate

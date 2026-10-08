@@ -12,6 +12,16 @@ crate-type = ["rlib"]
 
 [dependencies]
 omega-core = { path = "../omega-core" }
+# The qudit gate MATRICES (Fourier / shift / clock / rxy / csum on a d != 2
+# wire) come from the exact mixed-radix engine's `gates` module rather than a
+# second hand-typed table here. The matrix table is shared on purpose: the
+# MPS-vs-quditsv differential (tests/qudit_backend.rs) is then a test of the
+# MPS contraction, truncation and SWAP network — not a comparison of two
+# transcriptions of the same formulas. Only `gates` is used; this crate never
+# calls quditsv's apply path. No cycle: quditsv depends on omega-core and
+# omega-backend-statevector only (the latter names this crate as a
+# DEV-dependency, which cargo does not count as a cycle).
+omega-backend-quditsv = { path = "../omega-backend-quditsv" }
 num-complex = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
@@ -20,6 +30,15 @@ smallvec = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 smallvec = { workspace = true }
+# Peak RSS for the Q4 measurement harness (`examples/qudit_chain_profile.rs`):
+# `getrusage(RUSAGE_SELF).ru_maxrss`, the same figure `/usr/bin/time -v`
+# reports. Already in the lock file transitively; examples only.
+libc = "0.2"
+serde_json = { workspace = true }
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-emu-compare = { path = "../omega-emu-compare" }
+omega-parser = { path = "../omega-parser" }
+sha2 = { workspace = true }
 
 [[bench]]
 name = "mps_bench"
@@ -33,3 +52,24 @@ harness = false
 [[example]]
 name = "mps_chi_profile"
 path = "examples/mps_chi_profile.rs"
+
+# The CPU half of STATUS.md §5.16: does Accelerate `zgesdd` move the 90-97%
+# SVD share, after `gesvdj` on an RTX PRO 6000 failed to. Both harnesses are
+# `#[cfg(target_os = "macos")]` bodies with a one-line `main` elsewhere, so
+# they compile on a Linux `--all-targets` without an Accelerate framework.
+[[example]]
+name = "accelerate_svd_share"
+path = "examples/accelerate_svd_share.rs"
+
+# Sets the size gate in `accelerate_svd_flat`: LAPACK loses on the 8-column
+# blocks a depth-4 circuit produces and wins on the 64+ of a deep one.
+[[example]]
+name = "accelerate_svd_crossover"
+path = "examples/accelerate_svd_crossover.rs"
+
+# E3: our expectation path against quimb CircuitMPS. Not a CLI benchmark —
+# `execute(shots: None)` reconstructs a dense statevector and is not the
+# timed region.
+[[example]]
+name = "mps_quimb_compare"
+path = "examples/mps_quimb_compare/main.rs"

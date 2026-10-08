@@ -1,0 +1,14 @@
+DITQASM 2.0;
+qreg q [3][3,2,5];
+creg meas[3];
+h q[0];
+x q[1];
+z q[2];
+cx (0, 1, 1, 0.0) q[0], q[1];
+csum q[2], q[0];
+rxy (0, 1, 1.2, 0.3) q[0];
+rz (0, 2, 0.7) q[2];
+s q[1];
+measure q[0] -> meas[0];
+measure q[1] -> meas[1];
+measure q[2] -> meas[2];

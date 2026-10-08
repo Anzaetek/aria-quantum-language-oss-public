@@ -15,13 +15,19 @@
 //!   sides; targeting V16 lets every round-trip test re-use the
 //!   existing reader.
 //! - Single circuit per blob.
-//! - Empty `metadata` ("{}"), empty name, `GlobalPhase::None`.
+//! - Empty `metadata` ("{}"), empty name, global phase `'f'` 0.0.
+//! - The post-instruction trailer Qiskit's reader requires
+//!   (`CALIBRATION` num_cals = 0, null `LAYOUT_V2`) — see
+//!   [`write_circuit_trailer`] for how its absence went unnoticed.
 //! - No registers (CircuitIR's qubits flow through `num_qubits`; the
 //!   reader infers a default register from `num_qubits` / `num_clbits`
 //!   when the register table is empty).
 //! - Instructions: the gate set in [`gate_kind_to_qiskit_name`] —
 //!   H/X/Y/Z/S/Sdg/T/Tdg/Id, Rx/Ry/Rz, U1/U2/U3, CX/CY/CZ/Swap, CRz,
-//!   CU3, CCX, CSwap, plus Measure / Reset / Barrier. Params can be
+//!   CU3, CCX, CSwap, plus Measure / Reset / Barrier — and `Rbs`, which
+//!   has no Qiskit class of its own and is spelled
+//!   `XXPlusYYGate(−2θ, π/2)` on the same qargs (see [`qiskit_params`]
+//!   for the receipt; the reader inverts it). Params can be
 //!   `Concrete(_)` (emitted as the `b'f'` scalar payload) or any
 //!   algebraic combination of `Symbol`/`Add`/`Mul`/`Negate` (emitted as
 //!   the `b'e'` PARAMETER_EXPRESSION payload — PARAM_EXPR_ELEM_V13
@@ -83,6 +89,15 @@ const CUSTOM_DEF_HEADER_LEN: usize = 8;
 /// less-common photonic / Custom gates land with the photonic-mode
 /// encoder.
 pub fn write_qpy_circuit_ir(ir: &CircuitIR) -> Vec<u8> {
+    // QPY has no qudit register: a d = 3 wire would be written as a qubit
+    // and read back as one by Qiskit, which is the running-it-as-qubits
+    // defect one file format over (PLAN-QUDIT.md Q1). This writer's
+    // contract is already "panics with a clear message on what it cannot
+    // encode" (unsupported gates, below); an undeclarable register is the
+    // same class.
+    if let Err(e) = ir.refuse_qudits("QPY writer") {
+        panic!("{e}");
+    }
     let mut buf = Vec::new();
     write_file_header(&mut buf, /* num_circuits */ 1);
     write_program_type_key(&mut buf);
@@ -126,19 +141,63 @@ pub fn gate_kind_to_qiskit_name(gate: &GateKind) -> Option<&'static str> {
         GateKind::CU3 => "CU3Gate",
         GateKind::CCX => "CCXGate",
         GateKind::CSwap => "CSwapGate",
+        // Qudit gates (PLAN-QUDIT.md Q2) have no Qiskit gate class: QPY is a
+        // qubit format, and a qudit circuit is refused by `write_qpy_circuit_ir`
+        // before any gate is named. Named here so the map stays exhaustive.
+        GateKind::Rxy | GateKind::CSum => return None,
         GateKind::Measure => "Measure",
         GateKind::Barrier => "Barrier",
         GateKind::Reset => "Reset",
-        // Photonic + Custom + the as-yet-untested Pauli-frame variants
-        // surface as None so the writer panics with a clear "gate not
-        // yet supported" message rather than silently encoding garbage.
-        // Rbs has no canonical Qiskit gate class (XXPlusYY/XXMinusYY use
-        // a different generator and phase convention) — decompose before
-        // export rather than encode a near-miss.
-        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Rbs | GateKind::Custom(_) => {
-            return None
-        }
+        // No Qiskit class is RBS as written; XXPlusYYGate IS RBS once
+        // the angle is doubled and negated and β is pinned to π/2 — the
+        // params are rewritten in `qiskit_params`, never here. A bare
+        // `XXPlusYYGate(θ)` (β = 0) is a different unitary that ffsim
+        // would happily accept, which is the trap PLAN-OPEN-20260825 §3c.0d
+        // records.
+        GateKind::Rbs => "XXPlusYYGate",
+        // Photonic + Custom surface as None so the writer panics with a
+        // clear "gate not yet supported" message rather than silently
+        // encoding garbage.
+        GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => return None,
     })
+}
+
+/// The β Qiskit's `XXPlusYYGate` needs for omega's `Rbs`. Shared with the
+/// reader so the two halves cannot drift apart.
+pub const RBS_XX_PLUS_YY_BETA: f64 = std::f64::consts::FRAC_PI_2;
+
+/// omega params → Qiskit params for the class `gate_kind_to_qiskit_name`
+/// emits. Identity for every gate but `Rbs`.
+///
+/// `Rbs(θ)` on qargs `(q0, q1)` is `XXPlusYYGate(−2θ, β = π/2)` on the SAME
+/// qargs. Receipt (qiskit 2.5.2, this repo's `.venv-qiskit`):
+/// `Operator(XXPlusYYGate(−2θ, π/2))` on `(q0, q1)`, re-indexed from
+/// Qiskit's little-endian order into omega's q0-is-MSB `Gate2Q` order,
+/// equals `gates::rbs(θ)` to 5.5e-17 at θ ∈ {0.3, 1.1, −0.7, 2.9}.
+/// `XXPlusYYGate(+2θ, π/2)` matches only with the qargs REVERSED — the
+/// plan's first statement of this mapping had that sign, and it is
+/// invisible on any symmetric fixture. `tests/qpy_rbs_vs_qiskit.rs` pins
+/// it end-to-end through Qiskit's own gate semantics on `⟨X0 X1⟩ = −sin 2θ`,
+/// where the wrong sign flips the answer.
+///
+/// A symbolic θ becomes `Mul(θ, −2)`, so parametric circuits keep their
+/// symbol structure across the wire.
+pub fn qiskit_params(op: &GateOp) -> Vec<ParamExpr> {
+    match op.gate {
+        GateKind::Rbs => {
+            assert!(
+                op.params.len() == 1,
+                "write_qpy_circuit_ir: Rbs takes exactly one parameter, got {}",
+                op.params.len()
+            );
+            let minus_two_theta = match &op.params[0] {
+                ParamExpr::Concrete(v) => ParamExpr::Concrete(-2.0 * v),
+                sym => ParamExpr::Mul(Box::new(sym.clone()), Box::new(ParamExpr::Concrete(-2.0))),
+            };
+            vec![minus_two_theta, ParamExpr::Concrete(RBS_XX_PLUS_YY_BETA)]
+        }
+        _ => op.params.iter().cloned().collect(),
+    }
 }
 
 fn write_file_header(buf: &mut Vec<u8>, num_circuits: u64) {
@@ -161,7 +220,7 @@ fn write_program_type_key(buf: &mut Vec<u8>) {
 
 fn write_circuit(buf: &mut Vec<u8>, ir: &CircuitIR) {
     write_circuit_header(buf, ir);
-    write_circuit_body(buf); // empty name + global_phase=None + metadata="{}"
+    write_circuit_body(buf); // empty name + global_phase=0.0 + metadata="{}"
                              // No registers (num_registers=0 in the header). The reader infers
                              // qubit / clbit indices straight from num_qubits / num_clbits when
                              // the register table is empty.
@@ -169,6 +228,30 @@ fn write_circuit(buf: &mut Vec<u8>, ir: &CircuitIR) {
     for op in &ir.ops {
         write_instruction(buf, ir, op);
     }
+    write_circuit_trailer(buf);
+}
+
+/// The sections Qiskit writes AFTER the instruction list and its reader
+/// requires: `CALIBRATION` (`!H` num_cals = 0) and a null `LAYOUT_V2`
+/// (`!?iiiIi` = `False, -1, -1, -1, 0, 0`). 23 bytes.
+///
+/// Found 2026-08-29, the first time one of this writer's blobs was handed
+/// to Qiskit itself: `qpy.load` failed with "failed to fill whole buffer
+/// while parsing 'num_cals'". Every earlier test round-tripped through
+/// omega's own reader, which stops after the last instruction and never
+/// noticed the tail was missing. Byte-for-byte reference: `qpy.dump(…,
+/// version=16)` of the same circuit under qiskit 2.5.2, which agrees with
+/// this writer on every byte through the last parameter and then emits
+/// exactly these 23. `tests/qpy_rbs_vs_qiskit.rs` keeps Qiskit on the
+/// consuming end from now on.
+fn write_circuit_trailer(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&0u16.to_be_bytes()); // CALIBRATION.num_cals
+    buf.push(0); // LAYOUT_V2.exists = False
+    buf.extend_from_slice(&(-1i32).to_be_bytes()); // initial_layout_size
+    buf.extend_from_slice(&(-1i32).to_be_bytes()); // input_mapping_size
+    buf.extend_from_slice(&(-1i32).to_be_bytes()); // final_layout_size
+    buf.extend_from_slice(&0u32.to_be_bytes()); // extra_registers
+    buf.extend_from_slice(&0i32.to_be_bytes()); // input_qubit_count
 }
 
 fn write_instruction(buf: &mut Vec<u8>, ir: &CircuitIR, op: &GateOp) {
@@ -181,7 +264,9 @@ fn write_instruction(buf: &mut Vec<u8>, ir: &CircuitIR, op: &GateOp) {
     });
     let name_bytes = name.as_bytes();
     let label_bytes: &[u8] = b"";
-    let num_parameters: u16 = op.params.len() as u16;
+    // The params Qiskit's class takes, which for Rbs are NOT omega's.
+    let params = qiskit_params(op);
+    let num_parameters: u16 = params.len() as u16;
     // Measure has 1 carg; every other supported gate has 0.
     let (num_qargs, num_cargs): (u32, u32) = match op.gate {
         GateKind::Measure => (op.qubits.len() as u32, 1),
@@ -243,7 +328,7 @@ fn write_instruction(buf: &mut Vec<u8>, ir: &CircuitIR, op: &GateOp) {
 
     // Parameters: Concrete → `b'f'`, everything else → `b'e'`
     // PARAMETER_EXPRESSION payload (PARAM_EXPR_ELEM_V13 stack-machine).
-    for p in &op.params {
+    for p in &params {
         write_instruction_param(buf, ir, p);
     }
 }
@@ -426,8 +511,11 @@ fn symbol_id_to_uuid(id: SymbolId) -> [u8; 16] {
 
 fn write_circuit_header(buf: &mut Vec<u8>, ir: &CircuitIR) {
     let name_size: u16 = 0;
-    let global_phase_type: u8 = b'n'; // None
-    let global_phase_size: u16 = 0;
+    // 'f' + 8 bytes of 0.0, as Qiskit itself writes. A 'n' (None) phase is
+    // something Qiskit's writer never produces, so its reader was never the
+    // thing we were testing against when we emitted it.
+    let global_phase_type: u8 = b'f';
+    let global_phase_size: u16 = 8;
     let metadata_size: u64 = 2; // "{}" JSON
     let num_registers: u32 = 0;
     let num_instructions: u64 = ir.ops.len() as u64;
@@ -451,7 +539,11 @@ fn write_circuit_header(buf: &mut Vec<u8>, ir: &CircuitIR) {
 }
 
 fn write_circuit_body(buf: &mut Vec<u8>) {
-    // name (empty), global_phase (size 0 for 'n'), metadata = "{}".
+    // name (empty), global_phase 0.0 as 8 bytes, metadata = "{}". 0.0 is
+    // bit-identical in either byte order, so the LE-vs-BE question the
+    // reader's `circuit_body.rs` raises for 'f' payloads does not arise —
+    // and this writer never emits any other phase.
+    buf.extend_from_slice(&0.0f64.to_be_bytes());
     buf.extend_from_slice(b"{}");
 }
 

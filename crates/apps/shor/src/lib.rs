@@ -36,7 +36,12 @@ pub fn run(transport_override: Transport) -> Result<Verdict, String> {
     let lowered = harness::load_lowered("shor.aria", "Shor15", &[])?;
     let (flat, _) =
         harness::execute_report(transport, lowered.ir, harness::AppMode::Statevector, &[])?;
-    let amps: Vec<(f64, f64)> = flat.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+    let amps: Vec<(f64, f64)> = flat
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| (c[0], c[1]))
+        .collect();
 
     // Marginal probability over the counting register (low T bits of the state index).
     let dim = 1usize << T;

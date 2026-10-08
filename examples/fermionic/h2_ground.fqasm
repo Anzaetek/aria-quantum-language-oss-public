@@ -1,0 +1,38 @@
+// H2/STO-3G ground state. UCCSD at one pinned angle, not a VQE run.
+// theta = -0.11306813351297684, from h2_reference.txt (OpenFermion's
+// MolecularData file). Singles are absent: these are RHF orbitals, so
+// Brillouin's theorem sets them to zero. There is no optimiser.
+//
+// phi = (1/2) arccos(-(cos theta + sin theta))
+// psi = (1/2) arccos(-1/(cos theta - sin theta))
+// numnum(pi) on modes 0 and 1 sits between two spin-symmetric orbital
+// rotations. The rotation's Givens angle on the same-spin pairs is phi,
+// then -psi. Those pairs are (0,2) and (1,3), which are not adjacent.
+// An adjacent fermionic swap is givens(pi/2) followed by num(pi) on the
+// second mode; the swap conjugates an adjacent givens onto the pair.
+// The prepared state is cos(theta)|1100> + sin(theta)|0011>, the same
+// state as h2_ground.qasm. See docs/FERMIONIC_EXAMPLES.md.
+FERMIONICQASM 1.0;
+mode m[4];
+load m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(1.3241592560954649) m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];
+givens(1.3241592560954649) m[1], m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];
+numnum(3.1415926535897931) m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(-1.3496794465376205) m[0], m[1];
+givens(1.5707963267948966) m[1], m[2];
+num(3.1415926535897931) m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];
+givens(-1.3496794465376205) m[1], m[2];
+givens(1.5707963267948966) m[2], m[3];
+num(3.1415926535897931) m[3];

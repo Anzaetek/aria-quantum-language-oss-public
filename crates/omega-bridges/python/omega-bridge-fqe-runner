@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Wrapper for fqe_runner.py that resolves the bundled venv.
+#
+# Discovery order for the Python interpreter:
+# 1. $OMEGA_BRIDGE_FQE_PYTHON (full path to a python binary).
+# 2. $(dirname $0)/.venv-fqe/bin/python (the `make fqe-venv` default).
+# 3. <repo-root>/.venv-fqe/bin/python (where ci.sh keeps its venvs).
+#
+# No PATH fallback: FQE 0.3.0 is a Cython sdist that needs Python <= 3.12
+# and numpy < 2, which a system python3 will not have by accident.
+
+set -euo pipefail
+
+self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+runner="${self_dir}/fqe_runner.py"
+
+if [ ! -f "${runner}" ]; then
+  echo "fqe_runner.py not found alongside the wrapper at ${runner}" >&2
+  exit 2
+fi
+
+py="${OMEGA_BRIDGE_FQE_PYTHON:-${self_dir}/.venv-fqe/bin/python}"
+if [ ! -x "${py}" ] && [ -x "${self_dir}/../../../.venv-fqe/bin/python" ]; then
+  py="${self_dir}/../../../.venv-fqe/bin/python"
+fi
+if [ ! -x "${py}" ]; then
+  echo "no usable python (set OMEGA_BRIDGE_FQE_PYTHON or run 'make fqe-venv')" >&2
+  exit 2
+fi
+
+exec "${py}" "${runner}"

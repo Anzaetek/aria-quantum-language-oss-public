@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "emu-compare-stim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Stabilizer lane of the emulator comparison: omega-backend-pauli against Stim 1.16.0"
+
+[dependencies]
+omega-emu-compare = { path = "../../../crates/omega-emu-compare" }
+omega-core = { path = "../../../crates/omega-core" }
+omega-parser = { path = "../../../crates/omega-parser" }
+omega-backend-pauli = { path = "../../../crates/omega-backend-pauli" }
+omega-backend-stabrank = { path = "../../../crates/omega-backend-stabrank" }
+omega-backend-statevector = { path = "../../../crates/omega-backend-statevector" }
+aria-qec = { path = "../../../crates/aria-qec" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

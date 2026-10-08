@@ -79,6 +79,11 @@ $ omega-run circuit.qasm --backend my-backend --shots 512
 Copy **only** the shared library into that directory. Cargo's `.d` dep-info file
 shares the basename and will fail to `dlopen`.
 
+A directory named by `OMEGA_BACKEND_DIR` or `--backend-dir` that does not exist
+or cannot be read is a fatal error on every run, not a silent "zero plugins
+loaded": a mistyped path would otherwise surface only as `Unknown backend` on
+the one run that needed it.
+
 ## Prove it works: the conformance kit
 
 ```console

@@ -1,0 +1,8 @@
+# MQT Qudits — the DITQASM reference implementation (PLAN-FERMIONIC-QUDIT Q0).
+#
+# Pinned to the version that generated
+# crates/omega-parser/tests/fixtures/ditqasm/ (see PROVENANCE.json there).
+# tools/ditqasm_xcheck/reparse.py fails on a version mismatch on purpose:
+# the fixture bytes are that version's emitter, and the two upstream defects
+# it pins (D1, D2) are that version's. Bump deliberately, regenerate, re-read.
+mqt.qudits==0.5.2

@@ -77,9 +77,8 @@ fn shape(kind: &GateKind) -> Shape {
         // (as a comment) rather than refused, because it has no operational
         // meaning to lose — handled separately below.
         I | X | Y | Z | H | S | Sdg | T | Tdg | SX | RX | RY | RZ | P | U | CX | CY | CZ | SWAP
-        | RXX | RYY | RZZ | CP | CRz | RBS | CCX | CSWAP | Barrier | Reset | Measure => {
-            s(Profile::NotPhotonic, 0, 1, false)
-        }
+        | RXX | RYY | RZZ | CP | CRz | RBS | CCX | CSWAP | Barrier | Reset | Measure | Tunnel
+        | Load => s(Profile::NotPhotonic, 0, 1, false),
     }
 }
 
@@ -123,6 +122,8 @@ const ALL: &[GateKind] = &[
     GateKind::Kerr,
     GateKind::HalfWavePlate,
     GateKind::PolarizingBeamSplitter,
+    GateKind::Tunnel,
+    GateKind::Load,
 ];
 
 /// Distinct, generic values — no 0, no repeats — so a swapped or dropped

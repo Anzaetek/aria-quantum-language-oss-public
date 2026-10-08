@@ -1366,6 +1366,85 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "emu-compare-cv"
+version = "0.1.0"
+dependencies = [
+ "omega-backend-cv",
+ "omega-emu-compare",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "emu-compare-dense"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "omega-backend-statevector",
+ "omega-core",
+ "omega-emu-compare",
+ "omega-parser",
+ "rayon",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "emu-compare-fermionic"
+version = "0.1.0"
+dependencies = [
+ "omega-backend-majoranaprop",
+ "omega-backend-sector",
+ "omega-backend-statevector",
+ "omega-core",
+ "omega-emu-compare",
+ "omega-parser",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "emu-compare-gpu"
+version = "0.1.0"
+dependencies = [
+ "emu-compare-dense",
+ "num-complex",
+ "omega-backend-statevector-cuda",
+ "omega-core",
+ "omega-emu-compare",
+ "omega-parser",
+ "serde_json",
+]
+
+[[package]]
+name = "emu-compare-pauliprop"
+version = "0.1.0"
+dependencies = [
+ "omega-backend-pauliprop",
+ "omega-backend-statevector",
+ "omega-core",
+ "omega-emu-compare",
+ "omega-parser",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "emu-compare-stim"
+version = "0.1.0"
+dependencies = [
+ "aria-qec",
+ "omega-backend-pauli",
+ "omega-backend-stabrank",
+ "omega-backend-statevector",
+ "omega-core",
+ "omega-emu-compare",
+ "omega-parser",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2460,14 +2539,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-backend-majoranaprop"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "num-complex",
+ "omega-backend-pauliprop",
+ "omega-backend-statevector",
+ "omega-core",
+ "serde",
+ "smallvec",
+]
+
+[[package]]
 name = "omega-backend-mps"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "libc",
  "num-complex",
+ "omega-backend-quditsv",
+ "omega-backend-statevector",
  "omega-core",
+ "omega-emu-compare",
+ "omega-parser",
  "rand 0.10.1",
  "rayon",
+ "serde_json",
+ "sha2",
  "smallvec",
 ]
 
@@ -2478,6 +2577,8 @@ dependencies = [
  "cudarc",
  "num-complex",
  "omega-backend-mps",
+ "omega-core",
+ "rayon",
 ]
 
 [[package]]
@@ -2510,6 +2611,8 @@ dependencies = [
  "omega-backend-pauli",
  "omega-backend-statevector",
  "omega-core",
+ "omega-parser",
+ "serde_json",
  "smallvec",
 ]
 
@@ -2542,8 +2645,20 @@ dependencies = [
  "omega-core",
  "omega-parser",
  "rand 0.10.1",
+ "rayon",
  "smallvec",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "omega-backend-quditsv"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "omega-backend-statevector",
+ "omega-core",
+ "rand 0.10.1",
+ "smallvec",
 ]
 
 [[package]]
@@ -2554,6 +2669,28 @@ dependencies = [
  "omega-backend-statevector",
  "omega-core",
  "smallvec",
+]
+
+[[package]]
+name = "omega-backend-sector"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "omega-backend-statevector",
+ "omega-core",
+ "rand 0.10.1",
+ "smallvec",
+]
+
+[[package]]
+name = "omega-backend-stabrank"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "omega-backend-majoranaprop",
+ "omega-backend-pauli",
+ "omega-backend-statevector",
+ "omega-core",
 ]
 
 [[package]]
@@ -2621,9 +2758,11 @@ version = "0.1.0"
 dependencies = [
  "aria-core",
  "base64",
+ "num-complex",
  "omega-backend-mps",
  "omega-backend-pauliprop",
  "omega-backend-photonics",
+ "omega-backend-statevector",
  "omega-core",
  "omega-parser",
  "serde_json",
@@ -2637,12 +2776,16 @@ name = "omega-cli"
 version = "0.1.0"
 dependencies = [
  "num-complex",
+ "omega-backend-majoranaprop",
  "omega-backend-mps",
  "omega-backend-mps-cuda",
  "omega-backend-mps-metal",
  "omega-backend-pauli",
  "omega-backend-pauliprop",
  "omega-backend-photonics",
+ "omega-backend-quditsv",
+ "omega-backend-sector",
+ "omega-backend-stabrank",
  "omega-backend-statevector",
  "omega-backend-statevector-cuda",
  "omega-backend-statevector-metal",
@@ -2677,6 +2820,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omega-emu-compare"
+version = "0.1.0"
+dependencies = [
+ "omega-core",
+ "omega-parser",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "omega-ffi"
 version = "0.1.0"
 dependencies = [
@@ -2701,9 +2856,12 @@ name = "omega-parser"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "omega-backend-photonics",
+ "omega-backend-statevector",
  "omega-core",
  "pest",
  "pest_derive",
+ "serde_json",
  "smallvec",
  "thiserror 2.0.18",
 ]

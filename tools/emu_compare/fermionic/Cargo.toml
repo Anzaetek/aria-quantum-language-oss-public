@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "emu-compare-fermionic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Fermionic lane of the emulator comparison: sector, majoranaprop and statevector against ffsim"
+
+[dependencies]
+omega-emu-compare = { path = "../../../crates/omega-emu-compare" }
+omega-core = { path = "../../../crates/omega-core" }
+omega-parser = { path = "../../../crates/omega-parser" }
+omega-backend-statevector = { path = "../../../crates/omega-backend-statevector" }
+omega-backend-sector = { path = "../../../crates/omega-backend-sector" }
+omega-backend-majoranaprop = { path = "../../../crates/omega-backend-majoranaprop" }
+serde_json = { workspace = true }
+sha2 = { workspace = true }

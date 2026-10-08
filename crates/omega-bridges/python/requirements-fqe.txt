@@ -1,0 +1,16 @@
+# OpenFermion-FQE build environment — the JW-free fermionic oracle behind
+# `fqe_runner.py` / `tests/fqe_vs_statevector.rs`.
+#
+# FQE 0.3.0 (2023) is a Cython sdist. Its own metadata pins
+# `pyasn1-modules==0.2.7` and drags in `cirq-google` + `jupyter`, none of
+# which the runner uses, so `make fqe-venv` installs THIS file first and then
+# `fqe==0.3.0 --no-deps --no-build-isolation`. Python 3.11 (3.12 at most):
+# the sdist does not build on 3.13+. Verified 2026-08-29 on macOS arm64.
+numpy<2
+scipy
+cython
+setuptools
+wheel
+openfermion>=1.5
+cirq-core>=1.0
+pytest

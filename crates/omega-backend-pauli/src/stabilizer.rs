@@ -54,7 +54,12 @@ impl PauliRow {
 /// expectations became correct while **measurement sampling stayed broken** —
 /// a 3-qubit Clifford circuit put 1000/1000 shots on zero-probability
 /// bitstrings. `sim.rs` now calls this one. Do not reintroduce a second table.
-pub(crate) fn pauli_mult_phase(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
+///
+/// Exported because `omega-backend-stabrank`'s CH-form kernel multiplies the
+/// same Pauli group and must not carry a second table to do it. That kernel
+/// stores `X^x Z^z` without the `i^{xz}` factor, so it converts the result
+/// rather than copying the match arms — see `chform::plain_mult_phase`.
+pub fn pauli_mult_phase(x1: bool, z1: bool, x2: bool, z2: bool) -> i32 {
     match ((x1, z1), (x2, z2)) {
         ((false, false), _) | (_, (false, false)) => 0,
         ((true, false), (false, true)) => 3, // X·Z  => g = -1

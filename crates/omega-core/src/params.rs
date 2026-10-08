@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::circuit::{ParamExpr, SymbolId};
+use crate::circuit::{fallback_symbol_name, CircuitIR, ParamExpr, SymbolId};
 use crate::error::{OmegaError, Result};
 
 /// Maps symbol IDs to concrete f64 values for circuit execution.
@@ -22,6 +22,33 @@ impl ParameterBinding {
         self.values.get(&symbol).copied()
     }
 
+    /// Bind a flat value vector to `circuit`'s free symbols in ascending
+    /// symbol-ID order — the convention shared by the CLI's `--params`, the
+    /// WASM host ABI and the verification harnesses.
+    ///
+    /// Refuses unless `values.len()` equals the number of free symbols.
+    /// Before this existed each caller zipped the two lists itself and bound
+    /// whatever was missing to 0.0, which turns a short vector into a
+    /// plausible wrong expectation value instead of an error.
+    pub fn from_flat(circuit: &CircuitIR, values: &[f64]) -> Result<Self> {
+        let ids = circuit.sorted_symbol_ids();
+        if values.len() != ids.len() {
+            return Err(OmegaError::ParameterCount {
+                expected: ids.len(),
+                got: values.len(),
+                unbound: ids[values.len().min(ids.len())..]
+                    .iter()
+                    .map(|&id| circuit.symbol_name(id))
+                    .collect(),
+            });
+        }
+        Ok(ids
+            .into_iter()
+            .zip(values.iter().copied())
+            .collect::<Vec<_>>()
+            .into())
+    }
+
     /// Recursively resolve a parameter expression to a concrete value.
     pub fn resolve(&self, expr: &ParamExpr) -> Result<f64> {
         match expr {
@@ -32,7 +59,7 @@ impl ParameterBinding {
                     .copied()
                     .ok_or_else(|| OmegaError::UnboundSymbol {
                         id: *id,
-                        name: format!("sym_{}", id),
+                        name: fallback_symbol_name(*id),
                     })
             }
             ParamExpr::Negate(inner) => Ok(-self.resolve(inner)?),
@@ -51,10 +78,12 @@ impl ParamExpr {
     /// Symbolic derivative of this expression with respect to the given symbol.
     /// Returns a new ParamExpr tree representing d(self)/d(symbol).
     ///
-    /// Verified against the analytic derivative in
-    /// `verification/Verification/Adjoint/ChainRule.lean` —
-    /// theorem `differentiate_correct`. Each match arm below has
-    /// the corresponding `HasDerivAt` step in the Lean induction.
+    /// NOT verified in Lean, despite what this said until 2026-09-04: it
+    /// claimed `Verification/Adjoint/ChainRule.lean::differentiate_correct`
+    /// and a matching `HasDerivAt` step per match arm. No such file exists
+    /// here or in the private monorepo. The symbolic derivative is checked
+    /// numerically, by the gradient tests that compare adjoint AD against
+    /// parameter-shift.
     pub fn differentiate(&self, symbol: SymbolId) -> ParamExpr {
         match self {
             ParamExpr::Concrete(_) => ParamExpr::Concrete(0.0),
@@ -94,6 +123,80 @@ impl From<Vec<(SymbolId, f64)>> for ParameterBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit::CircuitType;
+
+    fn three_symbol_circuit() -> CircuitIR {
+        // Inserted out of ID order: binding must go by sorted ID, not by
+        // HashMap iteration order.
+        let mut c = CircuitIR::new(1, CircuitType::GateBased);
+        c.symbols.insert(7, "c".into());
+        c.symbols.insert(3, "a".into());
+        c.symbols.insert(5, "b".into());
+        c
+    }
+
+    #[test]
+    fn from_flat_binds_in_sorted_id_order() {
+        let c = three_symbol_circuit();
+        let pb = ParameterBinding::from_flat(&c, &[1.5, 2.5, 3.5]).unwrap();
+        assert_eq!(pb.get(3), Some(1.5));
+        assert_eq!(pb.get(5), Some(2.5));
+        assert_eq!(pb.get(7), Some(3.5));
+    }
+
+    #[test]
+    fn from_flat_refuses_short_vector_naming_unbound() {
+        let c = three_symbol_circuit();
+        match ParameterBinding::from_flat(&c, &[1.5]) {
+            Err(OmegaError::ParameterCount {
+                expected,
+                got,
+                unbound,
+            }) => {
+                assert_eq!(expected, 3);
+                assert_eq!(got, 1);
+                assert_eq!(unbound, vec!["b".to_string(), "c".to_string()]);
+            }
+            other => panic!("expected ParameterCount, got {other:?}"),
+        }
+        let msg = ParameterBinding::from_flat(&c, &[1.5])
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("got 1 value(s)"), "{msg}");
+        assert!(msg.contains("3 free parameter(s)"), "{msg}");
+        assert!(msg.contains("[b, c]"), "{msg}");
+    }
+
+    #[test]
+    fn from_flat_refuses_long_vector() {
+        let c = three_symbol_circuit();
+        match ParameterBinding::from_flat(&c, &[1.0, 2.0, 3.0, 4.0]) {
+            Err(OmegaError::ParameterCount {
+                expected,
+                got,
+                unbound,
+            }) => {
+                assert_eq!((expected, got), (3, 4));
+                assert!(unbound.is_empty());
+            }
+            other => panic!("expected ParameterCount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_flat_empty_circuit_accepts_only_empty_vector() {
+        let c = CircuitIR::new(1, CircuitType::GateBased);
+        assert!(ParameterBinding::from_flat(&c, &[]).is_ok());
+        assert!(ParameterBinding::from_flat(&c, &[0.0]).is_err());
+    }
+
+    #[test]
+    fn symbol_name_falls_back_to_sym_id() {
+        let c = three_symbol_circuit();
+        assert_eq!(c.symbol_name(3), "a");
+        assert_eq!(c.symbol_name(99), "sym_99");
+        assert_eq!(fallback_symbol_name(99), "sym_99");
+    }
 
     #[test]
     fn test_differentiate_concrete() {

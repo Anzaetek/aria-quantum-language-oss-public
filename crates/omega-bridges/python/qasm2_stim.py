@@ -311,13 +311,23 @@ class _Registers:
         return [offset + i]
 
 
-def convert(qasm: str, gate_set, expansions=None) -> tuple[str, int, list[int], int]:
+def convert(
+    qasm: str, gate_set, expansions=None, noise=None
+) -> tuple[str, int, list[int], int]:
     """Lower a QASM2 source to extended-Stim text.
 
     Args:
         qasm: QASM2 source.
         gate_set: iterable of accepted lowercase QASM gate names — pass
             ``GATE_SETS["tsim"]`` or ``GATE_SETS["ppvm"]``.
+        noise: optional ``stim_noise.StimNoise``. When given, every gate
+            application (including ``id``/``u0``, which lower to nothing, and
+            each qubit of a ``reset``) is followed by its per-qubit noise
+            lines, and every ``M`` carries the readout flip — omega's
+            placement, see ``stim_noise``. A multi-instruction expansion
+            (``swap``, ``ccx``) is ONE gate: noise follows the whole
+            expansion, as omega applies it once after its single op. With
+            ``noise=None`` the output is byte-identical to before.
 
     Returns:
         ``(stim_text, n_qubits, clbit_of_measurement, n_clbits)`` where
@@ -384,7 +394,10 @@ def convert(qasm: str, gate_set, expansions=None) -> tuple[str, int, list[int], 
                 )
             # One `M` per statement keeps the record order equal to the
             # operand order, which is what the clbit map assumes.
-            lines.append("M " + " ".join(str(q) for q in qubits))
+            if noise is not None:
+                lines.extend(noise.measure(qubits))
+            else:
+                lines.append("M " + " ".join(str(q) for q in qubits))
             clbit_of_measurement.extend(clbits)
             continue
 
@@ -399,7 +412,13 @@ def convert(qasm: str, gate_set, expansions=None) -> tuple[str, int, list[int], 
         if head == "reset":
             targets = _targets(regs, raw_targets)
             for group in targets:
-                lines.append("R " + " ".join(str(q) for q in group))
+                if noise is not None:
+                    # omega applies the per-gate channel after a Reset op too.
+                    for q in group:
+                        lines.append(f"R {q}")
+                        lines.extend(noise.after_gate((q,)))
+                else:
+                    lines.append("R " + " ".join(str(q) for q in group))
             continue
 
         if name not in gate_set:
@@ -439,7 +458,9 @@ def convert(qasm: str, gate_set, expansions=None) -> tuple[str, int, list[int], 
             [eval_param(p) for p in _split_params(raw_params)] if raw_params else []
         )
         operand_groups = _targets(regs, raw_targets)
-        lines.extend(_emit_gate(name, params, operand_groups, stmt, expansions))
+        lines.extend(
+            _emit_gate(name, params, operand_groups, stmt, expansions, noise)
+        )
 
     if regs.n_qubits == 0:
         raise ConversionError("no `qreg` declared")
@@ -449,7 +470,10 @@ def convert(qasm: str, gate_set, expansions=None) -> tuple[str, int, list[int], 
     # qubit in index order so the caller still gets counts back.
     if not clbit_of_measurement:
         regs.add_c("__omega_meas", regs.n_qubits)
-        lines.append("M " + " ".join(str(q) for q in range(regs.n_qubits)))
+        if noise is not None:
+            lines.extend(noise.measure(range(regs.n_qubits)))
+        else:
+            lines.append("M " + " ".join(str(q) for q in range(regs.n_qubits)))
         clbit_of_measurement = list(
             range(regs.n_clbits - regs.n_qubits, regs.n_clbits)
         )
@@ -487,6 +511,7 @@ def _emit_gate(
     groups: list[list[int]],
     stmt: str,
     expansions: dict | None = None,
+    noise=None,
 ) -> list[str]:
     """Emit the Stim line(s) for one gate application.
 
@@ -512,6 +537,16 @@ def _emit_gate(
     tuples = [
         tuple(g[0] if len(g) == 1 else g[i] for g in groups) for i in range(width)
     ]
+
+    # With noise, a broadcast is emitted one application at a time, each
+    # followed by its own noise — `cx q[0], r` touches q[0] once per target,
+    # and omega kicks it after each of those ops, not once at the end.
+    if noise is not None:
+        noisy: list[str] = []
+        for t in tuples:
+            noisy.extend(_emit_gate(name, params, [[x] for x in t], stmt, expansions))
+            noisy.extend(noise.after_gate(t))
+        return noisy
 
     # A backend-specific expansion wins over the fixed opcode: ppvm's parser
     # takes `CX` but not `SWAP`, so `swap` must lower to three CX for ppvm

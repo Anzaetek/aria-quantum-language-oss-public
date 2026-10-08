@@ -1,0 +1,6 @@
+# QuickQudits (QUICK-JKU, Apache-2.0 — verified Q0) — the external oracle for
+# the generalised Clifford qudit gates in omega-backend-quditsv
+# (PLAN-QUDIT.md Q2 leg iii). Its statevector backend, not its tableau.
+# Pinned to the version the harness was written against; a bump must re-run
+# tools/quditsv_xcheck/ and re-read its digit-order pin.
+quickqudits==1.0.1

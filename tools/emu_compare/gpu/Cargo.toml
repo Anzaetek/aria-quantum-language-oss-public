@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "emu-compare-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Dense GPU lane of the emulator comparison (E5): omega-backend-statevector-cuda (f32) against cuStateVec 1.15 driven directly, with Aer-GPU 0.15.1 as a sanity floor"
+
+[features]
+default = []
+# Our arm is a CUDA process; without this feature only the lane binary builds,
+# so the workspace stays green on machines without a GPU.
+cuda = ["dep:omega-backend-statevector-cuda", "omega-backend-statevector-cuda/cuda"]
+
+[dependencies]
+omega-emu-compare = { path = "../../../crates/omega-emu-compare" }
+emu-compare-dense = { path = "../dense" }
+omega-core = { path = "../../../crates/omega-core" }
+omega-parser = { path = "../../../crates/omega-parser" }
+omega-backend-statevector-cuda = { path = "../../../crates/omega-backend-statevector-cuda", optional = true }
+num-complex = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "emu-compare-gpu"
+path = "src/main.rs"
+
+[[bin]]
+name = "emu-compare-gpu-ours"
+path = "src/bin/ours.rs"
+required-features = ["cuda"]

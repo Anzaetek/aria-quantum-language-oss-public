@@ -1,0 +1,264 @@
+{
+  "artifacts": {
+    "clifford-100q-d100": {
+      "depth": 100,
+      "dialect": "legacy",
+      "family": "clifford",
+      "file": "tools/emu_compare/qasm/clifford_100q_d100.qasm",
+      "gates": {
+        "cx": 4950,
+        "h": 100,
+        "s": 10000
+      },
+      "generator": "gen_workloads.py -> clifford_qasm(100, 100)",
+      "qubits": 100,
+      "seed": null,
+      "sha256": "df93f02957bc2f3f438b6d91ebf64d1c8b359cc03d443fb4c416de4498ef467d",
+      "source": "generated"
+    },
+    "clifford-24q-d100": {
+      "depth": 100,
+      "dialect": "legacy",
+      "family": "clifford",
+      "file": "tools/emu_compare/qasm/clifford_24q_d100.qasm",
+      "gates": {
+        "cx": 1150,
+        "h": 24,
+        "s": 2400
+      },
+      "generator": "gen_workloads.py -> clifford_qasm(24, 100)",
+      "qubits": 24,
+      "seed": null,
+      "sha256": "ec5b5c693d4b06a49f649f7335b8eb881ce623a3aa7ff7cd22a65b8233a6b1a4",
+      "source": "generated"
+    },
+    "hea-14q-d12": {
+      "depth": 12,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_14q_d12.qasm",
+      "gates": {
+        "cx": 156,
+        "h": 14,
+        "rx": 168,
+        "rz": 78
+      },
+      "generator": "gen_workloads.py -> hea_qasm(14, 12)",
+      "qubits": 14,
+      "seed": null,
+      "sha256": "af80affd72c474d21e467991ab79e2f97c4d06d0fb53a544625afe1a700415d0",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "hea-14q-d24": {
+      "depth": 24,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_14q_d24.qasm",
+      "gates": {
+        "cx": 312,
+        "h": 14,
+        "rx": 336,
+        "rz": 156
+      },
+      "generator": "gen_workloads.py -> hea_qasm(14, 24)",
+      "qubits": 14,
+      "seed": null,
+      "sha256": "94885910b7210946145e4900e261f3c97f09fa8daa37e4d9593888cb4eb55311",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "hea-14q-d4": {
+      "depth": 4,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_14q_d4.qasm",
+      "gates": {
+        "cx": 52,
+        "h": 14,
+        "rx": 56,
+        "rz": 26
+      },
+      "generator": "gen_workloads.py -> hea_qasm(14, 4)",
+      "qubits": 14,
+      "seed": null,
+      "sha256": "b53061c6be00cc128cb91df7112bd3a789e246368c9a0294d29b051c0a0f5e79",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "hea-20q-d12": {
+      "depth": 12,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_20q_d12.qasm",
+      "gates": {
+        "cx": 228,
+        "h": 20,
+        "rx": 240,
+        "rz": 114
+      },
+      "generator": "gen_workloads.py -> hea_qasm(20, 12)",
+      "qubits": 20,
+      "seed": null,
+      "sha256": "fecdee85e089eb6c402108969e0bc57007e098a86cbbd844d6f23eb2b057d561",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "hea-20q-d24": {
+      "depth": 24,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_20q_d24.qasm",
+      "gates": {
+        "cx": 456,
+        "h": 20,
+        "rx": 480,
+        "rz": 228
+      },
+      "generator": "gen_workloads.py -> hea_qasm(20, 24)",
+      "qubits": 20,
+      "seed": null,
+      "sha256": "05a6d24196a8288fb4bb3a48b274c0a5437d29b52b01121a0c40027c8b8438c4",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "hea-24q-d24": {
+      "depth": 24,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_24q_d24.qasm",
+      "gates": {
+        "cx": 552,
+        "h": 24,
+        "rx": 576,
+        "rz": 276
+      },
+      "generator": "gen_workloads.py -> hea_qasm(24, 24)",
+      "qubits": 24,
+      "seed": null,
+      "sha256": "29b87414da160a3810b67a6e9d9fa9a180c2df511d6b960c164979ca1b263464",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "hea-26q-d24": {
+      "depth": 24,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_26q_d24.qasm",
+      "gates": {
+        "cx": 600,
+        "h": 26,
+        "rx": 624,
+        "rz": 300
+      },
+      "generator": "gen_workloads.py -> hea_qasm(26, 24)",
+      "qubits": 26,
+      "seed": null,
+      "sha256": "a05452b2e2584394573150353a99560f6b77dc4d10fec956861dc60c86d5dc48",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "hea-28q-d24": {
+      "depth": 24,
+      "dialect": "legacy",
+      "family": "hea",
+      "file": "tools/emu_compare/qasm/hea_28q_d24.qasm",
+      "gates": {
+        "cx": 648,
+        "h": 28,
+        "rx": 672,
+        "rz": 324
+      },
+      "generator": "gen_workloads.py -> hea_qasm(28, 24)",
+      "qubits": 28,
+      "seed": null,
+      "sha256": "12ff32fd1001946c04f5454dd9735cf6d741b4fce0d0b8261565efb2a8a09c75",
+      "source": "crates/omega-backend-mps/examples/mps_stage_profile.rs:82-108 (entangling_circuit), exported once"
+    },
+    "lucj16": {
+      "depth": 22,
+      "dialect": "lenient",
+      "family": "lucj",
+      "file": "tools/emu_compare/qasm/lucj16_norb8_na4_r1_s0_j0.1.qasm",
+      "gates": {
+        "cp": 22,
+        "p": 32,
+        "rbs": 112,
+        "rz": 224,
+        "x": 8
+      },
+      "generator": "lucj_gen.py 8 4 lucj16_norb8_na4_r1_s0_j0.1.qasm --seed 0 --reps 1 --jastrow-scale 0.1",
+      "ingestion": "rbs is bare, so our arms read this file in the `lenient` QASM2 dialect and the ffsim arm does not read it at all \u2014 it builds the same ansatz from ffsim's own operators, as lucj_gen.py did. The shared-file contract is weaker here than for HEA/RANDOM-1/Clifford and the row must say so.",
+      "jastrow_scale": 0.1,
+      "qubits": 16,
+      "reps": 1,
+      "seed": 0,
+      "sha256": "9aa2d7835bb3b149b237481850ef58e27b4bc2f838434174052249eeb8ee2d08",
+      "source": "crates/omega-bridges/python/lucj_gen.py",
+      "venv": {
+        "ffsim": "0.0.84",
+        "numpy": "2.5.3",
+        "qiskit": "2.5.2",
+        "scipy": "1.18.1"
+      }
+    },
+    "random1-20q-d20": {
+      "depth": 20,
+      "dialect": "legacy",
+      "family": "random1",
+      "file": "tools/emu_compare/qasm/random1_20q_d20_s0.qasm",
+      "gates": {
+        "cx": 190,
+        "rx": 400,
+        "rz": 400
+      },
+      "generator": "gen_workloads.py -> random1_qasm(20, 20, 0)",
+      "qubits": 20,
+      "seed": 0,
+      "sha256": "4d4a39d60e4c2a26a9cad8190f8d4f5a5297f193c1456cc92dfcfd32d3d84c20",
+      "source": "generated"
+    },
+    "random1-24q-d20": {
+      "depth": 20,
+      "dialect": "legacy",
+      "family": "random1",
+      "file": "tools/emu_compare/qasm/random1_24q_d20_s0.qasm",
+      "gates": {
+        "cx": 230,
+        "rx": 480,
+        "rz": 480
+      },
+      "generator": "gen_workloads.py -> random1_qasm(24, 20, 0)",
+      "qubits": 24,
+      "seed": 0,
+      "sha256": "2426e1a93b2f280b767736a82b5dbef45b57ee1aaf9bd8f5983ee5f9d0390703",
+      "source": "generated"
+    },
+    "random1-26q-d20": {
+      "depth": 20,
+      "dialect": "legacy",
+      "family": "random1",
+      "file": "tools/emu_compare/qasm/random1_26q_d20_s0.qasm",
+      "gates": {
+        "cx": 250,
+        "rx": 520,
+        "rz": 520
+      },
+      "generator": "gen_workloads.py -> random1_qasm(26, 20, 0)",
+      "qubits": 26,
+      "seed": 0,
+      "sha256": "5f436687c160159de8ef5136fe161311b0bfdcac7ec31cd082a9387c0f98f2e1",
+      "source": "generated"
+    },
+    "random1-28q-d20": {
+      "depth": 20,
+      "dialect": "legacy",
+      "family": "random1",
+      "file": "tools/emu_compare/qasm/random1_28q_d20_s0.qasm",
+      "gates": {
+        "cx": 270,
+        "rx": 560,
+        "rz": 560
+      },
+      "generator": "gen_workloads.py -> random1_qasm(28, 20, 0)",
+      "qubits": 28,
+      "seed": 0,
+      "sha256": "e2fb668c7f7591f66940b211400b57c9ad790362f0f78c0f487fea131a94a19a",
+      "source": "generated"
+    }
+  },
+  "note": "Pinned workloads for PLAN-EMULATOR-COMPARISON \u00a73. Regenerate with tools/emu_compare/gen_workloads.py; verify with --check. Every row in docs/EMULATOR-COMPARISON.md names one of these ids and its sha256."
+}

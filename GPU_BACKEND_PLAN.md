@@ -110,9 +110,13 @@
 > 2. **Validate the reset mechanism in Lean 4 — deferred, not scheduled.**
 >    Prove that sample→project→flip implements `ρ → |0⟩⟨0|_q ⊗ Tr_q(ρ)`, i.e.
 >    that averaging the two branches weighted by their Born probabilities gives
->    the reset channel, alongside the existing
->    `verification/Verification/Adjoint/PauliExpectation.lean` work. Explicitly
->    out of scope for the fix that landed; recorded here so it is not lost.
+>    the reset channel. (This said "alongside the existing
+>    `verification/Verification/Adjoint/PauliExpectation.lean` work" — that
+>    file has never existed in either repo; see the retraction atop
+>    `crates/omega-backend-statevector/src/adjoint.rs`. There is no adjoint
+>    Lean work to sit alongside, so this would be starting from zero.)
+>    Explicitly out of scope for the fix that landed; recorded here so it is
+>    not lost.
 
 > Active dev repo: **`aria-quantum-language-oss-public`** (per the README banner,
 > all future dev lands here). The repository's contribution rules apply: local CI is the

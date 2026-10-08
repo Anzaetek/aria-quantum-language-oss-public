@@ -18,10 +18,11 @@
 use num_complex::Complex64;
 use omega_backend_pauliprop::PauliSum;
 
-/// Term count below which a device round-trip isn't worth it — small sums stay
-/// on the CPU. Overridable at runtime via `PAULIPROP_GPU_MIN` (mainly for tests
-/// that want to force the GPU path on a small sum).
-const DEFAULT_MIN_TERMS: usize = 256;
+/// Term count below which a device round-trip isn't worth it. One spelling in
+/// the base crate (`omega_backend_pauliprop::DEFAULT_GPU_MIN_TERMS`), shared
+/// with the Metal arm and pinned by
+/// `aria-runtime/tests/gpu_backend_constants_pinned.rs`.
+pub use omega_backend_pauliprop::DEFAULT_GPU_MIN_TERMS as DEFAULT_MIN_TERMS;
 
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 mod gpu;
@@ -44,12 +45,7 @@ pub fn gpu_branch_count() -> u64 {
     0
 }
 
-fn min_terms() -> usize {
-    std::env::var("PAULIPROP_GPU_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MIN_TERMS)
-}
+use omega_backend_pauliprop::gpu_min_terms as min_terms;
 
 /// GPU branch hook (see module docs). Signature matches
 /// `omega_backend_pauliprop::BranchHook`; install with

@@ -1,0 +1,12 @@
+// In-house FermionicQASM 1.0. No authority of a standard.
+// Syntax fixture only: signs and spin order live in conventions.json.
+FERMIONICQASM 1.0;
+mode m[4];
+mode s[2] spin;
+creg c[4];
+load m[0], m[1];
+num($theta) m[0];
+numnum(0.5) m[0], m[3];
+givens(-0.7) s[0], s[1];
+tunnel($phi) s[2], s[3];
+measure m[0] -> c[0];

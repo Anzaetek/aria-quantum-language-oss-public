@@ -129,6 +129,24 @@ pub fn minimize(
     max_iters: usize,
     lr: f64,
 ) -> Result<(f64, Vec<f64>), String> {
+    // One initial value per free symbol, exactly, on both transports.
+    // `minimize_native` used to pad a short `init` with 0.0 and the host
+    // used to zero-pad a short params vector; either turns an arity slip
+    // into a plausible energy instead of an error.
+    let n_sym = ir.symbols.len();
+    if n_params != n_sym || init.len() != n_params {
+        let names: Vec<String> = ir
+            .sorted_symbol_ids()
+            .into_iter()
+            .map(|id| ir.symbol_name(id))
+            .collect();
+        return Err(format!(
+            "minimize: n_params={n_params} and init has {} value(s), but the circuit has \
+             {n_sym} free parameter(s) [{}]; pass exactly one initial value per symbol",
+            init.len(),
+            names.join(", ")
+        ));
+    }
     match transport {
         Transport::WasmInProcess => {
             minimize_wasm(guest, ir, observable, n_params, init, max_iters, lr)
@@ -196,8 +214,8 @@ fn minimize_native(
     };
 
     let eps = 1e-6;
+    // `minimize` has already checked init.len() == n_params; no padding.
     let mut params = init;
-    params.resize(n_params, 0.0);
     let mut best_val = eval(&params)?;
     let mut best = params.clone();
     for _ in 0..max_iters {
@@ -426,5 +444,81 @@ pub fn native_statevector(ir: &CircuitIR) -> Result<Vec<num_complex::Complex64>,
     {
         ExecResult::Statevector(sv) => Ok(sv),
         other => Err(format!("expected statevector, got {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rx_theta_circuit() -> CircuitIR {
+        // RX(theta)|0>: <Z> = cos(theta). One free symbol, named.
+        let mut c = CircuitIR::new(1, omega_core::circuit::CircuitType::GateBased);
+        c.symbols.insert(0, "theta".into());
+        c.add_op(omega_core::circuit::GateOp {
+            gate: GateKind::Rx,
+            qubits: smallvec::smallvec![omega_core::circuit::Qubit(0)],
+            params: smallvec::smallvec![omega_core::circuit::ParamExpr::Symbol(0)],
+            classical_bit: None,
+            condition: None,
+        });
+        c
+    }
+
+    fn z0() -> Observable {
+        Observable::parse("1.0*Z0").unwrap()
+    }
+
+    #[test]
+    fn minimize_refuses_init_length_mismatch() {
+        // Short init used to be padded with 0.0 by minimize_native.
+        let err = minimize(
+            Transport::Native,
+            "unused",
+            rx_theta_circuit(),
+            z0(),
+            1,
+            vec![],
+            1,
+            0.1,
+        )
+        .unwrap_err();
+        assert!(err.contains("init has 0 value(s)"), "{err}");
+        assert!(err.contains("1 free parameter(s) [theta]"), "{err}");
+
+        // n_params disagreeing with the circuit is refused even when init
+        // matches n_params: the host would otherwise drop the extra angle.
+        let err = minimize(
+            Transport::Native,
+            "unused",
+            rx_theta_circuit(),
+            z0(),
+            2,
+            vec![0.1, 0.2],
+            1,
+            0.1,
+        )
+        .unwrap_err();
+        assert!(err.contains("n_params=2"), "{err}");
+    }
+
+    #[test]
+    fn minimize_native_runs_with_complete_init() {
+        // <Z> = cos(theta) is minimised at theta = pi; descending from 2.5
+        // must end below the starting value with a one-element optimum.
+        let start = 2.5_f64;
+        let (val, params) = minimize(
+            Transport::Native,
+            "unused",
+            rx_theta_circuit(),
+            z0(),
+            1,
+            vec![start],
+            20,
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(params.len(), 1);
+        assert!(val < start.cos(), "val={val} start={}", start.cos());
     }
 }

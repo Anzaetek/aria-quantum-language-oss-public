@@ -13,7 +13,10 @@ is a Rust workspace with Python bindings offering two engines:
      *expectation values*, not shot distributions.
   2. `GeneralizedTableau` — a stabilizer tableau extended with
      non-Clifford gates (T, R_X/R_Y/R_Z, U3) and measurements, which
-     *does* sample forward, including under noise and atom loss.
+     *does* sample forward, including under Pauli noise (see
+     `stim_noise.py` for the instructions ppvm 0.1.0 was observed to
+     accept; `HERALDED_ERASE`/`E` are rejected at parse time, so "atom
+     loss" is not something this bridge can reach).
 
 **Ingestion choice: `sample_stim` over `ppvm-cli`.** The counts
 protocol wants a forward shot distribution, so engine (2) is the only
@@ -43,13 +46,24 @@ Outcomes:
 - Gate outside the supported subset → `ppvm-unsupported-gate`.
 - QASM2 the converter cannot parse → `ppvm-lower`.
 - Sampling failure → `ppvm-execute`.
+- Noise the mapping cannot express (`amplitude_damping`, asymmetric
+  `readout`, an unrecognised key) → `ppvm-noise-not-supported`
+  → Rust surfaces `BridgeError::CannotExpress`.
+- Malformed noise (wrong shape/type) → `bad-request`.
+
+**Noise.** The counts path maps omega's `depolarizing`, `pauli`,
+`phase_damping` and symmetric `readout`/`readout_flip` onto Stim noise
+instructions with omega's placement and rate resolution — see
+`stim_noise.py` for the table and the two places where the obvious Stim
+spelling would have been wrong. The expectation mode carries no noise.
 
 Request shape:
 
   {
     "qasm":  "OPENQASM 2.0; ...",   # required
     "shots": 1024,                   # required, positive int
-    "seed":  42                      # optional
+    "seed":  42,                     # optional
+    "noise": {"depolarizing": 0.01}  # optional, omega's --noise vocabulary
   }
 
 Response shape (success):
@@ -79,6 +93,13 @@ from qasm2_stim import (  # noqa: E402
     UnsupportedGate,
     bits_to_counts,
     convert,
+)
+from stim_noise import (  # noqa: E402
+    REFUSED_KEYS,
+    SUPPORTED_KEYS,
+    NoiseInvalid,
+    NoiseRefused,
+    StimNoise,
 )
 
 
@@ -112,8 +133,18 @@ def main() -> int:
                 "capabilities": {
                     "backend": "ppvm",
                     "modes": ["execute", "expectation", "gates"],
-                    "noise_keys": [],
-                    "notes": "no noise model through this path",
+                    "noise_keys": list(SUPPORTED_KEYS),
+                    "notes": (
+                        "execute mode only: depolarizing -> DEPOLARIZE1 per "
+                        "qubit after each gate (omega's independent per-qubit "
+                        "kick, not DEPOLARIZE2); pauli -> PAULI_CHANNEL_1; "
+                        "phase_damping(l) -> Z_ERROR(l/2); symmetric readout -> "
+                        "M(p) record flip. Refused as ppvm-noise-not-supported: "
+                        + ", ".join(sorted(REFUSED_KEYS))
+                        + " (non-unital, not a Pauli channel) and asymmetric "
+                        "readout (p10 != p01 has no Stim instruction). "
+                        "expectation mode takes no noise"
+                    ),
                 },
             }
         )
@@ -140,23 +171,26 @@ def main() -> int:
         _err("`shots` must be a positive integer", kind="bad-request")
         return 0
 
-    # ppvm's tableau *does* model depolarising / Pauli / loss channels,
-    # but this bridge has no mapping from omega's opaque noise dict to
-    # those instructions yet. Refuse loudly rather than return a
-    # noiseless distribution to a caller who asked for noise.
+    # Map omega's noise dict onto Stim noise instructions (see
+    # `stim_noise.py`). Anything the mapping cannot express EXACTLY is
+    # refused by name rather than approximated or dropped: a noiseless
+    # distribution handed to a caller who asked for noise is the bug class
+    # this bridge exists to catch.
     noise = req.get("noise")
-    if noise:
-        _err(
-            f"the ppvm bridge does not map omega's noise config onto ppvm's "
-            f"noise instructions yet (request carried noise={noise!r}); rerun "
-            "without `noise` or use the qiskit bridge",
-            kind="ppvm-noise-not-supported",
-        )
-        return 0
+    stim_noise = None
+    if noise is not None and noise != {}:
+        try:
+            stim_noise = StimNoise(noise)
+        except NoiseRefused as e:
+            _err(str(e), kind="ppvm-noise-not-supported")
+            return 0
+        except NoiseInvalid as e:
+            _err(f"malformed noise: {e}", kind="bad-request")
+            return 0
 
     try:
         stim_text, n_qubits, clbit_of_measurement, n_clbits = convert(
-            qasm, GATE_SETS["ppvm"], _PPVM_EXPANSIONS
+            qasm, GATE_SETS["ppvm"], _PPVM_EXPANSIONS, stim_noise
         )
     except UnsupportedGate as e:
         _err(str(e), kind="ppvm-unsupported-gate")
@@ -279,6 +313,15 @@ def _expectation(req: dict) -> int:
 
     qasm = req.get("qasm")
     obs_in = req.get("observables")
+    # The expectation protocol carries no noise, and `PauliSum` here is
+    # driven noiselessly. Refuse rather than return a noiseless number to a
+    # request that carried a noise model (the CLI refuses the combination
+    # earlier; this covers a direct caller).
+    if req.get("noise"):
+        _err("the ppvm expectation mode takes no noise model; the noise "
+             "mapping applies to execute (counts) mode only",
+             kind="ppvm-noise-not-supported")
+        return 0
     if not isinstance(qasm, str) or not qasm.strip():
         _err("`qasm` must be a non-empty string", kind="bad-request")
         return 0

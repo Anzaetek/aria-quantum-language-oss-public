@@ -81,7 +81,7 @@ harnesses that reuse `spectra_heisenberg.aria` rather than shipping their own
 | sketch_qml | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
 | strongly_entangling | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
 | qasm_gpu | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
-| hhl | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
+| hhl | run | differential + closed form | forward ⟨Z_q⟩ profile vs independent statevector; **and** `hhl_is_really_hhl.rs`: QPE loads the integer eigenvalue (P = 1), the uncompute disentangles the counting register, `P(ancilla=1) = Σ\|βᵢ\|²(C/λᵢ)²`, and the post-selected branch satisfies `A·o = C·b` to < 5e-16 |
 | qsvt_invert | run | differential | forward ⟨Z_q⟩ profile vs independent statevector |
 | **shor_ecdlp** | **parse only** | **showcase** | parses + instantiates; does **not** lower — see [LIMITATIONS.md](LIMITATIONS.md) |
 
@@ -89,3 +89,13 @@ The faithful correctness of HHL and QSVT inversion is additionally established
 in Lean (`proofs/lean4/QuantumProofs/{HHL,QSVT}.lean`) and in the pure-Rust
 solvers (`omega_core::{solver, chebyshev}`); the differential run-gate above is
 the example-level integration check on top of those proofs.
+
+A differential run-gate on its own is a **transport** check: it compares two
+engines on the same lowered IR, so it agrees with itself on whatever the
+circuit happens to encode and cannot see a circuit-level defect. `hhl` is the
+one example where that was demonstrated rather than assumed — it reported
+`Δmax = 0.000e0 PASS` across three separate circuit repairs. Its second row
+above is checked against closed forms written from `A`, `C` and `b`, which is
+what makes it evidence about the algorithm rather than about the pipeline. See
+[LIMITATIONS.md](LIMITATIONS.md) for the (fixed, small) system `hhl.aria`
+actually solves.

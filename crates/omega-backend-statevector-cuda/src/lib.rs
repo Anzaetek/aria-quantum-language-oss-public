@@ -1056,6 +1056,7 @@ impl Backend for CudaStatevectorBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> OmegaResult<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         let n = circuit.num_qubits;
         let mut state = self.allocate(n)?;
 
@@ -1063,13 +1064,32 @@ impl Backend for CudaStatevectorBackend {
         // fold + renormalise, matching the CPU backend). Mid-circuit
         // measurement with collapse still isn't supported on GPU — refuse so
         // the CLI dispatcher can fall back to CPU.
-        for op in &circuit.ops {
-            if let GateKind::Measure = &op.gate {
-                if config.mid_circuit_mode == MidCircuitMode::Collapse {
-                    return Err(OmegaError::Unsupported(
-                        "cuda: mid-circuit measurement not yet implemented".into(),
-                    ));
-                }
+        //
+        // A `Measure` is not the only thing that makes collapse mode differ.
+        // With shots and a declared creg, the CPU keys every outcome on the
+        // CLASSICAL register (`collapses` in omega-backend-statevector), even
+        // when no `Measure` ever writes it — a circuit forced into collapse by
+        // a conditioned gate alone reads `0` at the creg width. This backend
+        // only has the qubit-register sampler, so answering that shape would
+        // return different keys at a different width. Refuse it too.
+        // `tests/counts_width_and_collapse.rs` pins the disagreement.
+        if config.mid_circuit_mode == MidCircuitMode::Collapse {
+            let has_measure = circuit
+                .ops
+                .iter()
+                .any(|op| matches!(op.gate, GateKind::Measure));
+            let keyed_on_creg = config.shots.is_some() && circuit.num_classical_bits > 0;
+            if has_measure {
+                return Err(OmegaError::Unsupported(
+                    "cuda: mid-circuit measurement not yet implemented".into(),
+                ));
+            }
+            if keyed_on_creg {
+                return Err(OmegaError::Unsupported(
+                    "cuda: collapse mode is not implemented here (counts key on the \
+                     classical register)"
+                        .into(),
+                ));
             }
         }
 
@@ -1160,6 +1180,7 @@ impl Backend for CudaStatevectorBackend {
         _params: &ParameterBinding,
         _config: &ExecConfig,
     ) -> OmegaResult<ExecResult> {
+        _circuit.refuse_qudits(self.name())?;
         Err(OmegaError::Backend(
             "cuda backend not available on this build (rebuild on Linux/Windows with --features cuda)".into(),
         ))
@@ -1172,6 +1193,7 @@ impl Backend for CudaStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<f64> {
+        circuit.refuse_qudits(self.name())?;
         // The device sweep skips `Measure`, which is the wrong answer for a
         // measurement that has consequences. Defer first, so what reaches the GPU
         // is a circuit with no measurements at all.
@@ -1205,6 +1227,7 @@ impl Backend for CudaStatevectorBackend {
         _params: &ParameterBinding,
         _observable: &Observable,
     ) -> OmegaResult<f64> {
+        _circuit.refuse_qudits(self.name())?;
         Err(OmegaError::Backend(
             "cuda backend not available on this build (rebuild on Linux/Windows with --features cuda)".into(),
         ))
@@ -1217,6 +1240,7 @@ impl Backend for CudaStatevectorBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> OmegaResult<Vec<f64>> {
+        circuit.refuse_qudits(self.name())?;
         if observables.is_empty() {
             return Ok(Vec::new());
         }
@@ -1256,6 +1280,7 @@ impl Backend for CudaStatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        circuit.refuse_qudits(self.name())?;
         // A gradient must obey the same contract as the expectation it
         // differentiates, or `expectation_multi_then_gradient` pairs a
         // mixture-valued prediction with a pure-state gradient in ONE call: the
@@ -1290,6 +1315,7 @@ impl Backend for CudaStatevectorBackend {
         _params: &ParameterBinding,
         _observable: &Observable,
     ) -> OmegaResult<Option<Vec<(SymbolId, f64)>>> {
+        _circuit.refuse_qudits(self.name())?;
         Ok(None)
     }
 
@@ -1301,6 +1327,7 @@ impl Backend for CudaStatevectorBackend {
         observables: &[Observable],
         gradient_observable_factory: GradientObservableFactory<'_>,
     ) -> OmegaResult<ExpectationsAndGradient> {
+        circuit.refuse_qudits(self.name())?;
         // Prepared FIRST, before the fallbacks below are considered. Deferral
         // removes every `Measure`, so a feedforward circuit takes the fast fused
         // path and — the point — the gradient returned belongs to the same
@@ -1513,6 +1540,7 @@ impl Backend for CudaStatevectorBackend {
         observables: &[Observable],
         gradient_observable_factory: GradientObservableFactory<'_>,
     ) -> OmegaResult<ExpectationsAndGradient> {
+        circuit.refuse_qudits(self.name())?;
         // Non-CUDA build: emulate the default trait body explicitly so
         // the fallback path stays predictable.
         let predictions = self.expectation_multi(circuit, params, observables)?;
@@ -1587,6 +1615,18 @@ pub(crate) fn apply_op(
         GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "cuda-statevector: gate {:?} is not supported on this backend",
+                op.gate
+            )));
+        }
+
+        // Qudit gates (PLAN-QUDIT.md Q2): a qudit circuit is refused at this
+        // engine's door by `refuse_qudits`, and on d = 2 wires these gates
+        // have no CUDA kernel yet — refused by name rather than swept into a
+        // wildcard, so the exhaustive match keeps catching new variants.
+        GateKind::Rxy | GateKind::CSum => {
+            return Err(OmegaError::Unsupported(format!(
+                "cuda-statevector: {:?} is a qudit gate with no CUDA kernel; on qubit \
+                 wires use rx/ry (for rxy) or cx (for csum)",
                 op.gate
             )));
         }

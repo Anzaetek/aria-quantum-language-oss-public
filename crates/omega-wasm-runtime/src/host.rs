@@ -196,10 +196,12 @@ impl HostState {
         })?;
 
         let _ticket = self.run_ticket(circuit, true)?;
-        let binding = build_binding(circuit, params);
+        let binding = build_binding(circuit, params)?;
 
         match circuit.circuit_type {
-            CircuitType::GateBased => {
+            // Fermionic ops are qubit gates, so the statevector expectation
+            // is the one that runs them.
+            CircuitType::GateBased | CircuitType::Fermionic => {
                 let backend = StatevectorBackend::new();
                 backend.expectation(circuit, &binding, observable)
             }
@@ -228,7 +230,7 @@ impl HostState {
         // The WASM backend is the dense statevector even in shot mode, so the
         // ticket prices analytic=true honestly (see admit_run's contract).
         let _ticket = self.run_ticket(circuit, true)?;
-        let binding = build_binding(circuit, params);
+        let binding = build_binding(circuit, params)?;
         let config = ExecConfig {
             shots: Some(shots),
             seed,
@@ -256,7 +258,7 @@ impl HostState {
             ))
         })?;
         let _ticket = self.run_ticket(circuit, true)?;
-        let binding = build_binding(circuit, params);
+        let binding = build_binding(circuit, params)?;
         let config = ExecConfig {
             shots: None,
             seed: None,
@@ -301,7 +303,7 @@ impl HostState {
         })?;
 
         let _ticket = self.run_ticket(circuit, true)?;
-        let binding = build_binding(circuit, params);
+        let binding = build_binding(circuit, params)?;
         let config = ExecConfig {
             shots: Some(1),
             seed,
@@ -344,7 +346,7 @@ impl HostState {
         // execution's state, so per-observable tickets would charge the same
         // occupancy N times.
         let _ticket = self.run_ticket(circuit, true)?;
-        let binding = build_binding(circuit, params);
+        let binding = build_binding(circuit, params)?;
         let backend = StatevectorBackend::new();
 
         let mut results = Vec::with_capacity(observable_ids.len());
@@ -381,10 +383,10 @@ impl HostState {
         })?;
 
         let _ticket = self.run_ticket(circuit, true)?;
-        let binding = build_binding(circuit, params);
+        let binding = build_binding(circuit, params)?;
 
         let grad_pairs = match circuit.circuit_type {
-            CircuitType::GateBased => {
+            CircuitType::GateBased | CircuitType::Fermionic => {
                 let backend = StatevectorBackend::new();
                 compute_gradient(
                     &backend,
@@ -429,7 +431,10 @@ impl HostState {
                 circuit_id
             ))
         })?;
-        if !matches!(circuit.circuit_type, CircuitType::GateBased) {
+        if !matches!(
+            circuit.circuit_type,
+            CircuitType::GateBased | CircuitType::Fermionic
+        ) {
             return Err(omega_core::error::OmegaError::Unsupported(
                 "compute_functional_gradient_from_spec: only gate-based circuits supported".into(),
             ));
@@ -455,7 +460,7 @@ impl HostState {
             }
         };
         let _ticket = self.run_ticket(circuit, true)?;
-        let binding = build_binding(circuit, params);
+        let binding = build_binding(circuit, params)?;
         let backend = StatevectorBackend::new();
         let grad_pairs =
             compute_functional_gradient(&backend, circuit, &binding, &functional, &method)?;
@@ -464,15 +469,16 @@ impl HostState {
 }
 
 /// Build a ParameterBinding from a circuit and a flat parameter array.
-fn build_binding(circuit: &CircuitIR, params: &[f64]) -> ParameterBinding {
-    let mut binding = ParameterBinding::new();
-    let mut symbol_ids: Vec<u32> = circuit.symbols.keys().copied().collect();
-    symbol_ids.sort();
-    for (i, &sym_id) in symbol_ids.iter().enumerate() {
-        let value = if i < params.len() { params[i] } else { 0.0 };
-        binding.bind(sym_id, value);
-    }
-    binding
+///
+/// Refuses a vector whose length differs from the circuit's free-symbol
+/// count. This used to pad missing symbols with 0.0 and drop extras,
+/// silently — which is how a guest with a hard-coded NUM_PARAMS=2 once
+/// optimised two of four angles and still reported a plausible energy
+/// (tests/vqe_integration.rs). The guest sees the refusal the way it sees
+/// every other host error: a message on stderr and NaN / a zero gradient
+/// from the ABI call, never a substituted number.
+fn build_binding(circuit: &CircuitIR, params: &[f64]) -> Result<ParameterBinding> {
+    ParameterBinding::from_flat(circuit, params)
 }
 
 /// Create an H2 Hamiltonian (simplified 1-qubit model for testing).
@@ -636,7 +642,7 @@ mod tests {
         use omega_core::executor::Backend;
         let backend = StatevectorBackend::new();
         let circuit_ref = &state.circuits[&cid];
-        let binding = build_binding(circuit_ref, &params);
+        let binding = build_binding(circuit_ref, &params).expect("complete binding");
         let func = omega_core::gradient::Functional::Qubo(
             omega_core::qubo::Qubo::from_json(r#"{"n":2,"Q":[[0,0,1.0],[1,1,2.0]]}"#).unwrap(),
         );
@@ -857,40 +863,78 @@ mod tests {
         assert!(coeffs.contains(&0.1809));
     }
 
-    #[test]
-    fn test_build_binding_pads_missing_params_with_zero() {
-        // Circuit has 3 free symbols but caller passes 2 values —
-        // remaining symbols default to 0.0. This is the documented
-        // behaviour the WASM guests rely on for variable-arity
-        // ansätze.
+    fn three_symbol_circuit() -> CircuitIR {
         let mut circuit = CircuitIR::new(1, CircuitType::GateBased);
         circuit.symbols.insert(0, "a".into());
         circuit.symbols.insert(1, "b".into());
         circuit.symbols.insert(2, "c".into());
-        let binding = build_binding(&circuit, &[1.5, 2.5]);
-        assert!(
-            (binding
-                .resolve(&omega_core::circuit::ParamExpr::Symbol(0))
-                .unwrap()
-                - 1.5)
-                .abs()
-                < 1e-12
-        );
-        assert!(
-            (binding
-                .resolve(&omega_core::circuit::ParamExpr::Symbol(1))
-                .unwrap()
-                - 2.5)
-                .abs()
-                < 1e-12
-        );
-        // Symbol 2 wasn't supplied — must default to 0.0, not error.
-        assert!(
-            binding
-                .resolve(&omega_core::circuit::ParamExpr::Symbol(2))
-                .unwrap()
-                .abs()
-                < 1e-12
-        );
+        circuit
+    }
+
+    #[test]
+    fn test_build_binding_refuses_missing_params() {
+        // Circuit has 3 free symbols but caller passes 2 values. This used
+        // to bind `c` to 0.0 silently; the refusal must name it and the
+        // expected count so a guest with the wrong arity can see why.
+        let circuit = three_symbol_circuit();
+        match build_binding(&circuit, &[1.5, 2.5]) {
+            Err(omega_core::error::OmegaError::ParameterCount {
+                expected,
+                got,
+                unbound,
+            }) => {
+                assert_eq!((expected, got), (3, 2));
+                assert_eq!(unbound, vec!["c".to_string()]);
+            }
+            other => panic!("expected ParameterCount refusal, got {other:?}"),
+        }
+        // Too many values is refused too: extras would have been dropped.
+        assert!(build_binding(&circuit, &[1.0, 2.0, 3.0, 4.0]).is_err());
+    }
+
+    #[test]
+    fn test_build_binding_complete_params_bind_by_sorted_id() {
+        let circuit = three_symbol_circuit();
+        let binding = build_binding(&circuit, &[1.5, 2.5, 3.5]).unwrap();
+        for (id, want) in [(0, 1.5), (1, 2.5), (2, 3.5)] {
+            let got = binding
+                .resolve(&omega_core::circuit::ParamExpr::Symbol(id))
+                .unwrap();
+            assert!((got - want).abs() < 1e-12, "symbol {id}: {got} != {want}");
+        }
+    }
+
+    fn rx_theta_circuit() -> CircuitIR {
+        let mut c = CircuitIR::new(1, CircuitType::GateBased);
+        c.symbols.insert(0, "theta".into());
+        c.add_op(GateOp {
+            gate: GateKind::Rx,
+            qubits: smallvec![Qubit(0)],
+            params: smallvec![ParamExpr::Symbol(0)],
+            classical_bit: None,
+            condition: None,
+        });
+        c
+    }
+
+    #[test]
+    fn test_execute_expectation_refuses_missing_param_and_runs_complete() {
+        // End to end through the host API the guest ABI calls: an empty
+        // params vector on a one-parameter circuit is an error, not
+        // <Z> at theta=0 (which would be a plausible 1.0).
+        let mut state = HostState::new();
+        let cid = state.register_circuit(rx_theta_circuit());
+        let oid = state.register_observable(Observable {
+            terms: vec![(1.0, vec![(0, PauliOp::Z)])],
+        });
+        let err = state.execute_expectation(cid, &[], oid).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("1 free parameter(s)"), "{msg}");
+        assert!(msg.contains("theta"), "{msg}");
+
+        // RX(theta)|0>: <Z> = cos(theta).
+        let theta = 1.0_f64;
+        let z = state.execute_expectation(cid, &[theta], oid).unwrap();
+        assert!((z - theta.cos()).abs() < 1e-10, "<Z> = {z}");
     }
 }

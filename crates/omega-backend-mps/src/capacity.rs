@@ -41,36 +41,44 @@ const BYTES_PER_AMPLITUDE: u128 = 16;
 /// Env var that skips the check, mirroring the statevector guard's.
 pub const OVERSUBSCRIBE_VAR: &str = "OMEGA_MPS_ALLOW_OVERSUBSCRIBE";
 
-/// Largest bond the cut left of site `i` can carry, for an `n`-site chain.
-///
-/// `2^min(i, n-i)`, saturating: a cut with `k` qubits on one side has Schmidt
-/// rank at most `2^k`, and past 63 the shift would overflow long before any
-/// real χ is reached.
-fn max_bond_at(i: usize, n: usize) -> u128 {
-    let k = i.min(n - i);
-    if k >= 63 {
-        u128::MAX
-    } else {
-        1u128 << k
-    }
+/// Saturating product of local dimensions — the Hilbert-space size of a
+/// sub-chain, which is also the Schmidt-rank ceiling of any cut that leaves
+/// that sub-chain on one side.
+fn hilbert_dim(dims: &[u32]) -> u128 {
+    dims.iter()
+        .fold(1u128, |acc, &d| acc.saturating_mul(d as u128))
 }
 
-/// Worst-case bytes the site tensors can occupy at bond ceiling `chi`.
+/// Largest bond the cut left of site `i` can carry, for a chain whose sites
+/// have local dimensions `dims`.
+///
+/// `min(∏_{j<i} d_j, ∏_{j>=i} d_j)`, saturating: a cut is bounded by the
+/// smaller Hilbert space on either side of it. For qubits that is the old
+/// `2^min(i, n−i)`; for a d = 3 register it is `3^min(i, n−i)`, and a guard
+/// that kept the `2` would under-charge every qutrit chain by `(3/2)^k`.
+fn max_bond_at(i: usize, dims: &[u32]) -> u128 {
+    hilbert_dim(&dims[..i]).min(hilbert_dim(&dims[i..]))
+}
+
+/// Worst-case bytes the site tensors can occupy at bond ceiling `chi`, for a
+/// chain whose sites have local dimensions `dims` (PLAN-QUDIT.md Q3: the MPS
+/// core carries a per-site physical dimension, so the guard must too).
 ///
 /// Counts the tensors only. Working space for a two-site split is charged
-/// separately by [`split_workspace_bytes`], because it is transient and scales
-/// with χ alone rather than with `n`.
-pub fn tensor_bytes(n: usize, chi: usize) -> u128 {
+/// separately by [`split_workspace_bytes_dims`], because it is transient and
+/// scales with χ alone rather than with `n`.
+pub fn tensor_bytes_dims(dims: &[u32], chi: usize) -> u128 {
+    let n = dims.len();
     if n == 0 {
         return 0;
     }
     let chi = chi as u128;
     let mut total: u128 = 0;
-    for i in 0..n {
-        let left = max_bond_at(i, n).min(chi);
-        let right = max_bond_at(i + 1, n).min(chi);
+    for (i, &d) in dims.iter().enumerate() {
+        let left = max_bond_at(i, dims).min(chi);
+        let right = max_bond_at(i + 1, dims).min(chi);
         total = total.saturating_add(
-            left.saturating_mul(2)
+            left.saturating_mul(d as u128)
                 .saturating_mul(right)
                 .saturating_mul(BYTES_PER_AMPLITUDE),
         );
@@ -78,35 +86,53 @@ pub fn tensor_bytes(n: usize, chi: usize) -> u128 {
     total
 }
 
-/// Transient working space for one two-site split at bond ceiling `chi`.
+/// [`tensor_bytes_dims`] for an all-qubit chain of `n` sites.
+pub fn tensor_bytes(n: usize, chi: usize) -> u128 {
+    tensor_bytes_dims(&vec![2; n], chi)
+}
+
+/// Transient working space for one two-site split at bond ceiling `chi` on a
+/// chain whose largest local dimension is `d_max`.
 ///
-/// The split matrix is `2χ × 2χ`, and the one-sided Jacobi SVD keeps a working
-/// copy plus the accumulated rotations, so charge three of them. This is the
-/// term that makes a large χ expensive even on a short chain.
-pub fn split_workspace_bytes(chi: usize) -> u128 {
+/// The split matrix is `(d·χ) × (d·χ)` for a two-site gate on `d`-dimensional
+/// sites — `2χ × 2χ` for qubits, `3χ × 3χ` for qutrits — and the one-sided
+/// Jacobi SVD keeps a working copy plus the accumulated rotations, so charge
+/// three of them. This is the term that makes a large χ expensive even on a
+/// short chain.
+pub fn split_workspace_bytes_dims(dims: &[u32], chi: usize) -> u128 {
+    let d_max = dims.iter().copied().max().unwrap_or(2) as u128;
     let chi = chi as u128;
-    let matrix = chi
-        .saturating_mul(2)
-        .saturating_mul(chi.saturating_mul(2))
+    let side = chi.saturating_mul(d_max);
+    let matrix = side
+        .saturating_mul(side)
         .saturating_mul(BYTES_PER_AMPLITUDE);
     matrix.saturating_mul(3)
 }
 
-/// Refuse an MPS run this host cannot hold.
-pub fn check(n: usize, chi: usize) -> Result<()> {
+/// [`split_workspace_bytes_dims`] for a qubit chain.
+pub fn split_workspace_bytes(chi: usize) -> u128 {
+    split_workspace_bytes_dims(&[2], chi)
+}
+
+/// Refuse an MPS run this host cannot hold, for a chain whose sites have
+/// local dimensions `dims` (one entry per wire, `2` for a qubit).
+pub fn check_dims(dims: &[u32], chi: usize) -> Result<()> {
     if std::env::var(OVERSUBSCRIBE_VAR).is_ok_and(|v| v == "1") {
         return Ok(());
     }
     let Some(available) = hostmem::available_bytes() else {
         return Ok(());
     };
-    let need = tensor_bytes(n, chi).saturating_add(split_workspace_bytes(chi));
+    let n = dims.len();
+    let d_max = dims.iter().copied().max().unwrap_or(2);
+    let need = tensor_bytes_dims(dims, chi).saturating_add(split_workspace_bytes_dims(dims, chi));
     if need > available as u128 {
         return Err(OmegaError::Unsupported(format!(
-            "an MPS of {n} sites at bond dimension {chi} needs up to {} \
-             (tensors + one split's working space) but only {} is available on \
-             this host — refusing rather than driving it into swap. A site \
-             tensor is 32*chi^2 bytes, so halving chi quarters this. Options: \
+            "an MPS of {n} sites (local dimension up to {d_max}) at bond \
+             dimension {chi} needs up to {} (tensors + one split's working \
+             space) but only {} is available on this host — refusing rather \
+             than driving it into swap. A site tensor is 16*d*chi^2 bytes \
+             (32*chi^2 for a qubit), so halving chi quarters this. Options: \
              pin a smaller bond with `--backend mps:<chi>`, let `mps:auto` \
              grow only as far as it needs, or set {OVERSUBSCRIBE_VAR}=1 if you \
              know this host can take it. Note that a smaller chi is an \
@@ -117,6 +143,11 @@ pub fn check(n: usize, chi: usize) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// [`check_dims`] for an all-qubit chain of `n` sites.
+pub fn check(n: usize, chi: usize) -> Result<()> {
+    check_dims(&vec![2; n], chi)
 }
 
 /// Hard ceiling for a *dense* materialisation, matching the statevector
@@ -178,66 +209,88 @@ pub const MAX_DENSE_QUBITS: u32 = 64;
 /// is so large that nothing is discarded, the certificate is clean, and the run
 /// proceeds at maximum cost. The two guards bracket the useful range from
 /// opposite sides, and B4 lived in the gap above the upper one.
-pub fn dense_is_cheaper(n: usize, chi: usize) -> Option<String> {
-    // `1 << n` overflows past 63 and the dense path is unreachable there
-    // anyway — the statevector backend refuses above 64 qubits on the same
-    // arithmetic. No advisory to give.
-    if n >= 63 {
-        return None;
-    }
-    let dense = 1u128 << n;
-    // Upper bound on MPS amplitudes: `n` tensors of `chi x 2 x chi`. An upper
-    // bound is the right side to err on for an ADVISORY — it is the size the
-    // caller has authorised, whether or not the bond grows to meet it.
-    let mps = (n as u128)
-        .saturating_mul(chi as u128)
-        .saturating_mul(chi as u128)
-        .saturating_mul(2);
+pub fn dense_is_cheaper_dims(dims: &[u32], chi: usize) -> Option<String> {
+    let n = dims.len();
+    // `∏ d_i` past `2^63` is unreachable for the dense path anyway — the
+    // statevector backend refuses above 64 qubits on the same arithmetic, and
+    // a qudit chain hits the same ceiling sooner. No advisory to give.
+    let dense = dims
+        .iter()
+        .try_fold(1u128, |acc, &d| acc.checked_mul(d as u128))
+        .filter(|&dense| dense < (1u128 << 63))?;
+    // Upper bound on MPS amplitudes: `n` tensors of `chi x d_i x chi`. An
+    // upper bound is the right side to err on for an ADVISORY — it is the size
+    // the caller has authorised, whether or not the bond grows to meet it.
+    let chi2 = (chi as u128).saturating_mul(chi as u128);
+    let mps = dims.iter().fold(0u128, |acc, &d| {
+        acc.saturating_add(chi2.saturating_mul(d as u128))
+    });
     if mps <= dense {
         return None;
     }
     let ratio = mps as f64 / dense as f64;
+    let d_max = dims.iter().copied().max().unwrap_or(2);
+    let what = if d_max == 2 { "qubits" } else { "sites" };
     Some(format!(
-        "mps chi={chi} at {n} qubits allocates up to {mps} amplitudes against \
+        "mps chi={chi} at {n} {what} allocates up to {mps} amplitudes against \
          the dense statevector's {dense} — {ratio:.1}x LARGER than the state it \
          encodes, so `--backend statevector` will be faster and exact. MPS pays \
-         off when the bond stays small; above chi ~= 2^(n/2) it cannot. \
+         off when the bond stays small; above chi ~= d^(n/2) it cannot. \
          Proceeding anyway (this is advice, not a refusal)."
     ))
 }
 
+/// [`dense_is_cheaper_dims`] for an all-qubit chain of `n` sites.
+pub fn dense_is_cheaper(n: usize, chi: usize) -> Option<String> {
+    dense_is_cheaper_dims(&vec![2; n], chi)
+}
+
 /// exponential, and that is a real improvement worth making. Until then the
 /// limit is stated rather than discovered by the kernel.
-pub fn check_dense(n: u32) -> Result<()> {
-    if n >= MAX_DENSE_QUBITS {
+pub fn check_dense_dims(dims: &[u32]) -> Result<()> {
+    let n = dims.len();
+    // `∏ d_i` must fit the `usize` index space the dense vector is addressed
+    // with; for qubits that is the `n < 64` ceiling the statevector backend
+    // shares, and a qudit chain reaches it at a smaller `n`.
+    let amplitudes = dims
+        .iter()
+        .try_fold(1u128, |acc, &d| acc.checked_mul(d as u128))
+        .filter(|&a| a < (1u128 << MAX_DENSE_QUBITS));
+    let Some(amplitudes) = amplitudes else {
         return Err(OmegaError::Unsupported(format!(
-            "an MPS analytic run contracts to a dense {n}-qubit statevector, \
-             and 2^{n} indices do not fit in a 64-bit usize. Use shots \
-             (`--shots N`) so the run samples from the tensors instead of \
-             materialising them."
+            "an MPS analytic run contracts to a dense statevector over {n} \
+             sites, and its index space (the product of the local dimensions) \
+             does not fit in a 64-bit usize. Use shots (`--shots N`) so the run \
+             samples from the tensors instead of materialising them."
         )));
-    }
+    };
     if std::env::var(OVERSUBSCRIBE_VAR).is_ok_and(|v| v == "1") {
         return Ok(());
     }
     let Some(available) = hostmem::available_bytes() else {
         return Ok(());
     };
-    let need = (1u128 << n) * BYTES_PER_AMPLITUDE;
+    let need = amplitudes.saturating_mul(BYTES_PER_AMPLITUDE);
     if need > available as u128 {
         return Err(OmegaError::Unsupported(format!(
             "an MPS analytic run (no shots) contracts the tensors into a DENSE \
-             {n}-qubit statevector needing {}, but only {} is available on this \
+             {n}-site statevector needing {}, but only {} is available on this \
              host — refusing rather than being killed part-way through. The \
-             bond dimension does not bound this: the dense form is 2^n \
-             regardless of how little entanglement the state has. Use \
-             `--shots N` to sample from the tensors instead, which stays \
-             proportional to the bond dimension.",
+             bond dimension does not bound this: the dense form is the full \
+             product of the local dimensions (2^n for qubits) regardless of \
+             how little entanglement the state has. Use `--shots N` to sample \
+             from the tensors instead, which stays proportional to the bond \
+             dimension.",
             hostmem::human_bytes(need),
             hostmem::human_bytes(available as u128),
         )));
     }
     Ok(())
+}
+
+/// [`check_dense_dims`] for an all-qubit chain of `n` sites.
+pub fn check_dense(n: u32) -> Result<()> {
+    check_dense_dims(&vec![2; n as usize])
 }
 
 #[cfg(test)]
@@ -313,6 +366,132 @@ mod tests {
     #[test]
     fn an_empty_chain_costs_nothing() {
         assert_eq!(tensor_bytes(0, 64), 0);
+        assert_eq!(tensor_bytes_dims(&[], 64), 0);
+    }
+
+    /// The qubit wrappers must be the `d = 2` row of the dims arithmetic —
+    /// not a separate formula that can drift.
+    #[test]
+    fn the_qubit_wrappers_are_the_all_two_row() {
+        for (n, chi) in [(1usize, 4usize), (10, 1024), (60, 64), (3, 1)] {
+            let dims = vec![2u32; n];
+            assert_eq!(
+                tensor_bytes(n, chi),
+                tensor_bytes_dims(&dims, chi),
+                "n={n} chi={chi}"
+            );
+            assert_eq!(
+                split_workspace_bytes(chi),
+                split_workspace_bytes_dims(&dims, chi)
+            );
+            assert_eq!(dense_is_cheaper(n, chi), dense_is_cheaper_dims(&dims, chi));
+        }
+    }
+
+    /// PLAN-QUDIT.md Q3: the bond ceiling at a cut is the smaller Hilbert
+    /// space beside it, so a qutrit chain is charged `3^k`, not `2^k`, where
+    /// the chain is too short to reach χ. Checked from both sides: the exact
+    /// per-site figure, and that a `2^k` guard would have under-charged it.
+    #[test]
+    fn a_qutrit_chain_is_charged_its_own_schmidt_ceiling() {
+        // Three qutrits at χ = 1024: cuts carry 1, 3, 3, 1 (never near χ), so
+        // site tensors are 1·3·3, 3·3·3, 3·3·1 amplitudes = 45 × 16 bytes.
+        assert_eq!(
+            tensor_bytes_dims(&[3, 3, 3], 1024),
+            45 * BYTES_PER_AMPLITUDE
+        );
+        // Three qubits on the same arithmetic: 1·2·2 + 2·2·2 + 2·2·1 = 16.
+        assert_eq!(
+            tensor_bytes_dims(&[2, 2, 2], 1024),
+            16 * BYTES_PER_AMPLITUDE
+        );
+        // A wide qutrit chain at the χ cap costs 3/2 of the qubit chain: the
+        // per-site tensor is χ·d·χ.
+        let qubit = tensor_bytes_dims(&vec![2; 60], 64);
+        let qutrit = tensor_bytes_dims(&vec![3; 60], 64);
+        assert!(
+            qutrit > qubit,
+            "a qutrit chain must cost more than a qubit chain"
+        );
+        assert!(
+            qutrit < qubit * 2,
+            "at the chi cap a qutrit site is 3/2 of a qubit site, not more: {qutrit} vs {qubit}"
+        );
+        // Mixed radix: the largest local dimension sizes the split workspace.
+        assert_eq!(
+            split_workspace_bytes_dims(&[2, 5, 3], 8),
+            3 * (5 * 8) * (5 * 8) * BYTES_PER_AMPLITUDE
+        );
+    }
+
+    /// The dense guard must count `∏ d_i`, not `2^n`: 41 qutrits is `3^41`
+    /// ≈ 3.6 × 10¹⁹ amplitudes, past the `usize` index space (`2^64` ≈
+    /// 1.8 × 10¹⁹) where 41 qubits would have been a mere 32 TiB; 30 qutrits
+    /// is `3^30` ≈ 2 × 10¹⁴ × 16 B, which fits `usize` but no host — a `2^30`
+    /// guard would have admitted it at 16 GiB.
+    ///
+    /// The admitted qubit row is derived from what the host actually has, not
+    /// pinned at 30 qubits: 2^30 × 16 B is 16 GiB, which a 16 GB laptop can
+    /// never have free, and a test that asserts one host's memory is red on
+    /// every other. Without a memory probe the guard admits everything below
+    /// `usize` by design, so the host rows are a registered skip there.
+    #[test]
+    fn the_dense_guard_counts_the_product_of_local_dimensions() {
+        // Index-space rows: the same on every host.
+        let err = check_dense_dims(&[3; 41]).expect_err("3^41 must be refused");
+        assert!(format!("{err}").contains("usize"), "{err}");
+        // The qubit chain of the same length sits inside the index space:
+        // 2^41 is 32 TiB, so a host refuses it, but never for the usize reason.
+        if let Err(err) = check_dense(41) {
+            let msg = format!("{err}");
+            assert!(
+                !msg.contains("usize"),
+                "2^41 fits usize; refused for the wrong reason: {msg}"
+            );
+            assert!(msg.contains("available on this host"), "{msg}");
+        }
+
+        // Host rows: need the probe.
+        let Some(available) = hostmem::available_bytes() else {
+            eprintln!(
+                "SKIP: no host-memory probe on this platform; the host rows of \
+                 the dense guard are not exercised here"
+            );
+            return;
+        };
+        let err = check_dense_dims(&[3; 30]).expect_err("3^30 amplitudes (3.3 TB) must be refused");
+        assert!(format!("{err}").contains("shots"), "{err}");
+        // The largest 2^k that fits half of what is available now: k ≈ 28 on
+        // a 16 GB laptop, ≈ 31 on a 123 GB workstation. Half, so the row
+        // survives the probe drifting between this line and the guard's own.
+        let budget = (available as u128 / BYTES_PER_AMPLITUDE).max(2);
+        let k = (budget / 2).ilog2();
+        check_dense(k).expect("the qubit row within this host's memory stays admitted");
+        // One doubling past the whole budget is refused, and for the host
+        // reason, not the index-space one.
+        let over = budget.ilog2() + 1;
+        let err =
+            check_dense(over).expect_err("one doubling past the host's memory must be refused");
+        assert!(format!("{err}").contains("available on this host"), "{err}");
+    }
+
+    /// The crossover advisory for qutrits sits where `n·d·χ² > d^n`.
+    #[test]
+    fn the_dense_advisory_uses_the_qudit_hilbert_space() {
+        // 10 qutrits: dense = 3^10 = 59049; mps at χ = 8 is 10·3·64 = 1920 (quiet),
+        // at χ = 64 it is 10·3·4096 = 122880 (loud).
+        assert!(dense_is_cheaper_dims(&[3; 10], 8).is_none());
+        let msg = dense_is_cheaper_dims(&[3; 10], 64).expect("must warn");
+        assert!(
+            msg.contains("59049"),
+            "should quote the qutrit dense size: {msg}"
+        );
+        assert!(
+            msg.contains("sites"),
+            "should not call qutrits qubits: {msg}"
+        );
+        // Past the index-space ceiling there is no dense path to point at.
+        assert!(dense_is_cheaper_dims(&[3; 41], 1 << 20).is_none());
     }
 
     /// **The case that was killed by the OOM killer.** A one-gate 40-qubit

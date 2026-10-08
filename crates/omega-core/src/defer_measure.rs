@@ -322,20 +322,35 @@ pub fn prepare_for_expectation(
     circuit: &CircuitIR,
     observable: &crate::executor::Observable,
 ) -> crate::error::Result<(CircuitIR, crate::executor::Observable)> {
+    let (circuit, measured) = prepare_circuit_for_expectation(circuit)?;
+    let dephased = observable.dephase(&measured);
+    Ok((circuit, dephased))
+}
+
+/// The circuit half of [`prepare_for_expectation`]: the deferred circuit and
+/// the consequential measured qubits, with no observable in hand. For a
+/// caller whose observable is not a Pauli `Observable` — majoranaprop seeding
+/// a fermionic operator straight into the Majorana basis — and which must
+/// therefore dephase in its own basis. The obligation is unchanged: the
+/// returned qubit list MUST be dephased on, by the caller, before anything is
+/// evolved; the module-level wrong answer is the same wrong answer in every
+/// basis.
+pub fn prepare_circuit_for_expectation(
+    circuit: &CircuitIR,
+) -> crate::error::Result<(CircuitIR, Vec<u32>)> {
     if !circuit
         .ops
         .iter()
         .any(|op| matches!(op.gate, GateKind::Measure))
     {
-        return Ok((circuit.clone(), observable.clone()));
+        return Ok((circuit.clone(), Vec::new()));
     }
     let deferred = defer_measurements(circuit).map_err(|why| {
         crate::error::OmegaError::Unsupported(format!(
             "expectation is not defined for this circuit: {why}"
         ))
     })?;
-    let dephased = observable.dephase(&deferred.measured);
-    Ok((deferred.circuit, dephased))
+    Ok((deferred.circuit, deferred.measured))
 }
 
 /// [`prepare_for_expectation`] for the `expectation_multi` entry points.

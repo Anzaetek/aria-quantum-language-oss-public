@@ -1,5 +1,6 @@
 #![allow(clippy::needless_range_loop)]
-//! CUDA-accelerated truncated SVD for MPS bond compression via cuSOLVER `gesvdj`.
+//! CUDA-accelerated truncated SVD for MPS bond compression via cuSOLVER's
+//! exact `cusolverDnZgesvd`.
 //!
 //! # Why CUDA can do what Metal can't
 //!
@@ -8,8 +9,18 @@
 //! CUDA Graphs amortisation — that change which SVD algorithms fit
 //! the hardware. The Metal arm (sibling crate
 //! `omega-backend-mps-metal`) had to defer SVD-on-GPU entirely; the
-//! CUDA arm runs the SVD on-GPU end-to-end via `cusolverDnZgesvdj`
-//! (Jacobi SVD, f64-complex throughout).
+//! CUDA arm runs the SVD on-GPU via `cusolverDnZgesvd` (bidiagonalisation +
+//! QR, f64-complex throughout), computing the full thin SVD and truncating on
+//! the host with the CPU kernel's rule. It used to call the *approximate*
+//! `Zgesvda`, which made truncating runs ~6 orders less accurate than the CPU
+//! (see the `gesvdj` module doc; the module keeps its old name).
+//!
+//! # Dispatch is counted
+//!
+//! Every SVD through [`cuda_svd_flat`] is counted per thread as a GPU call or
+//! a CPU fallback with its reason — [`cuda_svd_dispatch`] /
+//! [`reset_cuda_svd_dispatch`]. The fallback is per call and does not change
+//! the result's shape, so without the counters it cannot be seen.
 //!
 //! # API
 //!
@@ -29,7 +40,7 @@
 //! - Default features → entry point routes to the CPU Jacobi SVD.
 //!   Mirrors `omega-backend-mps-metal` so the workspace builds on
 //!   every platform with `cargo build --workspace`.
-//! - `--features cuda` on Linux/Windows → calls cuSOLVER `Zgesvdj`.
+//! - `--features cuda` on Linux/Windows → calls cuSOLVER `Zgesvd`.
 //! - `--features cuda` on macOS → still compiles (cudarc is
 //!   target-gated). The entry point falls back to CPU.
 //! - `--features cuda` on Linux without a CUDA driver → compiles, but
@@ -101,20 +112,122 @@ pub fn cuda_truncated_svd(
 // the SVD itself. `CudaSvdContext` is `!Send` (holds `RefCell` + driver
 // handles), so a thread-local is exactly the right home; MPS execution runs on
 // one thread per backend call. The outer `Option` is "did we try to init yet",
-// the inner is "is a device actually present".
+// the inner `Result` is "is a device actually present" — and if not, why not,
+// so every call that then falls back is counted with its reason.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+type ContextSlot = Option<Result<gesvdj::CudaSvdContext, &'static str>>;
+
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 thread_local! {
-    static CUDA_SVD_CTX: std::cell::RefCell<Option<Option<gesvdj::CudaSvdContext>>> =
-        const { std::cell::RefCell::new(None) };
+    static CUDA_SVD_CTX: std::cell::RefCell<ContextSlot> = const { std::cell::RefCell::new(None) };
+}
+
+/// Where this thread's MPS bond-compression SVDs actually ran — the GPU, or
+/// the CPU Jacobi kernel after the device path failed.
+///
+/// [`cuda_svd_flat`] (and `CudaSvdContext::apply_2q`) fall back to the CPU
+/// **per call**. The result is correct either way, which is exactly why the
+/// fallback is invisible without this: a run measured, or reported, as a CUDA
+/// run did 20-45% of its SVDs on the CPU (`STATUS.md` §5.16), and only a
+/// harness's own shadow counters caught it. Read it after a run; a non-zero
+/// `cpu_fallbacks` means the run was not a pure device run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaSvdDispatch {
+    /// SVDs the device solved (`cusolverDnZgesvd`, result used).
+    pub gpu_calls: u64,
+    /// SVDs that went to `omega_backend_mps::svd::truncated_svd_flat` instead.
+    pub cpu_fallbacks: u64,
+    /// Why the most recent fallback happened: the CUDA context was unavailable
+    /// (no device / driver, or a missing symbol), the solver reported
+    /// `info != 0`, a device allocation or memcpy failed, the solver returned
+    /// an error status, or the `cuda` feature is not compiled in.
+    pub last_fallback: Option<&'static str>,
+}
+
+thread_local! {
+    /// This thread's [`CudaSvdDispatch`].
+    ///
+    /// **Thread-local, deliberately**, for the reason
+    /// `omega_backend_statevector_metal::reset_shots_cpu_fallback_count`
+    /// gives: `cargo test` runs other tests' SVDs on parallel threads, and a
+    /// process-global atomic read before and after a run would count theirs
+    /// as this run's. The SVD hook is entered and returns on the thread that
+    /// drives the MPS evolution (the CPU kernel may use rayon inside, but the
+    /// hook itself is not called from a worker), so a thread-local count is
+    /// the caller's.
+    static CUDA_SVD_DISPATCH: std::cell::Cell<CudaSvdDispatch> = const {
+        std::cell::Cell::new(CudaSvdDispatch {
+            gpu_calls: 0,
+            cpu_fallbacks: 0,
+            last_fallback: None,
+        })
+    };
+}
+
+/// This thread's SVD dispatch counts since the last
+/// [`reset_cuda_svd_dispatch`]. See [`CudaSvdDispatch`].
+pub fn cuda_svd_dispatch() -> CudaSvdDispatch {
+    CUDA_SVD_DISPATCH.with(|c| c.get())
+}
+
+/// Zero this thread's [`CudaSvdDispatch`], e.g. before a run whose dispatch is
+/// to be reported.
+pub fn reset_cuda_svd_dispatch() {
+    CUDA_SVD_DISPATCH.with(|c| c.set(CudaSvdDispatch::default()));
+}
+
+#[cfg_attr(
+    not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")),
+    allow(dead_code)
+)]
+pub(crate) fn note_gpu_call() {
+    CUDA_SVD_DISPATCH.with(|c| {
+        let mut d = c.get();
+        d.gpu_calls += 1;
+        c.set(d);
+    });
+}
+
+pub(crate) fn note_cpu_fallback(reason: &'static str) {
+    CUDA_SVD_DISPATCH.with(|c| {
+        let mut d = c.get();
+        d.cpu_fallbacks += 1;
+        d.last_fallback = Some(reason);
+        c.set(d);
+    });
+}
+
+/// Fallback reason when this build has no device path at all.
+const FALLBACK_NOT_BUILT: &str =
+    "the `cuda` feature is not compiled in (or the target is not Linux/Windows)";
+
+/// Why the per-thread context could not be built, as a static reason.
+#[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
+fn context_unavailable_reason(e: &CudaSvdUnavailable) -> &'static str {
+    match e {
+        CudaSvdUnavailable::NotBuilt => FALLBACK_NOT_BUILT,
+        CudaSvdUnavailable::NoDevice => {
+            "CUDA context unavailable: no CUDA device or driver could be opened"
+        }
+        CudaSvdUnavailable::MissingSymbol { .. } => {
+            "CUDA context unavailable: a symbol cudarc resolves is missing from the installed CUDA library"
+        }
+        CudaSvdUnavailable::Other(_) => "CUDA context unavailable: initialisation failed",
+    }
 }
 
 /// Flat-buffer truncated SVD in the exact calling convention of
 /// `omega_backend_mps::svd::truncated_svd_flat` — a plain `fn` (so it coerces
 /// to `omega_backend_mps::SvdFlatFn` and can be handed to
-/// `MpsBackend::with_svd_fn`). Runs on the GPU via cuSOLVER `gesvdj` when the
-/// `cuda` feature is on, the host is Linux/Windows, and a CUDA driver is
-/// present; otherwise falls back to the CPU Jacobi SVD. The GPU handle is
+/// `MpsBackend::with_svd_fn`). Runs on the GPU via cuSOLVER's exact `gesvd`
+/// when the `cuda` feature is on, the host is Linux/Windows, and a CUDA driver
+/// is present; otherwise falls back to the CPU Jacobi SVD. The GPU handle is
 /// amortized across calls via a thread-local context.
+///
+/// **Every call is counted** in [`cuda_svd_dispatch`]: on the GPU, or as a CPU
+/// fallback with its reason. The fallback is per call and invisible in the
+/// result, so the counters are the only way a caller can tell a device run
+/// from a partly-CPU one. The library itself never prints.
 pub fn cuda_svd_flat(
     matrix: &[Complex64],
     m: usize,
@@ -124,20 +237,30 @@ pub fn cuda_svd_flat(
     threshold: f64,
 ) -> SvdResultFlat {
     #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
-    {
+    let reason = {
         let gpu = CUDA_SVD_CTX.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(gesvdj::CudaSvdContext::new());
+            let ctx = slot.get_or_insert_with(|| {
+                gesvdj::CudaSvdContext::try_new().map_err(|e| context_unavailable_reason(&e))
+            });
+            match ctx {
+                Ok(ctx) => {
+                    ctx.truncated_svd_flat_reasoned(matrix, m, n, stride, max_rank, threshold)
+                }
+                Err(reason) => Err(*reason),
             }
-            slot.as_ref()
-                .and_then(|c| c.as_ref())
-                .and_then(|ctx| ctx.truncated_svd_flat(matrix, m, n, stride, max_rank, threshold))
         });
-        if let Some(result) = gpu {
-            return result;
+        match gpu {
+            Ok(result) => {
+                note_gpu_call();
+                return result;
+            }
+            Err(reason) => reason,
         }
-    }
+    };
+    #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")))]
+    let reason = FALLBACK_NOT_BUILT;
+    note_cpu_fallback(reason);
     omega_backend_mps::svd::truncated_svd_flat(matrix, m, n, stride, max_rank, threshold)
 }
 

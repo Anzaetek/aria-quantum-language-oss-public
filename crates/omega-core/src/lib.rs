@@ -9,6 +9,8 @@ pub mod defer_measure;
 pub mod device;
 pub mod error;
 pub mod executor;
+pub mod fcidump;
+pub mod fermion;
 pub mod ffi_types;
 pub mod gradient;
 pub mod grover;

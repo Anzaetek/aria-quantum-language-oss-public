@@ -251,6 +251,132 @@ fn the_controlled_phase_form_of_cu3_matches() {
     assert!(nonzero > 3, "only {nonzero} non-trivial values");
 }
 
+/// **`U2(φ,λ)` is `U3(π/2,φ,λ)` — through the same arm, against the real gate.**
+///
+/// The statevector backend defines `u2` as exactly that call, so this is not
+/// two copies of one decomposition agreeing with each other: pauliprop's
+/// three-rotation expansion is compared with the dense 2×2 matrix.
+#[test]
+fn u2_matches_the_statevector_backend() {
+    let pp = PauliPropBackend::new();
+    let sv = StatevectorBackend::new();
+    let params = ParameterBinding::default();
+    let mut nonzero = 0;
+    for (f, l) in [(1.1, 0.3), (-0.4, 2.2), (0.0, 0.0), (0.5, -0.5)] {
+        // `Ry` first: `U2` on `|0⟩` is an equal superposition and the `CX`
+        // then makes a maximally entangled pair, on which EVERY single-qubit
+        // expectation is exactly zero — a corpus the guard below rejected.
+        let mut c = CircuitIR::new(2, CircuitType::GateBased);
+        c.add_op(g(GateKind::Ry, &[0], &[0.6]));
+        c.add_op(g(GateKind::U2, &[0], &[f, l]));
+        c.add_op(g(GateKind::CX, &[0, 1], &[]));
+        c.add_op(g(GateKind::U2, &[1], &[l, f]));
+        let mut observables: Vec<Vec<(u32, PauliOp)>> = Vec::new();
+        for q in 0..2u32 {
+            for p in [PauliOp::X, PauliOp::Y, PauliOp::Z] {
+                observables.push(vec![(q, p)]);
+            }
+        }
+        for p in [PauliOp::X, PauliOp::Y, PauliOp::Z] {
+            observables.push(vec![(0, p), (1, p)]);
+        }
+        observables.push(vec![(0, PauliOp::X), (1, PauliOp::Z)]);
+        for ob in observables {
+            let o = obs(&ob);
+            let want = sv.expectation(&c, &params, &o).expect("reference");
+            let got = pp
+                .expectation(&c, &params, &o)
+                .unwrap_or_else(|e| panic!("U2({f},{l}): {e}"));
+            assert!(
+                (got - want).abs() < 1e-9,
+                "U2({f},{l}) {ob:?}: pauliprop {got} vs statevector {want}"
+            );
+            if want.abs() > 1e-6 {
+                nonzero += 1;
+            }
+        }
+    }
+    assert!(
+        nonzero > 5,
+        "only {nonzero} non-trivial values — corpus too degenerate"
+    );
+}
+
+/// **`Rbs(θ)` is two commuting Pauli rotations, and the qubit order is right.**
+///
+/// `RBS(θ) = exp(−iθ/2·(Y⊗X − X⊗Y)) = R_{YX}(θ)·R_{XY}(−θ)` exactly, because
+/// the two generators commute. The trap is not the identity but the
+/// convention: the gate is antisymmetric in its qubits, so swapping which one
+/// carries the `Y` of the first factor is `RBS(−θ)` — a wrong number on every
+/// odd observable, no error. Hence the corpus: an ASYMMETRIC input (`x q0`
+/// puts the state on `|10⟩`, which RBS rotates toward `|01⟩` with a definite
+/// sign) and two-qubit `XX`/`YY` observables, whose expectation is `∓sin 2θ`
+/// depending on that sign. Single-qubit `Z` would pass either way.
+#[test]
+fn rbs_matches_the_statevector_backend() {
+    let pp = PauliPropBackend::new();
+    let sv = StatevectorBackend::new();
+    let params = ParameterBinding::default();
+    let mut nonzero = 0;
+    let mut circuits: Vec<(String, CircuitIR)> = Vec::new();
+    for theta in [0.3, 1.1, -0.7, std::f64::consts::FRAC_PI_4] {
+        // |10⟩ in, asymmetric: distinguishes RBS(θ) from RBS(−θ).
+        let mut c = CircuitIR::new(2, CircuitType::GateBased);
+        c.add_op(g(GateKind::X, &[0], &[]));
+        c.add_op(g(GateKind::Rbs, &[0, 1], &[theta]));
+        circuits.push((format!("x q0; rbs({theta}) q0,q1"), c));
+
+        // Same gate with the qubits reversed — must equal RBS(−θ)[0,1].
+        let mut c = CircuitIR::new(2, CircuitType::GateBased);
+        c.add_op(g(GateKind::X, &[0], &[]));
+        c.add_op(g(GateKind::Rbs, &[1, 0], &[theta]));
+        circuits.push((format!("x q0; rbs({theta}) q1,q0"), c));
+
+        // Superposed input with real amplitude on every Pauli axis, then a
+        // second RBS on a different pair so the generator's support is not a
+        // trivial subset of the observable's.
+        let mut c = CircuitIR::new(3, CircuitType::GateBased);
+        c.add_op(g(GateKind::Ry, &[0], &[0.9]));
+        c.add_op(g(GateKind::Ry, &[1], &[-0.4]));
+        c.add_op(g(GateKind::S, &[1], &[]));
+        c.add_op(g(GateKind::Rbs, &[0, 1], &[theta]));
+        c.add_op(g(GateKind::Rbs, &[1, 2], &[0.5 * theta]));
+        circuits.push((format!("ry;ry;s; rbs({theta}) q0,q1; rbs q1,q2"), c));
+    }
+    for (name, c) in &circuits {
+        let n = c.num_qubits;
+        let mut observables: Vec<Vec<(u32, PauliOp)>> = Vec::new();
+        for q in 0..n {
+            for p in [PauliOp::X, PauliOp::Y, PauliOp::Z] {
+                observables.push(vec![(q, p)]);
+            }
+        }
+        for p in [PauliOp::X, PauliOp::Y, PauliOp::Z] {
+            observables.push(vec![(0, p), (1, p)]);
+        }
+        observables.push(vec![(0, PauliOp::X), (1, PauliOp::Y)]);
+        observables.push(vec![(0, PauliOp::Y), (1, PauliOp::X)]);
+        for ob in observables {
+            let o = obs(&ob);
+            let want = sv.expectation(c, &params, &o).expect("reference");
+            let got = pp
+                .expectation(c, &params, &o)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                (got - want).abs() < 1e-9,
+                "{name} {ob:?}: pauliprop {got} vs statevector {want}"
+            );
+            if want.abs() > 1e-6 {
+                nonzero += 1;
+            }
+        }
+    }
+    assert!(
+        nonzero > 20,
+        "only {nonzero} non-trivial values — corpus too degenerate"
+    );
+}
+
 /// **A general `CU3` must be REFUSED, not silently treated as a phase.**
 ///
 /// This is the trap: `cp` arrives widened to `CU3(0,0,λ)`, so an implementation

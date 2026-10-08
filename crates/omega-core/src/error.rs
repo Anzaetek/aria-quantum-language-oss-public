@@ -5,6 +5,24 @@ pub enum OmegaError {
     #[error("unbound symbol: {name} (id={id})")]
     UnboundSymbol { id: u32, name: String },
 
+    /// A flat parameter vector had the wrong length for the circuit's free
+    /// symbols. Refused rather than padded or truncated: a missing value
+    /// bound to 0.0 yields a plausible wrong number, and a dropped extra
+    /// hides a caller that disagrees with the circuit about its arity.
+    #[error(
+        "parameter count mismatch: got {got} value(s) but the circuit has {expected} free \
+         parameter(s); unbound: [{}]. Pass exactly one value per symbol, in symbol-ID order \
+         (missing values would otherwise bind to 0.0 and extras be dropped, silently)",
+        .unbound.join(", ")
+    )]
+    ParameterCount {
+        expected: usize,
+        got: usize,
+        /// Names of the symbols a short vector would have left unbound
+        /// (empty when the vector was too long).
+        unbound: Vec<String>,
+    },
+
     #[error("parse error: {0}")]
     Parse(String),
 

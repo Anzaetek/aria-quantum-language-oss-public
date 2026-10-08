@@ -593,7 +593,8 @@ fn detect_available_memory_bytes() -> Option<u64> {
 /// literal string `max`, v1 a huge number — which must be treated as "no
 /// limit" rather than as a gigantic budget.
 fn detect_cgroup_limit_bytes() -> Option<u64> {
-    const UNLIMITED_FLOOR: u64 = 1 << 50; // 1 PiB: no real container cap is this big.
+    // One spelling, no second copy to drift — shared with topology.rs.
+    use crate::topology::UNLIMITED_FLOOR;
     for path in [
         "/sys/fs/cgroup/memory.max",                   // v2, unified
         "/sys/fs/cgroup/memory/memory.limit_in_bytes", // v1

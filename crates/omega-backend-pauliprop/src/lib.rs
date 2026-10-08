@@ -17,6 +17,7 @@ pub mod sim;
 pub use bound::{branch_calls, term_ceiling, term_upper_bound, MAX_BRANCH_CALLS_PER_GATE};
 pub use pauli::{PauliKey, PauliSum, Weighted};
 pub use sim::{
-    gates_skipped, observable_l1_norm, pack_bits, peak_terms, reset_peak_terms, unpack_bits,
-    BranchHook, PauliPropBackend, PauliPropCertificate, DEFAULT_MAX_TERMS,
+    gates_skipped, gpu_min_terms, observable_l1_norm, pack_bits, peak_terms, reset_peak_terms,
+    unpack_bits, BranchHook, PauliPropBackend, PauliPropCertificate, DEFAULT_GPU_MIN_TERMS,
+    DEFAULT_MAX_TERMS,
 };

@@ -305,10 +305,14 @@ pub fn parse_nvidia_smi(stdout: &str) -> Vec<DeviceProbe> {
         .collect()
 }
 
+/// 1 PiB — no real container cap is this big, so anything at or above it is
+/// the "unlimited" sentinel, not a budget. One spelling, no second copy to
+/// drift: `worker::detect_cgroup_limit_bytes` reads this same constant.
+pub(crate) const UNLIMITED_FLOOR: u64 = 1 << 50;
+
 /// cgroup v2 then v1. Both report an effectively-unlimited sentinel when
 /// unconstrained, which must read as "no limit" rather than a giant budget.
 pub fn detect_cgroup_limit_bytes() -> Option<u64> {
-    const UNLIMITED_FLOOR: u64 = 1 << 50; // 1 PiB — no real container cap is this big.
     for path in [
         "/sys/fs/cgroup/memory.max",                   // v2, unified hierarchy
         "/sys/fs/cgroup/memory/memory.limit_in_bytes", // v1

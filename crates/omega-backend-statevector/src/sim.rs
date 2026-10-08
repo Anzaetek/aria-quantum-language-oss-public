@@ -51,6 +51,7 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> Result<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         let n = circuit.num_qubits as usize;
 
         // RNG for mid-circuit measurements and for Reset's Born-rule sampling.
@@ -158,6 +159,7 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<f64> {
+        circuit.refuse_qudits(self.name())?;
         // `expectation_pauli` does `(i >> q) & 1` with `q` straight from the
         // observable and PANICS when it names a qubit past the register.
         // Nothing upstream bounds it: `Observable::parse` reads a bare u32 and
@@ -181,12 +183,13 @@ impl Backend for StatevectorBackend {
 
         // Compute <psi|O|psi> = sum_i coeff_i * <psi|P_i|psi>.
         //
-        // Linearity of expectation in the operator argument is proved
-        // in `verification/Verification/Adjoint/Linearity.lean` — NOTE: that
-        // file is a TARGET, not yet written; see `verification/README.md` —
-        // theorem `AdjointLinearity.expVal_finset_sum`. That ratifies
-        // splitting `O = Σ cₖ Pₖ` into per-Pauli expectations with
-        // scalar coefficients, which is exactly this loop.
+        // Linearity of expectation in the operator argument is what lets
+        // `O = Σ cₖ Pₖ` split into per-Pauli expectations with scalar
+        // coefficients, which is exactly this loop. It is NOT machine-checked:
+        // this cited `Verification/Adjoint/Linearity.lean` as a "TARGET, not
+        // yet written", but no such file or directory exists in either this
+        // repo or the private monorepo (checked 2026-09-04), so it was not a
+        // target anyone was tracking. Stated as the obligation it is.
         let mut total = 0.0;
         for (coeff, pauli_string) in &observable.terms {
             let val = expectation_pauli(sv, circuit.num_qubits, pauli_string);
@@ -201,6 +204,7 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         observables: &[Observable],
     ) -> Result<Vec<f64>> {
+        circuit.refuse_qudits(self.name())?;
         // Single forward sweep, then per-Pauli loop against the same
         // resident statevector. Saves N-1 simulator runs when the QML
         // trainer asks for ⟨Z_q⟩ on each of N measurement qubits.
@@ -241,6 +245,7 @@ impl Backend for StatevectorBackend {
         params: &ParameterBinding,
         observable: &Observable,
     ) -> Result<Option<Vec<(SymbolId, f64)>>> {
+        circuit.refuse_qudits(self.name())?;
         // Same unchecked index as `expectation`: the adjoint sweep seeds from
         // the observable and panics on a qubit past the register. `/gradient`
         // takes a client-supplied observable, so this is reachable remotely.
@@ -279,6 +284,7 @@ impl Backend for StatevectorBackend {
         bindings: &[&ParameterBinding],
         observable: &Observable,
     ) -> Result<Vec<f64>> {
+        circuit.refuse_qudits(self.name())?;
         use rayon::prelude::*;
         bindings
             .par_iter()
@@ -294,6 +300,7 @@ impl Backend for StatevectorBackend {
         bindings: &[&ParameterBinding],
         observable: &Observable,
     ) -> Result<Vec<AdjointGradient>> {
+        circuit.refuse_qudits(self.name())?;
         use rayon::prelude::*;
         // Each row builds its OWN checkpoint tape, so peak memory is the
         // per-row tape times however many rows run at once — not one tape.
@@ -410,6 +417,7 @@ impl Backend for NoisyStatevectorBackend {
         params: &ParameterBinding,
         config: &ExecConfig,
     ) -> Result<ExecResult> {
+        circuit.refuse_qudits(self.name())?;
         let n = circuit.num_qubits as usize;
 
         let mut rng = match self.seed {
@@ -1444,15 +1452,16 @@ pub(crate) fn apply_controlled_1q(
             let i0 = scatter(k) | mask_c;
             let i1 = i0 | mask_t;
             let (a, b) = (state[i0], state[i1]);
-            // The leading `ZERO +` is NOT dead weight — do not "simplify" it
-            // away. The dense path this replaces computes
-            // `((0*a00 + 0*a01) + m0*a10) + m1*a11`, and `0.0 + (-0.0)` is
-            // `+0.0`: without the leading add, a product landing on `-0.0`
-            // comes out `-0.0` here and `+0.0` there. Equal under `==`,
-            // different in bits, and this is the CPU reference every other
-            // backend is bit-compared against. MEASURED: removing it fails
-            // `controlled_1q_fast_path_matches_the_dense_scan_bit_for_bit`
-            // on the signed-zero fixture at idx 0.
+            // See [`diagonal_2q`]'s signed-zero note.
+            //
+            // Until 2026-09-04 this arm claimed a leading `ZERO +` was
+            // load-bearing and cited a test to prove it. Both were stale: the
+            // term was removed when that claim was retracted (it trades three
+            // signed-zero divergences for one and guarantees nothing), the
+            // parallel arm below was updated, and this one was not — the very
+            // defect §A4 is about. The cited test never existed under that
+            // name; the real assertion is
+            // `every_2q_gate_differs_from_the_dense_scan_only_in_the_sign_of_zero`.
             state[i0] = m[0] * a + m[1] * b;
             state[i1] = m[2] * a + m[3] * b;
         }
@@ -1757,6 +1766,22 @@ pub(crate) fn apply_cswap(state: &mut [Complex64], n: usize, control: usize, t0:
     });
 }
 
+/// Sample `shots` outcomes from an already-evolved state, with the same
+/// sampler (and therefore the same counts for a given seed) as `execute`
+/// with `shots: Some(..)`.
+///
+/// Public so a benchmark can time sampling separately from evolution, as the
+/// emulator comparison's sampling rows require of every arm (PLAN-EMULATOR-
+/// COMPARISON §4.2). Keys are basis indices, qubit 0 the LOW bit.
+pub fn sample_from_state(
+    state: &[Complex64],
+    num_qubits: usize,
+    shots: u32,
+    seed: Option<u64>,
+) -> HashMap<u64, u32> {
+    sample_counts(state, num_qubits, shots, seed)
+}
+
 /// Sample measurement outcomes from the statevector.
 fn sample_counts(
     state: &[Complex64],
@@ -1819,14 +1844,15 @@ fn sample_counts(
 /// Compute <psi|P|psi> for a Pauli string P.
 ///
 /// The single-qubit closed forms used per-qubit below
-/// (Z: ±1 by bit, X: bit flip, Y: bit flip + i/-i) are proved
-/// against the matrix definition in
-/// `verification/Verification/Adjoint/PauliExpectation.lean` (a TARGET, not
-/// yet written — see `verification/README.md`) —
-/// theorems `expV_Z` / `expV_X` / `expV_Y` / `expV_I`. Each
-/// Pauli is also Hermitian
-/// (`σ?_hermitian`), so the resulting expectation is real (we
-/// take `.re` on the final accumulator).
+/// (Z: ±1 by bit, X: bit flip, Y: bit flip + i/-i) follow from the matrix
+/// definitions, and each Pauli is Hermitian, so the resulting expectation is
+/// real — which is why we take `.re` on the final accumulator.
+///
+/// NOT machine-checked. This cited `Verification/Adjoint/PauliExpectation.lean`
+/// as a "TARGET, not yet written"; no such file or directory exists in this
+/// repo or the private monorepo (checked 2026-09-04), so it was not a target
+/// anyone was tracking. What exercises these forms is
+/// `tests/parallel_shift_integration.rs` and the dense-oracle corpus tests.
 fn expectation_pauli(sv: &[Complex64], num_qubits: u32, pauli_string: &[(u32, PauliOp)]) -> f64 {
     let n = num_qubits as usize;
     let dim = 1usize << n;
@@ -2602,9 +2628,9 @@ mod group_walk_equivalence {
     /// * bit-identity across `T ∈ {1,2,12}` passes, because every thread count
     ///   runs the same wrong code. Invariance is a consistency property, not a
     ///   correctness one, and cannot detect a deterministic error.
-    /// * `the_serial_and_parallel_paths_agree` passes, because it asserts only
-    ///   that the norm is 1 — and a permutation preserves norm exactly, whatever
-    ///   it permutes.
+    /// * `the_norm_survives_both_sides_of_the_threshold` passes, because it
+    ///   asserts only that the norm is 1 — and a permutation preserves norm
+    ///   exactly, whatever it permutes.
     ///
     /// So this test exists to be the thing that fails. `n = 13` puts `dim` at
     /// 8192, comfortably over the threshold, and the triples are curated rather

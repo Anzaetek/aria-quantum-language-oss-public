@@ -232,7 +232,7 @@ mod tests {
         let norm: f64 = out.iter().map(|c| c.norm_sqr()).sum();
         assert!((norm - 1.0).abs() < 1e-9, "‖out‖² = {norm}");
         // (|00⟩+|01⟩)/√2 up to global phase — identical to the quantum-core
-        // reference (pinned in its `omega_pattern_cross_wire_golden` test).
+        // reference (pinned in its `omega_pattern_cross_wire_golden` test, quantum-core/src/backends/omega.rs:792).
         let s = FRAC_1_SQRT_2;
         let golden = [
             Complex64::new(s, 0.0),

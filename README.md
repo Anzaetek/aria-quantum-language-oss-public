@@ -66,6 +66,8 @@ aria-quantum-language-oss/
 │   ├── apps/<name>/      one small crate per example (~60 readable lines)
 │   └── omega-*/          vendored pure-Rust runtime: IR + backends + server
 ├── examples/aria/        43 example circuits (each header cites its harness + check)
+├── examples/qudit/       DITQASM qutrit examples (docs/QUDIT_EXAMPLES.md)
+├── examples/fermionic/   fermionic circuits and operators (docs/FERMIONIC_EXAMPLES.md)
 ├── proofs/lean4/         Lean 4 correctness theorems (sorry-free)
 ├── editors/              Aria syntax: tree-sitter · Neovim · VS Code
 ├── TUTORIAL.md · GRAMMAR.md · VERIFICATION.md · LIMITATIONS.md · TESTING.md
@@ -118,6 +120,9 @@ $ aria tune examples/aria/qml_tune.aria --circuit QmlTune --observable Z0 \
 - **[`GRAMMAR.md`](GRAMMAR.md)** — the complete language reference (lexical
   structure, statements, expressions, the gate set, observables, annotations,
   and an EBNF grammar).
+- **[`docs/FERMIONICQASM.md`](docs/FERMIONICQASM.md)** — FermionicQASM 1.0,
+  an in-house fermionic circuit language. It carries no authority of a
+  standard. Every example in that file is parsed by a test.
 
 ## Use it as a library
 
@@ -160,14 +165,14 @@ Every backend implements `omega_core::executor::Backend`
 | `--backend` | Crate | Status | Notes |
 |-------------|-------|--------|-------|
 | `sim` (default) | `omega-backend-statevector` | ✅ | Pure-Rust CPU statevector, exact |
-| `mps` | `omega-backend-mps` (+ `-mps-{cuda,metal}`) | ✅ | Pure-Rust MPS, scales with bounded entanglement. Under `--features cuda`, bond-compression SVD runs on the GPU (cuSOLVER `gesvdj`); under `--features metal`, the two-site θ-contraction runs on the GPU (SVD stays on CPU — Apple has no native f64). CPU fallback either way |
+| `mps` | `omega-backend-mps` (+ `-mps-{cuda,metal}`) | ✅ | Pure-Rust MPS, scales with bounded entanglement. Under `--features cuda`, bond-compression SVD runs on the GPU (cuSOLVER `gesvdj`, native f64). Under `--features metal` the two-site contraction stays on exact f64: the Metal kernel is f32 and is not installed, because `discarded_weight` would not be a bound. `MPS_METAL_CONTRACT=1` opts in and warns. |
 | `gpu` | `omega-backend-statevector-{metal,cuda,opencl}` | ✅ | Build `--features metal` (or `cuda`/`opencl`); auto-falls back to `sim` if the device is unavailable. **`opencl` additionally needs the ICD loader *dev* symlink to LINK**: `sudo apt install ocl-icd-opencl-dev`. A driver alone ships only `libOpenCL.so.1`, and `cl-sys` emits `-lOpenCL`, which resolves only against `libOpenCL.so` — without it the build fails with `unable to find library -lOpenCL` even though the runtime is fine. See [TESTING.md §9b](TESTING.md) for the no-root fallback |
 | `pauliprop` | `omega-backend-pauliprop` (+ `-pauliprop-{cuda,metal}`) | ✅ | Heisenberg Pauli-propagation; **expectation values only**. Exact & width-unbounded on Clifford; truncate deep non-Clifford with `--truncate C --max-weight W --max-freq F` (certified dropped-mass error bound). Under `--features cuda`/`metal` the non-Clifford branch step runs on the GPU with CPU fallback (the Metal arm keeps coefficients on the CPU in f64, so it stays exact) |
 | `remote` | omega-server HTTP | ✅ | `--features remote`, then `--backend remote --url …`; delegate to a running omega-server |
 | `tch` | `aria-backend-tch` | ✅ | `--features tch` (needs `LIBTORCH`); a libtorch `tch::Tensor` statevector. `aria run/train --backend tch` |
 
 ```console
-# Apple Metal (statevector, MPS θ-contraction, and pauliprop branch all GPU-accelerated):
+# Apple Metal (statevector and pauliprop branch on the GPU; MPS contraction stays on exact f64):
 $ cargo run -p aria-cli --features metal -- run examples/aria/qft.aria \
       --circuit QFT --int n=3 --backend gpu --statevector
 $ cargo run -p aria-cli --features metal -- run examples/aria/bell.aria \

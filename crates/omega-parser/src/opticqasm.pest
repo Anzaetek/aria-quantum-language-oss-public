@@ -1,4 +1,5 @@
-// OPTICQASM 1.0 PEG grammar for pest
+// OPTICQASM 1.0 PEG grammar for pest.
+// This is an in-house format. It carries no authority of a standard.
 
 program = { SOI ~ header ~ statement* ~ EOI }
 

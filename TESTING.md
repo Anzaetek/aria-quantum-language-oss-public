@@ -173,10 +173,12 @@ Checks (each prints `... ok`):
   magnitude.
 - `gpu_metal_agrees_with_sim_on_qft` — Metal statevector == CPU statevector on
   QFT(n=3), ≤ 1e-6 (f32 kernels). Use `--backend gpu` to run on the GPU.
-- `gpu_mps_metal_agrees_with_sim` — `--backend mps` with the Metal two-site
-  θ-contraction (the SVD stays on CPU) == exact CPU statevector on a 12-qubit
-  entangling brickwork, ≤ 1e-3 (f32 contraction). Apple GPUs have no native f64,
-  so on-GPU Jacobi SVD is deferred; the contraction is the GPU-friendly half.
+- `gpu_mps_metal_agrees_with_sim` — production `--backend mps` does **not**
+  dispatch the Metal two-site contraction. On a 12-qubit brickwork that does
+  not truncate, amplitudes match the exact CPU statevector to ≤ 1e-9, and the
+  Metal dispatch counter stays at zero. The f32 kernel is opt-in
+  (`MPS_METAL_CONTRACT=1`); the certificate pin that goes red if the hook is
+  reinstalled lives next to `make_mps` / `make_noisy_mps`.
 - `gpu_pauliprop_metal_agrees_with_sim` / `gpu_branch_matches_cpu_*` — the Metal
   Pauli-propagation branch == the CPU branch, ≤ 1e-9. The GPU runs only the
   integer symplectic work (anticommute test + child key); the f64 coefficient
@@ -242,10 +244,10 @@ $ cargo run -p aria-cli --features cuda -- run examples/aria/bell.aria \
 <Z0 Z1> = 1.000000000000
 ```
 
-Metal (Apple Silicon) wires all three arms too — statevector, the MPS two-site
-θ-contraction (SVD stays on CPU), and the pauliprop branch — verified under
-`ARIA_METAL=1` (§9). The one piece deferred on Metal is on-GPU Jacobi SVD, which
-Apple's lack of native f64 rules out (see `GPU_BACKEND_PLAN.md`).
+Metal (Apple Silicon) wires the statevector and the pauliprop branch, verified
+under `ARIA_METAL=1` (§9). The MPS two-site contraction stays on exact f64; the
+f32 kernel is not installed unless `MPS_METAL_CONTRACT=1`. On-GPU Jacobi SVD
+stays deferred: Apple has no native f64 (see `GPU_BACKEND_PLAN.md`).
 
 ### 9b. OpenCL GPU statevector agrees with CPU (cross-vendor; on by default on macOS)
 

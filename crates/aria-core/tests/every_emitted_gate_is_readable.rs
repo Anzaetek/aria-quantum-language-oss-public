@@ -33,6 +33,7 @@
 //! **fails to compile** until someone states what QASM2 does with it. That is
 //! the mechanism; the assertions are secondary.
 
+use aria_core::ast::fermionicqasm::to_fermionicqasm;
 use aria_core::ast::nodes::*;
 use aria_core::ast::qasm::to_qasm;
 
@@ -61,6 +62,9 @@ enum Spec {
     EmittedButUnreadable(usize, usize, &'static str),
     /// Not part of the QASM2 lane at all.
     NotQasm2,
+    /// Not a QASM2 gate spelling. `to_fermionicqasm` emits the named
+    /// FermionicQASM statement, and `omega-parser` reads that text back.
+    FermionicQasm(&'static str),
 }
 
 /// **Exhaustive on purpose — do not add a `_` arm.**
@@ -85,7 +89,13 @@ fn spec(kind: &GateKind) -> Spec {
         // nowhere. With the definition, Qiskit's legacy loader and omega-parser
         // both read it.
         RYY => Spec::RoundTrips(1, 2),
-        RBS => Spec::NotQasm2, // Givens rotation; no qelib1 spelling.
+        // No qelib1 spelling that preserves the gate. `to_qasm` decomposes it,
+        // which is a different circuit as far as gate identity goes.
+        // `to_fermionicqasm` spells it `givens` — the structure-preservation
+        // entry for this lane. The string is that spelling.
+        RBS => Spec::FermionicQasm("givens"),
+        Tunnel => Spec::FermionicQasm("tunnel"),
+        Load => Spec::FermionicQasm("load"),
         // Three-qubit.
         CCX | CSWAP => Spec::RoundTrips(0, 3),
         // Structural / non-unitary: covered by their own round-trip tests
@@ -144,6 +154,8 @@ const ALL: &[GateKind] = &[
     GateKind::Kerr,
     GateKind::HalfWavePlate,
     GateKind::PolarizingBeamSplitter,
+    GateKind::Tunnel,
+    GateKind::Load,
 ];
 
 /// `ALL` is NOT compiler-enforced the way `spec()` is, and it had already
@@ -167,7 +179,7 @@ const ALL: &[GateKind] = &[
 /// guard whose limit is undocumented is worse than none — it invites trust it
 /// has not earned.
 const _: () = assert!(
-    ALL.len() == GateKind::PolarizingBeamSplitter as usize + 1,
+    ALL.len() == GateKind::Load as usize + 1,
     "ALL is missing a GateKind variant (or the marker below it is stale) — \
      see the note above this assert"
 );
@@ -194,7 +206,7 @@ fn every_qasm2_gate_aria_core_emits_is_read_back_by_omega_parser() {
     for kind in ALL {
         let (np, nq) = match spec(kind) {
             Spec::RoundTrips(np, nq) => (np, nq),
-            Spec::EmittedButUnreadable(..) | Spec::NotQasm2 => continue,
+            Spec::EmittedButUnreadable(..) | Spec::NotQasm2 | Spec::FermionicQasm(_) => continue,
         };
         let text = match emit(kind, np, nq) {
             Ok(t) => t,
@@ -330,5 +342,53 @@ fn to_qasm_refuses_a_symbolic_parameter_rather_than_zeroing_it() {
         !err.contains("cannot represent `RZ`"),
         "rz IS representable in QASM2 — the refusal must be about the parameter, \
          not the gate: {err}"
+    );
+}
+
+/// `RBS` has no QASM2 spelling that keeps the gate. FermionicQASM spells it
+/// `givens`. `Tunnel` and `Load` are the same lane. Each spelling has to be
+/// text `omega-parser` lowers; a drifted name fails this and not the QASM2
+/// loop, which skips the variant.
+#[test]
+fn fermionicqasm_spellings_are_read_back_by_omega_parser() {
+    let mut saw_givens = false;
+    let mut checked = 0usize;
+    for kind in ALL {
+        let Spec::FermionicQasm(spelling) = spec(kind) else {
+            continue;
+        };
+        if *kind == GateKind::RBS {
+            saw_givens = true;
+            assert_eq!(spelling, "givens");
+        }
+        let mut c = Circuit::new("c");
+        let m = c.mode_reg("m", 2, false);
+        match kind {
+            GateKind::Load => c.apply(GateDef::new(GateKind::Load), vec![m[0].clone()]),
+            GateKind::RBS | GateKind::Tunnel => c.apply(
+                GateDef::with_params(*kind, vec![0.37]),
+                vec![m[0].clone(), m[1].clone()],
+            ),
+            other => panic!("{other:?} is FermionicQasm in spec() but this test does not build it"),
+        }
+        let text = to_fermionicqasm(&c).unwrap_or_else(|e| panic!("{kind:?}: not emitted: {e}"));
+        assert!(
+            text.contains(&format!("{spelling}(")) || text.contains(&format!("{spelling} ")),
+            "{kind:?}: emission does not contain `{spelling}`:\n{text}"
+        );
+        let ir = omega_parser::lower_to_ir(&text)
+            .unwrap_or_else(|e| panic!("{kind:?}: emitted but UNREADABLE: {e}\n{text}"));
+        assert!(!ir.ops.is_empty(), "{kind:?}: lowered to zero ops:\n{text}");
+        checked += 1;
+    }
+    assert!(
+        saw_givens,
+        "RBS is not classified as spellable in FermionicQASM. The QASM2 loop \
+         skips it, so without this classification nothing checks that `givens` \
+         still lowers."
+    );
+    assert!(
+        checked >= 3,
+        "only {checked} FermionicQASM spellings were read back"
     );
 }

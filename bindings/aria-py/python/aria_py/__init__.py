@@ -33,11 +33,15 @@ this wheel accepts. Pin an arm only to benchmark it deliberately: ``"gpu:cuda"``
 ``"gpu:metal"``, ``"gpu:opencl"`` — a pin the wheel lacks is an error, never a
 silent downgrade to CPU.
 
-``mps`` and ``pauliprop`` have no GPU variant on purpose: their accelerator (a
-bond-compression SVD, a branch expansion) is transparent, engages when it pays,
-and falls back per operation, so the result is identical either way. ``gpu``
-instead *errors* when the device is unusable — a silent fallback there would
-make a "GPU" measurement quietly report the CPU.
+``mps`` reports no device. ``Backend.accelerator()`` stays ``"cpu"`` for an
+``mps`` spec, and the methods here return a bare float — there is no device
+field on the result. On a metal wheel the f32 two-site contraction is not
+installed (``discarded_weight`` would not be a bound) unless
+``MPS_METAL_CONTRACT=1``, which warns on stderr and is the same variable
+``omega-run`` and the Rust runtime honour. ``pauliprop``'s branch expansion
+keeps its coefficients on the CPU. ``gpu`` *errors* when the device is
+unusable — a silent fallback there would make a "GPU" measurement quietly
+report the CPU.
 
 **Reuse a backend when it owns a device.** Construction is not free: building a
 CUDA backend per call put a flat ~390 ms floor under every GPU call, unchanged

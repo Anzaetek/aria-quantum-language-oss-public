@@ -92,6 +92,8 @@ fn encode_angle(data: &[f64]) -> CircuitIR {
         circuit_type: CircuitType::GateBased,
         symbols: HashMap::new(),
         custom_gates: HashMap::new(),
+        qudit_registers: Vec::new(),
+        fermionic_registers: Vec::new(),
     }
 }
 
@@ -140,6 +142,8 @@ fn encode_iqp(data: &[f64], layers: usize) -> CircuitIR {
         circuit_type: CircuitType::GateBased,
         symbols: HashMap::new(),
         custom_gates: HashMap::new(),
+        qudit_registers: Vec::new(),
+        fermionic_registers: Vec::new(),
     }
 }
 
@@ -161,6 +165,8 @@ pub fn infer(
         circuit_type: CircuitType::GateBased,
         symbols: model.ansatz.symbols.clone(),
         custom_gates: model.ansatz.custom_gates.clone(),
+        qudit_registers: Vec::new(),
+        fermionic_registers: Vec::new(),
     };
 
     // Append encoding ops
@@ -747,6 +753,8 @@ impl<'a> QmlTrainer<'a> {
             circuit_type: CircuitType::GateBased,
             symbols: self.model.ansatz.symbols.clone(),
             custom_gates: self.model.ansatz.custom_gates.clone(),
+            qudit_registers: Vec::new(),
+            fermionic_registers: Vec::new(),
         };
         circuit.ops.extend(encoding.ops);
         circuit.ops.extend(self.model.ansatz.ops.iter().cloned());

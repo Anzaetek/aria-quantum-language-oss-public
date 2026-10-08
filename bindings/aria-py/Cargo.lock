@@ -477,6 +477,7 @@ name = "omega-backend-mps"
 version = "0.1.0"
 dependencies = [
  "num-complex",
+ "omega-backend-quditsv",
  "omega-core",
  "rand",
  "rayon",
@@ -527,6 +528,16 @@ dependencies = [
  "metal",
  "num-complex",
  "omega-backend-pauliprop",
+]
+
+[[package]]
+name = "omega-backend-quditsv"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "omega-backend-statevector",
+ "omega-core",
+ "rand",
 ]
 
 [[package]]

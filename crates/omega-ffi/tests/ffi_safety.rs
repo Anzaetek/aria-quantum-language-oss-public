@@ -396,3 +396,106 @@ fn execute_with_parameters_binds_in_symbol_id_order() {
     unsafe { omega_result_free(res) };
     unsafe { omega_runtime_free(rt) };
 }
+
+// ---------------------------------------------------------------------
+// Parameter count: refused, never padded
+// ---------------------------------------------------------------------
+
+/// A Bell pair whose first rotation carries the single free symbol `theta`,
+/// so every entry point below has exactly one parameter to get right or wrong.
+const ONE_PARAM_QASM: &str = "OPENQASM 2.0;\ninclude \"qelib1.inc\";\nqreg q[2];\ncreg c[2];\nrx(theta) q[0];\nh q[0];\ncx q[0], q[1];\n";
+
+/// **A wrong-length parameter array is refused by `omega_execute`.**
+///
+/// Both directions, through the same C symbols an embedder calls. Before
+/// `ParameterBinding::from_flat` owned this rule the short case bound `theta`
+/// to 0.0 and the long case dropped the extra, and a C caller — with no
+/// exception, no stderr it reads, and a non-null handle in hand — had no way
+/// to find out it had run a different circuit. `examples/c-embed/embed.c`
+/// asserts the same two refusals from actual C; this pins them in-tree so a
+/// regression fails `cargo test` and not only the CI stage that invokes `cc`.
+#[test]
+fn execute_refuses_a_wrong_length_parameter_array() {
+    let rt = omega_runtime_new();
+    let src = CString::new(ONE_PARAM_QASM).unwrap();
+    let cid = unsafe { omega_circuit_from_source(rt, src.as_ptr(), 0) };
+    assert!(cid > 0, "the fixture must parse");
+    assert_eq!(
+        unsafe { omega_circuit_num_params(rt, cid) },
+        1,
+        "the fixture must have exactly one free symbol (theta)"
+    );
+
+    // Too few: a null array on a circuit that needs one value.
+    let short = unsafe { omega_execute(rt, cid, ptr::null(), 0, 0, 0) };
+    assert!(
+        short.is_null(),
+        "a missing parameter array must be refused, not zero-filled"
+    );
+
+    // Too many: the extra used to be dropped.
+    let two = [0.1f64, 0.2];
+    let over = unsafe { omega_execute(rt, cid, two.as_ptr(), 2, 0, 0) };
+    assert!(
+        over.is_null(),
+        "an over-long parameter array must be refused, not truncated"
+    );
+
+    // And the correct count still runs. rx(0) is the identity, so this is a
+    // plain Bell pair: |00> and |11> at 1/sqrt(2) each.
+    let one = [0.0f64];
+    let ok = unsafe { omega_execute(rt, cid, one.as_ptr(), 1, 0, 0) };
+    assert!(!ok.is_null(), "exactly one value must still execute");
+    assert_eq!(unsafe { omega_result_statevector_len(ok) }, 4);
+    let mut amps = [0.0f64; 8];
+    assert_eq!(
+        unsafe { omega_result_get_statevector_n(ok, amps.as_mut_ptr(), 4) },
+        4
+    );
+    let inv_sqrt2 = 1.0_f64 / 2.0_f64.sqrt();
+    assert!((amps[0] - inv_sqrt2).abs() < 1e-12, "|00> amplitude");
+    assert!((amps[6] - inv_sqrt2).abs() < 1e-12, "|11> amplitude");
+
+    unsafe { omega_result_free(ok) };
+    unsafe { omega_runtime_free(rt) };
+}
+
+/// **`omega_expectation` refuses the same wrong lengths, through its status
+/// code, and leaves `out` untouched.**
+///
+/// The scalar path is the one an optimiser drives in a loop, so a padded
+/// binding here is a whole variational run reported against angles nobody
+/// chose. The documented contract is that a non-zero return leaves the
+/// out-parameter alone; the sentinel below is how that is observed.
+#[test]
+fn expectation_refuses_a_wrong_length_parameter_array() {
+    let rt = omega_runtime_new();
+    let src = CString::new(ONE_PARAM_QASM).unwrap();
+    let cid = unsafe { omega_circuit_from_source(rt, src.as_ptr(), 0) };
+    assert!(cid > 0);
+    let obs = CString::new("Z0 Z1").unwrap();
+
+    let sentinel = -12345.0f64;
+    let mut out = sentinel;
+    let rc = unsafe { omega_expectation(rt, cid, ptr::null(), 0, obs.as_ptr(), &mut out) };
+    assert_ne!(rc, 0, "a missing parameter array must return non-zero");
+    assert_eq!(out, sentinel, "a refusal must not write the out-parameter");
+
+    let two = [0.1f64, 0.2];
+    let mut out = sentinel;
+    let rc = unsafe { omega_expectation(rt, cid, two.as_ptr(), 2, obs.as_ptr(), &mut out) };
+    assert_ne!(rc, 0, "an over-long parameter array must return non-zero");
+    assert_eq!(out, sentinel, "a refusal must not write the out-parameter");
+
+    // The correct count still answers: rx(0) leaves a Bell pair, <Z0 Z1> = 1.
+    let one = [0.0f64];
+    let mut out = sentinel;
+    let rc = unsafe { omega_expectation(rt, cid, one.as_ptr(), 1, obs.as_ptr(), &mut out) };
+    assert_eq!(rc, 0, "exactly one value must still be accepted");
+    assert!(
+        (out - 1.0).abs() < 1e-12,
+        "<Z0 Z1> on a Bell pair is 1, got {out}"
+    );
+
+    unsafe { omega_runtime_free(rt) };
+}

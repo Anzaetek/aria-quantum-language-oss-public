@@ -323,14 +323,18 @@ fn apply_op_dagger(
             )));
         }
 
-        // Photonic / RBS / custom / non-unitary rejected upstream. (RBS has a
-        // GPU adjoint on CUDA and Metal but no OpenCL kernel — see the
-        // matching arm in `execute::apply_op`.)
+        // Photonic / RBS / qudit / custom / non-unitary rejected upstream. (RBS
+        // has a GPU adjoint on CUDA and Metal but no OpenCL kernel — see the
+        // matching arm in `execute::apply_op`.) Rxy and CSum are qudit gates
+        // (PLAN-QUDIT); this backend is a qubit statevector and refuses them
+        // by name rather than leaving the match non-exhaustive.
         GateKind::Reset
         | GateKind::Measure
         | GateKind::Rbs
         | GateKind::PhaseShifter
         | GateKind::BeamSplitterRx
+        | GateKind::Rxy
+        | GateKind::CSum
         | GateKind::Custom(_) => {
             return Err(OmegaError::Unsupported(format!(
                 "opencl adjoint dagger: unsupported gate {:?}",

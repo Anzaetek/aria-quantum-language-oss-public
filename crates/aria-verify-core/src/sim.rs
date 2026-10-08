@@ -107,17 +107,46 @@ fn gate_params(op: &omega_core::circuit::GateOp, b: &ParameterBinding) -> Result
     op.params.iter().map(|p| resolve(p, b)).collect()
 }
 
-/// Simulate `ir` with `params` (bound in `ir.param_symbols` order) and return
-/// `⟨Z_q⟩` for every qubit `q`.
+/// Simulate `ir` with `params` (one value per free symbol, in ascending
+/// symbol-ID order) and return `⟨Z_q⟩` for every qubit `q`.
+///
+/// A thin wrapper over [`statevector`]. `⟨Z_q⟩` is a marginal, and a marginal
+/// is exactly what hid the HHL defect: the shipped circuit left the counting
+/// register entangled with the answer, and every single-qubit `⟨Z⟩` still
+/// matched the oracle to 0.0e0 because both sides ran the same lowered IR.
+/// Reach for [`statevector`] when the property under test is a relative phase,
+/// a post-selected branch, or an amplitude.
 pub fn forward_z_expectations(ir: &CircuitIR, params: &[f64]) -> Result<Vec<f64>, String> {
-    // Match the runtime's param ordering exactly (host::build_binding): the
-    // params slice binds the free symbols in ascending SymbolId order.
-    let mut binding = ParameterBinding::new();
-    let mut symbol_ids: Vec<omega_core::circuit::SymbolId> = ir.symbols.keys().copied().collect();
-    symbol_ids.sort_unstable();
-    for (i, &sid) in symbol_ids.iter().enumerate() {
-        binding.bind(sid, params.get(i).copied().unwrap_or(0.0));
+    let sv = statevector(ir, params)?;
+    let n = ir.num_qubits as usize;
+    let mut z = vec![0.0; n];
+    for (q, zq) in z.iter_mut().enumerate() {
+        let bit = 1usize << q;
+        let mut e = 0.0;
+        for (x, amp) in sv.iter().enumerate() {
+            let p = amp.norm_sqr();
+            e += if x & bit == 0 { p } else { -p };
+        }
+        *zq = e;
     }
+    Ok(z)
+}
+
+/// Simulate `ir` with `params` and return the full `2ⁿ` amplitude vector.
+///
+/// Qubit `q` is bit `q` of the basis index, so `q[0]` is the least significant
+/// bit. Amplitudes are phase-faithful, not just correct up to a global phase.
+pub fn statevector(ir: &CircuitIR, params: &[f64]) -> Result<Vec<C>, String> {
+    // This is the ORACLE. An oracle that quietly ran a d = 3 register as
+    // qubits would agree with a backend making the same mistake, which is
+    // the one failure a cross-check exists to catch — so it refuses too.
+    ir.refuse_qudits("aria-verify oracle")
+        .map_err(|e| e.to_string())?;
+    // Match the runtime's param ordering exactly (host::build_binding): the
+    // params slice binds the free symbols in ascending SymbolId order, and a
+    // wrong length is refused rather than zero-padded. The oracle must not
+    // "agree" with the transport because both silently zeroed the same angle.
+    let binding = ParameterBinding::from_flat(ir, params).map_err(|e| e.to_string())?;
 
     let n = ir.num_qubits as usize;
     if n > 20 {
@@ -231,19 +260,68 @@ pub fn forward_z_expectations(ir: &CircuitIR, params: &[f64]) -> Result<Vec<f64>
                     i += 1;
                 }
             }
+            // Qudit gates (PLAN-QUDIT.md Q2) on d = 2 wires, realised
+            // independently of `omega-backend-quditsv`'s matrix table so the
+            // d = 2 embedding there is checked against a second reading:
+            // rxy(0, 1, θ, φ) = exp(−iθ/2 (cos φ X + sin φ Y)); csum = CX.
+            GateKind::Rxy => {
+                let p = gate_params(op, &binding)?;
+                if p[0] != 0.0 || p[1] != 1.0 {
+                    return Err(format!(
+                        "verify sim: rxy levels ({}, {}) on a qubit; only (0, 1) exists",
+                        p[0], p[1]
+                    ));
+                }
+                let (c2, s2) = ((p[2] / 2.0).cos(), (p[2] / 2.0).sin());
+                let (cf, sf) = (p[3].cos(), p[3].sin());
+                // −i s2 (cf X + sf Y): X = [[0,1],[1,0]], Y = [[0,−i],[i,0]]
+                let off01 = c(0.0, -s2) * c(cf, 0.0) + c(0.0, -s2) * c(0.0, -sf);
+                let off10 = c(0.0, -s2) * c(cf, 0.0) + c(0.0, -s2) * c(0.0, sf);
+                apply_1q(&mut sv, q[0], [c(c2, 0.0), off01, off10, c(c2, 0.0)]);
+            }
+            GateKind::CSum => apply_ctrl_1q(&mut sv, q[0], q[1], [ZERO, ONE, ONE, ZERO]),
             ref other => return Err(format!("sim: unsupported gate {other:?}")),
         }
     }
 
-    let mut z = vec![0.0; n];
-    for (q, zq) in z.iter_mut().enumerate() {
-        let bit = 1usize << q;
-        let mut e = 0.0;
-        for (x, amp) in sv.iter().enumerate() {
-            let p = amp.norm_sqr();
-            e += if x & bit == 0 { p } else { -p };
-        }
-        *zq = e;
+    Ok(sv)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rx_theta_circuit() -> CircuitIR {
+        // RX(theta)|0>: <Z> = cos(theta). One free symbol, named.
+        let mut c = CircuitIR::new(1, omega_core::circuit::CircuitType::GateBased);
+        c.symbols.insert(0, "theta".into());
+        c.add_op(omega_core::circuit::GateOp {
+            gate: GateKind::Rx,
+            qubits: smallvec::smallvec![omega_core::circuit::Qubit(0)],
+            params: smallvec::smallvec![omega_core::circuit::ParamExpr::Symbol(0)],
+            classical_bit: None,
+            condition: None,
+        });
+        c
     }
-    Ok(z)
+
+    #[test]
+    fn forward_z_refuses_missing_param() {
+        // An empty vector used to bind theta to 0.0 and return <Z> = 1.0,
+        // a plausible number. It must be a refusal naming theta.
+        let err = forward_z_expectations(&rx_theta_circuit(), &[]).unwrap_err();
+        assert!(err.contains("got 0 value(s)"), "{err}");
+        assert!(err.contains("1 free parameter(s)"), "{err}");
+        assert!(err.contains("[theta]"), "{err}");
+        // Extras are refused as well, not dropped.
+        assert!(forward_z_expectations(&rx_theta_circuit(), &[0.1, 0.2]).is_err());
+    }
+
+    #[test]
+    fn forward_z_runs_with_complete_params() {
+        let theta = 1.0_f64;
+        let z = forward_z_expectations(&rx_theta_circuit(), &[theta]).unwrap();
+        assert_eq!(z.len(), 1);
+        assert!((z[0] - theta.cos()).abs() < 1e-10, "<Z> = {}", z[0]);
+    }
 }

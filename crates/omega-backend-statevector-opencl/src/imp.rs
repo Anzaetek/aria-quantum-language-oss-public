@@ -292,7 +292,9 @@ impl StateBuffer {
             .queue(&self.queue)
             .enq()
             .expect("opencl read_state");
-        buf.chunks_exact(2)
+        buf.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| Complex64::new(c[0] as f64, c[1] as f64))
             .collect()
     }
@@ -638,7 +640,7 @@ impl StateBuffer {
 
         let dim = self.dim();
         let kernel = Kernel::builder()
-            .program(&*self.program)
+            .program(&self.program)
             .name("apply_diagonal_product")
             .queue((*self.queue).clone())
             .arg(&self.buf)
@@ -763,7 +765,7 @@ impl StateBuffer {
             .map_err(|e| OpenClError::Runtime(format!("opencl partials buf: {e}")))?;
 
         let kernel = Kernel::builder()
-            .program(&*self.program)
+            .program(&self.program)
             .name("inner_product")
             .queue((*self.queue).clone())
             .arg(&self.buf)
@@ -804,7 +806,7 @@ impl StateBuffer {
             .map_err(|e| OpenClError::Runtime(format!("opencl partials read: {e}")))?;
         let mut acc_re: f64 = 0.0;
         let mut acc_im: f64 = 0.0;
-        for chunk in host.chunks_exact(2) {
+        for chunk in host.as_chunks::<2>().0.iter() {
             acc_re += chunk[0] as f64;
             acc_im += chunk[1] as f64;
         }
@@ -844,7 +846,7 @@ impl StateBuffer {
             .map_err(|e| OpenClError::Runtime(format!("opencl partials buf (pauli): {e}")))?;
 
         let kernel = Kernel::builder()
-            .program(&*self.program)
+            .program(&self.program)
             .name("pauli_expectation")
             .queue((*self.queue).clone())
             .arg(&self.buf)
@@ -885,7 +887,7 @@ impl StateBuffer {
             .map_err(|e| OpenClError::Runtime(format!("opencl partials read (pauli): {e}")))?;
         let mut acc_re: f64 = 0.0;
         let mut acc_im: f64 = 0.0;
-        for chunk in host.chunks_exact(2) {
+        for chunk in host.as_chunks::<2>().0.iter() {
             acc_re += chunk[0] as f64;
             acc_im += chunk[1] as f64;
         }

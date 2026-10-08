@@ -1,0 +1,9 @@
+# ffsim — IBM's fermionic simulator (fixed-particle-number basis).
+# Pulls qiskit and numpy itself; the runner also imports qiskit directly for
+# QPY decode and the SparsePauliOp expectation path shared with qiskit_runner.
+#
+# Unpinned on purpose: ffsim is pre-1.0 (0.0.x) and this file was written
+# on a host that could not reach PyPI (see PLAN-OPEN-20260825.md §3c.0e), so
+# any pin here would be a guess dressed as a decision. Pin once
+# `make ffsim-venv` has been run somewhere and the version recorded.
+ffsim

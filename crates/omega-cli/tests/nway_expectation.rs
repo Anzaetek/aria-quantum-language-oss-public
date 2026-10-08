@@ -29,8 +29,9 @@
 //! rejected deliberately — a minimal cover is fitted to the defects I happened
 //! to plant, which is overfitting dressed as efficiency. At 2–3 qubits the
 //! **full weight-≤2 set** (15 for n=2, 36 for n=3) is free and carries no
-//! selection bias, so that is what runs. [`observable_set_detects_planted_defects`]
-//! then verifies the harness rather than justifying a hand-picked list.
+//! selection bias, so that is what runs.
+//! `the_observable_set_is_the_full_weight_le_2_family` then verifies the
+//! harness rather than justifying a hand-picked list.
 //!
 //! # Mid-circuit constructs are refused from the IR, not filtered by name
 //!

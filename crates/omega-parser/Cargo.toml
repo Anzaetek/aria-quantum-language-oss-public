@@ -7,6 +7,15 @@ repository.workspace = true
 authors.workspace = true
 description = "Program/QASM parser for the omega quantum runtime."
 
+[features]
+# F4.3 non-triviality pin. `cfg(test)` compiles the tunnel-θ sign hook for
+# this crate's unit tests. The check itself lives in omega-bridges, an
+# integration test, and `cfg(test)` is not set on this library when that
+# crate links it — so the same hook is behind this feature, enabled on that
+# crate's dev-dependency. A production build has neither, and the sign
+# cannot move.
+f4-tunnel-theta-hook = []
+
 [dependencies]
 omega-core = { path = "../omega-core" }
 pest = { workspace = true }
@@ -16,6 +25,12 @@ smallvec = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# tests/ditqasm_registers.rs reads fixtures/ditqasm/PROVENANCE.json
+serde_json = { workspace = true }
+# F4.2 cross-lane differential runs both lowerings through the statevector,
+# and the photonics refusal is the backend's own door.
+omega-backend-statevector = { path = "../omega-backend-statevector" }
+omega-backend-photonics = { path = "../omega-backend-photonics" }
 
 [[bench]]
 name = "parser_bench"

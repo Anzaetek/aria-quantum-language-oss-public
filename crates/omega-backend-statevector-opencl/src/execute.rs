@@ -55,6 +55,23 @@ pub(crate) fn run(
         }
     }
 
+    // Collapse mode with shots and a declared creg keys counts on the
+    // CLASSICAL register on the CPU, even when no `Measure` writes it (a
+    // conditioned gate alone forces collapse). This backend only has the
+    // qubit-register sampler, so it would answer with different keys at a
+    // different width. Refuse, as for a `Measure`.
+    // `tests/collapse_counts_agree_with_cpu.rs` pins the disagreement.
+    if config.mid_circuit_mode == MidCircuitMode::Collapse
+        && config.shots.is_some()
+        && circuit.num_classical_bits > 0
+    {
+        return Err(OmegaError::Unsupported(
+            "opencl: collapse mode is not implemented here (counts key on the \
+             classical register)"
+                .into(),
+        ));
+    }
+
     // No mid-circuit measurement → classical bits stay zero throughout.
     let classical_bits = vec![0u8; circuit.num_classical_bits as usize];
     apply_ops_fused(&mut state, &circuit.ops, params, |op| {
@@ -233,12 +250,18 @@ fn apply_op(state: &mut StateBuffer, op: &GateOp, params: &ParameterBinding) -> 
         // this backend surfaces a clean "unsupported gate" error so the CLI
         // dispatcher falls back to the CPU statevector backend (which supports
         // RBS and its Givens parameter-shift rule).
-        GateKind::Rbs | GateKind::PhaseShifter | GateKind::BeamSplitterRx | GateKind::Custom(_) => {
-            Err(OmegaError::Unsupported(format!(
-                "opencl-statevector: gate {:?} is not supported on this backend",
-                op.gate
-            )))
-        }
+        // Rxy and CSum are qudit gates (PLAN-QUDIT); this backend is a qubit
+        // statevector and refuses them by name rather than leaving the match
+        // non-exhaustive.
+        GateKind::Rbs
+        | GateKind::PhaseShifter
+        | GateKind::BeamSplitterRx
+        | GateKind::Rxy
+        | GateKind::CSum
+        | GateKind::Custom(_) => Err(OmegaError::Unsupported(format!(
+            "opencl-statevector: gate {:?} is not supported on this backend",
+            op.gate
+        ))),
     }
 }
 
